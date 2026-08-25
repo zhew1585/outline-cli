@@ -13,6 +13,7 @@
 //! source and the `/api` path convention - never in `engine` or
 //! `spec-compile`.
 
+mod bounded;
 pub mod cache;
 
 use std::collections::HashSet;

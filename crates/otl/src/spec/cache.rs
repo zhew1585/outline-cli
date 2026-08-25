@@ -50,6 +50,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use directories::ProjectDirs;
 use engine::ir::{OpSpec, IR_SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
+
+use super::bounded::BoundedOps;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -73,6 +75,10 @@ const CACHE_FILE_NAME: &str = "ir-cache.bin";
 /// The rest of the name is random and the file is created exclusively; see
 /// [`store_at`] for why a predictable name would be a vulnerability.
 const TEMP_FILE_PREFIX: &str = "ir-cache.bin.tmp.";
+
+/// Why a cache path that is not a plain file is refused.
+const NOT_REGULAR_REASON: &str = "it is not a regular file (a symlink, pipe, socket, device or \
+     directory is never a cache this build wrote)";
 
 /// Length of a hex SHA-256 digest.
 const SPEC_HASH_HEX_LEN: usize = 64;
@@ -121,12 +127,12 @@ pub const MAX_CACHED_OPS: usize = 8192;
 /// Checked as the table is decoded, element by element, so decoding stops
 /// at the first operation that pushes the total past it instead of
 /// finishing and then being rejected.
-const MAX_DECODED_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_DECODED_BYTES: usize = 8 * 1024 * 1024;
 
 /// Fewest encoded bytes one operation can possibly occupy: four
 /// zero-length strings, a body-mode discriminant and an empty parameter
 /// list. Used to reject an impossible element count before decoding.
-const MIN_ENCODED_OP_BYTES: usize = 6;
+pub(super) const MIN_ENCODED_OP_BYTES: usize = 6;
 
 /// Bincode configuration: fixed, so a cache written by one build decodes
 /// identically in the next, and limited as a backstop.
@@ -195,116 +201,6 @@ pub struct CachedIr {
 struct Body {
     meta: CacheMeta,
     ops: BoundedOps,
-}
-
-/// The operation table, decoded under an explicit element and footprint
-/// budget.
-///
-/// # Why a byte limit is not enough
-///
-/// bincode's `with_limit` counts the bytes the decoder CONSUMES. It says
-/// nothing about what those bytes turn into: a minimal `OpSpec` encodes to
-/// six bytes (four empty strings, a discriminant, an empty parameter list)
-/// and occupies well over a hundred once decoded, and the serde path never
-/// charges the decoder for a decoded structure. So a one-megabyte cache
-/// could ask for a hundred thousand operations and get tens of megabytes
-/// of heap - all of it allocated BEFORE any validation could discard the
-/// file.
-///
-/// # What this bounds
-///
-/// The sequence is pulled element by element (bincode hands over a
-/// pull-based `SeqAccess` and allocates nothing itself), and decoding stops
-/// at the first element that breaks a rule:
-///
-/// - the declared element count must not exceed [`MAX_CACHED_OPS`], nor
-///   what the remaining bytes could possibly encode;
-/// - the running decoded footprint must stay under [`MAX_DECODED_BYTES`];
-/// - capacity is reserved for what is plausible, never for what the file
-///   claims.
-///
-/// One operation is still decoded whole before its footprint is counted,
-/// so the peak is that budget plus one operation's worth - bounded by the
-/// file limit, which is why that limit is small.
-struct BoundedOps(Vec<OpSpec>);
-
-impl Serialize for BoundedOps {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for BoundedOps {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_seq(OpsVisitor)
-    }
-}
-
-struct OpsVisitor;
-
-impl<'de> serde::de::Visitor<'de> for OpsVisitor {
-    type Value = BoundedOps;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "at most {MAX_CACHED_OPS} operations")
-    }
-
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let declared = seq.size_hint();
-        if let Some(count) = declared {
-            if count > MAX_CACHED_OPS {
-                return Err(serde::de::Error::custom(format!(
-                    "it declares {count} operations, more than the {MAX_CACHED_OPS} allowed"
-                )));
-            }
-        }
-        // Trust the smaller of "what it says" and "what could fit".
-        let plausible = MAX_CACHE_BODY_BYTES / MIN_ENCODED_OP_BYTES;
-        let capacity = declared.unwrap_or(0).min(MAX_CACHED_OPS).min(plausible);
-        let mut ops: Vec<OpSpec> = Vec::with_capacity(capacity);
-        let mut footprint = 0usize;
-        while let Some(op) = seq.next_element::<OpSpec>()? {
-            if ops.len() >= MAX_CACHED_OPS {
-                return Err(serde::de::Error::custom(format!(
-                    "it contains more than the {MAX_CACHED_OPS} operations allowed"
-                )));
-            }
-            footprint = footprint.saturating_add(footprint_of(&op));
-            if footprint > MAX_DECODED_BYTES {
-                return Err(serde::de::Error::custom(format!(
-                    "its operations decode to more than the {MAX_DECODED_BYTES} byte limit"
-                )));
-            }
-            ops.push(op);
-        }
-        Ok(BoundedOps(ops))
-    }
-}
-
-/// Rough heap footprint of one decoded operation: the struct itself, the
-/// bytes of its owned strings, and its parameter and enum containers.
-///
-/// Approximate on purpose - it is a budget, not an accounting - but it
-/// must never UNDER-count a field that an attacker can multiply, which is
-/// why the containers are charged by element size and not just by length.
-fn footprint_of(op: &OpSpec) -> usize {
-    let text = op.name.len() + op.path.len() + op.summary.len() + op.content_type.len();
-    let params: usize = op
-        .params
-        .iter()
-        .map(|param| {
-            std::mem::size_of::<engine::ir::ParamSpec>()
-                + param.name.len()
-                + param.format.len()
-                + param.enum_values.len() * std::mem::size_of::<std::borrow::Cow<'static, str>>()
-                + param
-                    .enum_values
-                    .iter()
-                    .map(|value| value.len())
-                    .sum::<usize>()
-        })
-        .sum();
-    std::mem::size_of::<OpSpec>() + text + params
 }
 
 /// Why a cache could not be located, read, or written.
@@ -477,28 +373,10 @@ fn read_capped(file: &Path) -> Result<Option<Vec<u8>>, CacheError> {
         path: file.to_path_buf(),
         reason,
     };
-    let not_regular = || {
-        damaged(
-            "it is not a regular file (a symlink, pipe, socket, device or \
-             directory is never a cache this build wrote)"
-                .to_string(),
-        )
-    };
-    // Deliberately does NOT follow symlinks.
-    let metadata = match fs::symlink_metadata(file) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error("read", file, error)),
-    };
-    if !metadata.is_file() {
-        return Err(not_regular());
+    let not_regular = || damaged(NOT_REGULAR_REASON.to_string());
+    if stat_regular(file)?.is_none() {
+        return Ok(None);
     }
-    if metadata.len() > MAX_CACHE_FILE_BYTES as u64 {
-        return Err(damaged(format!(
-            "it is larger than the {MAX_CACHE_FILE_BYTES} byte limit"
-        )));
-    }
-
     let handle = fs::File::open(file).map_err(|error| io_error("read", file, error))?;
     // Re-check through the OPEN handle: if the path was swapped between the
     // two calls, this is what notices.
@@ -522,6 +400,34 @@ fn read_capped(file: &Path) -> Result<Option<Vec<u8>>, CacheError> {
         )));
     }
     Ok(Some(raw))
+}
+
+/// Stat the cache path without following symlinks, returning `None` when
+/// there is simply no cache.
+///
+/// Rejects anything that is not a plain file of plausible size BEFORE it is
+/// opened, which is the only place that check can do any good: opening a
+/// FIFO blocks until a writer appears, and following a symlink to a device
+/// hides both its type and its endless length.
+fn stat_regular(file: &Path) -> Result<Option<fs::Metadata>, CacheError> {
+    let metadata = match fs::symlink_metadata(file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("read", file, error)),
+    };
+    if !metadata.is_file() {
+        return Err(CacheError::Damaged {
+            path: file.to_path_buf(),
+            reason: NOT_REGULAR_REASON.to_string(),
+        });
+    }
+    if metadata.len() > MAX_CACHE_FILE_BYTES as u64 {
+        return Err(CacheError::Damaged {
+            path: file.to_path_buf(),
+            reason: format!("it is larger than the {MAX_CACHE_FILE_BYTES} byte limit"),
+        });
+    }
+    Ok(Some(metadata))
 }
 
 /// Check the raw prefix and decode the body.
