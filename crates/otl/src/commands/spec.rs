@@ -393,4 +393,60 @@ mod tests {
         let hash = "0123456789abcdef".repeat(4);
         assert_eq!(short_hash(&hash), "sha256:0123456789ab");
     }
+
+    fn op(name: &str) -> OpSpec {
+        OpSpec {
+            name: name.to_string().into(),
+            path: format!("/api/{name}").into(),
+            summary: String::new().into(),
+            content_type: String::new().into(),
+            body_mode: engine::ir::BodyMode::KeyValue,
+            params: Vec::new().into(),
+        }
+    }
+
+    /// The TTY rendering never runs in the end-to-end tests (a pipe gets
+    /// JSON by contract), so both states are checked here.
+    #[test]
+    fn a_sync_report_renders_in_both_output_states() {
+        let meta = cache::CacheMeta::new("f".repeat(64), "https://spec.example".to_string());
+        let report = sync_report(
+            &[op("things.info"), op("things.brandNew")],
+            &names(&["things.info", "things.gone"]),
+            &meta,
+            Path::new("/tmp/cache/ir-cache.bin"),
+        );
+
+        assert!(
+            report.human.contains("synced 2 operations"),
+            "{}",
+            report.human
+        );
+        assert!(
+            report.human.contains("new: things.brandNew"),
+            "{}",
+            report.human
+        );
+        assert!(
+            report.human.contains("gone: things.gone"),
+            "{}",
+            report.human
+        );
+        assert!(
+            report.human.contains("sha256:ffffffffffff"),
+            "{}",
+            report.human
+        );
+        assert!(
+            report.human.contains("/tmp/cache/ir-cache.bin"),
+            "{}",
+            report.human
+        );
+
+        assert_eq!(report.json["operations"], Value::from(2));
+        assert_eq!(report.json["added"], json!(["things.brandNew"]));
+        assert_eq!(report.json["removed"], json!(["things.gone"]));
+        assert_eq!(report.json["source"], Value::from("https://spec.example"));
+        assert_eq!(report.json["spec_hash"], Value::from("f".repeat(64)));
+    }
 }
