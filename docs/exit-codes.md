@@ -16,6 +16,7 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 | 6 | Server error | Outline instance failed to process the request (5xx) |
 | 7 | Network error | DNS failure, connection refused, TLS failure, request timeout, response body that times out or is cut mid-transfer |
 | 8 | Rate limited | The server kept answering HTTP 429 until the retry budget was exhausted; retry later |
+| 9 | Partial failure | A batch command finished, but some items in the batch failed: `otl docs export` wrote some documents and could not write others |
 
 Notes:
 
@@ -26,3 +27,5 @@ Notes:
 - API errors (codes 3-6) print the sanitized server-provided message on stderr, plus the machine-readable error code (e.g. `[validation_error]`) when the server sent one. For a `--body` request the free-form message is withheld (it may quote the request body, which can contain secrets) and only a shape-validated error code is printed; `--show-server-message` opts back in. The exit code is unaffected either way.
 - Network errors (code 7) and server errors (code 6) include a retry suggestion in the stderr message; only code 7 means the request may never have reached the server.
 - Rate limiting has two outcomes: a 429 the retry budget absorbed succeeds normally, and a 429 that outlasted the budget exits **8**. Code 3 remains for any 429 surfaced without exhausting retries.
+- Partial failure (code 9) is only for batch commands that deliberately keep going after one item fails. It means "the work that succeeded is real, and some of it is missing": `otl docs export` uses it when at least one document could not be fetched or written, and lists every failure on stderr. A batch that fails before doing any work at all reports the underlying error's own code instead, never 9. Enumerating the batch is not part of the batch: if the collection listing itself fails, that error's code (3-7) is returned and nothing is exported.
+- A pager or browser launched by `otl docs view` is not part of the command's result: if `$PAGER` cannot be spawned the content is written straight to stdout with a stderr warning and the exit code stays 0, and a pager the user quits early is normal completion. A `--web` invocation that cannot launch a browser is a real failure (code 1) and prints the URL so it can be opened by hand.

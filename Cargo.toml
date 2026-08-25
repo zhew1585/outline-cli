@@ -30,6 +30,10 @@ unicode-width = "0.2"
 # Emoji ligatures (ZWJ sequences, skin-tone modifiers) are one grapheme
 # cluster of width 2, not the sum of their codepoints' widths.
 unicode-segmentation = "1.12"
+# Terminal height, to decide whether `docs view` output exceeds one screen.
+# There is no std API for this and the alternative (an ioctl) needs unsafe,
+# which both crates forbid.
+terminal_size = "0.4"
 
 # dev / test
 wiremock = "0.6"

@@ -75,6 +75,36 @@ pub fn render(payload: &Value, mode: OutputMode) -> Result<String, serde_json::E
     }
 }
 
+/// Render a table with caller-chosen columns.
+///
+/// The curated commands (`otl docs search`, `otl collections list`, ...)
+/// pick their own columns instead of letting [`select_columns`] guess, but
+/// share this layout, cell sanitizing and truncation with the generic
+/// renderer - there is deliberately no per-command table code.
+///
+/// `rows` must be rectangular with respect to `headers`; shorter rows are
+/// padded with empty cells and extra cells are dropped, so a mismatch
+/// cannot panic on an index.
+pub fn render_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return EMPTY_LIST_PLACEHOLDER.to_string();
+    }
+    let header: Vec<String> = headers.iter().map(|name| sanitize_cell(name)).collect();
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            (0..header.len())
+                .map(|index| {
+                    row.get(index)
+                        .map(|cell| sanitize_cell(cell))
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    layout_table(&header, &body)
+}
+
 /// Render a list of objects as a table, or `None` when the payload does
 /// not have that shape.
 ///

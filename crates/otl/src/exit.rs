@@ -27,6 +27,10 @@ pub enum ExitCode {
     /// Rate limited: the server kept answering HTTP 429 until the retry
     /// budget was exhausted.
     RateLimited = 8,
+    /// Partial success: a batch command completed, but some items in the
+    /// batch failed. Whatever succeeded is on disk / on stdout, and the
+    /// failures are summarized on stderr.
+    Partial = 9,
 }
 
 impl From<ExitCode> for std::process::ExitCode {
@@ -65,6 +69,16 @@ impl CliError {
     /// A generic failure (exit code 1).
     pub fn failure(source: impl Into<anyhow::Error>) -> Self {
         Self::new(ExitCode::Failure, source)
+    }
+
+    /// A partial failure of a batch command (exit code 9).
+    ///
+    /// Reserved for commands that keep going after an individual item
+    /// fails: the successful part of the work stands, and this code tells a
+    /// script that the batch was incomplete without pretending it failed
+    /// wholesale.
+    pub fn partial(source: impl Into<anyhow::Error>) -> Self {
+        Self::new(ExitCode::Partial, source)
     }
 }
 
