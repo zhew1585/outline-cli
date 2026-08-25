@@ -17,13 +17,20 @@ use serde_json::Value;
 /// in the engine - the engine joins `base_url + op.path` verbatim.
 const API_PATH_PREFIX: &str = "/api";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 4;
+const IR_SCHEMA_VERSION: u32 = 5;
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
 /// The only request content type the generic engine can assemble.
 const JSON_CONTENT_TYPE: &str = "application/json";
 /// Maximum `$ref`/`allOf` expansion depth (guards against reference cycles).
 const MAX_SCHEMA_DEPTH: usize = 8;
+/// JSON pointer to the success response schema of an operation. `~1` is the
+/// pointer escape for the `/` in `application/json`.
+const SUCCESS_SCHEMA_POINTER: &str = "/responses/200/content/application~1json/schema";
+/// Outline envelope convention: the payload of a success response lives
+/// under `data`. This is service-specific, so it is applied here (the otl
+/// layer) and never in the engine.
+const ENVELOPE_DATA_PROPERTY: &str = "data";
 
 struct Op {
     name: String,
@@ -33,6 +40,17 @@ struct Op {
     /// `engine::ir::BodyMode` variant name.
     body_mode: &'static str,
     params: Vec<Param>,
+    response_fields: Vec<Field>,
+}
+
+/// One field of an operation's response payload, in declaration order.
+struct Field {
+    name: String,
+    /// `engine::ir::ParamType` variant name.
+    ty: &'static str,
+    format: String,
+    nullable: bool,
+    read_only: bool,
 }
 
 struct Param {
@@ -51,6 +69,10 @@ struct Facets {
     format: String,
     minimum: Option<f64>,
     maximum: Option<f64>,
+    /// `readOnly`: the value is server-generated. Irrelevant to request
+    /// validation, but it is the schema signal a generic renderer uses to
+    /// tell a writable label from a derived one.
+    read_only: bool,
 }
 
 fn main() {
@@ -135,6 +157,88 @@ fn compile_op(path: &str, post: &Value, spec: &Value) -> Op {
         content_type,
         body_mode,
         params,
+        response_fields: extract_response_fields(post, spec),
+    }
+}
+
+/// Fields of one item of the operation's success payload.
+///
+/// The envelope (`{"data": ...}`) and the list-vs-object distinction are
+/// resolved here; an operation whose spec describes no success schema, or
+/// whose payload is not an object, yields no fields and leaves the renderer
+/// to fall back on the data it receives.
+fn extract_response_fields(post: &Value, spec: &Value) -> Vec<Field> {
+    let Some(schema) = post.pointer(SUCCESS_SCHEMA_POINTER) else {
+        return Vec::new();
+    };
+    let Some(item) = response_item_schema(schema, spec, 0) else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    collect_fields(item, spec, 0, &mut fields);
+    fields
+}
+
+/// Walk from a response schema to the schema of one payload item.
+fn response_item_schema<'a>(schema: &'a Value, spec: &'a Value, depth: usize) -> Option<&'a Value> {
+    if depth > MAX_SCHEMA_DEPTH {
+        panic!("schema $ref/allOf nesting exceeds {MAX_SCHEMA_DEPTH} levels (cycle?)");
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return response_item_schema(resolve_ref(reference, spec), spec, depth + 1);
+    }
+    let data = schema.pointer(&format!("/properties/{ENVELOPE_DATA_PROPERTY}"))?;
+    Some(unwrap_array(data, spec, depth))
+}
+
+/// The item schema of an array, or the schema itself when it is not one.
+fn unwrap_array<'a>(schema: &'a Value, spec: &'a Value, depth: usize) -> &'a Value {
+    if depth > MAX_SCHEMA_DEPTH {
+        panic!("schema $ref/allOf nesting exceeds {MAX_SCHEMA_DEPTH} levels (cycle?)");
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return unwrap_array(resolve_ref(reference, spec), spec, depth + 1);
+    }
+    match schema.get("items") {
+        Some(items) if schema.get("type").and_then(Value::as_str) == Some("array") => items,
+        _ => schema,
+    }
+}
+
+/// Collect response fields in declaration order, expanding `$ref` and
+/// `allOf`. Later duplicates are ignored (first definition wins).
+///
+/// Declaration order is load-bearing: it is the schema's own statement of
+/// which fields matter most, and the renderer ranks columns by it. The build
+/// dependency on `serde_json` therefore enables `preserve_order`.
+fn collect_fields(schema: &Value, spec: &Value, depth: usize, out: &mut Vec<Field>) {
+    if depth > MAX_SCHEMA_DEPTH {
+        panic!("schema $ref/allOf nesting exceeds {MAX_SCHEMA_DEPTH} levels (cycle?)");
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        collect_fields(resolve_ref(reference, spec), spec, depth + 1, out);
+        return;
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            collect_fields(branch, spec, depth + 1, out);
+        }
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, prop) in properties {
+        if out.iter().any(|existing| existing.name == *name) {
+            continue;
+        }
+        let facets = extract_facets(prop, spec);
+        out.push(Field {
+            name: name.clone(),
+            ty: param_type(prop, spec, depth),
+            format: facets.format,
+            nullable: facets.nullable,
+            read_only: facets.read_only,
+        });
     }
 }
 
@@ -306,6 +410,9 @@ fn collect_facets(schema: &Value, spec: &Value, depth: usize, facets: &mut Facet
     if schema.get("nullable").and_then(Value::as_bool) == Some(true) {
         facets.nullable = true;
     }
+    if schema.get("readOnly").and_then(Value::as_bool) == Some(true) {
+        facets.read_only = true;
+    }
     if facets.enum_values.is_empty() {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
             facets.enum_values = values.iter().map(enum_literal).collect();
@@ -383,7 +490,40 @@ fn render_op(out: &mut String, op: &Op) {
         render_param(out, param);
     }
     let _ = writeln!(out, "        ]),");
+    let _ = writeln!(
+        out,
+        "        response_fields: ::std::borrow::Cow::Borrowed(&["
+    );
+    for field in &op.response_fields {
+        render_field(out, field);
+    }
+    let _ = writeln!(out, "        ]),");
     let _ = writeln!(out, "    }},");
+}
+
+fn render_field(out: &mut String, field: &Field) {
+    let _ = writeln!(out, "            engine::ir::FieldSpec {{");
+    let _ = writeln!(
+        out,
+        "                name: ::std::borrow::Cow::Borrowed({:?}),",
+        field.name
+    );
+    let _ = writeln!(
+        out,
+        "                ty: engine::ir::ParamType::{},",
+        field.ty
+    );
+    let _ = writeln!(
+        out,
+        "                format: ::std::borrow::Cow::Borrowed({:?}),",
+        field.format
+    );
+    let _ = writeln!(
+        out,
+        "                nullable: {}, read_only: {},",
+        field.nullable, field.read_only
+    );
+    let _ = writeln!(out, "            }},");
 }
 
 fn render_param(out: &mut String, param: &Param) {

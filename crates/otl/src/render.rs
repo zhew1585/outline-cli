@@ -4,16 +4,20 @@
 //!
 //! - `Json`: pretty JSON, jq-consumable, no color or decoration. Chosen by
 //!   `--json` or whenever stdout is not a TTY.
-//! - `Table`: schema/data-driven table for list-shaped payloads, chosen
-//!   only on a TTY. Columns are picked generically from the data (no
-//!   per-endpoint rendering code); non-list payloads fall back to JSON.
+//! - `Table`: schema-driven table for list-shaped payloads, chosen only on
+//!   a TTY. Columns are picked from the operation's compiled response
+//!   schema by one generic policy - there is no per-endpoint rendering code
+//!   and no per-endpoint data anywhere in the IR. Non-list payloads fall
+//!   back to JSON, and so does a payload whose keys the schema does not
+//!   describe (spec drift, or a response shape the spec never declared).
 //!
 //! Nothing here emits ANSI escapes, and cell text is scrubbed of control
 //! characters: server-controlled strings must not smuggle escapes or line
 //! breaks into the terminal. Any future decoration must be gated on
 //! [`OutputMode::Table`] so that non-TTY output stays decoration-free.
 
-use serde_json::Value;
+use engine::{FieldSpec, ParamType};
+use serde_json::{Map, Value};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -39,6 +43,13 @@ const TRUNCATION_MARK: &str = "\u{2026}"; // …
 const COLUMN_GAP: &str = "  ";
 /// Placeholder printed for an empty list in table mode.
 const EMPTY_LIST_PLACEHOLDER: &str = "(no items)";
+/// Schema `format` marking a field as an opaque identifier.
+const UUID_FORMAT: &str = "uuid";
+/// Schema `format` marking a field as a timestamp.
+const DATE_TIME_FORMAT: &str = "date-time";
+/// The conventional identifier field name, used only when no field carries
+/// a `uuid` format (some schemas type their ids as plain strings).
+const ID_FIELD: &str = "id";
 
 /// How data is rendered on stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +74,18 @@ pub fn resolve_mode(json_flag: bool, stdout_is_tty: bool) -> OutputMode {
 
 /// Render a response payload for the given mode (without trailing newline).
 ///
+/// `schema` describes one item of the operation's response payload, as
+/// compiled into the IR; pass an empty slice when the shape is unknown.
 /// In table mode, payloads that are not a list of objects fall back to
 /// pretty JSON so every payload shape stays renderable.
-pub fn render(payload: &Value, mode: OutputMode) -> Result<String, serde_json::Error> {
+pub fn render(
+    payload: &Value,
+    mode: OutputMode,
+    schema: &[FieldSpec],
+) -> Result<String, serde_json::Error> {
     match mode {
         OutputMode::Json => serde_json::to_string_pretty(payload),
-        OutputMode::Table => match try_render_table(payload) {
+        OutputMode::Table => match try_render_table(payload, schema) {
             Some(table) => Ok(table),
             None => serde_json::to_string_pretty(payload),
         },
@@ -77,22 +94,13 @@ pub fn render(payload: &Value, mode: OutputMode) -> Result<String, serde_json::E
 
 /// Render a list of objects as a table, or `None` when the payload does
 /// not have that shape.
-///
-// TODO(story-1.5b): thread the operation's response schema in here (an
-// `&OpSpec` carrying response field descriptors from the IR) and select
-// columns from the SCHEMA instead of the observed rows. Until the IR gains
-// response schemas, the column set is derived from the response itself; it
-// is made deterministic within a response by unioning keys across all rows
-// and ordering them by a fixed priority, so it cannot drift between rows or
-// with map iteration order - but two responses of the same operation that
-// omit different optional fields can still differ.
-fn try_render_table(payload: &Value) -> Option<String> {
+fn try_render_table(payload: &Value, schema: &[FieldSpec]) -> Option<String> {
     let rows = payload.as_array()?;
     if rows.is_empty() {
         return Some(EMPTY_LIST_PLACEHOLDER.to_string());
     }
     let objects: Vec<_> = rows.iter().map(Value::as_object).collect::<Option<_>>()?;
-    let columns = select_columns(&objects);
+    let columns = select_columns(&objects, schema);
     if columns.is_empty() {
         return None;
     }
@@ -105,10 +113,94 @@ fn try_render_table(payload: &Value) -> Option<String> {
     Some(layout_table(&header, &body))
 }
 
-/// Pick up to [`MAX_TABLE_COLUMNS`] keys, preferring identity and
-/// timestamp-like keys.
+/// Pick up to [`MAX_TABLE_COLUMNS`] columns, from the response schema when
+/// it describes this payload and from the data itself otherwise.
 ///
-/// Determinism rules, so the same response always yields the same header:
+/// The schema is preferred because it is the only source that makes the
+/// header a property of the OPERATION rather than of one response: two
+/// responses that happen to omit different optional fields still render the
+/// same columns. The data-driven policy remains for payloads no schema
+/// describes - a raw `--body` call, an operation whose spec declares no
+/// response shape, or spec drift - and is chosen when none of the schema's
+/// columns appear in the payload at all.
+fn select_columns<'a>(rows: &[&'a Map<String, Value>], schema: &'a [FieldSpec]) -> Vec<&'a str> {
+    let from_schema = select_schema_columns(schema);
+    let matches_payload = from_schema
+        .iter()
+        .any(|key| rows.iter().any(|row| row.contains_key(*key)));
+    if matches_payload {
+        return from_schema;
+    }
+    select_data_columns(rows)
+}
+
+/// The generic schema-driven column policy.
+///
+/// One rule set for every operation, derived from facets any OpenAPI schema
+/// can state - there is no per-endpoint knowledge here or in the IR:
+///
+/// 1. anything not displayable as a single value (objects, arrays, unions)
+///    is dropped;
+/// 2. the IDENTITY column is the first non-nullable `uuid`-formatted field,
+///    or else a field literally named `id`;
+/// 3. the LABEL column is the first non-nullable plain string (a string with
+///    no `format`, so not an id, timestamp, URL or e-mail), preferring one
+///    the schema does NOT mark `readOnly`: a writable string is the name the
+///    user gave the object, while a read-only one is derived from it;
+/// 4. then the non-nullable timestamps, in declaration order;
+/// 5. then the remaining non-nullable values, then the nullable ones.
+///
+/// Ties are always broken by the schema's own declaration order, which is
+/// how the spec ranks its fields.
+fn select_schema_columns(schema: &[FieldSpec]) -> Vec<&str> {
+    let scalars: Vec<&FieldSpec> = schema
+        .iter()
+        .filter(|field| field.ty != ParamType::Json)
+        .collect();
+    let identity = scalars
+        .iter()
+        .position(|f| f.format == UUID_FORMAT && !f.nullable)
+        .or_else(|| scalars.iter().position(|f| f.name == ID_FIELD));
+    let label = scalars
+        .iter()
+        .enumerate()
+        .filter(|(index, f)| Some(*index) != identity && is_plain_label(f))
+        .min_by_key(|(index, f)| (f.read_only, *index))
+        .map(|(index, _)| index);
+
+    let chosen = |index: usize| Some(index) == identity || Some(index) == label;
+    let rest = scalars
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !chosen(*index));
+    let timestamps = rest
+        .clone()
+        .filter(|(_, f)| f.format == DATE_TIME_FORMAT && !f.nullable);
+    let required = rest
+        .clone()
+        .filter(|(_, f)| f.format != DATE_TIME_FORMAT && !f.nullable);
+    let optional = rest.filter(|(_, f)| f.nullable);
+
+    let ordered = identity
+        .into_iter()
+        .chain(label)
+        .chain(timestamps.chain(required).chain(optional).map(|(i, _)| i));
+    ordered
+        .take(MAX_TABLE_COLUMNS)
+        .map(|index| scalars[index].name.as_ref())
+        .collect()
+}
+
+/// Whether a field reads as the object's human label: a string the schema
+/// constrains no further (an id, timestamp, URL or e-mail all carry a
+/// `format`) and that is always present.
+fn is_plain_label(field: &FieldSpec) -> bool {
+    field.ty == ParamType::String && field.format.is_empty() && !field.nullable
+}
+
+/// Pick columns from the response itself, for payloads no schema describes.
+///
+/// Determinism rules, so the same payload always yields the same header:
 ///
 /// - the candidate set is the UNION of the keys of every row, never a
 ///   sample, so an optional field missing from the first row (or from any
@@ -117,16 +209,16 @@ fn try_render_table(payload: &Value) -> Option<String> {
 ///   neither row order nor JSON object iteration order;
 /// - a key whose value is a container in any row is dropped entirely, so a
 ///   column is never half-rendered.
-fn select_columns<'a>(rows: &[&'a serde_json::Map<String, Value>]) -> Vec<&'a String> {
-    let mut candidates: Vec<&String> = Vec::new();
+fn select_data_columns<'a>(rows: &[&'a Map<String, Value>]) -> Vec<&'a str> {
+    let mut candidates: Vec<&str> = Vec::new();
     for row in rows {
         for key in row.keys() {
-            if !candidates.contains(&key) {
+            if !candidates.contains(&key.as_str()) {
                 candidates.push(key);
             }
         }
     }
-    let mut columns: Vec<&String> = candidates
+    let mut columns: Vec<&str> = candidates
         .into_iter()
         .filter(|key| {
             rows.iter()
@@ -143,8 +235,9 @@ fn select_columns<'a>(rows: &[&'a serde_json::Map<String, Value>]) -> Vec<&'a St
     columns
 }
 
-/// Ranking used to auto-pick key columns; lower is better. Ties are broken
-/// by key name in [`select_columns`], never by input order.
+/// Ranking used to auto-pick key columns without a schema; lower is better.
+/// Ties are broken by key name in [`select_data_columns`], never by input
+/// order.
 fn key_priority(key: &str) -> u8 {
     match key {
         "id" => 0,

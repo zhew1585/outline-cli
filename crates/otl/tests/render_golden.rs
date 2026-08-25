@@ -8,8 +8,29 @@
 
 use std::path::Path;
 
+use engine::{FieldSpec, ParamType};
 use otl::render::{render, resolve_mode, OutputMode};
 use serde_json::{json, Value};
+
+/// No response schema: the data-driven fallback policy.
+const NO_SCHEMA: &[FieldSpec] = &[];
+
+/// A response-field descriptor, as `build.rs` compiles them.
+fn field(
+    name: &'static str,
+    ty: ParamType,
+    format: &'static str,
+    nullable: bool,
+    read_only: bool,
+) -> FieldSpec {
+    FieldSpec {
+        name: std::borrow::Cow::Borrowed(name),
+        ty,
+        format: std::borrow::Cow::Borrowed(format),
+        nullable,
+        read_only,
+    }
+}
 
 /// Whether golden files may be rewritten instead of asserted.
 ///
@@ -33,7 +54,12 @@ fn may_update_golden(update: Option<&str>, ci: Option<&str>) -> bool {
 /// Compare rendered output against a golden file (or rewrite it when
 /// `OTL_UPDATE_GOLDEN=1` outside CI).
 fn assert_golden(payload: &Value, mode: OutputMode, golden_name: &str) {
-    let rendered = format!("{}\n", render(payload, mode).unwrap());
+    assert_golden_with(payload, mode, NO_SCHEMA, golden_name);
+}
+
+/// Same, with an explicit response schema driving column selection.
+fn assert_golden_with(payload: &Value, mode: OutputMode, schema: &[FieldSpec], golden_name: &str) {
+    let rendered = format!("{}\n", render(payload, mode, schema).unwrap());
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(golden_name);
@@ -125,7 +151,7 @@ fn table_strips_control_characters_from_server_data() {
     let payload = json!([
         { "id": "doc-evil", "title": "red\u{1b}[31mtext\nline" }
     ]);
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     assert!(!rendered.contains('\u{1b}'), "ESC leaked: {rendered:?}");
     assert!(
         !rendered.contains("text\nline"),
@@ -136,20 +162,20 @@ fn table_strips_control_characters_from_server_data() {
 #[test]
 fn table_mode_falls_back_to_json_for_non_list_payloads() {
     let object = json!({ "id": "doc-1", "title": "Hello" });
-    let table = render(&object, OutputMode::Table).unwrap();
-    let json_out = render(&object, OutputMode::Json).unwrap();
+    let table = render(&object, OutputMode::Table, NO_SCHEMA).unwrap();
+    let json_out = render(&object, OutputMode::Json, NO_SCHEMA).unwrap();
     assert_eq!(table, json_out);
 
     let scalars = json!(["a", "b"]);
     assert_eq!(
-        render(&scalars, OutputMode::Table).unwrap(),
-        render(&scalars, OutputMode::Json).unwrap()
+        render(&scalars, OutputMode::Table, NO_SCHEMA).unwrap(),
+        render(&scalars, OutputMode::Json, NO_SCHEMA).unwrap()
     );
 }
 
 #[test]
 fn json_mode_is_pretty_json_without_decoration() {
-    let rendered = render(&documents_payload(), OutputMode::Json).unwrap();
+    let rendered = render(&documents_payload(), OutputMode::Json, NO_SCHEMA).unwrap();
     let reparsed: Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(reparsed, documents_payload());
     assert!(!rendered.contains('\u{1b}'), "ANSI in JSON output");
@@ -189,7 +215,7 @@ fn table_column_set_is_stable_across_heterogeneous_rows() {
     let other = json!({ "id": "c", "title": "Third" });
 
     let header_of = |payload: &Value| -> String {
-        render(payload, OutputMode::Table)
+        render(payload, OutputMode::Table, NO_SCHEMA)
             .unwrap()
             .lines()
             .next()
@@ -217,7 +243,7 @@ fn table_aligns_cjk_emoji_and_combining_characters() {
         { "id": "3", "title": "e\u{301}mile", "updatedAt": "C" },
         { "id": "4", "title": "ok \u{1f600}", "updatedAt": "D" }
     ]);
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     assert_golden(&payload, OutputMode::Table, "table_unicode.txt");
 
     // Compute the display column at which the final cell starts on each
@@ -266,7 +292,7 @@ fn table_aligns_emoji_ligatures() {
     ]);
     assert_golden(&payload, OutputMode::Table, "table_emoji.txt");
 
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     let starts: Vec<usize> = rendered
         .lines()
         .map(|line| {
@@ -286,7 +312,7 @@ fn table_never_splits_a_grapheme_cluster() {
     // inside one (which would emit a mangled fragment).
     let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
     let payload = json!([{ "id": "1", "title": family.repeat(40) }]);
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     let cell = rendered.lines().nth(1).unwrap();
     // Every emoji present must appear as a whole family cluster: no bare
     // ZWJ at a cut point, and no dangling joiner before the ellipsis.
@@ -305,7 +331,7 @@ fn table_caps_zero_width_codepoint_floods() {
     // Absolute cluster and codepoint caps must bound it.
     let flood = format!("a{}", "\u{301}".repeat(100_000));
     let payload = json!([{ "id": "1", "title": flood, "updatedAt": "2026-08-01" }]);
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     assert!(
         rendered.len() < 4_000,
         "output not bounded: {} bytes",
@@ -322,7 +348,7 @@ fn table_caps_many_zero_width_clusters() {
     // base character) must be bounded too.
     let flood = "a\u{301}".repeat(100_000);
     let payload = json!([{ "id": "1", "title": flood }]);
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     assert!(
         rendered.len() < 4_000,
         "output not bounded: {} bytes",
@@ -337,7 +363,7 @@ fn table_truncates_wide_characters_by_display_width() {
     // width budget on a character boundary and never panic.
     let wide = "中".repeat(40);
     let payload = json!([{ "id": "1", "title": wide }]);
-    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
     let title_cell = rendered.lines().nth(1).unwrap();
     let width: usize = title_cell
         .chars()
@@ -356,4 +382,259 @@ fn mode_resolution_follows_flag_then_tty() {
     assert_eq!(resolve_mode(true, false), OutputMode::Json);
     assert_eq!(resolve_mode(false, true), OutputMode::Table);
     assert_eq!(resolve_mode(false, false), OutputMode::Json);
+}
+
+// ---------------------------------------------------------------------------
+// Story 1-5b: schema-driven column selection.
+//
+// The column set becomes a property of the OPERATION, taken from the response
+// schema compiled into the IR, instead of a property of one response body.
+// The data-driven policy above stays as the fallback for payloads no schema
+// describes, so its golden files are unchanged.
+// ---------------------------------------------------------------------------
+
+/// The `Document` response schema, in the vendored spec's own field order
+/// (abridged to the fields that matter for column selection).
+fn document_schema() -> Vec<FieldSpec> {
+    vec![
+        field("id", ParamType::String, "uuid", false, true),
+        field("collectionId", ParamType::String, "uuid", true, false),
+        field("parentDocumentId", ParamType::String, "uuid", true, false),
+        field("title", ParamType::String, "", false, false),
+        field("fullWidth", ParamType::Boolean, "", false, false),
+        field("icon", ParamType::String, "", true, false),
+        field("text", ParamType::String, "", false, false),
+        field("url", ParamType::String, "", false, true),
+        field("urlId", ParamType::String, "", false, false),
+        field("tasks", ParamType::Json, "", false, false),
+        field("revision", ParamType::Number, "", false, true),
+        field("createdAt", ParamType::String, "date-time", false, true),
+        field("createdBy", ParamType::Json, "", false, false),
+        field("updatedAt", ParamType::String, "date-time", false, true),
+        field("publishedAt", ParamType::String, "date-time", true, true),
+        field("archivedAt", ParamType::String, "date-time", true, true),
+    ]
+}
+
+/// The `Collection` response schema: here the schema declares a read-only
+/// `url` BEFORE the writable `name`, which is what makes the read-only
+/// signal load-bearing.
+fn collection_schema() -> Vec<FieldSpec> {
+    vec![
+        field("id", ParamType::String, "uuid", false, true),
+        field("url", ParamType::String, "", false, true),
+        field("urlId", ParamType::String, "", false, true),
+        field("name", ParamType::String, "", false, false),
+        field("description", ParamType::String, "", true, false),
+        field("sort", ParamType::Json, "", false, false),
+        field("index", ParamType::String, "", true, false),
+        field("sharing", ParamType::Boolean, "", false, false),
+        field("createdAt", ParamType::String, "date-time", false, true),
+        field("updatedAt", ParamType::String, "date-time", false, true),
+    ]
+}
+
+#[test]
+fn schema_picks_identity_label_and_timestamps() {
+    // id (the only non-nullable uuid), title (the first non-nullable plain
+    // string that is not read-only - `text` loses on declaration order, `url`
+    // on being read-only), then the non-nullable timestamps in schema order.
+    assert_golden_with(
+        &documents_payload(),
+        OutputMode::Table,
+        &document_schema(),
+        "schema_table_documents.txt",
+    );
+}
+
+#[test]
+fn schema_prefers_a_writable_label_over_a_read_only_one() {
+    let payload = json!([
+        {
+            "id": "col-1",
+            "url": "/collection/engineering-abc",
+            "urlId": "abc",
+            "name": "Engineering",
+            "sort": { "field": "index" },
+            "createdAt": "2026-07-01T09:00:00.000Z",
+            "updatedAt": "2026-08-01T10:00:00.000Z"
+        },
+        {
+            "id": "col-2",
+            "url": "/collection/design-def",
+            "urlId": "def",
+            "name": "Design",
+            "sort": { "field": "index" },
+            "createdAt": "2026-05-11T08:12:00.000Z",
+            "updatedAt": "2026-08-20T15:30:00.000Z"
+        }
+    ]);
+    assert_golden_with(
+        &payload,
+        OutputMode::Table,
+        &collection_schema(),
+        "schema_table_collections.txt",
+    );
+}
+
+#[test]
+fn schema_columns_do_not_depend_on_which_optional_fields_a_response_omits() {
+    // The whole point of 1-5b: two responses of the same operation that
+    // carry different optional fields still render the same header.
+    let schema = document_schema();
+    // Column NAMES, not the padded header line: padding follows the widest
+    // cell, which is data, while the column set must not.
+    let header_of = |payload: &Value| -> Vec<String> {
+        render(payload, OutputMode::Table, &schema)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let full = header_of(&documents_payload());
+    let sparse = header_of(&json!([{ "id": "doc-9" }]));
+    let extra = header_of(&json!([
+        { "id": "doc-9", "title": "T", "createdAt": "x", "updatedAt": "y", "icon": "e" }
+    ]));
+    assert_eq!(full, sparse, "header drifted with an omitted field");
+    assert_eq!(full, extra, "header drifted with an extra field");
+}
+
+#[test]
+fn schema_never_promotes_a_long_body_or_a_container_to_a_column() {
+    let header = render(&documents_payload(), OutputMode::Table, &document_schema())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    for noise in ["text", "tasks", "createdBy", "collectionId"] {
+        assert!(!header.contains(noise), "{noise} became a column: {header}");
+    }
+}
+
+#[test]
+fn a_payload_the_schema_does_not_describe_falls_back_to_the_data() {
+    // Spec drift, or a shape the spec never declared: rather than an empty
+    // table, the data-driven policy takes over.
+    let payload = json!([
+        { "alpha": "a", "beta": "b" },
+        { "alpha": "c", "beta": "d" }
+    ]);
+    let rendered = render(&payload, OutputMode::Table, &document_schema()).unwrap();
+    assert!(rendered.contains("alpha"), "{rendered}");
+    assert!(rendered.contains("beta"), "{rendered}");
+    assert_eq!(
+        rendered,
+        render(&payload, OutputMode::Table, NO_SCHEMA).unwrap()
+    );
+}
+
+#[test]
+fn an_all_json_schema_falls_back_to_the_data() {
+    // `auth.info` returns an envelope of objects only: nothing displayable,
+    // so the schema contributes no columns.
+    let schema = vec![
+        field("user", ParamType::Json, "", false, false),
+        field("team", ParamType::Json, "", false, false),
+    ];
+    let payload = json!([{ "id": "x", "title": "y" }]);
+    assert_eq!(
+        render(&payload, OutputMode::Table, &schema).unwrap(),
+        render(&payload, OutputMode::Table, NO_SCHEMA).unwrap()
+    );
+}
+
+#[test]
+fn a_schema_without_a_uuid_falls_back_to_the_id_field_name() {
+    let schema = vec![
+        field("name", ParamType::String, "", false, false),
+        field("id", ParamType::String, "", false, true),
+        field("count", ParamType::Number, "", false, false),
+    ];
+    let payload = json!([{ "id": "1", "name": "n", "count": 2 }]);
+    let header = render(&payload, OutputMode::Table, &schema)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(header.starts_with("id"), "identity not first: {header}");
+}
+
+#[test]
+fn schema_columns_are_capped_and_ordered_deterministically() {
+    let schema = document_schema();
+    let payload = documents_payload();
+    let header = render(&payload, OutputMode::Table, &schema)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(header.split("  ").filter(|c| !c.is_empty()).count(), 4);
+    // Repeated rendering is byte-identical (no map-iteration dependence).
+    for _ in 0..3 {
+        assert_eq!(
+            render(&payload, OutputMode::Table, &schema).unwrap(),
+            render(&payload, OutputMode::Table, &schema).unwrap()
+        );
+    }
+}
+
+#[test]
+fn json_mode_ignores_the_schema_entirely() {
+    // `--json` output is the payload verbatim, whatever the schema says.
+    assert_eq!(
+        render(&documents_payload(), OutputMode::Json, &document_schema()).unwrap(),
+        render(&documents_payload(), OutputMode::Json, NO_SCHEMA).unwrap()
+    );
+}
+
+#[test]
+fn the_compiled_ir_drives_real_operations() {
+    // Not a hand-written schema: the actual IR entry compiled from the
+    // vendored spec must yield the same generic choice.
+    let documents = otl::ops::find("documents.list").unwrap();
+    let header = render(
+        &documents_payload(),
+        OutputMode::Table,
+        &documents.response_fields,
+    )
+    .unwrap()
+    .lines()
+    .next()
+    .unwrap()
+    .to_string();
+    assert!(header.starts_with("id"), "{header}");
+    assert!(header.contains("title"), "{header}");
+    assert!(
+        header.contains("createdAt") && header.contains("updatedAt"),
+        "{header}"
+    );
+    assert!(
+        !header.contains("text"),
+        "long body became a column: {header}"
+    );
+
+    let collections = otl::ops::find("collections.list").unwrap();
+    let payload = json!([{ "id": "c1", "url": "/c/x", "name": "Engineering" }]);
+    let header = render(&payload, OutputMode::Table, &collections.response_fields)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(header.contains("name"), "{header}");
+    assert!(
+        !header
+            .split("  ")
+            .next()
+            .unwrap_or_default()
+            .contains("url"),
+        "a read-only url outranked the name: {header}"
+    );
 }
