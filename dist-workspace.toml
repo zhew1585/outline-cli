@@ -1,0 +1,68 @@
+# cargo-dist configuration (Story 4.5: release pipeline).
+#
+# One config produces every distribution channel the spec asks for
+# (specs/spec-outline-cli/stack.md "分发"):
+#   * shell installer  -> curl | sh  (macOS + Linux)
+#   * homebrew formula -> pushed to the tap named below
+#   * msi              -> Windows installer
+#
+# Phone-home policy (NFR4): `install-updater = false` on purpose. The
+# updater axodotdev ships would contact a release server behind the user's
+# back, which this project forbids. Do not turn it on.
+#
+# Regenerating: this file is the source of truth for
+# `.github/workflows/release.yml` and `crates/otl/wix/main.wxs`, which are
+# generated and must never be hand-edited. After editing this file run
+#   dist generate
+# and commit the result. Do NOT run `dist init --yes` to regenerate: it
+# rewrites `targets` with its own defaults, re-adding triples this project
+# deliberately does not ship. CI (.github/workflows/release-guards.yml)
+# verifies config and generated files agree via `dist generate --check`.
+
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "homebrew", "msi"]
+# Homebrew tap the generated formula is pushed to by the `homebrew` publish
+# job. Prerequisites, both outside this repository:
+#   1. the tap repo `weizhesafeheron/homebrew-tap` must exist;
+#   2. a `HOMEBREW_TAP_TOKEN` repository secret with `contents: write` on it.
+# Without them the release still succeeds up to the publish step and the
+# .rb formula is still attached to the GitHub Release as an artifact.
+tap = "weizhesafeheron/homebrew-tap"
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# NFR3 - three first-class platforms. Linux ships musl so the binary is
+# statically linked and glibc-version independent; the two macOS triples
+# cover Apple Silicon and Intel. Keep this list in sync with the platform
+# matrix documented in README.md ("Install").
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# Releasing is a tag-only activity: the generated workflow must not fire on
+# pull requests. The equivalent pre-merge validation (`dist plan` +
+# `dist generate --check`) lives in .github/workflows/release-guards.yml,
+# which is hand-written and reviewable, so nothing is lost by skipping here.
+pr-run-mode = "skip"
+
+# Extra steps injected into every build job. Used to install the musl
+# cross toolchain the Linux target needs; see the fragment's own header for
+# why it is spelled out by hand instead of using `[dist.dependencies.apt]`.
+# The path is resolved relative to .github/workflows/.
+github-build-setup = "../build-setup/linux-musl.yml"
