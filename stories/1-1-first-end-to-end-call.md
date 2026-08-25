@@ -1,6 +1,6 @@
 # Story 1.1: 首次端到端调用
 
-Status: ready-for-dev
+Status: done
 
 ## Story
 
@@ -22,35 +22,35 @@ so that 引擎最小闭环（IR 编译 + 分发器 + 认证 + 请求）被真实
 
 ## Tasks / Subtasks
 
-- [ ] Task 1: Cargo workspace 脚手架 (AC: 1)
-  - [ ] 根 Cargo.toml 定义 workspace，成员 `crates/engine`、`crates/otl`
-  - [ ] engine 为纯库 crate（thiserror 错误），otl 为二进制 crate（binary name = `otl`，anyhow）
-  - [ ] rustfmt.toml / clippy 基线；`#![forbid(unsafe_code)]` 两 crate 都加
-- [ ] Task 2: vendor 上游 spec (AC: 1)
-  - [ ] 下载 https://raw.githubusercontent.com/outline/openapi/main/spec3.json 到 `crates/otl/spec/spec3.json`（用 JSON 版，见 Dev Notes）
-  - [ ] 记录 vendor 来源 commit/日期到 `crates/otl/spec/VENDOR.md`
-- [ ] Task 3: engine IR 数据结构 (AC: 1)
-  - [ ] `OpSpec { name, path, params }`、`ParamSpec { name, ty, required }`、`ParamType { String, Integer, Boolean, Number, Json }`
-  - [ ] 全部 derive Serialize/Deserialize + 常量 `IR_SCHEMA_VERSION`
-  - [ ] engine 不出现任何 Outline 字样（架构红线）
-- [ ] Task 4: build.rs IR 编译管线 (AC: 1)
-  - [ ] otl 的 build.rs：serde_json 解析 spec3.json，只筛选 path 以 `/documents.` 开头的 operation
-  - [ ] 从 requestBody schema 提取参数名/类型/必填（只处理标量，本 story 忽略复杂类型，标记为 Json）
-  - [ ] 产出 Rust 源码或 bincode blob 到 OUT_DIR，`include!`/`include_bytes!` 进二进制
-  - [ ] `cargo:rerun-if-changed=spec/spec3.json`
-- [ ] Task 5: engine 请求通道最小版 (AC: 2)
-  - [ ] `Client::new(base_url, token)` + `execute(op: &OpSpec, args: &[(String, String)]) -> Result<serde_json::Value, EngineError>`
-  - [ ] k=v 组装 JSON body（本 story 只做 string 直通，类型转换留给 Story 1.3，但结构上按 ParamType 分发）
-  - [ ] reqwest blocking + rustls：`reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-tls"] }`
-  - [ ] POST `{base}/api/{op.name}`，头：authorization Bearer / content-type / accept 均 application/json
-- [ ] Task 6: otl CLI 入口 (AC: 2, 3)
-  - [ ] clap：`otl api <operation> [k=v...]`，operation 候选来自 IR 表
-  - [ ] 配置读取：`OUTLINE_URL`（必填，报错含设置示例）、`OUTLINE_API_KEY`（缺失时不发请求，stderr 可读错误，退出码 2）
-  - [ ] 成功输出响应 JSON 的 `data` 字段（无 data 则整体）到 stdout，pretty print
-- [ ] Task 7: 测试 (AC: 1-3)
-  - [ ] wiremock 集成测试：模拟 `/api/documents.info` 返回 Outline 信封 `{"data": {...}}`，断言请求方法/头/体
-  - [ ] assert_cmd：缺 OUTLINE_API_KEY → 退出码 2 + stderr 含提示；缺 OUTLINE_URL 同理
-  - [ ] build.rs 管线单测：对 vendored spec 断言 documents.* 操作数 > 10 且含 documents.info/documents.search
+- [x] Task 1: Cargo workspace 脚手架 (AC: 1)
+  - [x] 根 Cargo.toml 定义 workspace，成员 `crates/engine`、`crates/otl`
+  - [x] engine 为纯库 crate（thiserror 错误），otl 为二进制 crate（binary name = `otl`，anyhow）
+  - [x] rustfmt.toml / clippy 基线；`#![forbid(unsafe_code)]` 两 crate 都加
+- [x] Task 2: vendor 上游 spec (AC: 1)
+  - [x] 下载 https://raw.githubusercontent.com/outline/openapi/main/spec3.json 到 `crates/otl/spec/spec3.json`（用 JSON 版，见 Dev Notes）
+  - [x] 记录 vendor 来源 commit/日期到 `crates/otl/spec/VENDOR.md`
+- [x] Task 3: engine IR 数据结构 (AC: 1)
+  - [x] `OpSpec { name, path, params }`、`ParamSpec { name, ty, required }`、`ParamType { String, Integer, Boolean, Number, Json }`
+  - [x] 全部 derive Serialize/Deserialize + 常量 `IR_SCHEMA_VERSION`
+  - [x] engine 不出现任何 Outline 字样（架构红线）
+- [x] Task 4: build.rs IR 编译管线 (AC: 1)
+  - [x] otl 的 build.rs：serde_json 解析 spec3.json，只筛选 path 以 `/documents.` 开头的 operation
+  - [x] 从 requestBody schema 提取参数名/类型/必填（只处理标量，本 story 忽略复杂类型，标记为 Json）
+  - [x] 产出 Rust 源码或 bincode blob 到 OUT_DIR，`include!`/`include_bytes!` 进二进制
+  - [x] `cargo:rerun-if-changed=spec/spec3.json`
+- [x] Task 5: engine 请求通道最小版 (AC: 2)
+  - [x] `Client::new(base_url, token)` + `execute(op: &OpSpec, args: &[(String, String)]) -> Result<serde_json::Value, EngineError>`
+  - [x] k=v 组装 JSON body（本 story 只做 string 直通，类型转换留给 Story 1.3，但结构上按 ParamType 分发）
+  - [x] reqwest blocking + rustls：`reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-tls"] }`
+  - [x] POST `{base}/api/{op.name}`，头：authorization Bearer / content-type / accept 均 application/json
+- [x] Task 6: otl CLI 入口 (AC: 2, 3)
+  - [x] clap：`otl api <operation> [k=v...]`，operation 候选来自 IR 表
+  - [x] 配置读取：`OUTLINE_URL`（必填，报错含设置示例）、`OUTLINE_API_KEY`（缺失时不发请求，stderr 可读错误，退出码 2）
+  - [x] 成功输出响应 JSON 的 `data` 字段（无 data 则整体）到 stdout，pretty print
+- [x] Task 7: 测试 (AC: 1-3)
+  - [x] wiremock 集成测试：模拟 `/api/documents.info` 返回 Outline 信封 `{"data": {...}}`，断言请求方法/头/体
+  - [x] assert_cmd：缺 OUTLINE_API_KEY → 退出码 2 + stderr 含提示；缺 OUTLINE_URL 同理
+  - [x] build.rs 管线单测：对 vendored spec 断言 documents.* 操作数 > 10 且含 documents.info/documents.search
 
 ## Dev Notes
 
@@ -101,10 +101,35 @@ outline-cli/
 
 ### Agent Model Used
 
-（待 dev-story 填写）
+claude-fable-5 (Claude Code agent), 2026-08-25
 
 ### Debug Log References
 
+- 无阻塞性调试问题。
+- 唯一环境问题：首次 `cargo test -p engine` 编译因资源限制被中断（exit 137），重跑通过。
+
 ### Completion Notes List
 
+- 偏差 1：reqwest 0.13 已将 feature `rustls-tls`（0.12 命名）改名为 `rustls`，另需 `webpki-roots` 提供信任根。
+  story 文本按 0.12 命名书写，按 0.13 实际 feature 落地，语义不变（rustls 后端、禁用默认 native-tls）。
+- 偏差 2（微小）：wiremock 0.6 需要 async 运行时，测试用 `#[tokio::test(flavor = "multi_thread")]` + `spawn_blocking` 包裹 blocking 客户端/CLI 进程；生产代码仍是纯 blocking，无 tokio 依赖。
+- IR 表走 codegen Rust 源码路线（`static OPS: &[engine::ir::OpSpec]`），未用 bincode（留给 Story 4.2）。
+- IR 字段用 `Cow<'static, str>` / `Cow<'static, [ParamSpec]>`：静态表零拷贝构造，同时保持 Serialize/Deserialize。
+- 生成代码含 `const _: () = assert!(engine::ir::IR_SCHEMA_VERSION == 1);` 编译期锁定 schema 版本。
+- vendored spec 实测含 30 个 documents.* 操作；未知参数按 Json/字符串直通（本地校验属 Story 1.4 范围）。
+- 质量门全绿：cargo build / cargo test（17 通过 0 失败）/ cargo clippy --all-targets -- -D warnings / cargo fmt --check。
+- 架构红线验证：`grep -ri outline crates/engine/` 零命中。
+
 ### File List
+
+- Cargo.toml, Cargo.lock, rustfmt.toml
+- crates/engine/Cargo.toml
+- crates/engine/src/{lib.rs, ir.rs, client.rs, error.rs}
+- crates/engine/tests/execute.rs
+- crates/otl/Cargo.toml
+- crates/otl/build.rs
+- crates/otl/spec/{spec3.json, VENDOR.md}
+- crates/otl/src/{main.rs, lib.rs, ops.rs, config.rs, exit.rs}
+- crates/otl/src/commands/{mod.rs, api.rs}
+- crates/otl/tests/{api_e2e.rs, ir_table.rs}
+- docs/exit-codes.md
