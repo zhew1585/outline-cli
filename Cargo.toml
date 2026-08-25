@@ -5,6 +5,7 @@ members = ["crates/engine", "crates/otl"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/weizhesafeheron/outline-cli"
 rust-version = "1.85"
 
 [workspace.dependencies]

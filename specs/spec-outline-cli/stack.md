@@ -25,7 +25,7 @@ kernel 的 intent 不含实现处方，全部落在此处。
 - 客户端获取（已定）：双路径，DCR 优先。未配置 client_id 时自动 DCR 注册（公共客户端），注册结果连同 registration_access_token 本地缓存；DCR 不可用（workspace 未开 MCP）时回退提示管理员在 Settings → Applications 预注册。
 - DCR 清理约束（源码确认）：DCR 客户端管理员无法在界面删除，仅能凭 registration_access_token 走 RFC 7592 删除。CLI 必须持久化该 token，并提供 `otl auth logout --purge` 自删注册，避免服务器堆积孤儿客户端。
 - 回调端口（已定）：DCR 场景先绑定随机端口，再以实际端口的精确 redirect_uri 注册；预注册场景使用文档化固定端口清单（4 个备选 URI 依次尝试绑定）。
-- 实测确认（docs.91aql.com，脚本 scripts/test_oauth.py）：DCR（RFC 7591）自注册可用（依赖 workspace MCP 偏好开启）；公共客户端（无 secret）+ PKCE 可用；access token 3600s；refresh_token 每次轮换；revoke 正常。
+- 实测确认（自托管实例，脚本 scripts/test_oauth.py，地址从 `OUTLINE_URL` 注入）：DCR（RFC 7591）自注册可用（依赖 workspace MCP 偏好开启）；公共客户端（无 secret）+ PKCE 可用；access token 3600s；refresh_token 每次轮换；revoke 正常。
 - 自托管无需服务端开关；管理员预注册路径为 Settings → Applications（需 admin 权限）。
 - 凭证存储（已定，2026-08-26 改）：本地凭证文件，不使用系统钥匙串。
   - 位置：用户配置目录下的独立文件（`directories` 解析，如 `~/.config/outline-cli/credentials.toml`），与 `config.toml` 分离——配置可分享/进 git，凭证不会被误带走。

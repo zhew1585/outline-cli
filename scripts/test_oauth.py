@@ -7,7 +7,8 @@ Validates the exact flow the future Rust CLI will use:
   -> refresh grant -> revocation.
 
 Stdlib only. Usage:
-  python3 scripts/test_oauth.py [--base https://docs.91aql.com] [--scope read]
+  OUTLINE_URL=https://outline.example.com python3 scripts/test_oauth.py [--scope read]
+  python3 scripts/test_oauth.py --base https://outline.example.com
   OUTLINE_OAUTH_CLIENT_ID=... [OUTLINE_OAUTH_CLIENT_SECRET=...] to skip DCR.
 """
 
@@ -226,9 +227,15 @@ def revoke(meta: dict, client_id: str, client_secret: str | None,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default="https://docs.91aql.com")
+    parser.add_argument(
+        "--base",
+        default=os.environ.get("OUTLINE_URL"),
+        help="Outline instance base URL (defaults to $OUTLINE_URL)",
+    )
     parser.add_argument("--scope", default="read")
     args = parser.parse_args()
+    if not args.base:
+        parser.error("pass --base https://outline.example.com or set OUTLINE_URL")
     base = args.base.rstrip("/")
     redirect_uri = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
 

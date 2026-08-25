@@ -53,7 +53,7 @@ success: sync 后新端点可用；doctor 能发现本地 spec 缺失或已弃�
 - 两步协议（附件上传 attachments.create → S3 POST 等）通用引擎不覆盖：手写特例命令预算约 5 个。
 - 上游 spec 为社区维护：仅经 overlay 打补丁，不 fork；CI 对真实 workspace 跑契约测试兜底正确性。
 - 三平台（macOS/Linux/Windows）均为一等公民，CI 矩阵覆盖。
-- 自托管实例支持：base URL 可配置；参考实测环境 https://docs.91aql.com 。
+- 自托管实例支持：base URL 可配置；实测环境为一个自托管实例，地址从 env 注入（不写入仓库）。
 - 命名已定：二进制 `otl`，crate `outline-cli`（crates.io 上 `outline` 与 `otl` 已被占用，二者均为无关项目）。
 - CLI 不主动联网检查更新或 spec（不 phone home）；spec 更新仅随版本发布或用户显式 `spec sync`。
 
@@ -69,7 +69,7 @@ success: sync 后新端点可用；doctor 能发现本地 spec 缺失或已弃�
 
 ## Success signal
 
-对真实 workspace（docs.91aql.com 或云版）：`otl auth login` 完成 OAuth 全流程且后续请求自动续期；六个精选命令全部成功；spec 中任选 3 个未精选端点经 `otl api` 调用成功；`time otl --help` 启动 <10ms；`--json` 输出被 jq 消费且退出码符合文档。
+对真实 workspace（自托管实例或云版，地址从 env 注入）：`otl auth login` 完成 OAuth 全流程且后续请求自动续期；六个精选命令全部成功；spec 中任选 3 个未精选端点经 `otl api` 调用成功；`time otl --help` 启动 <10ms；`--json` 输出被 jq 消费且退出码符合文档。
 
 ## assumptions[]
 
