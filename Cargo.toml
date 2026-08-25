@@ -29,6 +29,16 @@ assert_cmd = "2.0"
 predicates = "3.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+# Release profile tuned for binary size and cold-start time (SPEC: <10ms
+# startup, ~5MB binary). `panic = "abort"` is safe for `cargo test --release`
+# because Cargo forces unwind when building test harnesses.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

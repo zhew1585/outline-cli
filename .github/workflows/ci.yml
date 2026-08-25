@@ -1,0 +1,139 @@
+# CI baseline (Story 1.8): three-platform matrix, lint gates, startup
+# performance gate, runtime-YAML guard, and a secrets-gated contract job.
+#
+# Phone-home policy: only standard actions (checkout, rust-toolchain,
+# rust-cache) - no telemetry or update-check actions. All third-party
+# actions are pinned to full commit SHAs (supply-chain hardening).
+#
+# NOTE on dtolnay/rust-toolchain: when pinned to a SHA the toolchain is no
+# longer carried by the ref, so `with: toolchain: stable` is mandatory.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+
+  runtime-yaml-guard:
+    name: no runtime YAML/OpenAPI parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: forbid YAML/OpenAPI crates in the runtime dependency graph
+        shell: bash
+        run: |
+          # SPEC constraint: the runtime never parses OpenAPI/YAML - build.rs
+          # compiles the vendored spec to a static IR table at build time.
+          # `-e normal` excludes dev- and build-dependencies, so this fails
+          # only when a YAML/OpenAPI parser leaks into the shipped binary.
+          # Fail-closed: a cargo tree failure aborts via set -e before grep.
+          set -euo pipefail
+          tree_out="$(cargo tree -p outline-cli -e normal --prefix none)"
+          if grep -iE 'yaml|yml|openapi|oas3' <<<"${tree_out}"; then
+            echo "::error::YAML/OpenAPI parser found in the runtime dependency graph"
+            exit 1
+          fi
+          echo "runtime dependency graph is clean"
+
+  startup-bench:
+    name: startup time gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: install hyperfine
+        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: bench otl --help cold start
+        env:
+          # Hard acceptance line (SPEC.md Constraints): mean < 10 ms.
+          # CI enforces the same threshold as the local default.
+          STARTUP_THRESHOLD_MS: "10"
+        run: ./scripts/bench-startup.sh
+      - name: startup guards against the release artifact
+        # The bench step above built the release binary, so the release-only
+        # guard (no manifest-directory path embedded) actually runs here
+        # instead of skipping.
+        run: cargo test --release -p outline-cli --test startup_guard
+
+  contract:
+    # Contract tests hit a real Outline workspace and only run when the
+    # OUTLINE_TEST_* secrets are configured (skipped otherwise, per project
+    # rule). No credentials are stored in the repository.
+    #
+    # Security boundary: this job runs ONLY on a push to a trusted branch.
+    # `pull_request` is excluded because same-repo PR code must not see
+    # secrets, and `workflow_dispatch` is excluded because anyone with write
+    # access can dispatch an arbitrary same-repo branch (checkout would take
+    # that ref and run branch-controlled code with the real credentials).
+    # Trust comes from the ref, never from actor permissions. Secrets are
+    # also exposed only to the two `run` steps below - never to third-party
+    # actions via job-level env.
+    name: contract tests (real workspace)
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-latest
+    steps:
+      - name: check for contract-test credentials
+        id: creds
+        shell: bash
+        env:
+          OUTLINE_TEST_URL: ${{ secrets.OUTLINE_TEST_URL }}
+          OUTLINE_TEST_API_KEY: ${{ secrets.OUTLINE_TEST_API_KEY }}
+        run: |
+          if [[ -n "${OUTLINE_TEST_URL}" && -n "${OUTLINE_TEST_API_KEY}" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "OUTLINE_TEST_URL / OUTLINE_TEST_API_KEY not configured; contract tests skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.creds.outputs.present == 'true'
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        if: steps.creds.outputs.present == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: steps.creds.outputs.present == 'true'
+      - name: run contract smoke tests
+        if: steps.creds.outputs.present == 'true'
+        env:
+          OUTLINE_TEST_URL: ${{ secrets.OUTLINE_TEST_URL }}
+          OUTLINE_TEST_API_KEY: ${{ secrets.OUTLINE_TEST_API_KEY }}
+        run: cargo test -p outline-cli --test contract_smoke -- --ignored
