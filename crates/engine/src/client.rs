@@ -16,6 +16,8 @@ use crate::ir::{OpSpec, ParamType};
 
 /// Placeholder shown instead of secrets in Debug output.
 const REDACTED: &str = "***";
+/// Minimum length (in chars) of a trailing secret fragment worth redacting.
+const MIN_SECRET_FRAGMENT_CHARS: usize = 4;
 /// Maximum number of bytes read from an error response body.
 const MAX_ERROR_BODY_BYTES: u64 = 8 * 1024;
 /// Maximum number of characters kept from a server-provided error message.
@@ -91,6 +93,16 @@ impl Client {
             .json()
             .map_err(|source| EngineError::InvalidResponse { url, source })
     }
+}
+
+/// Check whether a string is a well-formed, credential-free base URL:
+/// parses as absolute `http`/`https`, has a host, and carries no userinfo,
+/// query, or fragment - the same shape [`Client::new`] enforces.
+///
+/// Callers can use this for pre-flight configuration checks and to decide
+/// whether an unvalidated URL is safe to display at all.
+pub fn is_valid_base_url(base_url: &str) -> bool {
+    validate_base_url(base_url).is_ok()
 }
 
 /// Validate the base URL with a real URL parser.
@@ -186,12 +198,37 @@ fn extract_error_message(response: reqwest::blocking::Response, secret: &str) ->
 /// Replace every occurrence of `secret` in `text` with [`REDACTED`].
 ///
 /// An empty secret is left alone (a plain `str::replace("")` would insert
-/// the marker between every character).
+/// the marker between every character). After the exact replacement, any
+/// trailing fragment that is a prefix of the secret is also redacted: the
+/// [`MAX_ERROR_BODY_BYTES`] read cap can cut a reflected secret mid-way,
+/// and such a cut fragment can only appear at the very end of the capped
+/// text, where an exact match cannot find it.
 fn redact_secret(text: &str, secret: &str) -> String {
     if secret.is_empty() {
-        text.to_string()
-    } else {
-        text.replace(secret, REDACTED)
+        return text.to_string();
+    }
+    redact_cut_secret_tail(&text.replace(secret, REDACTED), secret)
+}
+
+/// Redact a trailing prefix of `secret` (at least
+/// [`MIN_SECRET_FRAGMENT_CHARS`] chars long) left behind by the body cap.
+///
+/// A cap cut mid-character leaves a U+FFFD from lossy decoding after the
+/// fragment, so trailing replacement characters are ignored when matching.
+fn redact_cut_secret_tail(text: &str, secret: &str) -> String {
+    let trimmed = text.trim_end_matches(char::REPLACEMENT_CHARACTER);
+    let fragment = secret
+        .char_indices()
+        .map(|(index, c)| &secret[..index + c.len_utf8()])
+        .rev()
+        .filter(|prefix| prefix.chars().count() >= MIN_SECRET_FRAGMENT_CHARS)
+        .find(|prefix| trimmed.ends_with(prefix));
+    match fragment {
+        Some(prefix) => {
+            let kept = &trimmed[..trimmed.len() - prefix.len()];
+            format!("{kept}{REDACTED}")
+        }
+        None => text.to_string(),
     }
 }
 

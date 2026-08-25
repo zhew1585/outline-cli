@@ -170,6 +170,45 @@ async fn reflected_bearer_token_is_redacted_from_error_message() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn token_prefix_cut_by_body_cap_is_redacted() {
+    // Reviewer PoC: 8180 bytes of padding followed by the token. The 8 KiB
+    // body cap cuts the token mid-way, leaving only its prefix at the end
+    // of the capped text, where an exact replacement cannot match. Any
+    // trailing token prefix (>= 4 chars) must still be redacted.
+    let token = "TOKEN-SECRET-ABCDEFGHIJKLMN";
+    let body = format!("{}{token}", "\n".repeat(8180));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(body, "text/plain"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, token)?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { message, .. }) => {
+            // No prefix of the token of length >= 4 may survive.
+            for length in 4..=token.len() {
+                assert!(
+                    !message.contains(&token[..length]),
+                    "token prefix {:?} leaked: {message:?}",
+                    &token[..length]
+                );
+            }
+            assert_eq!(message, "***");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
 #[test]
 fn new_rejects_non_http_base_url() {
     let error = Client::new("ftp://example.com", "token").unwrap_err();

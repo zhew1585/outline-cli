@@ -15,6 +15,6 @@ pub mod client;
 pub mod error;
 pub mod ir;
 
-pub use client::Client;
+pub use client::{is_valid_base_url, Client};
 pub use error::EngineError;
 pub use ir::{OpSpec, ParamSpec, ParamType, IR_SCHEMA_VERSION};
