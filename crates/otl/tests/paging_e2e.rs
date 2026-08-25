@@ -156,6 +156,9 @@ async fn missing_pagination_hint_does_not_stop_early() {
         3,
         "rows silently dropped: {stdout}"
     );
+    // The offset IS echoed here (only the page size is missing), so the
+    // result is fully confirmed and there is nothing to report.
+    assert_eq!(stderr, "", "unexpected diagnostics: {stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -375,9 +378,9 @@ async fn server_clamped_manual_page_warns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unconfirmed_offset_fails_instead_of_merging_wrong_rows() {
-    // Re-review finding 1 PoC: the server ignores the requested offset and
-    // echoes a string, so page 2 would duplicate row 0 into the result.
+async fn contradicting_offset_echo_fails_instead_of_merging_wrong_rows() {
+    // The server ignores the requested offset and says so by echoing 0
+    // again: page 2 would duplicate row 0 into the result.
     let server = MockServer::start().await;
     for offset in [0, 2] {
         Mock::given(method("POST"))
@@ -385,7 +388,7 @@ async fn unconfirmed_offset_fails_instead_of_merging_wrong_rows() {
             .and(body_partial_json(json!({ "offset": offset })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": items(0..2),
-                "pagination": { "offset": "0", "limit": 2 },
+                "pagination": { "offset": 0, "limit": 2 },
             })))
             .mount(&server)
             .await;
@@ -398,6 +401,65 @@ async fn unconfirmed_offset_fails_instead_of_merging_wrong_rows() {
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains("pagination failed"), "stderr: {stderr}");
     assert_eq!(stdout, "", "wrong rows printed as success: {stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unusable_offset_echo_still_fails() {
+    // Present but not a number: nothing to compare, so it cannot be waved
+    // through as merely absent.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": items(0..2),
+            "pagination": { "offset": "0", "limit": 2 },
+        })))
+        .mount(&server)
+        .await;
+
+    let output = run(server.uri(), vec!["documents.list"]).await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("pagination failed"), "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "",
+        "unverifiable rows printed as success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn absent_offset_echo_succeeds_with_a_notice_and_correct_rows() {
+    // An endpoint that sends no pagination envelope at all (spec drift)
+    // must still be usable: correct merged rows, exit 0, and one notice.
+    let server = MockServer::start().await;
+    for (offset, rows) in [(0, items(0..2)), (2, items(2..3)), (3, vec![])] {
+        Mock::given(method("POST"))
+            .and(path("/api/documents.list"))
+            .and(body_partial_json(json!({ "offset": offset })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": rows })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let output = run(server.uri(), vec!["--json", "documents.list"]).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let rows: Value = serde_json::from_str(&stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "rows lost or duplicated: {stdout}");
+    assert_eq!(rows[0]["id"], "doc-0");
+    assert_eq!(rows[2]["id"], "doc-2");
+    // Never silent, and said once - not once per page.
+    assert_eq!(
+        stderr.matches("did not echo the pagination offset").count(),
+        1,
+        "notice missing or repeated: {stderr:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

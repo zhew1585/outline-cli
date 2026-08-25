@@ -191,8 +191,13 @@ impl Client {
             // invariants cannot be skipped on this branch.
             let accepted = paginate::accept_page(spec, &mut value, start, 1, 0)?;
             let truncation = paginate::manual_page_truncation(&accepted);
+            let offset_unconfirmed = accepted.offset_unconfirmed;
             paginate::restore_items(spec, &mut value, accepted.items);
-            return Ok(Fetched { value, truncation });
+            return Ok(Fetched {
+                value,
+                truncation,
+                offset_unconfirmed,
+            });
         }
 
         paginate::fetch_all_pages(

@@ -41,10 +41,8 @@ pub struct PaginationSpec {
     /// reports one. Without this hint the engine cannot tell a clamped
     /// page from the last page, and keeps fetching until an empty page.
     pub page_size_pointer: Option<Cow<'static, str>>,
-    /// Pointer to the offset the server actually applied, if reported.
-    /// A value that disagrees with the requested offset aborts the fetch
-    /// rather than risking skipped or duplicated rows.
-    pub offset_pointer: Option<Cow<'static, str>>,
+    /// How to treat the offset the server reports having applied.
+    pub offset_echo: OffsetEcho,
     /// Pointer to page-local metadata that describes only the first page
     /// (offset/limit echoes). It is removed from the merged envelope so
     /// consumers cannot mistake it for the merged result's own paging
@@ -56,6 +54,52 @@ pub struct PaginationSpec {
     pub max_pages: u32,
 }
 
+/// How much the engine trusts the offset a server reports applying.
+///
+/// The three states answer two independent questions - does this API
+/// report the applied offset at all, and is that report guaranteed? - so
+/// they are spelled out at the call site rather than inferred:
+///
+/// - a report that CONTRADICTS the request (or is there but unusable) is
+///   always a hard error, in every mode that looks: continuing would merge
+///   rows the engine cannot place;
+/// - a report that is ABSENT is a different situation. A spec can be wrong
+///   or drift, so an endpoint may simply not send the envelope. Refusing to
+///   work at all is a worse outcome than paging by the local counter and
+///   saying so, which is what [`Self::ValidateIfPresent`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffsetEcho {
+    /// Never look at any reported offset; page purely by the local counter.
+    Ignored,
+    /// Validate the report when the server sends one, and fall back to the
+    /// local counter (flagging the page as unconfirmed) when it does not.
+    ValidateIfPresent {
+        /// Pointer to the offset the server applied.
+        pointer: Cow<'static, str>,
+    },
+    /// The API guarantees the report: a page without a usable one is a
+    /// protocol violation and fails the fetch.
+    Required {
+        /// Pointer to the offset the server applied.
+        pointer: Cow<'static, str>,
+    },
+}
+
+impl OffsetEcho {
+    /// The pointer this mode reads, if it reads one.
+    fn pointer(&self) -> Option<&str> {
+        match self {
+            Self::Ignored => None,
+            Self::ValidateIfPresent { pointer } | Self::Required { pointer } => Some(pointer),
+        }
+    }
+
+    /// Whether a missing report is a hard error.
+    fn requires_echo(&self) -> bool {
+        matches!(self, Self::Required { .. })
+    }
+}
+
 impl PaginationSpec {
     /// Check the descriptor before any network I/O.
     ///
@@ -64,10 +108,10 @@ impl PaginationSpec {
     /// never be able to delete the merged results.
     pub fn validate(&self) -> Result<(), EngineError> {
         let items = validate_pointer("items_pointer", &self.items_pointer)?;
-        for (name, pointer) in [
-            ("page_size_pointer", &self.page_size_pointer),
-            ("offset_pointer", &self.offset_pointer),
-        ] {
+        if let Some(pointer) = self.offset_echo.pointer() {
+            validate_pointer("offset_echo pointer", pointer)?;
+        }
+        for (name, pointer) in [("page_size_pointer", &self.page_size_pointer)] {
             if let Some(pointer) = pointer {
                 validate_pointer(name, pointer)?;
             }
@@ -98,6 +142,11 @@ pub struct Fetched {
     /// Present exactly when the result may be incomplete - callers MUST
     /// surface this to the user (never truncate silently).
     pub truncation: Option<Truncation>,
+    /// True when at least one page arrived without the offset report the
+    /// descriptor asked for, so page boundaries rest on the local counter
+    /// alone. Callers MUST tell the user (once): the rows are usable, but
+    /// unverified.
+    pub offset_unconfirmed: bool,
 }
 
 impl Fetched {
@@ -106,6 +155,7 @@ impl Fetched {
         Self {
             value,
             truncation: None,
+            offset_unconfirmed: false,
         }
     }
 }
@@ -185,6 +235,10 @@ pub(crate) struct AcceptedPage {
     pub items: Vec<Value>,
     /// The server-applied page size, when it reported a usable one.
     pub capacity: Option<u64>,
+    /// True when the descriptor asked for an offset report and the server
+    /// sent none (only reachable under
+    /// [`OffsetEcho::ValidateIfPresent`], which tolerates that).
+    pub offset_unconfirmed: bool,
 }
 
 /// Validate one response against the descriptor and take its rows out.
@@ -201,7 +255,7 @@ pub(crate) fn accept_page(
     page: u32,
     already_fetched: usize,
 ) -> Result<AcceptedPage, EngineError> {
-    check_offset_hint(spec, response, requested_offset)?;
+    let offset_unconfirmed = check_offset_echo(spec, response, requested_offset)?;
     let capacity = page_capacity(spec, response);
     // A response with no array at the items pointer does not match the
     // descriptor the caller chose. Returning it - verbatim on page one or
@@ -216,7 +270,11 @@ pub(crate) fn accept_page(
                 spec.items_pointer
             ),
         })?;
-    Ok(AcceptedPage { items, capacity })
+    Ok(AcceptedPage {
+        items,
+        capacity,
+        offset_unconfirmed,
+    })
 }
 
 /// Put a manually paged response's rows back where they came from.
@@ -266,12 +324,17 @@ where
     let mut merged: Vec<Value> = Vec::new();
     let mut envelope: Option<Value> = None;
     let mut offset = start;
+    let mut unconfirmed = false;
 
     for page in 0..spec.max_pages {
         let request_limit = page_request_limit(spec, max_items, merged.len() as u64);
         let mut response = fetch_page(offset, request_limit)?;
-        let accepted = accept_page(spec, &mut response, offset, page + 1, merged.len())?;
-        let AcceptedPage { items, capacity } = accepted;
+        let AcceptedPage {
+            items,
+            capacity,
+            offset_unconfirmed,
+        } = accept_page(spec, &mut response, offset, page + 1, merged.len())?;
+        unconfirmed |= offset_unconfirmed;
 
         let received = items.len() as u64;
         if envelope.is_none() {
@@ -280,17 +343,23 @@ where
         merged.extend(items);
 
         if let Some(cut) = truncate_to_cap(&mut merged, max_items) {
-            return Ok(finish(spec, envelope, merged, Some(cut)));
+            return Ok(finish(spec, envelope, merged, Some(cut), unconfirmed));
         }
         if received == 0 || capacity.is_some_and(|capacity| received < capacity) {
-            return Ok(finish(spec, envelope, merged, None));
+            return Ok(finish(spec, envelope, merged, None, unconfirmed));
         }
         let Some(next) = offset.checked_add(received) else {
             let truncation = Truncation {
                 fetched: merged.len() as u64,
                 cause: TruncationCause::OffsetSpaceExhausted,
             };
-            return Ok(finish(spec, envelope, merged, Some(truncation)));
+            return Ok(finish(
+                spec,
+                envelope,
+                merged,
+                Some(truncation),
+                unconfirmed,
+            ));
         };
         offset = next;
     }
@@ -300,7 +369,13 @@ where
         fetched: merged.len() as u64,
         cause: TruncationCause::PageLimit,
     };
-    Ok(finish(spec, envelope, merged, Some(truncation)))
+    Ok(finish(
+        spec,
+        envelope,
+        merged,
+        Some(truncation),
+        unconfirmed,
+    ))
 }
 
 /// Assemble the merged envelope: rows at the items pointer, page-local
@@ -310,6 +385,7 @@ fn finish(
     envelope: Option<Value>,
     merged: Vec<Value>,
     truncation: Option<Truncation>,
+    offset_unconfirmed: bool,
 ) -> Fetched {
     let mut value = envelope.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     if let Some(slot) = value.pointer_mut(&spec.items_pointer) {
@@ -321,35 +397,53 @@ fn finish(
             remove_at_path(&mut value, &path);
         }
     }
-    Fetched { value, truncation }
+    Fetched {
+        value,
+        truncation,
+        offset_unconfirmed,
+    }
 }
 
-/// Abort unless the server confirms the offset that was requested.
+/// Check the offset the server reports against the one requested.
 ///
-/// `offset_pointer: None` means the API reports no offset, and the engine
-/// trusts its own counter. Having configured a pointer, though, the value
-/// must be there and be a number: a missing or malformed hint would leave
-/// "advance by the received count" unverified, and a server that ignored
-/// the requested offset would then silently duplicate or skip rows.
-fn check_offset_hint(
+/// Returns whether the page had to be accepted unconfirmed (no report,
+/// under [`OffsetEcho::ValidateIfPresent`]).
+///
+/// A report that exists but contradicts the request - or is there in a form
+/// that cannot be compared - is always fatal: advancing by the received
+/// count would then skip or duplicate rows, and wrong data must never be
+/// presented as a result. A report that is simply absent is tolerated
+/// unless the descriptor declares it [`OffsetEcho::Required`].
+fn check_offset_echo(
     spec: &PaginationSpec,
     response: &Value,
     requested: u64,
-) -> Result<(), EngineError> {
-    let Some(pointer) = &spec.offset_pointer else {
-        return Ok(());
+) -> Result<bool, EngineError> {
+    let Some(pointer) = spec.offset_echo.pointer() else {
+        return Ok(false);
     };
-    let Some(reported) = response.pointer(pointer).and_then(Value::as_u64) else {
-        return Err(EngineError::Pagination {
-            reason: format!(
-                "server reported no usable offset at `{pointer}`, so the \
-                 requested offset {requested} cannot be confirmed; \
-                 aborting rather than skipping or duplicating rows"
-            ),
-        });
+    let unusable = |detail: &str| EngineError::Pagination {
+        reason: format!(
+            "server reported {detail} at `{pointer}`, so the requested \
+             offset {requested} cannot be confirmed; aborting rather than \
+             skipping or duplicating rows"
+        ),
+    };
+    // A JSON null is the wire's way of saying "no value", so it counts as
+    // absent rather than as a contradictory report.
+    let reported = match response.pointer(pointer) {
+        None | Some(Value::Null) => {
+            if spec.offset_echo.requires_echo() {
+                return Err(unusable("no offset"));
+            }
+            return Ok(true);
+        }
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| unusable("an unusable offset"))?,
     };
     if reported == requested {
-        return Ok(());
+        return Ok(false);
     }
     Err(EngineError::Pagination {
         reason: format!(

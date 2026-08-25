@@ -39,6 +39,13 @@ const SHOW_MESSAGE_HINT: &str =
 const DEDICATED_COMMAND_HINT: &str =
     "it is not callable via `otl api`; a dedicated command is planned";
 
+/// Notice for a list response that carried no pagination echo, so page
+/// boundaries rest on the CLI's own offset counter.
+const UNCONFIRMED_OFFSET_NOTICE: &str =
+    "notice: the server did not echo the pagination offset, so page \
+     boundaries could not be confirmed; results were paged by offset and \
+     may repeat or omit rows if the server ignored it";
+
 /// Marker appended in `otl api list` to operations that cannot be called.
 const NOT_CALLABLE_MARKER: &str = "[not callable via api";
 
@@ -133,6 +140,11 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
     }
     .map_err(|error| execute_error(error, detail))?;
 
+    if fetched.offset_unconfirmed {
+        // Once per command, not once per page: the rows are usable, the
+        // boundaries between them just could not be verified.
+        stdio::write_diagnostic_line(UNCONFIRMED_OFFSET_NOTICE);
+    }
     if let Some(truncation) = &fetched.truncation {
         warn_truncated(truncation);
     }

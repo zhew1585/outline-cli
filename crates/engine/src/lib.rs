@@ -34,6 +34,6 @@ pub use body::build_request_body;
 pub use client::{base_url_origin, is_valid_base_url, Client, ErrorDetail, DEFAULT_TIMEOUT};
 pub use error::{EngineError, TransportKind};
 pub use ir::{BodyMode, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION};
-pub use paginate::{Fetched, PaginationSpec, Truncation, TruncationCause};
+pub use paginate::{Fetched, OffsetEcho, PaginationSpec, Truncation, TruncationCause};
 pub use retry::RetryPolicy;
 pub use throttle::{Throttle, TokenBucket};

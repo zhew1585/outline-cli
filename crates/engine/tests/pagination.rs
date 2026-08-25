@@ -9,8 +9,8 @@
 use std::borrow::Cow;
 
 use engine::{
-    BodyMode, Client, EngineError, OpSpec, PaginationSpec, ParamSpec, ParamType, TruncationCause,
-    ValidationMode,
+    BodyMode, Client, EngineError, OffsetEcho, OpSpec, PaginationSpec, ParamSpec, ParamType,
+    TruncationCause, ValidationMode,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{body_partial_json, method, path};
@@ -59,7 +59,9 @@ fn spec() -> PaginationSpec {
         limit_param: Cow::Borrowed(LIMIT_PARAM),
         items_pointer: Cow::Borrowed("/result/rows"),
         page_size_pointer: Some(Cow::Borrowed("/meta/page_size")),
-        offset_pointer: Some(Cow::Borrowed("/meta/from")),
+        offset_echo: OffsetEcho::Required {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
         stale_metadata_pointer: Some(Cow::Borrowed("/meta")),
         page_size: 100,
         max_pages: 100,
@@ -352,7 +354,7 @@ async fn page_limit_reports_possible_not_definite_truncation() {
         max_pages: 2,
         // This fixture answers every offset with the same body, so it
         // cannot echo the requested offset; the page cap is the subject.
-        offset_pointer: None,
+        offset_echo: OffsetEcho::Ignored,
         ..spec()
     };
     let uri = server.uri();
@@ -548,7 +550,7 @@ async fn non_list_first_response_is_an_error_not_a_silent_success() {
 
     // No offset hint configured, so the items pointer is the only check.
     let items_only = PaginationSpec {
-        offset_pointer: None,
+        offset_echo: OffsetEcho::Ignored,
         ..spec()
     };
     let uri = server.uri();
@@ -604,7 +606,7 @@ fn errors_propagate_from_any_page() {
 // --- Re-review findings ---------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn missing_offset_hint_is_an_error_when_the_pointer_is_configured() {
+async fn contradicting_offset_echo_is_always_an_error() {
     // Re-review finding 1 (PoC): the server ignores the requested offset
     // and echoes a non-numeric hint, so "advance by received" cannot be
     // trusted. Merging [0,1] with [0] would silently duplicate a row.
@@ -630,7 +632,7 @@ async fn missing_offset_hint_is_an_error_when_the_pointer_is_configured() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn absent_offset_hint_is_an_error_when_the_pointer_is_configured() {
+async fn absent_offset_echo_is_an_error_only_when_required() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/rpc/things.list"))
@@ -647,7 +649,7 @@ async fn absent_offset_hint_is_an_error_when_the_pointer_is_configured() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn no_offset_pointer_configured_means_the_engine_trusts_its_counter() {
+async fn ignored_offset_echo_means_the_engine_trusts_its_counter() {
     // None keeps its meaning: the API reports no offset, so no check.
     let server = MockServer::start().await;
     for (offset, rows) in [(0, items(0..2)), (2, items(2..3))] {
@@ -663,7 +665,7 @@ async fn no_offset_pointer_configured_means_the_engine_trusts_its_counter() {
     }
 
     let hintless = PaginationSpec {
-        offset_pointer: None,
+        offset_echo: OffsetEcho::Ignored,
         ..spec()
     };
     let uri = server.uri();
@@ -812,7 +814,9 @@ fn invalid_hint_pointers_are_rejected_too() {
             ..spec()
         },
         PaginationSpec {
-            offset_pointer: Some(Cow::Borrowed("/meta/~9from")),
+            offset_echo: OffsetEcho::Required {
+                pointer: Cow::Borrowed("/meta/~9from"),
+            },
             ..spec()
         },
         PaginationSpec {
@@ -1014,4 +1018,247 @@ async fn manual_page_keeps_its_rows_and_its_own_paging_echo() {
     assert_eq!(rows[1]["id"], "row-1");
     assert_eq!(fetched.value["meta"]["page_size"], 5);
     assert!(fetched.truncation.is_none());
+}
+
+// --- OffsetEcho: the three descriptor states -----------------------------
+
+/// The descriptor with a chosen offset-echo mode.
+fn spec_with(echo: OffsetEcho) -> PaginationSpec {
+    PaginationSpec {
+        offset_echo: echo,
+        ..spec()
+    }
+}
+
+/// Fetch with an explicit offset-echo mode.
+async fn run_with_echo(uri: String, echo: OffsetEcho) -> Result<engine::Fetched, EngineError> {
+    tokio::task::spawn_blocking(move || {
+        let client = Client::new(&uri, "token")?;
+        client.execute_paged(&op(), &[], ValidationMode::Strict, &spec_with(echo), None)
+    })
+    .await
+    .unwrap()
+}
+
+/// A two-page collection whose pages omit the offset echo entirely.
+async fn mount_echoless_pages(server: &MockServer) {
+    for (offset, rows, size) in [(0, items(0..2), 2), (2, items(2..3), 2)] {
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ OFFSET_PARAM: offset })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "rows": rows },
+                "meta": { "page_size": size },
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn required_echo_rejects_an_absent_offset() {
+    let server = MockServer::start().await;
+    // Page one alone: the fetch must abort on it, so no page two is asked
+    // for and none is mounted.
+    Mock::given(method("POST"))
+        .and(path("/rpc/things.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": { "rows": items(0..2) },
+            "meta": { "page_size": 2 },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = run_with_echo(
+        server.uri(),
+        OffsetEcho::Required {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        EngineError::Pagination { reason } => assert!(reason.contains("no offset"), "{reason}"),
+        other => panic!("expected Pagination error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_if_present_tolerates_an_absent_offset_but_flags_it() {
+    // A spec can be wrong or drift: an endpoint that sends no envelope must
+    // still be usable. The rows come back merged, marked unconfirmed.
+    let server = MockServer::start().await;
+    mount_echoless_pages(&server).await;
+
+    let fetched = run_with_echo(
+        server.uri(),
+        OffsetEcho::ValidateIfPresent {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = fetched.value["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "rows dropped: {}", fetched.value);
+    assert_eq!(rows[2]["id"], "row-2");
+    assert!(
+        fetched.offset_unconfirmed,
+        "an absent echo must be reported, never silent"
+    );
+    assert!(fetched.truncation.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_if_present_still_rejects_a_contradicting_offset() {
+    // Tolerating absence must not tolerate a server contradicting itself:
+    // that path produces wrong rows.
+    let server = MockServer::start().await;
+    mount_page(&server, 0, 2, items(0..2)).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ OFFSET_PARAM: 2 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": { "rows": items(0..2) },
+            "meta": { "from": 0, "page_size": 2 },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = run_with_echo(
+        server.uri(),
+        OffsetEcho::ValidateIfPresent {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, EngineError::Pagination { .. }), "{error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_if_present_still_rejects_an_unusable_offset() {
+    // Present but not a number: comparable to nothing, so it cannot be
+    // waved through as "absent".
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rpc/things.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": { "rows": items(0..2) },
+            "meta": { "from": "0", "page_size": 2 },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = run_with_echo(
+        server.uri(),
+        OffsetEcho::ValidateIfPresent {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        EngineError::Pagination { reason } => {
+            assert!(reason.contains("unusable offset"), "{reason}");
+        }
+        other => panic!("expected Pagination error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_offset_counts_as_absent_not_as_a_contradiction() {
+    // JSON null is the wire's way of saying "no value".
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rpc/things.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": { "rows": items(0..1) },
+            "meta": { "from": null, "page_size": 2 },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = run_with_echo(
+        server.uri(),
+        OffsetEcho::ValidateIfPresent {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(fetched.offset_unconfirmed);
+    assert_eq!(fetched.value["result"]["rows"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ignored_echo_never_flags_anything() {
+    let server = MockServer::start().await;
+    mount_echoless_pages(&server).await;
+
+    let fetched = run_with_echo(server.uri(), OffsetEcho::Ignored)
+        .await
+        .unwrap();
+    assert_eq!(fetched.value["result"]["rows"].as_array().unwrap().len(), 3);
+    assert!(
+        !fetched.offset_unconfirmed,
+        "nothing was asked for, so nothing is unconfirmed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confirmed_pages_are_not_flagged() {
+    let server = MockServer::start().await;
+    mount_page(&server, 0, 2, items(0..2)).await;
+    mount_page(&server, 2, 2, items(2..3)).await;
+
+    let fetched = run_with_echo(
+        server.uri(),
+        OffsetEcho::ValidateIfPresent {
+            pointer: Cow::Borrowed("/meta/from"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!fetched.offset_unconfirmed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_manual_branch_flags_an_absent_offset_too() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ LIMIT_PARAM: 5 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": { "rows": items(0..2) },
+            "meta": { "page_size": 5 },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let echo = OffsetEcho::ValidateIfPresent {
+        pointer: Cow::Borrowed("/meta/from"),
+    };
+    let fetched = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&uri, "token")?;
+        client.execute_paged(
+            &op(),
+            &[(LIMIT_PARAM.to_string(), "5".to_string())],
+            ValidationMode::Strict,
+            &spec_with(echo),
+            None,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(fetched.offset_unconfirmed);
+    assert_eq!(fetched.value["result"]["rows"].as_array().unwrap().len(), 2);
 }

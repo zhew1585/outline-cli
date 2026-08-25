@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 
-use engine::{OpSpec, PaginationSpec};
+use engine::{OffsetEcho, OpSpec, PaginationSpec};
 
 /// Request parameter carrying the start offset.
 pub const OFFSET_PARAM: &str = "offset";
@@ -22,14 +22,22 @@ const ITEMS_POINTER: &str = "/data";
 const PAGE_SIZE_POINTER: &str = "/pagination/limit";
 /// JSON pointer to the offset the server applied.
 ///
-/// Configuring this makes the engine verify every page against the offset
-/// it asked for, so a server that ignored the request cannot silently
-/// produce duplicated or skipped rows. Outline documents `pagination` on
-/// every paginated response; if a server ever omits it, the command fails
-/// with an explicit message and manual paging (`offset=` plus `limit=`)
-/// remains available. Failing loudly is the intended trade: merging the
-/// wrong rows silently is the failure mode this whole story exists to
-/// prevent.
+/// Used in [`OffsetEcho::ValidateIfPresent`] mode, which splits the two
+/// cases that deserve different answers:
+///
+/// - the echo is there but disagrees with the offset we asked for (or is
+///   there in an uncomparable form): the server is contradicting itself,
+///   and merging its pages would produce duplicated or skipped rows. That
+///   is wrong DATA, so the command fails.
+/// - the echo is missing entirely: the vendored spec documents
+///   `pagination` on paginated responses, but a community spec can be
+///   wrong or drift from a given instance. Bricking on such an endpoint
+///   would be a worse outcome than paging by our own offset counter, so
+///   the rows are returned with a notice that boundaries are unverified.
+///
+/// `Required` is deliberately not used here for that second reason;
+/// `Ignored` is deliberately not used because it would make the
+/// contradiction case undetectable.
 const OFFSET_POINTER: &str = "/pagination/offset";
 /// JSON pointer to the page-local paging echo, dropped after merging.
 const PAGE_METADATA_POINTER: &str = "/pagination";
@@ -58,7 +66,9 @@ fn outline_spec() -> PaginationSpec {
         limit_param: Cow::Borrowed(LIMIT_PARAM),
         items_pointer: Cow::Borrowed(ITEMS_POINTER),
         page_size_pointer: Some(Cow::Borrowed(PAGE_SIZE_POINTER)),
-        offset_pointer: Some(Cow::Borrowed(OFFSET_POINTER)),
+        offset_echo: OffsetEcho::ValidateIfPresent {
+            pointer: Cow::Borrowed(OFFSET_POINTER),
+        },
         stale_metadata_pointer: Some(Cow::Borrowed(PAGE_METADATA_POINTER)),
         page_size: PAGE_SIZE,
         max_pages: MAX_PAGES,
