@@ -9,4 +9,5 @@ pub mod exit;
 pub mod ops;
 pub mod paging;
 pub mod render;
+pub mod spec;
 pub mod stdio;

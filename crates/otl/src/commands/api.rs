@@ -343,7 +343,7 @@ fn run_list(cmd: &ApiArgs) -> Result<(), CliError> {
         )));
     }
     let mut out = String::new();
-    for op in ops::OPS {
+    for op in ops::table() {
         out.push_str(&op.name);
         out.push('\t');
         out.push_str(&op.summary);

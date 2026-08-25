@@ -7,6 +7,15 @@ use engine::{BodyMode, ParamType};
 use otl::ops;
 use serde_json::Value;
 
+/// Look up an operation in the BUILT-IN table.
+///
+/// Not `ops::find`, which prefers a synced spec cache if the machine has
+/// one: this file asserts what `build.rs` compiled from the vendored spec,
+/// so it must not depend on the developer's cache directory.
+fn builtin(name: &str) -> Option<&'static engine::OpSpec> {
+    ops::OPS.iter().find(|op| op.name == name)
+}
+
 /// The vendored spec, parsed fresh so tests compare against the source of
 /// truth rather than a hardcoded operation count.
 fn vendored_spec() -> Value {
@@ -40,7 +49,7 @@ fn table_compiles_every_spec_operation() {
         "IR table op count != spec op count"
     );
     for name in &expected {
-        assert!(ops::find(name).is_some(), "{name} missing from IR table");
+        assert!(builtin(name).is_some(), "{name} missing from IR table");
     }
 }
 
@@ -55,7 +64,7 @@ fn table_spans_multiple_resources() {
         "auth.info",
         "attachments.create",
     ] {
-        assert!(ops::find(name).is_some(), "{name} missing");
+        assert!(builtin(name).is_some(), "{name} missing");
     }
 }
 
@@ -86,7 +95,7 @@ fn every_op_has_a_single_line_summary() {
 
 #[test]
 fn documents_info_has_string_id_param() {
-    let op = ops::find("documents.info").unwrap();
+    let op = builtin("documents.info").unwrap();
     let param = op.param("id").unwrap();
     assert_eq!(param.ty, ParamType::String);
 }
@@ -95,7 +104,7 @@ fn documents_info_has_string_id_param() {
 fn documents_search_expands_all_of_params() {
     // `documents.search` composes its schema via allOf + $ref (Pagination);
     // the build pipeline must expand both.
-    let op = ops::find("documents.search").unwrap();
+    let op = builtin("documents.search").unwrap();
     let query = op.param("query").unwrap();
     assert_eq!(query.ty, ParamType::String);
     // From the referenced Pagination component schema.
@@ -111,7 +120,7 @@ fn documents_search_expands_all_of_params() {
 #[test]
 fn documents_list_expands_multiple_refs() {
     // `documents.list` composes Pagination + Sorting + inline properties.
-    let op = ops::find("documents.list").unwrap();
+    let op = builtin("documents.list").unwrap();
     assert_eq!(op.param("sort").unwrap().ty, ParamType::String);
     assert_eq!(op.param("direction").unwrap().ty, ParamType::String);
     assert_eq!(op.param("limit").unwrap().ty, ParamType::Number);
@@ -135,14 +144,14 @@ fn no_all_of_op_has_an_empty_param_table() {
         "users.list",
         "events.list",
     ] {
-        let op = ops::find(name).unwrap();
+        let op = builtin(name).unwrap();
         assert!(!op.params.is_empty(), "{name} has an empty param table");
     }
 }
 
 #[test]
 fn scalar_integer_and_boolean_params_are_typed() {
-    let op = ops::find("documents.update").unwrap();
+    let op = builtin("documents.update").unwrap();
     assert_eq!(op.param("lastRevision").unwrap().ty, ParamType::Integer);
     assert_eq!(op.param("publish").unwrap().ty, ParamType::Boolean);
     // Objects and arrays stay Json (complex; k=v must be rejected).
@@ -153,10 +162,10 @@ fn scalar_integer_and_boolean_params_are_typed() {
 #[test]
 fn ref_and_all_of_wrapped_scalars_resolve_to_scalar_types() {
     // documents.update `editMode` is `$ref -> TextEditMode` (string enum).
-    let edit_mode = ops::find("documents.update").unwrap().param("editMode");
+    let edit_mode = builtin("documents.update").unwrap().param("editMode");
     assert_eq!(edit_mode.unwrap().ty, ParamType::String);
     // users.list `role` is `allOf -> $ref UserRole` (string enum).
-    let role = ops::find("users.list").unwrap().param("role");
+    let role = builtin("users.list").unwrap().param("role");
     assert_eq!(role.unwrap().ty, ParamType::String);
 }
 
@@ -166,7 +175,7 @@ fn root_level_one_of_marks_the_operation_raw_body_only() {
     // | required: collectionId): exactly one of the two must be present, a
     // rule key=value assembly cannot express. The operation is therefore
     // compiled as raw-body-only, with both properties still described.
-    let op = ops::find("shares.create").unwrap();
+    let op = builtin("shares.create").unwrap();
     assert_eq!(op.body_mode, BodyMode::RawJsonOnly);
     assert_eq!(op.param("documentId").unwrap().ty, ParamType::String);
     assert_eq!(op.param("collectionId").unwrap().ty, ParamType::String);
@@ -177,7 +186,7 @@ fn only_root_level_unions_are_raw_body_only() {
     // A oneOf nested inside a property (e.g. documents.list `filters`)
     // must not make the whole operation raw-body-only.
     assert_eq!(
-        ops::find("documents.list").unwrap().body_mode,
+        builtin("documents.list").unwrap().body_mode,
         BodyMode::KeyValue
     );
     let raw_only: Vec<&str> = ops::OPS
@@ -192,7 +201,7 @@ fn only_root_level_unions_are_raw_body_only() {
 fn non_json_request_bodies_are_marked_unsupported() {
     // documents.import only accepts multipart/form-data, which the generic
     // engine cannot assemble; it must be marked, not silently callable.
-    let op = ops::find("documents.import").unwrap();
+    let op = builtin("documents.import").unwrap();
     assert_eq!(op.body_mode, BodyMode::Unsupported);
     assert_eq!(op.content_type.as_ref(), "multipart/form-data");
     assert!(op.params.is_empty(), "no params for an unsupported body");
@@ -219,19 +228,19 @@ fn json_and_bodyless_operations_carry_the_expected_content_type() {
         }
     }
     // Operations without any request body carry no content type.
-    assert!(ops::find("auth.info").unwrap().content_type.is_empty());
+    assert!(builtin("auth.info").unwrap().content_type.is_empty());
 }
 
 #[test]
 fn enum_variants_are_compiled_into_the_ir() {
-    let op = ops::find("accessRequests.approve").unwrap();
+    let op = builtin("accessRequests.approve").unwrap();
     let permission = op.param("permission").unwrap();
     assert_eq!(
         permission.enum_values.as_ref(),
         ["read", "read_write", "admin"]
     );
     // Enums reached through allOf/$ref wrappers are compiled too.
-    let create = ops::find("collections.create").unwrap();
+    let create = builtin("collections.create").unwrap();
     assert_eq!(
         create.param("permission").unwrap().enum_values.as_ref(),
         ["read", "read_write"]
@@ -242,7 +251,7 @@ fn enum_variants_are_compiled_into_the_ir() {
 
 #[test]
 fn nullable_params_are_flagged() {
-    let op = ops::find("documents.update").unwrap();
+    let op = builtin("documents.update").unwrap();
     assert!(op.param("collectionId").unwrap().nullable);
     assert!(op.param("icon").unwrap().nullable);
     assert!(!op.param("id").unwrap().nullable);
@@ -251,10 +260,10 @@ fn nullable_params_are_flagged() {
 
 #[test]
 fn formats_are_compiled_into_the_ir() {
-    let approve = ops::find("accessRequests.approve").unwrap();
+    let approve = builtin("accessRequests.approve").unwrap();
     assert_eq!(approve.param("id").unwrap().format.as_ref(), "uuid");
     assert_eq!(
-        ops::find("documents.insights")
+        builtin("documents.insights")
             .unwrap()
             .param("startDate")
             .unwrap()
@@ -263,7 +272,7 @@ fn formats_are_compiled_into_the_ir() {
         "date-time"
     );
     assert_eq!(
-        ops::find("shares.update")
+        builtin("shares.update")
             .unwrap()
             .param("iconUrl")
             .unwrap()
@@ -273,7 +282,7 @@ fn formats_are_compiled_into_the_ir() {
     );
     // A vendor-specific format is carried but not enforced at runtime.
     assert_eq!(
-        ops::find("users.update")
+        builtin("users.update")
             .unwrap()
             .param("language")
             .unwrap()
@@ -282,7 +291,7 @@ fn formats_are_compiled_into_the_ir() {
         "BCP47"
     );
     // An unconstrained string carries no format.
-    assert!(ops::find("documents.update")
+    assert!(builtin("documents.update")
         .unwrap()
         .param("title")
         .unwrap()
@@ -296,10 +305,7 @@ fn pattern_constraints_are_deliberately_not_compiled() {
     // Validating it would need a regex engine (about a megabyte of binary
     // for the two pattern constraints in the whole spec), so the value is
     // left for the server to reject. This test documents that choice.
-    let color = ops::find("templates.update")
-        .unwrap()
-        .param("color")
-        .unwrap();
+    let color = builtin("templates.update").unwrap().param("color").unwrap();
     assert!(color.format.is_empty(), "no format facet on color");
     assert_eq!(color.ty, ParamType::String);
     assert!(color.nullable);
@@ -307,33 +313,30 @@ fn pattern_constraints_are_deliberately_not_compiled() {
 
 #[test]
 fn numeric_bounds_are_compiled_into_the_ir() {
-    let size = ops::find("attachments.create")
+    let size = builtin("attachments.create")
         .unwrap()
         .param("size")
         .unwrap();
     assert_eq!(size.minimum, Some(0.0));
     assert_eq!(size.maximum, None);
-    let revision = ops::find("documents.update")
+    let revision = builtin("documents.update")
         .unwrap()
         .param("lastRevision")
         .unwrap();
     assert_eq!(revision.minimum, Some(0.0));
     // An unbounded number carries no bounds.
-    let limit = ops::find("documents.search")
-        .unwrap()
-        .param("limit")
-        .unwrap();
+    let limit = builtin("documents.search").unwrap().param("limit").unwrap();
     assert_eq!((limit.minimum, limit.maximum), (None, None));
 }
 
 #[test]
 fn required_params_are_marked() {
     // Upstream spec marks `id` as required for documents.update.
-    let op = ops::find("documents.update").unwrap();
+    let op = builtin("documents.update").unwrap();
     let param = op.param("id").unwrap();
     assert!(param.required);
     // users.invite requires the complex `invites` parameter.
-    let invites = ops::find("users.invite").unwrap().param("invites").unwrap();
+    let invites = builtin("users.invite").unwrap().param("invites").unwrap();
     assert!(invites.required);
     assert_eq!(invites.ty, ParamType::Json);
 }
@@ -341,12 +344,12 @@ fn required_params_are_marked() {
 #[test]
 fn ops_without_request_body_have_empty_param_tables() {
     for name in ["auth.info", "auth.config"] {
-        let op = ops::find(name).unwrap();
+        let op = builtin(name).unwrap();
         assert!(op.params.is_empty(), "{name} should have no params");
     }
 }
 
 #[test]
 fn find_returns_none_for_unknown_operation() {
-    assert!(ops::find("documents.doesNotExist").is_none());
+    assert!(builtin("documents.doesNotExist").is_none());
 }

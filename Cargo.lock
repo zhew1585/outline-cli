@@ -1076,6 +1076,7 @@ dependencies = [
  "sha2",
  "spec-compile",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "unicode-segmentation",
  "unicode-width",

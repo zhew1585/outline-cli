@@ -26,6 +26,10 @@ directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Typed errors for the spec cache. anyhow stays the boundary type (main and
+# the command layer); a cache failure needs to be inspectable - "stale" and
+# "damaged" get different diagnostics - so it is a real enum.
+thiserror = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 
@@ -33,6 +37,9 @@ unicode-segmentation = { workspace = true }
 spec-compile = { workspace = true }
 
 [dev-dependencies]
+# Cache tests build a cache file byte by byte to pin its layout.
+bincode = { workspace = true }
+sha2 = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 wiremock = { workspace = true }

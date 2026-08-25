@@ -28,6 +28,14 @@
 //! Together: the runtime sources cannot ask for the spec, the shipped binary
 //! carries no path or copy of it, and the process still works with no spec
 //! reachable from where it runs.
+//!
+//! Story 4.2 note: `otl spec sync` DOES parse an OpenAPI document at run
+//! time - that is its whole job, and SPEC.md carves it out explicitly. It
+//! never touches the vendored file though: the document arrives from the
+//! network (or from a path the user typed), is compiled once, and is stored
+//! as a bincode IR cache that later commands only deserialize. Every guard
+//! below therefore still holds, unchanged: no runtime source locates the
+//! vendored spec, and startup parses no document.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -68,6 +76,11 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
 
 /// File name of the vendored spec; a runtime read has to name it.
 const SPEC_FILE_NAME: &str = "spec3.json";
+/// How the vendored spec is named when it is READ from disk: the file name
+/// alone is not enough evidence, because the upstream URL ends in the same
+/// file name and `spec sync` legitimately carries that URL (Story 4.2). A
+/// path fragment cannot appear in that URL.
+const SPEC_PATH_MARKER: &str = "spec/spec3.json";
 /// Distinctive text from the vendored spec's `info.description`: present if
 /// the spec were embedded in the binary, absent from the compiled IR table
 /// (which only carries operation names, paths and parameter names).
@@ -100,9 +113,9 @@ fn spec_path_and_content_absent_from_binary() {
     );
 
     assert!(
-        !contains_bytes(&bytes, SPEC_FILE_NAME),
-        "{} references {SPEC_FILE_NAME}: the runtime must not open the spec \
-         (build.rs compiles it to a static IR table)",
+        !contains_bytes(&bytes, SPEC_PATH_MARKER),
+        "{} references {SPEC_PATH_MARKER}: the runtime must not open the \
+         vendored spec (build.rs compiles it to a static IR table)",
         bin.display()
     );
     assert!(
@@ -144,10 +157,17 @@ const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Reviewed exceptions as (path suffix, pattern) pairs. Empty on purpose:
-/// add an entry with a comment only when a runtime source legitimately needs
-/// one of the patterns above.
-const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[];
+/// Reviewed exceptions as (path suffix, pattern) pairs. Add an entry with a
+/// comment only when a runtime source legitimately needs one of the patterns
+/// above.
+const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[
+    // Story 4.2: the upstream spec URL ends in the same file name. It is a
+    // URL constant for `otl spec sync` (a network fetch on one explicit
+    // command), not a path to the vendored file - nothing here reads a spec
+    // from disk. `spec_path_and_content_absent_from_binary` still forbids
+    // the file PATH in the shipped binary, which is what a disk read needs.
+    ("crates/otl/src/spec/mod.rs", SPEC_FILE_NAME),
+];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
 /// are therefore excluded by construction.

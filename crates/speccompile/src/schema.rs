@@ -39,7 +39,7 @@ pub(crate) fn extract_params(
     let params = params
         .into_iter()
         .map(|param| CompiledParam {
-            required: required.iter().any(|name| *name == param.name),
+            required: required.contains(&param.name),
             ..param
         })
         .collect();
@@ -243,6 +243,8 @@ fn enum_literal(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::{compile_json, CompileOptions};
 
