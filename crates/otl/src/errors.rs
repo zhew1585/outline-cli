@@ -18,6 +18,11 @@ use crate::exit::{CliError, ExitCode};
 /// Hint appended to server errors (HTTP 5xx).
 const SERVER_RETRY_HINT: &str =
     "The server failed to process the request; it may help to retry later.";
+/// Advice for a request that could not even be assembled locally. The
+/// offending value is never echoed - it is the credential itself.
+const INVALID_REQUEST_HINT: &str = "This usually means the API key contains characters that are \
+     not allowed in an HTTP header (for example a trailing newline). \
+     Re-copy the key without surrounding whitespace.";
 /// Hint appended to network/transport failures.
 const NETWORK_RETRY_HINT: &str =
     "Check your network connection and the OUTLINE_URL host, then retry.";
@@ -33,6 +38,11 @@ pub fn map_engine_error(error: EngineError) -> CliError {
 fn classify(error: &EngineError) -> (ExitCode, String) {
     match error {
         EngineError::InvalidBaseUrl { .. } => (ExitCode::Usage, error.to_string()),
+        // Nothing was sent, so this is a configuration problem, not a
+        // network one: no retry hint, and exit code 2.
+        EngineError::InvalidRequest { .. } => {
+            (ExitCode::Usage, format!("{error}.\n{INVALID_REQUEST_HINT}"))
+        }
         EngineError::Transport { .. } => (
             ExitCode::Network,
             format!("network error: {error}.\n{NETWORK_RETRY_HINT}"),
@@ -133,6 +143,22 @@ mod tests {
         // the code as the message; do not print it twice.
         let mapped = map_engine_error(api(404, Some("not_found"), "not_found"));
         assert!(!mapped.to_string().contains("[not_found]"));
+    }
+
+    #[test]
+    fn maps_invalid_request_to_usage_without_retry_hint() {
+        // A request that never left the machine is a configuration error,
+        // not a network error: exit 2, and no "retry" advice.
+        let mapped = map_engine_error(EngineError::InvalidRequest {
+            reason: "a header value contains characters that are not valid in HTTP".to_string(),
+        });
+        assert_eq!(mapped.code, ExitCode::Usage);
+        let text = mapped.to_string();
+        assert!(
+            !text.contains("retry"),
+            "retry hint on a local error: {text}"
+        );
+        assert!(text.contains("HTTP header"), "hint missing: {text}");
     }
 
     #[test]

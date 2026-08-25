@@ -8,13 +8,16 @@
 //! - [`client`]: the single request channel through which every HTTP call
 //!   must flow.
 //! - [`error`]: typed engine errors.
+//! - [`sanitize`]: the credential-hygiene pipeline every piece of
+//!   server-provided text passes through at error construction time.
 
 #![forbid(unsafe_code)]
 
 pub mod client;
 pub mod error;
 pub mod ir;
+pub mod sanitize;
 
-pub use client::{base_url_origin, is_valid_base_url, Client};
+pub use client::{base_url_origin, is_valid_base_url, Client, DEFAULT_TIMEOUT};
 pub use error::{EngineError, TransportKind};
 pub use ir::{OpSpec, ParamSpec, ParamType, IR_SCHEMA_VERSION};

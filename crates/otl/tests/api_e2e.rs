@@ -351,6 +351,89 @@ async fn non_tty_stdout_defaults_to_raw_json() {
         .stdout(predicate::str::contains('\u{1b}').not());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_stdout_pipe_exits_quietly_without_panicking() {
+    // A script that stops reading early (`otl ... | head -1`) must not turn
+    // into a panic and the undocumented exit code 101.
+    let rows: Vec<_> = (0..20_000)
+        .map(|index| {
+            json!({
+                "id": format!("doc-{index}"),
+                "title": format!("Document number {index} with a reasonably long title"),
+                "updatedAt": "2026-08-01T10:00:00.000Z"
+            })
+        })
+        .collect();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": rows })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let (code, stderr) = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin("otl"))
+            .env_remove("OUTLINE_URL")
+            .env_remove("OUTLINE_API_KEY")
+            .env("OUTLINE_URL", uri)
+            .env("OUTLINE_API_KEY", "test-key")
+            .args(["api", "--json", "documents.list"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Read a single byte, then close the read end of the pipe.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut first = [0_u8; 1];
+        let _ = stdout.read(&mut first);
+        drop(stdout);
+
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !stderr.contains("panicked"),
+        "panicked on closed pipe: {stderr}"
+    );
+    // Broken pipe is normal completion: quiet success, no diagnostics.
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "unexpected diagnostics: {stderr}");
+}
+
+#[test]
+fn api_key_with_newline_exits_2_and_never_echoes_the_key() {
+    // An invalid header value fails locally: nothing is sent, so this is a
+    // configuration error (code 2), not a network error (code 7).
+    let output = otl()
+        .env("OUTLINE_URL", "http://127.0.0.1:9")
+        .env("OUTLINE_API_KEY", "bad\nkey-SECRET-9c7a")
+        .args(["api", "documents.info", "id=x"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("SECRET-9c7a"),
+        "credential leaked: {stderr}"
+    );
+    assert!(stderr.contains("HTTP header"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("retry"),
+        "retry hint on a local error: {stderr}"
+    );
+}
+
 #[test]
 fn base_url_path_secret_never_reaches_stderr() {
     // Reviewer PoC: a secret in the base URL PATH (token-in-path auth) plus

@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use otl::commands::api::{self, ApiArgs};
 use otl::exit::ExitCode;
 use otl::render;
+use otl::stdio;
 
 /// Outline CLI: work with your Outline knowledge base from the terminal.
 #[derive(Debug, Parser)]
@@ -38,7 +39,7 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => ExitCode::Success.into(),
         Err(error) => {
-            eprintln!("error: {error}");
+            stdio::write_diagnostic_line(&format!("error: {error}"));
             error.code.into()
         }
     }

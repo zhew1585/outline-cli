@@ -13,6 +13,7 @@ use crate::errors::map_engine_error;
 use crate::exit::CliError;
 use crate::ops;
 use crate::render::{self, OutputMode};
+use crate::stdio;
 
 /// Arguments for `otl api`.
 #[derive(Debug, Args)]
@@ -64,6 +65,7 @@ fn print_response(response: &Value, mode: OutputMode) -> Result<(), CliError> {
     let payload = response.get("data").unwrap_or(response);
     let rendered = render::render(payload, mode)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
-    println!("{rendered}");
-    Ok(())
+    // Never `println!` on the data path: a consumer that closes the pipe
+    // early must not turn into a panic and exit code 101.
+    stdio::write_data_line(&rendered)
 }

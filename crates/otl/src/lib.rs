@@ -8,3 +8,4 @@ pub mod errors;
 pub mod exit;
 pub mod ops;
 pub mod render;
+pub mod stdio;
