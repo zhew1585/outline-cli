@@ -11,8 +11,11 @@
 //!   a `--limit`) makes the document a root, never a dangling reference;
 //! - a document that is its own parent, or part of a parent CYCLE, is
 //!   promoted to a root, so the walk cannot loop forever;
-//! - rows without an id are dropped (they could not be fetched anyway) and
-//!   a duplicate id keeps its first occurrence;
+//! - a row without a usable id cannot be fetched, so it is dropped - but
+//!   REPORTED, through [`Plan::unusable`]. The server said that document
+//!   exists; dropping it quietly would let an export claim to be complete
+//!   while missing it. A duplicate id keeps its first occurrence and is not
+//!   reported, because the document itself is not missing;
 //! - siblings are ordered by title then id, so re-exporting the same
 //!   collection produces the same tree regardless of API ordering.
 //!
@@ -41,10 +44,36 @@ struct Entry<'a> {
     parent: Option<usize>,
 }
 
+/// One listing row that could not become a document.
+pub struct Unusable {
+    /// 1-based position in the merged listing, so the user can find it.
+    pub position: usize,
+    /// The row's title, if it had one - the only handle a caller has left.
+    pub title: String,
+    /// Why the row could not be used.
+    pub reason: &'static str,
+}
+
+impl Unusable {
+    /// How this row is named in the failure summary.
+    ///
+    /// There is no document id to print - that is the whole problem - so
+    /// the position in the listing stands in for one, with the title when
+    /// the row had one.
+    pub fn label(&self) -> String {
+        if self.title.is_empty() {
+            return format!("listing row {}", self.position);
+        }
+        format!("listing row {} ({})", self.position, self.title)
+    }
+}
+
 /// A collection's documents, arranged as a forest.
 pub struct Plan<'a> {
     entries: Vec<Entry<'a>>,
     children: Vec<Vec<usize>>,
+    /// Rows the listing offered that could not be turned into documents.
+    unusable: Vec<Unusable>,
     /// Top-level documents, in write order.
     pub roots: Vec<usize>,
 }
@@ -88,6 +117,14 @@ impl<'a> Plan<'a> {
         found
     }
 
+    /// Listing rows that could not be turned into documents.
+    ///
+    /// Never empty silently: the caller is expected to fold these into
+    /// whatever it reports as the completeness of its own work.
+    pub fn unusable(&self) -> &[Unusable] {
+        &self.unusable
+    }
+
     /// Total number of documents in the plan.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -101,7 +138,11 @@ impl<'a> Plan<'a> {
 
 /// Build the export plan for one flat document list.
 pub fn plan<'a>(documents: &'a [Value]) -> Plan<'a> {
-    let (mut entries, parents) = collect(documents);
+    let Collected {
+        mut entries,
+        parents,
+        unusable,
+    } = collect(documents);
     let index = index_of(&entries);
     let mut parent: Vec<Option<usize>> = parents
         .iter()
@@ -118,8 +159,16 @@ pub fn plan<'a>(documents: &'a [Value]) -> Plan<'a> {
     Plan {
         entries,
         children,
+        unusable,
         roots,
     }
+}
+
+/// What [`collect`] pulled out of the listing.
+struct Collected<'a> {
+    entries: Vec<Entry<'a>>,
+    parents: Vec<Option<&'a str>>,
+    unusable: Vec<Unusable>,
 }
 
 /// Extract the usable rows and their raw parent ids.
@@ -130,15 +179,25 @@ pub fn plan<'a>(documents: &'a [Value]) -> Plan<'a> {
 /// on two pages, and keeping both would fetch it twice, write it twice
 /// under two de-duplicated names, and inflate every count in the summary.
 /// One document, one file.
-fn collect<'a>(documents: &'a [Value]) -> (Vec<Entry<'a>>, Vec<Option<&'a str>>) {
+fn collect<'a>(documents: &'a [Value]) -> Collected<'a> {
     let mut entries = Vec::with_capacity(documents.len());
     let mut parents = Vec::with_capacity(documents.len());
+    let mut unusable = Vec::new();
     let mut seen: HashSet<&str> = HashSet::with_capacity(documents.len());
-    let mut without_id = 0_usize;
     let mut duplicates = 0_usize;
-    for document in documents {
+    for (position, document) in documents.iter().enumerate() {
         let Some(id) = fields::string_at(document, "/id").filter(|id| !id.is_empty()) else {
-            without_id += 1;
+            // No id means no way to fetch the document. It is still a
+            // document the server listed, so it is recorded rather than
+            // just counted: the caller has to be able to report it.
+            unusable.push(Unusable {
+                position: position + 1,
+                title: fields::string_at(document, "/title")
+                    .unwrap_or_default()
+                    .to_string(),
+                reason: "the collection listing gave this document no usable id, \
+                         so its contents could not be fetched",
+            });
             continue;
         };
         if !seen.insert(id) {
@@ -152,19 +211,17 @@ fn collect<'a>(documents: &'a [Value]) -> (Vec<Entry<'a>>, Vec<Option<&'a str>>)
         });
         parents.push(fields::string_at(document, "/parentDocumentId"));
     }
-    if without_id > 0 {
-        stdio::write_diagnostic_line(&format!(
-            "warning: skipped {without_id} row(s) from the collection listing \
-             that carried no document id"
-        ));
-    }
     if duplicates > 0 {
         stdio::write_diagnostic_line(&format!(
             "warning: the collection listing returned {duplicates} document(s) \
              more than once; each was exported a single time"
         ));
     }
-    (entries, parents)
+    Collected {
+        entries,
+        parents,
+        unusable,
+    }
 }
 
 /// Map document id to its position.

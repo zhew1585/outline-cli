@@ -140,15 +140,39 @@ impl Session {
     }
 }
 
-/// Characters that are invisible or re-order what follows them.
+/// Ranges of invisible or text-reordering formatting characters.
 ///
-/// Not `char::is_control`, but a right-to-left override inside a URL makes
-/// the link printed on stdout read as a different address than the one the
-/// browser will open, which is the whole point of showing it.
-const INVISIBLE: &[char] = &[
-    '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}',
-    '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
+/// These are not `char::is_control`, but a right-to-left override inside a
+/// URL makes the link printed on stdout read as a different address than the
+/// one the browser will open - which defeats the point of printing it.
+///
+/// Given as RANGES covering the Unicode `Cf` (format) category rather than a
+/// hand-picked list, because a hand-picked list is exactly the kind of thing
+/// that goes stale: an earlier version of this check named U+202E and
+/// U+2066..U+2069 and quietly let U+061C (ARABIC LETTER MARK) and the
+/// deprecated U+206A..U+206F through. A URL path has no legitimate use for
+/// any of them.
+const INVISIBLE_RANGES: &[(char, char)] = &[
+    ('\u{00ad}', '\u{00ad}'),   // SOFT HYPHEN
+    ('\u{061c}', '\u{061c}'),   // ARABIC LETTER MARK
+    ('\u{180e}', '\u{180e}'),   // MONGOLIAN VOWEL SEPARATOR
+    ('\u{200b}', '\u{200f}'),   // zero width space .. RIGHT-TO-LEFT MARK
+    ('\u{202a}', '\u{202e}'),   // embedding and override controls
+    ('\u{2060}', '\u{2064}'),   // word joiner .. invisible plus
+    ('\u{2066}', '\u{206f}'),   // isolates and the deprecated format controls
+    ('\u{feff}', '\u{feff}'),   // ZERO WIDTH NO-BREAK SPACE (BOM)
+    ('\u{fff9}', '\u{fffb}'),   // interlinear annotation controls
+    ('\u{1d173}', '\u{1d17a}'), // musical format controls
+    ('\u{e0001}', '\u{e0001}'), // LANGUAGE TAG (deprecated)
+    ('\u{e0020}', '\u{e007f}'), // tag characters
 ];
+
+/// Whether `c` is one of the invisible or reordering formatting characters.
+fn is_invisible(c: char) -> bool {
+    INVISIBLE_RANGES
+        .iter()
+        .any(|(first, last)| c >= *first && c <= *last)
+}
 
 /// Percent-encodings that a URL parser turns back into a path separator or
 /// a dot segment. Compared case-insensitively.
@@ -183,7 +207,7 @@ fn is_safe_relative_path(path: &str) -> bool {
             .any(|encoded| lowered.contains(encoded))
         && !path
             .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || c == '\u{7f}' || INVISIBLE.contains(&c))
+            .any(|c| c.is_control() || c.is_whitespace() || c == '\u{7f}' || is_invisible(c))
 }
 
 /// Take the `data` payload out of a response envelope.
@@ -347,9 +371,37 @@ mod tests {
             "/doc/a\u{200b}b",
             "/doc/\u{feff}x",
             "/doc/\u{2066}x\u{2069}",
+            // Previously missed: not control characters, not whitespace,
+            // and not on the old hand-picked list.
+            "/doc/a\u{061c}b",  // ARABIC LETTER MARK
+            "/doc/a\u{206a}b",  // INHIBIT SYMMETRIC SWAPPING (deprecated)
+            "/doc/a\u{206e}b",  // NATIONAL DIGIT SHAPES (deprecated)
+            "/doc/a\u{00ad}b",  // SOFT HYPHEN
+            "/doc/a\u{2060}b",  // WORD JOINER
+            "/doc/a\u{fff9}b",  // INTERLINEAR ANNOTATION ANCHOR
+            "/doc/a\u{e0041}b", // TAG LATIN CAPITAL LETTER A
         ] {
             assert!(!is_safe_relative_path(path), "accepted {path:?}");
         }
+    }
+
+    #[test]
+    fn the_invisible_ranges_are_well_formed_and_ordered() {
+        // A typo'd range (last < first) would silently match nothing.
+        let mut previous: Option<char> = None;
+        for (first, last) in INVISIBLE_RANGES {
+            assert!(first <= last, "reversed range {first:?}..{last:?}");
+            if let Some(previous) = previous {
+                assert!(previous < *first, "unordered range at {first:?}");
+            }
+            previous = Some(*last);
+        }
+        // Spot-check both ends of a multi-codepoint range.
+        assert!(is_invisible('\u{200b}'));
+        assert!(is_invisible('\u{200f}'));
+        assert!(!is_invisible('\u{2010}'));
+        assert!(!is_invisible('a'));
+        assert!(!is_invisible('\u{4e2d}'));
     }
 
     #[test]

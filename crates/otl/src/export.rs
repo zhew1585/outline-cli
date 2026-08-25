@@ -230,24 +230,43 @@ impl Names {
 /// Two things have to be folded away, because two filesystems in wide use
 /// fold them and would otherwise turn two documents into one file:
 ///
-/// - **case**, via full Unicode lowercasing (not just ASCII): macOS and
-///   Windows are case-insensitive by default;
+/// - **case**. Not `to_lowercase` alone: lowercasing is not case FOLDING,
+///   and the difference is reachable. Greek final sigma `ς` is already
+///   lowercase, so `to_lowercase` leaves it distinct from `σ` even though a
+///   case-insensitive filesystem treats the two names as one entry.
+///   Uppercasing first collapses both to `Σ`, and lowercasing that gives
+///   one key - the standard way to get a caseless comparison without
+///   carrying a full case-folding table, and strictly more aggressive than
+///   lowercasing alone.
 /// - **normalization**, via NFC: `é` written as one codepoint (U+00E9) and
 ///   as `e` + a combining acute (U+0065 U+0301) are DIFFERENT byte strings
 ///   but the same directory entry on a macOS volume.
 ///
-/// NFC rather than NFKC on purpose: NFKC would also fold compatibility
-/// characters (`ﬁ` to `fi`, full-width to ASCII), which real filesystems do
-/// not, so it would merge names that can coexist.
+/// NFC rather than NFKC for the normalization step: NFKC folds ordinary
+/// letters together (full-width to ASCII, `№` to `No`) far beyond anything a
+/// filesystem does.
 ///
-/// The fold is deliberately conservative, so a filesystem with even broader
-/// equivalence could still fuse two names. That is caught downstream rather
-/// than assumed away: `otl docs export` re-checks the identity of each file
-/// it writes and reports a collision instead of counting two exports.
+/// The two steps err in OPPOSITE directions, and that is deliberate. The
+/// uppercase-then-lowercase round trip is slightly too aggressive - it also
+/// collapses a few compatibility spellings, so `ﬁle`/`file` and
+/// `Straße`/`Strasse` share a key even though a real filesystem keeps them
+/// apart. Both error directions were weighed:
+///
+/// - folding too much costs a `-2` suffix on a name that could have kept its
+///   own spelling. Cosmetic.
+/// - folding too little means two documents claim one directory entry, and
+///   one of them is gone. That is the bug this key exists to prevent.
+///
+/// So the key leans toward over-folding. And because it is a MODEL of what
+/// filesystems do rather than a copy (macOS and NTFS each use their own
+/// table), it is not the last line of defence either: `otl docs export`
+/// checks, BEFORE each write, whether the destination is already a file it
+/// wrote earlier in the run, and reports a collision rather than
+/// overwriting one document with another.
 fn collision_key(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 
-    name.to_lowercase().nfc().collect()
+    name.to_uppercase().to_lowercase().nfc().collect()
 }
 
 /// `base` with a `-N` de-duplication suffix, keeping the byte cap.
@@ -449,12 +468,61 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_characters_are_not_folded_away() {
-        // NFKC would merge these; no mainstream filesystem does, so folding
-        // them would refuse names that can legitimately coexist.
+    fn case_folding_catches_greek_final_sigma() {
+        // `ς` is already lowercase, so `to_lowercase` alone leaves it
+        // distinct from `σ` - and a case-insensitive filesystem does not.
         let mut names = Names::new();
-        assert_eq!(names.claim("\u{fb01}le"), "\u{fb01}le"); // U+FB01 LATIN SMALL LIGATURE FI
-        assert_eq!(names.claim("file"), "file");
+        assert_eq!(names.claim("\u{3c3}"), "\u{3c3}"); // σ
+        assert_eq!(
+            names.claim("\u{3c2}"),
+            "\u{3c2}-2",
+            "final sigma reused the name of a plain sigma"
+        );
+    }
+
+    #[test]
+    fn case_folding_is_at_least_as_strong_as_lowercasing() {
+        // Property check over a spread of scripts: anything `to_lowercase`
+        // would fold must still fold, so the stronger key cannot regress
+        // the case the previous one handled.
+        for (left, right) in [
+            ("Deploy", "deploy"),
+            ("\u{c9}", "\u{e9}"),   // É / é
+            ("\u{412}", "\u{432}"), // Cyrillic Ve
+            ("\u{3a3}", "\u{3c3}"), // Σ / σ
+            ("STRASSE", "strasse"),
+        ] {
+            assert_eq!(
+                collision_key(left),
+                collision_key(right),
+                "{left:?} and {right:?} must share a key"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_letters_are_not_folded_by_normalization() {
+        // NFKC would merge these; no filesystem does. Folding them would
+        // refuse names that can plainly coexist, and unlike the case fold
+        // there is no collision risk on the other side of the trade.
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{ff21}bc"), "\u{ff21}bc"); // full-width A
+        assert_eq!(names.claim("Abc"), "Abc");
+        assert_eq!(names.claim("\u{2116}5"), "\u{2116}5"); // NUMERO SIGN
+        assert_eq!(names.claim("No5"), "No5");
+    }
+
+    #[test]
+    fn the_case_fold_deliberately_errs_toward_over_folding() {
+        // The uppercase round trip also collapses a few compatibility
+        // spellings. That is accepted: the cost is a `-2` suffix on a name
+        // that could have kept its own spelling, whereas under-folding costs
+        // a document. Asserted so the direction is a decision, not a
+        // surprise, and so a future change to a stricter fold has to be
+        // deliberate.
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{fb01}le"), "\u{fb01}le"); // ligature fi
+        assert_eq!(names.claim("file"), "file-2");
     }
 
     #[test]

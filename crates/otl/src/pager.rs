@@ -169,7 +169,13 @@ fn for_display(text: &str) -> (String, usize) {
             '\n' => out.push('\n'),
             '\r' => {}
             '\t' => {
-                let column = out.len() - out.rfind('\n').map_or(0, |index| index + 1);
+                // The tab stop is a TERMINAL column, so the text before it
+                // has to be measured in columns too. Counting bytes puts
+                // the stop in the wrong place after any non-ASCII text: a
+                // CJK character is 3 bytes but 2 columns, a combining mark
+                // is 2 bytes and 0 columns.
+                let line_start = out.rfind('\n').map_or(0, |index| index + 1);
+                let column = render::display_columns(&out[line_start..]);
                 let pad = TAB_WIDTH - (column % TAB_WIDTH);
                 out.extend(std::iter::repeat_n(' ', pad));
             }
@@ -190,9 +196,24 @@ fn for_display(text: &str) -> (String, usize) {
 
 /// Feed `text` to a pager on its stdin and wait for it to finish.
 ///
-/// Returns `Err` only when the pager could not be run at all. A pager the
-/// user quits early closes its stdin, which shows up as a broken pipe here
-/// and is normal completion - the same rule stdout writes follow.
+/// Returns `Err` when the pager did not do its job, so the caller can fall
+/// back to writing the document to stdout.
+///
+/// The verdict is its EXIT STATUS, not how much it read. "How much it read"
+/// looks like the sharper test - a pager the user quit has consumed part of
+/// the document, one that never started has consumed none - but it cannot
+/// be measured from here: a small document disappears into the pipe buffer
+/// and every write "succeeds" whether or not anything on the other end ever
+/// looked at it. `PAGER=false` on a short document is indistinguishable
+/// from a pager that displayed it.
+///
+/// Status is unambiguous where it matters. Pagers exit 0 when the user
+/// quits (`less`, `more`, `bat`, `most` all do), and non-zero when they
+/// failed to run - so a non-zero status means the document may never have
+/// been shown. The cost of being wrong is bounded and asymmetric: falling
+/// back after a pager that did display the content prints it twice, which
+/// is untidy; NOT falling back loses the document entirely while exiting 0.
+/// The warning on the fallback path says which happened.
 fn run(pager: &Pager, text: &str) -> Result<(), String> {
     let mut child = Command::new(&pager.program)
         .args(&pager.args)
@@ -200,15 +221,22 @@ fn run(pager: &Pager, text: &str) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("{}: {}", pager.program.to_string_lossy(), error.kind()))?;
     if let Some(mut stdin) = child.stdin.take() {
-        // Ignore write failures: a pager that exits early (`q` on the first
-        // screen) closes the pipe, which is not an error.
+        // A write failure here is expected when the user quits early: the
+        // pager closed the pipe. The status below is what decides.
         let _ = stdin.write_all(text.as_bytes());
         let _ = stdin.flush();
     }
-    // The pager's own exit status is the user's business, not ours: quitting
-    // with `q` is success, and a non-zero status must not become our own.
-    let _ = child.wait();
-    Ok(())
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "{} exited with {}",
+            pager.program.to_string_lossy(),
+            status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |code| format!("status {code}"))
+        )),
+        Err(error) => Err(format!("cannot wait for the pager: {}", error.kind())),
+    }
 }
 
 /// Whether `text` needs more than one screen of `height` rows at `width`
@@ -270,7 +298,7 @@ fn terminal_size() -> (u16, u16) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
@@ -411,6 +439,37 @@ mod tests {
     }
 
     #[test]
+    fn tab_stops_are_measured_in_columns_not_bytes() {
+        // U+4E2D is 3 bytes but 2 columns, so the next tab stop is at
+        // column 8 and the tab must expand to 6 spaces. Counting bytes
+        // would produce 5 and put everything after it in the wrong column -
+        // and make the line measure as fitting the screen when it does not.
+        let (display, _) = for_display("\u{4e2d}\tX\n");
+        assert_eq!(display, "\u{4e2d}      X\n");
+        assert_eq!(render::display_columns(display.trim_end()), 9);
+
+        // A combining mark adds no columns, so the stop is unchanged from
+        // the base letter alone.
+        let (display, _) = for_display("e\u{301}\tX\n");
+        assert_eq!(display, "e\u{301}       X\n");
+    }
+
+    #[test]
+    fn a_tab_after_wide_text_is_counted_when_measuring_the_screen() {
+        // End to end for the same bug: the line is 9 columns, so on an
+        // 8-column terminal it wraps onto a second row and, with one row
+        // reserved for the prompt, needs the pager.
+        let (display, _) = for_display("\u{4e2d}\tX\n");
+        assert!(exceeds_screen(&display, 2, 8));
+    }
+
+    #[test]
+    fn each_line_gets_its_own_tab_stops() {
+        let (display, _) = for_display("ab\tc\nabcdefghij\tk\n");
+        assert_eq!(display, "ab      c\nabcdefghij      k\n");
+    }
+
+    #[test]
     fn display_text_drops_carriage_returns_without_marking_them() {
         // A CRLF document must not grow a marker on every line.
         let (display, replaced) = for_display("a\r\nb\r\n");
@@ -460,5 +519,44 @@ mod tests {
             args: Vec::new(),
         };
         assert!(run(&pager, "text").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pager_that_fails_to_run_is_reported_so_the_document_is_not_lost() {
+        // `PAGER=false` starts fine and exits 1 without showing anything.
+        // Treating that as success made the whole document vanish behind
+        // exit code 0.
+        let pager = Pager {
+            program: OsString::from("false"),
+            args: Vec::new(),
+        };
+        let error = run(&pager, &"line\n".repeat(1000))
+            .expect_err("a pager that exited non-zero must be reported");
+        assert!(error.contains("status 1"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pager_the_user_quit_early_is_normal_completion() {
+        // `head -1` takes one line and exits 0 while the writer still has
+        // data - the shape of quitting `less` with `q`. Exit 0, so no
+        // fallback and no duplicated output.
+        let pager = Pager {
+            program: OsString::from("sh"),
+            args: vec![OsString::from("-c"), OsString::from("head -1 > /dev/null")],
+        };
+        assert!(run(&pager, &"line\n".repeat(100_000)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_pager_is_reported_rather_than_read_as_success() {
+        let pager = Pager {
+            program: OsString::from("sh"),
+            args: vec![OsString::from("-c"), OsString::from("kill -TERM $$")],
+        };
+        let error = run(&pager, "short\n").expect_err("a signalled pager must be reported");
+        assert!(error.contains("signal"), "{error}");
     }
 }

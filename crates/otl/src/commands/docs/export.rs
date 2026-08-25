@@ -22,6 +22,7 @@ use crate::render::{self, OutputMode};
 use crate::session::Session;
 use crate::stdio;
 
+use super::target::{self, Dir, TempName};
 use super::tree::{self, Plan};
 
 /// Operation that enumerates a collection's documents (auto-paginated).
@@ -32,8 +33,6 @@ const INFO_OPERATION: &str = "documents.info";
 const EXTENSION: &str = "md";
 /// Maximum number of failures listed individually in the final summary.
 const MAX_LISTED_FAILURES: usize = 20;
-/// Prefix of the temporary file each document is written through.
-const TEMP_PREFIX: &str = "otl-export-";
 
 /// Arguments for `otl docs export`.
 #[derive(Debug, Args)]
@@ -70,6 +69,8 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     // The canonical path is what everything below joins onto, so an
     // ancestor symlink is resolved once, up front, and reported.
     let root = prepare_out_dir(&cmd.out, cmd.overwrite)?;
+    let root_dir = Dir::open(root.clone())
+        .map_err(|reason| CliError::usage(anyhow!("{}: {reason}", root.display())))?;
     let session = Session::open()?;
     let args = vec![("collectionId".to_string(), cmd.collection.clone())];
     let documents = session.call_rows(LIST_OPERATION, &args, cmd.limit)?;
@@ -87,15 +88,29 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
         failures: Vec::new(),
         flattened: false,
         temp_counter: 0,
-        #[cfg(unix)]
         written_ids: HashSet::new(),
-        // A truncated enumeration means documents exist that this run never
-        // even saw, so the export is incomplete no matter how many files
-        // were written. Unlike a list command, the caller cannot tell from
-        // the output directory that anything is missing.
-        truncated: documents.truncation,
+        // Only truncation the caller did NOT ask for makes the export
+        // incomplete. `--limit N` stopping at N documents is the requested
+        // outcome and stays exit 0 - the same boundary the other curated
+        // list commands honour, and the one registered in
+        // docs/exit-codes.md.
+        truncated: documents.incomplete().copied(),
+        limited: documents.truncation.is_some() && documents.incomplete().is_none(),
     };
-    export.write_level(&root, &plan, &plan.roots, 0, &mut Names::new());
+    // A row the listing could not identify is a document the server said
+    // exists and this run never fetched. It has to land in the accounting
+    // like any other missing document.
+    for unusable in plan.unusable() {
+        export.fail(&unusable.label(), unusable.reason.to_string());
+    }
+    export.write_level(&root_dir, &plan, &plan.roots, 0, &mut Names::new());
+    if let Err(reason) = root_dir.sync() {
+        stdio::write_diagnostic_line(&format!(
+            "warning: could not flush {} to disk ({reason}); the files are \
+             written but a crash could lose the most recent directory entries",
+            root.display()
+        ));
+    }
     export.finish(mode)
 }
 
@@ -112,15 +127,18 @@ struct Export<'a> {
     temp_counter: u64,
     /// Filesystem identity of every file this run has written.
     ///
-    /// The de-duplication in [`Names`] folds Unicode case and normalization,
-    /// but a filesystem is free to consider even more names equivalent. This
-    /// is the backstop: if a rename lands on a file this run already wrote,
-    /// two documents collided and one has been lost, which must be reported
-    /// rather than counted as two successful exports.
-    #[cfg(unix)]
+    /// The de-duplication in [`Names`] folds Unicode case and
+    /// normalization, but a filesystem is free to consider even more names
+    /// equivalent. This is the backstop, and it is consulted BEFORE each
+    /// write: if the destination already IS a file this run wrote, the two
+    /// names are one directory entry on this filesystem, and overwriting
+    /// would lose a document that was reported as exported.
     written_ids: HashSet<(u64, u64)>,
-    /// Why the enumeration stopped short, if it did.
+    /// Why the enumeration stopped short in a way the caller did not ask
+    /// for, if it did.
     truncated: Option<engine::Truncation>,
+    /// Whether `--limit` is what stopped the enumeration.
+    limited: bool,
 }
 
 impl Export<'_> {
@@ -136,7 +154,7 @@ impl Export<'_> {
     /// Recursion depth here is therefore bounded by `MAX_DEPTH`.
     fn write_level(
         &mut self,
-        dir: &Path,
+        dir: &Dir,
         plan: &Plan<'_>,
         nodes: &[usize],
         depth: usize,
@@ -166,37 +184,46 @@ impl Export<'_> {
     /// the same name holding it and its descendants.
     fn write_branch(
         &mut self,
-        dir: &Path,
+        dir: &Dir,
         plan: &Plan<'_>,
         node: usize,
         stem: &str,
         children: &[usize],
         depth: usize,
     ) {
-        let child_dir = dir.join(stem);
-        if let Err(reason) = create_child_dir(self.root, &child_dir) {
-            // The whole subtree lives in that directory, so every document
-            // under it failed too. Reporting only the parent would let the
-            // descendants vanish from both stdout and the summary - exactly
-            // the silent loss this command exists to avoid.
-            self.fail(plan.id(node), reason.clone());
-            for descendant in plan.descendants(node) {
-                self.fail(plan.id(descendant), reason.clone());
+        let child_dir = match dir.child(self.root, stem) {
+            Ok(child_dir) => child_dir,
+            Err(reason) => {
+                // The whole subtree lives in that directory, so every
+                // document under it failed too. Reporting only the parent
+                // would let the descendants vanish from both stdout and the
+                // summary - exactly the silent loss this command exists to
+                // avoid.
+                self.fail(plan.id(node), reason.clone());
+                for descendant in plan.descendants(node) {
+                    self.fail(plan.id(descendant), reason.clone());
+                }
+                return;
             }
-            return;
-        }
+        };
         let mut child_names = Names::new();
         // The parent's own file lives inside its directory and shares its
         // name, claimed there before any child can take it.
         let own = child_names.claim_exact(stem);
         self.write_document(&child_dir, plan, node, &own);
         self.write_level(&child_dir, plan, children, depth + 1, &mut child_names);
+        if let Err(reason) = child_dir.sync() {
+            stdio::write_diagnostic_line(&format!(
+                "warning: could not flush {} to disk ({reason})",
+                child_dir.path().display()
+            ));
+        }
     }
 
     /// Fetch and write one document.
-    fn write_document(&mut self, dir: &Path, plan: &Plan<'_>, node: usize, stem: &str) {
+    fn write_document(&mut self, dir: &Dir, plan: &Plan<'_>, node: usize, stem: &str) {
         let id = plan.id(node);
-        let path = dir.join(format!("{stem}.{EXTENSION}"));
+        let file_name = format!("{stem}.{EXTENSION}");
         let markdown = match self.fetch_markdown(id) {
             Ok(markdown) => markdown,
             Err(error) => {
@@ -204,40 +231,36 @@ impl Export<'_> {
                 return;
             }
         };
+        // Before writing, not after: a `rename` installs a new inode, so a
+        // check afterwards can never see that it just replaced a file this
+        // run had already written.
+        if let Some(existing) = target::existing_identity(&dir.path().join(&file_name)) {
+            if self.written_ids.contains(&existing) {
+                self.fail(
+                    id,
+                    "another document in this export already occupies this \
+                     file: the filesystem treats their two names as one \
+                     directory entry, so writing this one would lose the \
+                     other"
+                        .to_string(),
+                );
+                return;
+            }
+        }
         self.temp_counter += 1;
         let temp = TempName {
             counter: self.temp_counter,
         };
-        match write_file_atomically(dir, &path, &temp, &markdown, self.overwrite) {
-            Ok(()) => self.claim_written(id, &path),
+        match target::write_atomically(dir, &file_name, EXTENSION, &temp, &markdown, self.overwrite)
+        {
+            Ok(path) => {
+                if let Some(id) = target::existing_identity(path.as_path()) {
+                    self.written_ids.insert(id);
+                }
+                self.record(&path);
+            }
             Err(reason) => self.fail(id, reason),
         }
-    }
-
-    /// Record a written file, or report the collision if two documents just
-    /// landed on the same one.
-    fn claim_written(&mut self, id: &str, path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            // A failing stat is ignored on purpose: the write itself
-            // succeeded, so refusing to record it because the follow-up
-            // check could not run would be worse than not checking.
-            if let Ok(metadata) = std::fs::symlink_metadata(path) {
-                if !self.written_ids.insert((metadata.dev(), metadata.ino())) {
-                    self.fail(
-                        id,
-                        "another document in this export already wrote this \
-                         file: the filesystem treats their names as the same \
-                         entry, so only one of the two survived"
-                            .to_string(),
-                    );
-                    return;
-                }
-            }
-        }
-        self.record(path);
     }
 
     /// The markdown for one document, with a title heading.
@@ -345,14 +368,22 @@ impl Export<'_> {
 
     /// A machine-readable summary of the whole export.
     ///
-    /// `complete` is the field a backup script should branch on: it is false
-    /// whenever a document failed OR the enumeration itself was cut short,
-    /// which is the one case the file tree cannot reveal on its own.
+    /// Three separate facts, because collapsing them would mislead:
+    ///
+    /// - `complete`: the export delivered everything it was asked for. This
+    ///   is the field a backup script branches on.
+    /// - `enumeration_truncated`: the listing stopped before the collection
+    ///   was exhausted for a reason the caller did NOT ask for. The one
+    ///   shortfall the file tree cannot reveal on its own.
+    /// - `limit_reached`: `--limit` stopped the listing. Not a failure - it
+    ///   is what was requested - but a script asking "is this the whole
+    ///   collection?" needs `complete && !limit_reached`.
     fn print_json(&self) -> Result<(), CliError> {
         let payload = serde_json::json!({
             "out": self.root.display().to_string(),
             "complete": self.failures.is_empty() && self.truncated.is_none(),
             "enumeration_truncated": self.truncated.is_some(),
+            "limit_reached": self.limited,
             "exported": self.written,
             "failed": self
                 .failures
@@ -456,117 +487,6 @@ fn is_empty_dir(dir: &Path) -> Result<bool, CliError> {
         CliError::usage(anyhow!("cannot read {}: {}", dir.display(), error.kind()))
     })?;
     Ok(entries.next().is_none())
-}
-
-/// Create one subdirectory and confirm it is still inside `root`.
-///
-/// `create_dir` never follows a link to create something elsewhere (unlike
-/// `create_dir_all`), and an entry that already exists is accepted only when
-/// `symlink_metadata` says it is a real directory. The canonical-path check
-/// afterwards is what catches the remaining case - a directory swapped for a
-/// link between the check and the writes that follow - because it re-asks
-/// the OS where this path actually leads instead of trusting the earlier
-/// answer.
-fn create_child_dir(root: &Path, path: &Path) -> Result<(), String> {
-    match std::fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-                format!("cannot inspect the target directory: {}", error.kind())
-            })?;
-            if !metadata.file_type().is_dir() {
-                return Err("a symlink or file already occupies the target directory".to_string());
-            }
-        }
-        Err(error) => return Err(format!("cannot create the directory: {}", error.kind())),
-    }
-    let resolved = std::fs::canonicalize(path)
-        .map_err(|error| format!("cannot resolve the directory: {}", error.kind()))?;
-    if !resolved.starts_with(root) {
-        return Err("the directory resolves outside the export directory".to_string());
-    }
-    Ok(())
-}
-
-/// The unique part of one temporary file name.
-struct TempName {
-    counter: u64,
-}
-
-impl TempName {
-    /// The file name to create in the destination directory.
-    ///
-    /// Unique per write within a run (counter) and per run (pid), so two
-    /// concurrent exports into one directory cannot pick the same temporary
-    /// file - and `create_new` below fails loudly rather than silently
-    /// sharing one if they somehow did.
-    fn file_name(&self) -> String {
-        format!(
-            ".{TEMP_PREFIX}{}-{}.{EXTENSION}",
-            std::process::id(),
-            self.counter
-        )
-    }
-}
-
-/// Write one file atomically: fresh temp file in the same directory, fsync,
-/// then rename into place.
-///
-/// This is what makes the two dangerous outcomes impossible rather than
-/// unlikely:
-///
-/// - **A half-written file.** The destination is only ever touched by
-///   `rename`, which either replaces it completely or not at all. An I/O
-///   error while writing leaves the destination untouched - crucially, a
-///   previous good backup survives a failed `--overwrite`, where truncating
-///   the destination first would have destroyed it.
-/// - **Writing through a symlink.** The temp file is created with
-///   `create_new` (`O_CREAT|O_EXCL`), which fails outright on an existing
-///   entry and therefore can never follow a link; and `rename` REPLACES a
-///   symlink at the destination instead of following it. There is no
-///   check-then-open window left to lose, unlike a `symlink_metadata` test
-///   followed by `open`.
-///
-/// Without `overwrite`, an existing destination is refused up front. That
-/// check is advisory (the file could appear afterwards), but its job is
-/// only to keep a re-run from replacing files, not to defend the tree - the
-/// `rename` semantics above do that.
-fn write_file_atomically(
-    dir: &Path,
-    path: &Path,
-    temp: &TempName,
-    content: &str,
-    overwrite: bool,
-) -> Result<(), String> {
-    use std::io::Write;
-
-    if !overwrite && std::fs::symlink_metadata(path).is_ok() {
-        return Err("a file already exists at this path; pass --overwrite to \
-                    replace it"
-            .to_string());
-    }
-    let temp_path = dir.join(temp.file_name());
-    let write = || -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        file.write_all(content.as_bytes())?;
-        // fsync before rename: a rename that beats its own data to disk
-        // would leave an empty file behind a power loss.
-        file.sync_all()
-    };
-    if let Err(error) = write() {
-        // Nothing was renamed, so the destination is untouched; drop the
-        // partial temp file so a failed export leaves no debris.
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("cannot write the file: {}", error.kind()));
-    }
-    if let Err(error) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("cannot place the file: {}", error.kind()));
-    }
-    Ok(())
 }
 
 /// `text` with exactly one trailing newline.

@@ -47,8 +47,11 @@ so that 拿到 id 供其他命令使用。
   `to_value` 深拷贝，测试里必须用 move 构造，否则测试自身变成 O(n²)）。
 - **`collections.documents` 的 `id` 是 `format: uuid`**：真实实例的 collection id 就是 UUID，
   但若某实例返回非 UUID，engine 会本地拒绝，该行计数落到 `?`——降级而非崩溃。
-- **计数有三种可区分状态**（R1 finding 9）：精确数字、`<n>+`（走到节点上限，只能算下界）、
-  `?`（结构读不到）。把上限截断显示成精确的 `100000` 是错误事实，不是四舍五入。
+- **计数有三种可区分状态**（R1 finding 9 + R2 finding 6）：精确数字、`<n>+`（走到节点上限，只能算下界）、
+  `?`（结构读不到**或不认识**）。把上限截断显示成精确的 `100000` 是错误事实，不是四舍五入；
+  同理 `data:null` / `data:{}` / `data:[null]` 证明不了 collection 是空的——它们只说明结构没被识别，
+  报 `0` 等于替服务端断言「这里没有文档」。因此 `count_nodes` 返回 `Option`：非数组、
+  或数组里有非对象元素，一律归 `?` 并计入 stderr 警告。
 - **列宽按终端显示宽度算**：复用既有 `render` 的 grapheme + `unicode-width` 布局，
   所以 CJK 名称后面的列不会错位（golden file 锁住了这一点）。
 

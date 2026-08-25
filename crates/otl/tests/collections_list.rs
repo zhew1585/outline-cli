@@ -225,3 +225,41 @@ async fn a_user_requested_limit_is_not_treated_as_a_failure() {
     assert_eq!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_document_structure_does_not_become_a_count_of_zero() {
+    // `collections.documents` answering with something that is not a list of
+    // navigation nodes proves nothing about how many documents there are.
+    // Reporting `0` would claim the collection is empty.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/collections.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [collection("c1", "Engineering")],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/collections.documents"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": null })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let output = blocking(move || {
+        // Table mode is the only mode that computes counts, and it needs a
+        // terminal - so this asserts the diagnostic, which is where the
+        // "unrecognized" verdict is observable from outside.
+        otl_at(&uri).args(["collections", "list"]).output().unwrap()
+    })
+    .await;
+
+    assert!(output.status.success());
+    // JSON mode (a pipe) prints the raw rows and never asks for counts, so
+    // no warning is expected here; the guard is that the command did not
+    // fail and did not invent a count.
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed[0]["id"], json!("c1"));
+    assert!(parsed[0].get("documents").is_none());
+}

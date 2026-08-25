@@ -166,27 +166,34 @@ fn count_label(collection: &Value, counts: &Counts, no_counts: bool) -> String {
 fn document_counts(session: &Session, collections: &[Value]) -> Counts {
     let mut counts = Counts::default();
     let mut failed = 0_usize;
+    let mut unrecognized = 0_usize;
     for id in collections
         .iter()
         .filter_map(|collection| fields::string_at(collection, "/id"))
     {
         let args = [("id".to_string(), id.to_string())];
         match session.call_data(DOCUMENTS_OPERATION, &args) {
-            Ok(structure) => {
-                let count = count_nodes(&structure);
-                counts.counted.insert(id.to_string(), count.nodes);
-                if count.capped {
-                    counts.capped.insert(id.to_string());
+            // An unrecognized shape counts as unreadable, not as zero.
+            Ok(structure) => match count_nodes(&structure) {
+                Some(count) => {
+                    counts.counted.insert(id.to_string(), count.nodes);
+                    if count.capped {
+                        counts.capped.insert(id.to_string());
+                    }
                 }
-            }
+                None => unrecognized += 1,
+            },
             Err(_) => failed += 1,
         }
     }
-    if failed > 0 {
+    if failed + unrecognized > 0 {
         stdio::write_diagnostic_line(&format!(
-            "warning: could not read the document structure of {failed} \
-             collection(s); their counts show as {UNKNOWN_COUNT} \
-             (--no-counts skips this lookup entirely)"
+            "warning: could not determine the document count of {} \
+             collection(s) ({failed} could not be read, {unrecognized} \
+             answered with a structure this version does not recognize); \
+             their counts show as {UNKNOWN_COUNT} (--no-counts skips this \
+             lookup entirely)",
+            failed + unrecognized
         ));
     }
     if !counts.capped.is_empty() {
@@ -210,40 +217,46 @@ struct NodeCount {
     capped: bool,
 }
 
-/// Count the nodes of a navigation tree.
+/// Count the nodes of a navigation tree, or `None` when the payload is not
+/// one.
 ///
 /// Walked with an explicit stack, not recursion: the depth of the tree is
 /// server-controlled and a recursive walk would be a stack-overflow away
 /// from an abort.
 ///
-/// Hitting the cap is REPORTED rather than folded into the number: showing
-/// a capped walk as the exact count `100000` would be a wrong fact, not a
-/// rounded one.
-fn count_nodes(structure: &Value) -> NodeCount {
-    let Some(roots) = structure.as_array() else {
-        return NodeCount {
-            nodes: 0,
-            capped: false,
-        };
-    };
+/// Two things are deliberately NOT reported as a count:
+///
+/// - a payload that is not an array of nodes (`null`, an object, an entry
+///   that is not a node). Such a response does not say the collection is
+///   empty, it says the structure could not be recognized - and `0` claims
+///   the first. Unrecognized becomes `?`, the same as an unreadable one.
+/// - a walk that hit the cap. Showing it as the exact count `100000` would
+///   be a wrong fact rather than a rounded one, so it is marked as a floor.
+fn count_nodes(structure: &Value) -> Option<NodeCount> {
+    let roots = structure.as_array()?;
     let mut stack: Vec<&Value> = roots.iter().collect();
     let mut nodes = 0;
     while let Some(node) = stack.pop() {
         if nodes >= MAX_COUNTED_NODES {
-            return NodeCount {
+            return Some(NodeCount {
                 nodes,
                 capped: true,
-            };
+            });
+        }
+        // A node that is not an object is not a document: the shape is not
+        // what the spec describes, so no count can be claimed from it.
+        if !node.is_object() {
+            return None;
         }
         nodes += 1;
         if let Some(children) = node.get("children").and_then(Value::as_array) {
             stack.extend(children.iter());
         }
     }
-    NodeCount {
+    Some(NodeCount {
         nodes,
         capped: false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -257,8 +270,9 @@ mod tests {
     #[test]
     fn counts_a_flat_structure() {
         let structure = json!([{ "id": "a" }, { "id": "b" }]);
-        assert_eq!(count_nodes(&structure).nodes, 2);
-        assert!(!count_nodes(&structure).capped);
+        let count = count_nodes(&structure).expect("a plain array is countable");
+        assert_eq!(count.nodes, 2);
+        assert!(!count.capped);
     }
 
     #[test]
@@ -267,14 +281,35 @@ mod tests {
             { "id": "a", "children": [{ "id": "b", "children": [{ "id": "c" }] }] },
             { "id": "d" }
         ]);
-        assert_eq!(count_nodes(&structure).nodes, 4);
+        assert_eq!(count_nodes(&structure).map(|count| count.nodes), Some(4));
     }
 
     #[test]
-    fn counts_nothing_for_a_non_array_payload() {
-        for payload in [json!({}), json!(null), json!([])] {
-            assert_eq!(count_nodes(&payload).nodes, 0);
-            assert!(!count_nodes(&payload).capped);
+    fn an_empty_array_is_a_genuine_zero() {
+        let count = count_nodes(&json!([])).expect("an empty array is countable");
+        assert_eq!(count.nodes, 0);
+        assert!(!count.capped);
+    }
+
+    #[test]
+    fn an_unrecognized_structure_is_not_a_count_of_zero() {
+        // These responses do not say the collection is empty; they say the
+        // shape was not understood. Reporting `0` would claim the first.
+        for payload in [
+            json!(null),
+            json!({}),
+            json!({ "documents": [] }),
+            json!("nope"),
+            json!(7),
+            json!([null]),
+            json!(["not a node"]),
+            json!([{ "id": "a", "children": [null] }]),
+        ] {
+            assert_eq!(
+                count_nodes(&payload),
+                None,
+                "{payload} was reported as a count"
+            );
         }
     }
 
@@ -307,6 +342,7 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("join");
+        let counted = counted.expect("a deep array is countable");
         assert_eq!(counted.nodes, MAX_COUNTED_NODES);
         // The cap must be VISIBLE: a capped walk reported as the exact
         // number 100000 would be a wrong fact rather than a rounded one.

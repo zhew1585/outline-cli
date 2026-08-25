@@ -37,14 +37,23 @@ so that 内容可进 git 或离线阅读。
   - [x] 每篇正文前置 `# <title>`（文件名已被安全化，标题靠这行保真），已以 `# ` 开头则不重复加
   - [x] 目录深度上限 8 层，更深的**用队列**（不是递归）平铺到该层并警告一次
   - [x] 写盘原子化：同目录 temp（`create_new`）→ `write_all` → `fsync` → `rename`；失败清理 temp
+  - [x] R2 修复：无 `--overwrite` 时先用 `create_new` **占位**目标名（内核保证互斥），再 temp→rename 覆盖占位；
+        失败连占位一起删。「目标不存在」不再是 check-then-rename
+  - [x] R2 修复：目录写完后 `fsync` 目录项（Unix），rename 的持久性不再只依赖文件内容 fsync
   - [x] 不跟随符号链接：子目录 `create_dir` + `symlink_metadata` 校验 + canonicalize 后必须仍在 root 内；
         文件只经 `create_new` + `rename` 落地（`rename` 替换链接而非跟随），无 check-then-open 竞态
+  - [x] R2 修复：目录被**钉住**（`Dir` 记录 open 时的 (dev, ino)），每次写入前 `verify()` 复核；
+        目录被换成链接或另一个目录会报错而非静默接收导出
   - [x] `documents.info` 无 `text` 字段（或为 null）→ 记为失败，不写只有标题的文件；空字符串照常导出
   - [x] `--out` 非空目录在**任何请求之前**拒绝（退出码 2），`--overwrite` 才允许覆盖
 - [x] Task 4: 部分失败 (AC: 2)
   - [x] 失败逐条收集（id + 原因），结尾汇总到 stderr（最多列 20 条 + "and N more"）
   - [x] 有失败 → 退出码 9（新增），已登记 `docs/exit-codes.md`
   - [x] **枚举被 CLI 页上限截断 → 同样退出码 9**，`--json` 里 `complete:false` + `enumeration_truncated:true`
+  - [x] R2 修复：`--limit` 截断是用户要求的，退出码 0、`complete:true`，另给 `limit_reached:true`
+        （用 `Rows::incomplete()` 而不是 `truncation.is_some()`）
+  - [x] R2 修复：枚举里**无可用 id 的行**计入 Failure（`Plan::unusable`），
+        不再「丢掉 + 只警告 + complete:true」；重复 id 仍只警告（文档本身没丢）
   - [x] 枚举本身失败 → 沿用其自身退出码（3-7），不写任何文件，不报 9
   - [x] stdout：Table 模式逐行输出相对路径；JSON 模式输出 `{out, exported[], failed[]}`
 - [x] Task 5: 测试 (AC: 1, 2)
@@ -86,11 +95,18 @@ so that 内容可进 git 或离线阅读。
   所以祖先链接照常跟随，但只跟随一次（`--out` 在动手前 canonicalize），
   结尾的 "exported N documents to <path>" 报告解析后的真实位置——重定向可见而非静默。
   `--out` 的**末级**不得是符号链接（退出 2）。
-- **Unicode 规范化去重**（R1 finding 4）：NFC 的 `é`（U+00E9）与 NFD 的 `e`+U+0301 是不同字节串，
-  但在 macOS 卷上是**同一个目录项**。去重键因此是「全 Unicode 小写 + NFC」。
-  不用 NFKC：它会把 `ﬁ`→`fi`、全角→ASCII 也折掉，而真实文件系统不这么做，会误合本可共存的名字。
-  更宽的等价关系（某些文件系统可能有）由下游兜底：每写完一个文件就记下它的 (dev, ino)，
-  撞上本次已写过的文件就报冲突，而不是把两次覆盖计成两次成功导出。
+- **Unicode 去重键**（R1 finding 4 + R2 finding 5）：NFC 的 `é`（U+00E9）与 NFD 的 `e`+U+0301 是不同字节串，
+  但在 macOS 卷上是**同一个目录项**；希腊 final sigma `ς` 与 `σ` 在大小写不敏感卷上同理。
+  `to_lowercase()` 挡不住后者（`ς` 本来就是小写），所以键是「先 uppercase 再 lowercase，再 NFC」——
+  不带完整 case-folding 表拿到 caseless 比较的标准做法，比单纯 lowercase 更激进。
+  两个方向的误差被权衡过并写进代码注释：**折多了**只是让某个名字白拿一个 `-2` 后缀（外观代价），
+  **折少了**是两篇文档抢一个目录项、丢一篇（数据代价）。因此故意偏向折多。
+  副作用是 `ﬁle`/`file`、`Straße`/`Strasse` 也会共享键——有测试锁死这个方向，改回严格必须是显式决定。
+  normalization 仍只用 NFC 不用 NFKC：NFKC 会把全角→ASCII、`№`→`No` 也折掉，那远超任何文件系统。
+- **别名兜底必须在覆盖之前**（R2 finding 5）：旧实现在 rename **之后**记 (dev, ino)——
+  而 rename 装的是新 temp 的**新 inode**，事后 stat 永远看不到「刚刚覆盖了本次已导出的文件」。
+  现在是写入**前**先 stat 目标：若它已经是本次写过的文件，说明这两个名字在该文件系统上是同一个目录项，
+  报冲突并跳过，而不是把覆盖计成两次成功。
 - **退出码 9 是新增的公共 API**：已写入 `docs/exit-codes.md`，并明确"批量还没开始就失败的用原错误码"。
 - **Windows 路径长度**：8 层 × 96 B 的 stem 可能越过传统 `MAX_PATH`(260)。
   这类失败会变成该篇文档的 I/O 失败并进结尾汇总（而不是静默丢失），深度上限也是为此存在。
@@ -104,9 +120,17 @@ so that 内容可进 git 或离线阅读。
   不在本 story 范围。
 - **不写 manifest**：没有 id → 路径的映射文件，因此二次导出后无法按 id 定位旧文件。
   v2 的 pull/push 才需要这个。
-- **(dev, ino) 冲突兜底只在 Unix**：Windows 需要另一套 API（`file_index`）。
-  NTFS 大小写不敏感但不做 normalization folding，所以「小写 + NFC」键在那里已经覆盖了实际等价关系；
-  这条兜底是给等价关系更宽的文件系统（主要是 macOS）用的。
+- **(dev, ino) 兜底与目录钉住只在 Unix**：Windows 的 file index 只有 std 的 unstable API 能拿到
+  （`MetadataExt::file_index`，`windows_by_handle` feature）。NTFS 大小写不敏感但不做 normalization folding，
+  而本键的 uppercase 往返正好覆盖 NTFS 的 uppercase 折叠，所以 Windows 上的残余风险很小；
+  但**它确实没有兜底**，这一点在此明记。`create_new` + `rename` 的保证是跨平台的，承重部分在那里。
+- **路径式写入无法对抗「导出过程中被重命名目录」的攻击者**（R2 finding 4）：
+  resolved path 检查完再使用，中间那个窗口要用 `openat` 系目录句柄才能关掉，std 不提供，
+  而本项目禁止 `unsafe`。两点约束损失：这种攻击者本来就对被写入的目录树有写权限（他能直接改导出结果）；
+  且目录钉住把「静默改道」变成「报错」——被换掉的目录 inode 与钉住的不一致。
+  `target.rs` 的模块文档写的是这个**窄**保证，不再声称 "never through a symlink"。
+- **并发导出到同一目录**：无 `--overwrite` 时由 `create_new` 占位保证互斥（内核语义，非检查），
+  两个进程不可能都成功写同名文件。带 `--overwrite` 时后写者胜——这正是该 flag 的语义。
 - **`index` 排序信息未使用**：兄弟按标题排序（确定性、git 友好），不复刻 Outline 侧边栏顺序。
 
 ### References

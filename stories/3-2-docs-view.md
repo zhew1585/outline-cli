@@ -62,7 +62,15 @@ so that 终端内完成阅读。
   而那正是应该按字面显示的场景。
 - **"超一屏"要按屏幕行算**（R1 finding 5）：终端会自动换行，一行 10,000 列在 80 列窗口里占 125 行。
   只数 `lines()` 会把它判成 1 行直接灌进终端。宽度计算复用 render 的 grapheme + unicode-width，
-  CJK 宽 2、组合符宽 0 都算对；tab 先展开再量。
+  CJK 宽 2、组合符宽 0 都算对。
+- **tab stop 也必须按列算**（R2 finding 7）：tab 停位是**终端列**，所以它前面的文本也得按列量。
+  按 UTF-8 字节算会在任何非 ASCII 文本之后把停位放错（`中` 是 3 字节但 2 列），
+  进而让整行的列数算少、该分页的文档不分页。
+- **pager 起来了但非零退出不能当成功**（R2 finding 9）：`PAGER=false` 会正常 spawn 后立刻退出 1，
+  什么都没显示。判据只能是**退出状态**，不能是「它读了多少字节」——
+  短文档整篇落进管道缓冲区，每次 write 都"成功"，与对端是否看过无关。
+  常见 pager（less/more/bat/most）用户按 q 都退 0，所以非零即视为没显示，回退到 stdout 并警告。
+  误判的代价是不对称的：多打一遍只是难看，不回退则是文档连同 exit 0 一起消失。
 - **绝不把内容交给 shell**：pager 通过 stdin 拿正文，opener 通过独立 argv 拿 URL。
   Windows 特意不用 `cmd /c start`——`cmd` 会重新解析参数，URL 里的 `&` 会变成命令分隔符。
 - **`--web` 的 URL 从 origin 拼**：`Session` 只保存 `scheme://host[:port]`（base URL 的 path 可能带凭证，

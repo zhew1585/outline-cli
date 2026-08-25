@@ -872,3 +872,132 @@ async fn an_output_directory_that_is_a_symlink_is_refused() {
         .stderr(predicate::str::contains("symlink"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_requested_limit_is_not_reported_as_an_incomplete_export() {
+    // The counterpart to `an_enumeration_stopped_by_the_page_cap_...`, and
+    // the boundary docs/exit-codes.md publishes: `--limit N` stopping at N
+    // documents is the requested outcome, so exit 0. Reporting 9 here would
+    // contradict the documented contract and make a deliberate partial
+    // export indistinguishable from a broken one.
+    let server = server_with(vec![
+        row("a", "Alpha", None),
+        row("b", "Beta", None),
+        row("c", "Gamma", None),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--limit",
+                "1",
+                "--out",
+            ])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--limit must not be reported as a failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["complete"], json!(true));
+    assert_eq!(parsed["enumeration_truncated"], json!(false));
+    // But the fact that the export covers only part of the collection is
+    // still visible, for a script asking "is this the whole collection?".
+    assert_eq!(parsed["limit_reached"], json!(true));
+    assert_eq!(tree(&out).len(), 1);
+    // And the ordinary truncation warning still went to stderr.
+    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_row_without_an_id_is_counted_as_a_failure() {
+    // The server listed a document; nothing could be fetched for it because
+    // the row carried no id. Dropping it with only a warning let the export
+    // claim `complete: true` while missing a document the server named.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                { "title": "Unidentified" },
+                { "id": "", "title": "Empty id" },
+                { "id": 42, "title": "Numeric id" },
+                row("ok", "Good", None),
+            ],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "id": "ok", "title": "Good", "text": "kept\n" },
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["complete"], json!(false));
+    // One entry per unusable row, each locatable in the listing.
+    let failed = parsed["failed"].as_array().expect("a failed array");
+    assert_eq!(failed.len(), 3, "{parsed}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("listing row 1 (Unidentified)"), "{stderr}");
+    assert!(stderr.contains("no usable id"), "{stderr}");
+    // The document that could be fetched is still exported.
+    assert_eq!(tree(&out), BTreeSet::from(["Good.md".to_string()]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicate_row_is_not_counted_as_a_failure() {
+    // The counterpart: a repeated id is not a missing document, so it must
+    // not turn a healthy export into a partial one.
+    let server = server_with(vec![row("a", "Alpha", None), row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["complete"], json!(true));
+    assert_eq!(tree(&out), BTreeSet::from(["Alpha.md".to_string()]));
+}
