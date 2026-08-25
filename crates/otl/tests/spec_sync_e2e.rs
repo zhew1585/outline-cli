@@ -366,6 +366,110 @@ async fn an_unreachable_source_is_a_network_error() {
     assert!(!cache.path().join("ir-cache.bin").exists());
 }
 
+/// The spec source is a different server from the Outline instance, and
+/// its failures must be reported as such. Before this was a separate error
+/// domain, a spec host's 401 told the user to check `OUTLINE_API_KEY` -
+/// which `spec sync` never sends anywhere - and a connection failure
+/// blamed `OUTLINE_URL`, which is not involved at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_failures_are_never_reported_as_outline_failures() {
+    let cache = TempDir::new().unwrap();
+    for (status, expected_code) in [(401u16, 4), (403, 4), (404, 5), (500, 6), (418, 3)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(SPEC_PATH))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let url = format!("{}{SPEC_PATH}", server.uri());
+        let (_, stderr, code) = run(cache.path(), &["spec", "sync", "--url", &url]).await;
+        assert_eq!(code, expected_code, "HTTP {status}: {stderr}");
+        for forbidden in ["OUTLINE_API_KEY", "OUTLINE_URL"] {
+            assert!(
+                !stderr.contains(forbidden),
+                "HTTP {status} blamed {forbidden}: {stderr}"
+            );
+        }
+        assert!(
+            stderr.contains("document source") || stderr.contains("spec"),
+            "HTTP {status} does not name the spec source: {stderr}"
+        );
+    }
+}
+
+/// A rate-limited source is retried and, once the budget is spent, exits
+/// with the documented rate-limit code - not a generic HTTP failure. The
+/// mock answers `Retry-After: 0`, so the retries are immediate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limited_source_retries_and_then_exits_eight() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(SPEC_PATH))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        // The initial attempt plus the default retry budget: proof that the
+        // CLI path really does retry rather than giving up at once.
+        .expect(6)
+        .mount(&server)
+        .await;
+    let cache = TempDir::new().unwrap();
+    let url = format!("{}{SPEC_PATH}", server.uri());
+
+    let (_, stderr, code) = run(cache.path(), &["spec", "sync", "--url", &url]).await;
+    assert_eq!(code, 8, "{stderr}");
+    assert!(stderr.contains("rate limit"), "{stderr}");
+    assert!(!stderr.contains("OUTLINE_API_KEY"), "{stderr}");
+    assert!(!cache.path().join("ir-cache.bin").exists());
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_source_does_not_blame_the_outline_instance() {
+    let cache = TempDir::new().unwrap();
+    let (_, stderr, code) = run(
+        cache.path(),
+        &["spec", "sync", "--url", "http://127.0.0.1:1/spec.json"],
+    )
+    .await;
+    assert_eq!(code, 7, "{stderr}");
+    assert!(!stderr.contains("OUTLINE_URL"), "{stderr}");
+    assert!(stderr.contains("127.0.0.1:1"), "{stderr}");
+}
+
+/// A spec that injects terminal control sequences must not reach stdout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_with_terminal_escapes_is_neutralized() {
+    // A summary is display-only, so it is sanitized and the sync succeeds;
+    // an enum value has meaning, so that document is refused outright.
+    let sanitized = r#"{"paths":{"/things.info":{"post":{
+        "summary":"safe \u001b]52;c;cGF3bmVk\u0007 \u001b[31mred\u001b[0m\tforged"}}}}"#;
+    let server = serve(sanitized.to_string()).await;
+    let cache = TempDir::new().unwrap();
+    let url = format!("{}{SPEC_PATH}", server.uri());
+    let (_, stderr, code) = run(cache.path(), &["spec", "sync", "--url", &url]).await;
+    assert_eq!(code, 0, "{stderr}");
+
+    let (stdout, _, code) = run(cache.path(), &["api", "list"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "escape reached stdout: {stdout:?}"
+    );
+    assert!(!stdout.contains('\u{7}'), "bell reached stdout: {stdout:?}");
+    // One operation, one line: the tab could not forge a second column set.
+    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+
+    let refused = r#"{"paths":{"/things.info":{"post":{"requestBody":{"content":
+        {"application/json":{"schema":{"type":"object","properties":
+        {"mode":{"type":"string","enum":["ok","bad\u001b[31m"]}}}}}}}}}}"#;
+    let server = serve(refused.to_string()).await;
+    let cache = TempDir::new().unwrap();
+    let url = format!("{}{SPEC_PATH}", server.uri());
+    let (_, stderr, code) = run(cache.path(), &["spec", "sync", "--url", &url]).await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("cannot be used"), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "escape echoed: {stderr:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bad_source_url_is_rejected_before_any_request() {
     let cache = TempDir::new().unwrap();
@@ -373,6 +477,65 @@ async fn a_bad_source_url_is_rejected_before_any_request() {
         let (_, stderr, code) = run(cache.path(), &["spec", "sync", "--url", url]).await;
         assert_eq!(code, 2, "{url}: {stderr}");
     }
+}
+
+/// `--spec` must reject anything that is not a regular file WITHOUT
+/// opening it. Opening a FIFO blocks until a writer appears, which no read
+/// cap can interrupt - the command would hang forever instead of failing.
+///
+/// The child is polled rather than waited on, so a regression fails this
+/// test instead of hanging the suite.
+#[cfg(unix)]
+#[test]
+fn a_fifo_is_refused_instead_of_blocking() {
+    use std::process::{Command as Proc, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("spec.pipe");
+    let made = Proc::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs on unix");
+    assert!(made.success(), "mkfifo failed");
+
+    let cache = TempDir::new().unwrap();
+    let mut child = Proc::new(assert_cmd::cargo::cargo_bin("otl"))
+        .env("OTL_CACHE_DIR", cache.path())
+        .args(["spec", "sync", "--spec"])
+        .arg(&fifo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(2), "expected a usage error");
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("`spec sync --spec <fifo>` blocked: it opened the pipe");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A directory is refused the same way, with a message about the file type
+/// rather than a raw io error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_is_not_accepted_as_a_document() {
+    let cache = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let (_, stderr, code) = run(
+        cache.path(),
+        &["spec", "sync", "--spec", &dir.path().display().to_string()],
+    )
+    .await;
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("not a regular file"), "{stderr}");
 }
 
 #[test]
