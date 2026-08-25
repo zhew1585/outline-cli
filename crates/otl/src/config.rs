@@ -25,19 +25,16 @@ pub struct Config {
 
 impl fmt::Debug for Config {
     /// Manual impl: the API key must never appear in Debug output, and the
-    /// base URL is shown only if it passes the same shape checks
-    /// `engine::Client::new` enforces (absolute http/https, host present,
-    /// no userinfo, no query, no fragment). `Config` holds the raw env
-    /// value before validation, so credentials could hide in userinfo,
-    /// query, or fragment; anything not provably clean is redacted whole.
+    /// base URL is reduced to its origin (`scheme://host[:port]`) - the
+    /// only URL-derived form safe to display, since userinfo, query,
+    /// fragment, and even the path may embed credentials. `Config` holds
+    /// the raw env value before validation; anything whose origin cannot
+    /// be determined safely is redacted whole.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let base_url: &str = if engine::is_valid_base_url(&self.base_url) {
-            &self.base_url
-        } else {
-            REDACTED
-        };
+        let origin = engine::base_url_origin(&self.base_url);
+        let base_url: &str = origin.as_deref().unwrap_or(REDACTED);
         f.debug_struct("Config")
-            .field("base_url", &base_url)
+            .field("base_url_origin", &base_url)
             .field("api_key", &REDACTED)
             .finish()
     }
@@ -144,5 +141,21 @@ mod tests {
         };
         let rendered = format!("{config:?}");
         assert!(rendered.contains("https://docs.example.com"));
+    }
+
+    #[test]
+    fn debug_output_hides_base_url_path() {
+        // A path can carry secrets too (token-in-path auth schemes);
+        // Debug shows the origin only.
+        let config = Config {
+            base_url: "https://example.com/PATH-SECRET-9c7a".to_string(),
+            api_key: "PATH-SECRET-9c7a".to_string(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("PATH-SECRET-9c7a"),
+            "path secret leaked: {rendered}"
+        );
+        assert!(rendered.contains("https://example.com"));
     }
 }

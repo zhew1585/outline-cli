@@ -1,8 +1,11 @@
 //! Typed errors for the engine request channel.
 //!
 //! Error messages never echo credentials: base-URL problems report only a
-//! reason (the raw value may embed userinfo), and request URLs are built
-//! from a validated, credential-free base.
+//! reason (the raw value may embed userinfo), and any URL-derived text in
+//! user-visible output is reduced to the origin (`scheme://host[:port]`) -
+//! never path, query, or userinfo, which may all carry secrets.
+
+use std::fmt;
 
 use thiserror::Error;
 
@@ -24,11 +27,18 @@ pub enum EngineError {
     ClientBuild(#[source] reqwest::Error),
 
     /// A transport-level failure (DNS, TLS, connection, timeout, ...).
-    #[error("request to {url} failed: {source}")]
+    ///
+    /// Display shows only the request origin and a failure category, never
+    /// the raw transport error text (which can embed the full request URL).
+    /// The underlying error remains available via `source()` for
+    /// programmatic use only.
+    #[error("request to {origin} failed: {kind}")]
     Transport {
-        /// The URL that was requested (credential-free by construction).
-        url: String,
-        /// The underlying transport error.
+        /// Origin (`scheme://host[:port]`) of the request - no path/query.
+        origin: String,
+        /// Classified failure category.
+        kind: TransportKind,
+        /// The underlying transport error (programmatic use; do not print).
         #[source]
         source: reqwest::Error,
     },
@@ -43,12 +53,57 @@ pub enum EngineError {
     },
 
     /// The response body was not valid JSON.
-    #[error("invalid JSON in response from {url}: {source}")]
+    #[error("invalid JSON in response from {origin}")]
     InvalidResponse {
-        /// The URL that was requested.
-        url: String,
-        /// The underlying decode error.
+        /// Origin (`scheme://host[:port]`) of the request - no path/query.
+        origin: String,
+        /// The underlying decode error (programmatic use).
         #[source]
         source: reqwest::Error,
     },
+}
+
+/// Coarse classification of a transport failure, safe to display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// Request timed out.
+    Timeout,
+    /// TCP/TLS connection could not be established (DNS, refused, TLS, ...).
+    Connect,
+    /// A redirect policy was violated.
+    Redirect,
+    /// The request or response body failed mid-transfer.
+    Body,
+    /// Any other transport-level failure.
+    Other,
+}
+
+impl TransportKind {
+    /// Classify a reqwest error into a displayable category.
+    pub fn classify(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else if error.is_redirect() {
+            Self::Redirect
+        } else if error.is_body() || error.is_decode() {
+            Self::Body
+        } else {
+            Self::Other
+        }
+    }
+}
+
+impl fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Timeout => "request timed out",
+            Self::Connect => "connection failed (DNS, refused, or TLS)",
+            Self::Redirect => "redirect policy violated",
+            Self::Body => "body transfer failed",
+            Self::Other => "transport error",
+        };
+        f.write_str(text)
+    }
 }

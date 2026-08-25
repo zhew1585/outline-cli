@@ -11,7 +11,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION};
 use reqwest::Url;
 use serde_json::{Map, Value};
 
-use crate::error::EngineError;
+use crate::error::{EngineError, TransportKind};
 use crate::ir::{OpSpec, ParamType};
 
 /// Placeholder shown instead of secrets in Debug output.
@@ -29,14 +29,20 @@ const NO_ERROR_DETAILS: &str = "no error details in response body";
 pub struct Client {
     http: reqwest::blocking::Client,
     base_url: String,
+    /// `scheme://host[:port]` of the base URL - the only URL-derived text
+    /// this client ever puts into user-visible output (base URL paths can
+    /// carry secrets, e.g. token-in-path auth schemes).
+    origin: String,
     token: String,
 }
 
 impl fmt::Debug for Client {
-    /// Manual impl: the bearer token must never appear in Debug output.
+    /// Manual impl: the bearer token must never appear in Debug output,
+    /// and the base URL is reduced to its origin (a path can carry
+    /// secrets).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
-            .field("base_url", &self.base_url)
+            .field("origin", &self.origin)
             .field("token", &REDACTED)
             .finish_non_exhaustive()
     }
@@ -56,6 +62,7 @@ impl Client {
         Ok(Self {
             http,
             base_url: parsed.as_str().trim_end_matches('/').to_string(),
+            origin: parsed.origin().ascii_serialization(),
             token: token.to_string(),
         })
     }
@@ -77,7 +84,8 @@ impl Client {
             .json(&body)
             .send()
             .map_err(|source| EngineError::Transport {
-                url: url.clone(),
+                origin: self.display_origin(),
+                kind: TransportKind::classify(&source),
                 source,
             })?;
 
@@ -91,18 +99,41 @@ impl Client {
 
         response
             .json()
-            .map_err(|source| EngineError::InvalidResponse { url, source })
+            .map_err(|source| EngineError::InvalidResponse {
+                origin: self.display_origin(),
+                source,
+            })
+    }
+
+    /// The origin for error messages, passed through secret redaction as
+    /// defense in depth (an origin should never contain the token, but no
+    /// URL-derived text reaches output without going through the pipeline).
+    fn display_origin(&self) -> String {
+        redact_secret(&self.origin, &self.token)
     }
 }
 
-/// Check whether a string is a well-formed, credential-free base URL:
-/// parses as absolute `http`/`https`, has a host, and carries no userinfo,
-/// query, or fragment - the same shape [`Client::new`] enforces.
+/// Check whether a string is a well-formed base URL: parses as absolute
+/// `http`/`https`, has a host, and carries no userinfo, query, or fragment
+/// - the same shape [`Client::new`] enforces.
 ///
-/// Callers can use this for pre-flight configuration checks and to decide
-/// whether an unvalidated URL is safe to display at all.
+/// Validity is NOT a credential-safety guarantee: a valid base URL may
+/// still carry secrets in its path. Never display a full base URL; use
+/// [`base_url_origin`] for anything user-visible.
 pub fn is_valid_base_url(base_url: &str) -> bool {
     validate_base_url(base_url).is_ok()
+}
+
+/// The origin (`scheme://host[:port]`) of a base URL that passes
+/// [`Client::new`]'s shape checks, or `None` if it does not.
+///
+/// This is the only URL-derived form safe to display: it can never carry
+/// userinfo, query, fragment, or path components, all of which may embed
+/// credentials.
+pub fn base_url_origin(base_url: &str) -> Option<String> {
+    validate_base_url(base_url)
+        .ok()
+        .map(|parsed| parsed.origin().ascii_serialization())
 }
 
 /// Validate the base URL with a real URL parser.

@@ -255,6 +255,47 @@ fn debug_output_redacts_token() {
 }
 
 #[test]
+fn debug_output_reduces_base_url_to_origin() {
+    // A base URL path can carry secrets (token-in-path auth schemes);
+    // Debug must show the origin only.
+    let client = Client::new("https://example.com/PATH-SECRET-9c7a", "token").unwrap();
+    let rendered = format!("{client:?}");
+    assert!(
+        !rendered.contains("PATH-SECRET-9c7a"),
+        "path leaked: {rendered}"
+    );
+    assert!(rendered.contains("https://example.com"));
+}
+
+#[test]
+fn transport_error_display_shows_origin_only() {
+    // Nothing listens on port 9; the send fails at the transport level.
+    // The error Display must show scheme://host:port only - never the
+    // path (which may carry secrets), and never raw reqwest error text.
+    let client = Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
+    let error = client
+        .execute(&op_with_path("/api/things.info"), &[])
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Transport { .. }),
+        "got {error:?}"
+    );
+    let rendered = format!("{error}");
+    assert!(
+        !rendered.contains("PATH-SECRET"),
+        "path secret leaked: {rendered}"
+    );
+    assert!(
+        rendered.contains("http://127.0.0.1:9"),
+        "origin missing: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/api/things.info"),
+        "request path leaked: {rendered}"
+    );
+}
+
+#[test]
 fn new_normalizes_trailing_slash() {
     // A trailing slash must not produce `//api/...` URLs; constructing the
     // client is enough to exercise normalization without a network call.

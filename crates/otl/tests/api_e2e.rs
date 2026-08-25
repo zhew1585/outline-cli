@@ -199,6 +199,33 @@ async fn response_without_data_prints_whole_body() {
         .stdout(predicate::eq(include_str!("golden/no_data_envelope.txt")));
 }
 
+#[test]
+fn base_url_path_secret_never_reaches_stderr() {
+    // Reviewer PoC: a secret in the base URL PATH (token-in-path auth) plus
+    // the same value as API key. Nothing listens on port 9, so the request
+    // fails at the transport level - and neither the Transport Display nor
+    // the reqwest source chain may put the secret on stderr.
+    let output = otl()
+        .env("OUTLINE_URL", "http://127.0.0.1:9/PATH-SECRET-9c7a")
+        .env("OUTLINE_API_KEY", "PATH-SECRET-9c7a")
+        .args(["api", "documents.info", "id=x"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(
+        stderr.matches("PATH-SECRET").count(),
+        0,
+        "path secret leaked: {stderr}"
+    );
+    assert!(!stdout.contains("PATH-SECRET"), "stdout leaked: {stdout}");
+    assert!(
+        stderr.contains("http://127.0.0.1:9"),
+        "origin missing from diagnostics: {stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reflected_api_key_never_reaches_stderr() {
     // A server that echoes the Authorization value in its error body must

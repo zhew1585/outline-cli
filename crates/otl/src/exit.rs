@@ -50,7 +50,11 @@ impl CliError {
 }
 
 impl fmt::Display for CliError {
+    /// Prints only the top-level error message, never the source chain:
+    /// underlying transport errors (reqwest) can embed the full request
+    /// URL, whose path may carry secrets. Engine error Displays are
+    /// crafted to be complete and credential-free on their own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#}", self.source)
+        write!(f, "{}", self.source)
     }
 }
