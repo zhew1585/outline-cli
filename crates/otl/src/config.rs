@@ -25,14 +25,16 @@ pub struct Config {
 
 impl fmt::Debug for Config {
     /// Manual impl: the API key must never appear in Debug output, and the
-    /// base URL is redacted too whenever it might embed `user:password@`
-    /// userinfo. `Config` holds the raw env value before `Client::new`
-    /// validation, so it cannot be assumed credential-free here.
+    /// base URL is shown only if it passes the same shape checks
+    /// `engine::Client::new` enforces (absolute http/https, host present,
+    /// no userinfo, no query, no fragment). `Config` holds the raw env
+    /// value before validation, so credentials could hide in userinfo,
+    /// query, or fragment; anything not provably clean is redacted whole.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let base_url: &str = if self.base_url.contains('@') {
-            REDACTED
-        } else {
+        let base_url: &str = if engine::is_valid_base_url(&self.base_url) {
             &self.base_url
+        } else {
+            REDACTED
         };
         f.debug_struct("Config")
             .field("base_url", &base_url)
@@ -117,5 +119,30 @@ mod tests {
             "base_url credential leaked: {rendered}"
         );
         assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+    }
+
+    #[test]
+    fn debug_output_redacts_base_url_with_query_secret() {
+        // Credentials can hide outside userinfo too; anything that would
+        // not pass Client::new shape checks is redacted whole.
+        let config = Config {
+            base_url: "https://example.com/?access_token=query-secret".to_string(),
+            api_key: "query-secret".to_string(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("query-secret"),
+            "query credential leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn debug_output_shows_clean_base_url() {
+        let config = Config {
+            base_url: "https://docs.example.com".to_string(),
+            api_key: "k".to_string(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("https://docs.example.com"));
     }
 }
