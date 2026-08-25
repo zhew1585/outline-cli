@@ -23,6 +23,9 @@ const SERVER_RETRY_HINT: &str =
 const INVALID_REQUEST_HINT: &str = "This usually means the API key contains characters that are \
      not allowed in an HTTP header (for example a trailing newline). \
      Re-copy the key without surrounding whitespace.";
+/// Hint appended when rate-limit retries are exhausted.
+const RATE_LIMIT_HINT: &str =
+    "Wait for the rate limit to reset and retry, or fetch fewer items per run.";
 /// Hint appended to network/transport failures.
 const NETWORK_RETRY_HINT: &str =
     "Check your network connection and the OUTLINE_URL host, then retry.";
@@ -78,6 +81,19 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
         | EngineError::UnionBody { .. }
         | EngineError::UnsupportedBodyType { .. }
         | EngineError::InvalidRequestBody { .. } => (ExitCode::Usage, error.to_string()),
+        // The server throttled this client until the retry budget ran out:
+        // its own exit code, so scripts can tell "try later" from a real
+        // failure.
+        EngineError::RateLimited { .. } => (
+            ExitCode::RateLimited,
+            format!("{error}.\n{RATE_LIMIT_HINT}"),
+        ),
+        // A server that breaks its own pagination contract mid-fetch, or a
+        // descriptor that cannot be used: both are "the result is not
+        // trustworthy", never a partial success.
+        EngineError::Pagination { .. } | EngineError::InvalidPaginationSpec { .. } => {
+            (ExitCode::Failure, error.to_string())
+        }
         EngineError::ClientBuild(_) | EngineError::InvalidResponse { .. } => {
             (ExitCode::Failure, error.to_string())
         }

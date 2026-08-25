@@ -1,0 +1,1 @@
+warning: results may be truncated after 2 items; a `limit=` argument fetches one page only; drop it to fetch every page, or page manually with `offset=`

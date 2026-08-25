@@ -8,16 +8,20 @@
 
 use std::fmt;
 use std::io::Read;
+use std::thread;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use reqwest::Url;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
+use reqwest::{StatusCode, Url};
 use serde_json::Value;
 
 use crate::body::{build_request_body, ensure_dispatchable};
 use crate::error::{is_transport_failure, EngineError, TransportKind};
 use crate::ir::{OpSpec, ValidationMode};
+use crate::paginate::{self, Fetched, PaginationSpec};
+use crate::retry::RetryPolicy;
 use crate::sanitize::{clean_server_text, redact_secret, REDACTED};
+use crate::throttle::Throttle;
 
 /// Default total request timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,6 +39,8 @@ const NO_ERROR_DETAILS: &str = "no error details in response body";
 const INVALID_HEADER_REASON: &str =
     "a header value contains characters that are not valid in HTTP \
      (for example a newline or a control character)";
+/// Minimum self-imposed throttle delay worth announcing on stderr.
+const THROTTLE_NOTICE_MIN: Duration = Duration::from_secs(1);
 /// Explanation used in place of withheld server text.
 const SERVER_MESSAGE_WITHHELD: &str =
     "server message withheld: it may quote the request body, which can contain secrets";
@@ -61,6 +67,11 @@ pub struct Client {
     /// carry secrets, e.g. token-in-path auth schemes).
     origin: String,
     token: String,
+    /// How the channel reacts to HTTP 429 responses.
+    retry: RetryPolicy,
+    /// Shared request-rate budget; clients given the same handle pace
+    /// against one another.
+    throttle: Throttle,
 }
 
 impl fmt::Debug for Client {
@@ -103,7 +114,21 @@ impl Client {
             base_url: parsed.as_str().trim_end_matches('/').to_string(),
             origin: parsed.origin().ascii_serialization(),
             token: token.to_string(),
+            retry: RetryPolicy::default(),
+            throttle: Throttle::process_wide(),
         })
+    }
+
+    /// Replace the 429 retry policy (defaults to [`RetryPolicy::default`]).
+    #[must_use]
+    pub fn with_retry_policy(self, retry: RetryPolicy) -> Self {
+        Self { retry, ..self }
+    }
+
+    /// Share a specific throttle handle instead of the process-wide one.
+    #[must_use]
+    pub fn with_throttle(self, throttle: Throttle) -> Self {
+        Self { throttle, ..self }
     }
 
     /// Execute one RPC operation with `key=value` arguments.
@@ -127,6 +152,58 @@ impl Client {
         // Every value came from the caller's own command line, so server
         // error text may be surfaced in full (sanitized and token-free).
         self.send(&op.path, bytes, ErrorDetail::Full)
+    }
+
+    /// Execute one RPC operation, auto-paginating per `spec` and capping
+    /// the total fetched rows at `max_items` when given.
+    ///
+    /// All pagination vocabulary comes from `spec`; the engine has no
+    /// convention of its own. Arguments are validated and coerced exactly
+    /// as in [`Client::execute`], then the descriptor's offset and page-size
+    /// parameters are set per page. If the caller's own arguments already
+    /// pin the page size, that is honored as manual paging: exactly one
+    /// page is fetched, and a full page is reported as possibly truncated.
+    ///
+    /// The returned [`Fetched::truncation`] is `Some` whenever the result
+    /// may be incomplete; callers MUST surface it to the user - truncation
+    /// is never silent.
+    ///
+    /// Raw bodies are deliberately not paginated: [`Client::execute_raw`]
+    /// sends what it was given, verbatim and once.
+    pub fn execute_paged(
+        &self,
+        op: &OpSpec,
+        args: &[(String, String)],
+        validation: ValidationMode,
+        spec: &PaginationSpec,
+        max_items: Option<u64>,
+    ) -> Result<Fetched, EngineError> {
+        // Everything local first: a malformed descriptor or offset must
+        // fail before a single byte goes on the wire.
+        spec.validate()?;
+        let start = paginate::start_offset(spec, args)?;
+        let body = build_request_body(op, args, validation)?;
+
+        if paginate::has_manual_page_size(spec, args) {
+            let mut value = self.send(&op.path, encode(&body)?, ErrorDetail::Full)?;
+            // The single page goes through the same acceptance check as any
+            // auto-paginated page, so the offset-hint and items-pointer
+            // invariants cannot be skipped on this branch.
+            let accepted = paginate::accept_page(spec, &mut value, start, 1, 0)?;
+            let truncation = paginate::manual_page_truncation(&accepted);
+            paginate::restore_items(spec, &mut value, accepted.items);
+            return Ok(Fetched { value, truncation });
+        }
+
+        paginate::fetch_all_pages(
+            spec,
+            |offset, limit| {
+                let page = page_body(&body, spec, offset, limit);
+                self.send(&op.path, encode(&page)?, ErrorDetail::Full)
+            },
+            start,
+            max_items,
+        )
     }
 
     /// Execute one RPC operation with a caller-supplied raw JSON body.
@@ -176,27 +253,69 @@ impl Client {
         detail: ErrorDetail,
     ) -> Result<Value, EngineError> {
         let url = format!("{}{}", self.base_url, op_path);
-        let response = self
-            .http
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(ACCEPT, "application/json")
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .map_err(|source| self.send_error(source))?;
+        let mut attempt: u32 = 0;
+        loop {
+            self.pace();
+            let response = self
+                .http
+                .post(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+                .header(ACCEPT, "application/json")
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .send()
+                .map_err(|source| self.send_error(source))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let parts = extract_error_parts(response, &self.token, detail);
-            return Err(EngineError::Api {
-                status: status.as_u16(),
-                code: parts.code,
-                message: parts.message,
-            });
+            let status = response.status();
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                if attempt >= self.retry.max_retries {
+                    return Err(EngineError::RateLimited {
+                        origin: self.display_origin(),
+                        retries: attempt,
+                    });
+                }
+                let wait = self
+                    .retry
+                    .retry_wait(retry_after_header(&response).as_deref(), attempt);
+                attempt += 1;
+                // Diagnostics only ever go to stderr; stdout is data.
+                eprintln!(
+                    "rate limited by {} (HTTP 429); waiting {:.1}s before retry {}/{}",
+                    self.display_origin(),
+                    wait.as_secs_f64(),
+                    attempt,
+                    self.retry.max_retries
+                );
+                thread::sleep(wait);
+                continue;
+            }
+            if !status.is_success() {
+                let parts = extract_error_parts(response, &self.token, detail);
+                return Err(EngineError::Api {
+                    status: status.as_u16(),
+                    code: parts.code,
+                    message: parts.message,
+                });
+            }
+
+            return response.json().map_err(|source| self.body_error(source));
         }
+    }
 
-        response.json().map_err(|source| self.body_error(source))
+    /// Draw one token from the shared throttle, sleeping out any required
+    /// delay (with a stderr notice for noticeable waits).
+    fn pace(&self) {
+        let delay = self.throttle.acquire_delay();
+        if delay.is_zero() {
+            return;
+        }
+        if delay >= THROTTLE_NOTICE_MIN {
+            eprintln!(
+                "throttling: waiting {:.1}s to respect the request rate limit",
+                delay.as_secs_f64()
+            );
+        }
+        thread::sleep(delay);
     }
 
     /// Classify a failure of `send()`.
@@ -249,6 +368,33 @@ impl Client {
     fn display_origin(&self) -> String {
         redact_secret(&self.origin, &self.token)
     }
+}
+
+/// The `Retry-After` header of a response, if present and readable.
+fn retry_after_header(response: &reqwest::blocking::Response) -> Option<String> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Serialize a request body to bytes.
+fn encode(body: &Value) -> Result<Vec<u8>, EngineError> {
+    serde_json::to_vec(body).map_err(|error| EngineError::InvalidRequestBody {
+        reason: error.to_string(),
+    })
+}
+
+/// One page's request body: the validated body with the descriptor's
+/// offset and page-size parameters set as JSON numbers.
+fn page_body(body: &Value, spec: &PaginationSpec, offset: u64, limit: u64) -> Value {
+    let mut page = body.clone();
+    if let Value::Object(map) = &mut page {
+        map.insert(spec.offset_param.to_string(), Value::from(offset));
+        map.insert(spec.limit_param.to_string(), Value::from(limit));
+    }
+    page
 }
 
 /// Check whether a string is a well-formed base URL: parses as absolute

@@ -83,6 +83,44 @@ pub enum EngineError {
         message: String,
     },
 
+    /// The server kept answering HTTP 429 until the retry budget ran out.
+    ///
+    /// Dedicated variant so callers can distinguish "retry later" from
+    /// other failures; carries only the origin (credential-free).
+    #[error(
+        "rate limited by {origin} (HTTP 429): giving up after {retries} retries; \
+         the server is throttling this client - try again later"
+    )]
+    RateLimited {
+        /// Origin (`scheme://host[:port]`) of the request - no path/query.
+        origin: String,
+        /// Number of retries performed before giving up.
+        retries: u32,
+    },
+
+    /// A paginated fetch could not be completed consistently.
+    ///
+    /// Raised when a page does not match the caller's pagination
+    /// descriptor, or when the server reports an offset that disagrees
+    /// with the requested one. Returning the rows fetched so far as a
+    /// success would be silent truncation, so this is a hard error.
+    #[error("pagination failed: {reason}")]
+    Pagination {
+        /// Human-readable reason, built from descriptor and counts only.
+        reason: String,
+    },
+
+    /// A pagination descriptor is not usable.
+    ///
+    /// Detected before any network request. This is a caller-side
+    /// programming error (a malformed JSON pointer, or metadata removal
+    /// that would delete the merged rows), never user input.
+    #[error("invalid pagination descriptor: {reason}")]
+    InvalidPaginationSpec {
+        /// Human-readable reason, free of any caller-supplied value.
+        reason: String,
+    },
+
     /// The response body was not valid JSON.
     #[error("invalid JSON in response from {origin}")]
     InvalidResponse {

@@ -24,6 +24,9 @@ pub enum ExitCode {
     Server = 6,
     /// Network/transport failure (DNS, connect, TLS, timeout).
     Network = 7,
+    /// Rate limited: the server kept answering HTTP 429 until the retry
+    /// budget was exhausted.
+    RateLimited = 8,
 }
 
 impl From<ExitCode> for std::process::ExitCode {

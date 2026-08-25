@@ -7,5 +7,6 @@ pub mod config;
 pub mod errors;
 pub mod exit;
 pub mod ops;
+pub mod paging;
 pub mod render;
 pub mod stdio;

@@ -15,6 +15,7 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 | 5 | Resource not found | Unknown document, collection, or other resource (404) |
 | 6 | Server error | Outline instance failed to process the request (5xx) |
 | 7 | Network error | DNS failure, connection refused, TLS failure, request timeout, response body that times out or is cut mid-transfer |
+| 8 | Rate limited | The server kept answering HTTP 429 until the retry budget was exhausted; retry later |
 
 Notes:
 

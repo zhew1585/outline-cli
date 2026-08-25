@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 unicode-width = { workspace = true }
+httpdate = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

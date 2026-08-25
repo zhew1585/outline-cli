@@ -367,7 +367,14 @@ async fn closed_stdout_pipe_exits_quietly_without_panicking() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/documents.list"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": rows })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": rows,
+            // `documents.list` is auto-paginated, so the response carries
+            // the paging echo a real list response has: offset 0 as asked,
+            // and a page capacity far above the rows returned, making this
+            // the first and only page.
+            "pagination": { "offset": 0, "limit": 100_000 },
+        })))
         .mount(&server)
         .await;
 

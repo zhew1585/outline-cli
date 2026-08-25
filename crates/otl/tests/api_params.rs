@@ -635,7 +635,12 @@ async fn large_integer_is_sent_without_precision_loss() {
     Mock::given(method("POST"))
         .and(path("/api/documents.search"))
         .and(body_string(r#"{"limit":9007199254740993}"#.to_string()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+        // `documents.search` is auto-paginated, so a realistic response
+        // carries the paging echo (offset as asked, applied page size).
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [],
+            "pagination": { "offset": 0, "limit": 9_007_199_254_740_993_i64 },
+        })))
         .expect(1)
         .mount(&server)
         .await;

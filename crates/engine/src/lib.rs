@@ -12,6 +12,10 @@
 //! - [`error`]: typed engine errors.
 //! - [`sanitize`]: the credential-hygiene pipeline every piece of
 //!   server-provided text passes through at error construction time.
+//! - [`paginate`]: auto-pagination driven by a caller-supplied
+//!   [`PaginationSpec`] (the engine knows no wire vocabulary of its own).
+//! - [`retry`]: 429 backoff policy (Retry-After aware).
+//! - [`throttle`]: token-bucket rate limiting over a shared handle.
 
 #![forbid(unsafe_code)]
 
@@ -20,10 +24,16 @@ pub mod client;
 pub mod error;
 mod format;
 pub mod ir;
+pub mod paginate;
+pub mod retry;
 pub mod sanitize;
 mod scalar;
+pub mod throttle;
 
 pub use body::build_request_body;
 pub use client::{base_url_origin, is_valid_base_url, Client, ErrorDetail, DEFAULT_TIMEOUT};
 pub use error::{EngineError, TransportKind};
 pub use ir::{BodyMode, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION};
+pub use paginate::{Fetched, PaginationSpec, Truncation, TruncationCause};
+pub use retry::RetryPolicy;
+pub use throttle::{Throttle, TokenBucket};

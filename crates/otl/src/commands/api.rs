@@ -14,13 +14,17 @@ use std::io::Read;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{BodyMode, Client, EngineError, ErrorDetail, ValidationMode};
+use engine::{
+    BodyMode, Client, EngineError, ErrorDetail, Fetched, Truncation, TruncationCause,
+    ValidationMode,
+};
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::errors::{map_engine_error, map_engine_error_with_hint};
 use crate::exit::CliError;
 use crate::ops;
+use crate::paging;
 use crate::render::{self, OutputMode};
 use crate::stdio;
 
@@ -74,6 +78,15 @@ pub struct ApiArgs {
     /// with your Outline instance.
     #[arg(long)]
     pub no_validate: bool,
+
+    /// Cap the total number of rows fetched by auto-pagination.
+    ///
+    /// List operations fetch every page by default; with `--limit` the
+    /// fetch stops at N rows and a truncation warning goes to stderr if
+    /// more rows were available. Cannot be combined with a raw `limit=`
+    /// argument, which pins the server page size instead.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub limit: Option<u64>,
 }
 
 /// How the request body is supplied.
@@ -99,17 +112,93 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         ))
     })?;
     let payload = build_payload(cmd)?;
+    // A raw --body is sent verbatim and once, so pagination never applies.
+    let pagination = match &payload {
+        Payload::KeyValue(_) => paging::spec_for(op),
+        Payload::Raw(_) => None,
+    };
+    check_limit_usage(cmd, &payload, pagination.is_some())?;
     let config = Config::from_env().map_err(CliError::usage)?;
 
     let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
     let detail = error_detail(cmd);
-    let response = match &payload {
-        Payload::KeyValue(args) => client.execute(op, args, validation_mode(cmd)),
-        Payload::Raw(body) => client.execute_raw(op, body, detail),
+    let fetched = match (&payload, &pagination) {
+        (Payload::KeyValue(args), Some(spec)) => {
+            client.execute_paged(op, args, validation_mode(cmd), spec, cmd.limit)
+        }
+        (Payload::KeyValue(args), None) => client
+            .execute(op, args, validation_mode(cmd))
+            .map(Fetched::complete),
+        (Payload::Raw(body), _) => client.execute_raw(op, body, detail).map(Fetched::complete),
     }
     .map_err(|error| execute_error(error, detail))?;
 
-    print_response(&response, mode)
+    if let Some(truncation) = &fetched.truncation {
+        warn_truncated(truncation);
+    }
+    print_response(&fetched.value, mode)
+}
+
+/// Reject `--limit` where it cannot mean anything, before any request.
+///
+/// `--limit` (a total cap) and a raw `limit=` argument (a per-page size)
+/// mean different things and would silently fight each other, so asking
+/// for both is a usage error rather than a guess. `--limit` on a `--body`
+/// call or on an operation that does not paginate would be a silent no-op.
+fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Result<(), CliError> {
+    if cmd.limit.is_none() {
+        return Ok(());
+    }
+    if let Payload::KeyValue(args) = payload {
+        if args.iter().any(|(key, _)| key == paging::LIMIT_PARAM) {
+            return Err(CliError::usage(anyhow!(
+                "--limit and a `{param}=` argument cannot be combined: --limit \
+                 caps the total rows fetched across pages, while `{param}=` \
+                 pins the server page size and fetches a single page; keep one",
+                param = paging::LIMIT_PARAM
+            )));
+        }
+    }
+    if !paginated {
+        return Err(CliError::usage(anyhow!(
+            "--limit applies only to list operations called with key=value \
+             arguments, and {:?} does not paginate here; drop --limit",
+            cmd.operation
+        )));
+    }
+    Ok(())
+}
+
+/// Explicit stderr warning whenever results may be incomplete (hard rule:
+/// pagination never truncates silently), including how to get more.
+///
+/// Only [`TruncationCause::is_definite`] causes are stated as fact; the
+/// others say results *may* be truncated, because the data could have
+/// ended exactly at the boundary.
+fn warn_truncated(truncation: &Truncation) {
+    let remedy = match truncation.cause {
+        TruncationCause::MaxItems => "raise or drop --limit to fetch more",
+        TruncationCause::PageLimit => {
+            "narrow the query, or continue from this point with an \
+             `offset=` argument"
+        }
+        TruncationCause::ManualPage => {
+            "a `limit=` argument fetches one page only; drop it to fetch \
+             every page, or page manually with `offset=`"
+        }
+        TruncationCause::OffsetSpaceExhausted => {
+            "the pagination offset space is exhausted; narrow the query"
+        }
+    };
+    let certainty = if truncation.cause.is_definite() {
+        "results truncated"
+    } else {
+        "results may be truncated"
+    };
+    stdio::write_diagnostic_line(&format!(
+        "warning: {certainty} after {} items; {remedy}",
+        truncation.fetched
+    ));
 }
 
 /// How strictly to validate locally: `--no-validate` keeps the structural
