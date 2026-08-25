@@ -91,9 +91,19 @@ so that 不背命令。
 | 4 | MAJOR | 已修：build 期白名单（构建失败）+ 运行期白名单 + 描述去控制字符；含敌对 fixture 与 `bash -n`/`zsh -n` 检查 |
 | 5 | MAJOR | 已修（收敛口径）：AC / long help / README / 每份脚本头部注释均按 shell 写明覆盖范围，双向测试核对 |
 
+### R2 复核处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| R2-5 | MINOR | 已修：R1 的口径收敛漏了公开 rustdoc（模块开头仍写 “operation names all complete”）。现在模块文档按 shell 写明，并新增 `the_public_module_documentation_matches_the_delivered_coverage`——直接读源文件的模块注释，与 `completes_operation_names` 判定表核对。文档也是一种声明，一并纳入测试。 |
+
+R2 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
+进一步验证」——生成期过滤不依赖 build.rs 的编译期拒绝，是独立的第二道，specsync 合并后可直接复验该接缝。
+
 ### 故意留下的缺口
 
-- powershell / elvish 不补全 api 操作名（上游生成器限制，见上）。已在 AC、help、README 与脚本内自陈。
+- powershell / elvish 不补全 api 操作名（上游生成器限制，见上）。已在 AC、help、README、模块 rustdoc
+  与脚本头部注释内自陈，五处均有测试或核对。
 - fish 在 `otl api <op> ` 之后仍会继续提供操作名候选（fish 的 `complete` 条件无法表达「第 N 个位置」）。
   噪声可接受，替代方案是为 200 个名字生成 `not __fish_seen_subcommand_from` 条件，代价远大于收益。
 - 不提供 `otl completions --install`（自动写入 shell 配置）：那属于分发范围（Story 4.5），且会往用户的

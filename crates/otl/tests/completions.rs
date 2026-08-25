@@ -391,3 +391,43 @@ fn a_shell_that_claims_operation_names_actually_carries_them() {
         );
     }
 }
+
+#[test]
+fn the_public_module_documentation_matches_the_delivered_coverage() {
+    // R2 finding 5: help, README and the script headers were narrowed, but
+    // the module rustdoc still claimed every operation name completes
+    // everywhere. Documentation is a claim like any other, so it is checked.
+    let source = include_str!("../src/commands/completions.rs");
+    let doc: String = source
+        .lines()
+        .take_while(|line| line.starts_with("//!") || line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!doc.is_empty(), "no module documentation found");
+    assert!(
+        !doc.contains("operation names all complete"),
+        "rustdoc over-claims: {doc}"
+    );
+    // It must name the shells that do get operation names.
+    assert!(
+        doc.contains("bash, zsh and fish"),
+        "rustdoc does not state the coverage: {doc}"
+    );
+    // Every shell named as covered must actually be covered, and every one
+    // not named must not be.
+    use clap_complete::Shell;
+    for (shell, name) in [
+        (Shell::Bash, "bash"),
+        (Shell::Zsh, "zsh"),
+        (Shell::Fish, "fish"),
+        (Shell::PowerShell, "powershell"),
+        (Shell::Elvish, "elvish"),
+    ] {
+        let claimed_in_doc = doc.contains(&format!("{name} "))
+            || doc.contains(&format!("{name},"))
+            || doc.contains(&format!("{name}."));
+        if otl::commands::completions::completes_operation_names(shell) {
+            assert!(claimed_in_doc, "{name} is covered but unmentioned: {doc}");
+        }
+    }
+}

@@ -81,6 +81,10 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
   **改为**：schema 提供**完整排名**（操作级、确定），调用方丢掉「没有任何一行携带」的字段后再取前四。
   `nullable` 的语义随之更正为「非空字段当它出现时永远不是空单元格，因此更值得占一列」，不再声称「必然存在」。
   新的确定性表述：**排序**与响应无关；**出现哪些列**只取决于响应携带的字段集合，与行序、map 迭代序无关。
+  **R2 追加**：R1 的过滤只看「key 是否存在」，而 nullable 字段常常是「存在且显式为 null」——渲染出来就是
+  空单元格。因此判据改为**有内容**（`has_content`）：缺失、`null`、空白字符串都不算；`false` 与 `0` 算，
+  它们是读者想看的值。不变量升级为「被选中的列不可能每行都空」，并对多种 payload 形状统一断言
+  （`no_selected_column_is_ever_blank_in_every_row`）。
   新增测试：`a_sparse_response_shows_the_fields_it_has_not_empty_columns`（逐列断言「不得每行都空」）、
   `a_present_field_is_never_crowded_out_by_an_absent_one`、
   `the_schema_still_supplies_the_ranking_not_the_payload`、
@@ -99,6 +103,7 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
 | # | 级别 | 处置 |
 |---|------|------|
 | 6 | MAJOR | 已修：schema 只提供排名，出现哪些列由响应字段集决定；不再把 `nullable=false` 当作「必然存在」；`required` 明确不入 IR（全 spec 皆空，纯死重量）；四个新测试钉住稀疏响应行为 |
+| R2-4 | MAJOR | 已修：过滤条件由「key 存在」改为「有内容」——`null`、缺失、空白字符串都不算内容，`false` / `0` 算。原实现下 `[{"id":"1","a":null,"b":null,"c":null,"d":"useful"}]` 会渲染三个全空列并把 `d` 挤掉 |
 | — | 验证 | 审查者独立确认 resolver-2 的 build-dep feature 隔离成立（`.fingerprint` 里 runtime `["default","std"]` 与 build-script `[...,"preserve_order",...]` 两套 artifact 并存） |
 
 ### 故意留下的缺口

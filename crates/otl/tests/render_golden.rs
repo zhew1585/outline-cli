@@ -698,3 +698,83 @@ fn the_compiled_ir_drives_real_operations() {
         "a read-only url outranked the name: {header}"
     );
 }
+
+#[test]
+fn columns_that_are_null_in_every_row_are_not_shown() {
+    // R2 finding 4: presence of a key is not content. `icon`, `color` and
+    // `publishedAt` are legitimately nullable and can be present-but-null in
+    // every row; each would take one of the four slots and render blank,
+    // pushing out a field that does have something to show.
+    let schema = document_schema();
+    let payload = json!([
+        { "id": "d1", "icon": null, "color": null, "publishedAt": null, "urlId": "keep-me" },
+        { "id": "d2", "icon": null, "color": null, "publishedAt": null, "urlId": "keep-me-2" }
+    ]);
+    let header = header_of(&payload, &schema);
+    assert_eq!(header, vec!["id", "urlId"], "blank columns were kept");
+
+    let rendered = render(&payload, OutputMode::Table, &schema).unwrap();
+    assert!(rendered.contains("keep-me"), "{rendered}");
+}
+
+#[test]
+fn blank_strings_do_not_earn_a_column_but_false_and_zero_do() {
+    let schema = vec![
+        field("id", ParamType::String, "uuid", false, true),
+        field("title", ParamType::String, "", false, false),
+        field("fullWidth", ParamType::Boolean, "", false, false),
+        field("revision", ParamType::Number, "", false, true),
+    ];
+    // An empty (or whitespace-only) title renders as a blank cell.
+    let payload = json!([
+        { "id": "d1", "title": "   ", "fullWidth": false, "revision": 0 },
+        { "id": "d2", "title": "", "fullWidth": false, "revision": 0 }
+    ]);
+    let header = header_of(&payload, &schema);
+    assert!(!header.contains(&"title".to_string()), "{header:?}");
+    // `false` and `0` are values a reader wants to see.
+    assert!(header.contains(&"fullWidth".to_string()), "{header:?}");
+    assert!(header.contains(&"revision".to_string()), "{header:?}");
+}
+
+#[test]
+fn no_selected_column_is_ever_blank_in_every_row() {
+    // The invariant, checked over a spread of payload shapes.
+    let schema = document_schema();
+    for payload in [
+        json!([{ "id": "d1" }]),
+        json!([{ "id": "d1", "icon": null }]),
+        json!([{ "id": "d1", "title": "", "icon": "x" }]),
+        json!([{ "id": "d1", "title": null, "createdAt": "c", "updatedAt": null }]),
+        documents_payload(),
+    ] {
+        let rendered = render(&payload, OutputMode::Table, &schema).unwrap();
+        let lines: Vec<&str> = rendered.lines().collect();
+        let header = header_of(&payload, &schema);
+        for (index, name) in header.iter().enumerate() {
+            let has_data = lines[1..].iter().any(|line| {
+                line.split_whitespace()
+                    .nth(index)
+                    .is_some_and(|cell| !cell.trim().is_empty())
+            });
+            assert!(
+                has_data,
+                "column {name} is blank in every row for {payload}:\n{rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_payload_whose_schema_fields_are_all_null_falls_back_to_the_data() {
+    // Nothing the schema ranks has content, so the data-driven policy takes
+    // over rather than printing a table of blanks.
+    let schema = document_schema();
+    let payload = json!([{ "id": null, "title": null, "extra": "visible" }]);
+    let rendered = render(&payload, OutputMode::Table, &schema).unwrap();
+    assert_eq!(
+        rendered,
+        render(&payload, OutputMode::Table, NO_SCHEMA).unwrap()
+    );
+    assert!(rendered.contains("extra"), "{rendered}");
+}

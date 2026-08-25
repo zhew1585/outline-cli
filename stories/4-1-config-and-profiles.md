@@ -69,16 +69,28 @@ so that 工作/个人/自托管随手切。
   代价是不再指名出错的键；补偿是把整份 schema 列出来（比指名更有用，且与文件内容完全无关）。
   证据是表驱动测试 `no_config_file_value_is_ever_echoed_into_a_diagnostic`：13 种让解析失败的位置，
   每种都把同一个可识别 secret 放在**值**的位置，断言 Display 与 Debug 都不含它，且仍带行号。
+- **诊断里的路径一律过 `sanitize_path`（R2 finding 3 的处置）**：R1 只清理了 profile 名，漏了 `--config`
+  / `OUTLINE_CONFIG` 的**路径**——`Path::display()` 对非 UTF-8 有损但对控制字节原样放行，因此
+  `--config $'/x/\e]8;;http://evil\aFORGED\e]8;;\a\nerror: forged'` 能在终端里种一个可点击超链接并伪造
+  一行 `error:`。现在路径与名字走同一套处理（控制字符换 U+FFFD、长度截断，路径上限 200 字符）。
 - **诊断里的名字一律过 `sanitize_name`（R1 finding 7 的处置）**：TOML 的 quoted key 可以塞 ESC 与换行，
   原实现里 `available.join(", ")` 与 `[profiles.{profile}]` 是 Display 直出，可向 stderr 注入 ANSI/OSC
   或伪造后续诊断行。现在控制字符换成 U+FFFD、长度截断、名字一律加引号，profile 列表还有条数上限
   （200 个 profile 不会灌满 stderr）。测试断言：输出无 ESC，且没有任何一行以 `error:` 开头
   （伪造诊断行不可能成立）。
-- **所有配置层类型都手写 Debug（R1 finding 2 的处置）**：`Overrides` / `Profile` / `ConfigFile` /
-  `LoadedConfig` 原来用派生 Debug，会原样吐出 base URL 的 userinfo/path/query，绕过 `Config`/`Settings`
-  已做的 redaction。现在四者都手写（URL 只显示 origin），`EnvLayer` 的 per-profile 密钥表只显示条数。
-  测试 `no_configuration_type_leaks_a_url_through_debug` 把同一个带 userinfo/path/query 秘密的 URL
-  灌进全部 7 个类型，逐个断言。
+- **所有配置层类型都手写 Debug（R1 finding 2 + R2 finding 2 的处置）**：`Overrides` / `Profile` /
+  `ConfigFile` / `LoadedConfig` 原来用派生 Debug，会原样吐出 base URL 的 userinfo/path/query，绕过
+  `Config`/`Settings` 已做的 redaction。现在四者都手写（URL 只显示 origin），`EnvLayer` 的 per-profile
+  密钥表只显示条数。
+  R2 指出还漏了一整类载荷：**名字本身**。`default_profile = "<secret>"` 与 `[profiles.<secret>]` 都是
+  用户写进文件的值，`ConfigError` 的派生 Debug 还会原样吐出 `name`/`available`/`path`。
+  现在的边界写死为：**Debug 里不出现任何 profile 名**（只显示 `***` / `<unset>`），名字只在 `Display`
+  出现且过 sanitize + 截断。理由是两者的用途不同——`Display` 是用户为了改自己的文件而必须看到的一次性
+  诊断（有界、已清理），`Debug` 是会落进日志、panic 消息与 error chain 的无界机器面，没有「必须看到」的
+  需求，所以按最严处理。`ConfigError` 因此改为手写 Debug 转发 Display，彻底关掉第二条未过滤通道。
+  测试 `no_configuration_type_leaks_a_url_through_debug`（URL 载荷，7 个类型）、
+  `no_configuration_type_leaks_a_profile_name_through_debug`（名字载荷，6 个类型）、
+  `config_error_debug_never_exposes_raw_names_or_paths`（4 个变体）。
 - **优先级必须逐项**：整体覆盖（某层存在就丢弃下层）是最容易写错的地方——`OUTLINE_URL` 只该覆盖 URL，
   不该连带丢掉 profile 选的认证方式。`precedence_is_applied_per_key_not_per_layer` 专门盯这个。
 - **`OUTLINE_CONFIG=`（设置但为空）= 不读配置文件**。这是脚本/CI/测试把自己钉在纯 env 路径上的唯一办法，
@@ -129,13 +141,31 @@ R1 指出：`--profile personal` 会把环境里的全局 `OUTLINE_API_KEY`（�
 `one_profiles_key_is_never_sent_to_another_profiles_instance` 断言退出 2 且
 `received_requests()` 为空——即「密钥根本没上路」，而不只是「响应失败」。
 
-### env URL 与 profile URL 不一致时只警告不拒绝
+### profile 同时作用于凭证与 origin（R2 finding 1 的处置：由警告改为拒绝）
 
-`OUTLINE_URL` 仍然按 AC 的优先级压过 profile 的 `url`（逐项 flag > env > file 不变），但此时 profile 的
-凭证会发往 profile 没有声明的实例，因此 stderr 出一条警告。这里选警告而非拒绝，因为两个变量都在同一个
-环境里由同一个用户设置，且凭证仍是该 profile 自己的——与 finding 1 的「一个 workspace 的密钥去另一个
-workspace」不同级。`--url` 是「我就是要重定向」的显式表达，不警告。警告不打印 URL 本身（base URL 的
-path/query 可能带凭证）。
+R1 修复里我对「profile 没有对应密钥变量」选了拒绝（理由：警告收不回已发出的凭证），却对「`OUTLINE_URL`
+指向别处」选了警告放行。R2 用我自己的论据打回来了，而且我新增的 e2e 测试**明确断言那次请求成功**，等于把
+被审查的行为固化成预期。审查者是对的，我原来的「不同严重度」论证不成立：
+
+- 「凭证仍是该 profile 自己的」不能让泄漏变得可接受。密钥被送到 profile 从未声明的 origin，这个 origin
+  可能根本不是用户的实例（旧 shell 里遗留的 `OUTLINE_URL`、CI 里从别处继承的变量、复制粘贴的 env 片段）。
+- 不可撤回性对两条路径完全一样。既然不可撤回性是拒绝全局密钥回退的理由，它对这里同样成立。
+
+**改为**：profile 在场时，base URL 只来自 profile 自己的 `url` 或本次命令里的 `--url`；`OUTLINE_URL`
+不再是一个层，而是一个一致性检查——与解析结果不一致即 `ConflictingUrl` 报错（退出 2，不发请求）。
+profile 没有 `url` 且没有 `--url` 时也报错（不再由 `OUTLINE_URL` 顶上），因为那是同一条规则的另一面：
+ambient 变量不得决定 profile 凭证的去向。
+
+**优先级契约的准确表述**：flag > env > file 逐项生效，唯一例外是「被选中 profile 的 base URL」——那一项
+env 不参与，只做一致性检查。AC、README、exit-codes、模块文档均已按此收敛，不留口径差。
+
+**测试反转**：原先断言「成功且收到 from-elsewhere」的 e2e 改为
+`an_env_url_pointing_away_from_the_profile_sends_nothing`：退出 2、stdout 为空、stderr 不含密钥与 URL、
+且 `received_requests()` 为空。另加 `a_profile_without_a_url_is_not_rescued_by_the_env_var`（规则另一面）
+与 `the_url_flag_redirects_a_profile_deliberately`（逃生门仍然可用）。
+
+**逐项优先级仍有测试**：`precedence_is_applied_per_key_not_per_layer` 改为让三个层各贡献一个键
+（env 给 profile、flag 给 URL、file 给 auth），比原来的「env URL 覆盖 profile URL」更能证明「不是整层覆盖」。
 
 ### 故意留下的缺口
 
@@ -175,6 +205,19 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 | 3 | BLOCKER | 已修：诊断不再含任何 parser 文本，只有自有描述 + 行号 + 静态 schema；13 例表驱动测试 |
 | 7 | MAJOR | 已修：`sanitize_name` 用于所有进诊断的名字；列表有条数上限；无 ESC / 无伪造行断言 |
 | — | 顺带 | 已修：README 关于嵌套凭证键的措辞收敛为「顶层或 profile 内」 |
+
+### R2 复核处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| R2-1 | BLOCKER | 已修：`OUTLINE_URL` 与 profile URL 冲突改为拒绝（`ConflictingUrl`）；profile 无 URL 时不再由 env 顶上；e2e 测试反转为断言「另一实例零请求」 |
+| R2-2 | BLOCKER | 已修：Debug 不再输出任何 profile 名（含 `default_profile` 与表键）；`ConfigError` 改为手写 Debug 转发 Display，去掉派生 Debug 这条未过滤的通道 |
+| R2-3 | MAJOR | 已修：新增 `sanitize_path`，所有进诊断的路径都过它；端到端断言 OSC/BEL/换行不落 stderr |
+| R2-6 | MAJOR | 已修：`profile_api_key_suffix(name, case_insensitive)`，Windows 走大小写折叠、POSIX 保持敏感；平台规则做成参数，两种行为在任何平台都可测 |
+| R2-7 | MINOR | 已修：`MAX_PROFILE_VAR_CHARS = 64` 在**派生处**设界（截断后的变量名是错误建议），超长 profile 名走 `ProfileApiKeyVarUnnameable` |
+
+R2 已 VERIFIED：R1-3（TOML 文本只用于分类）、R1-4（两层白名单）、R1-7（控制字符清理，并额外确认 bidi
+经 Rust Debug 转义后无法改变终端方向状态）。
 
 ### File List
 

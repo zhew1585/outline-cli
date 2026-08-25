@@ -109,10 +109,15 @@ letter or digit becoming `_` (`self-hosted` → `OUTLINE_API_KEY_SELF_HOSTED`). 
 to the global `OUTLINE_API_KEY`: falling back would send the key that happens to be exported to whichever
 instance the selected profile points at, which is one workspace's credential going to another
 workspace's server. When a profile is missing its key, `otl` says which variable to set and exits 2
-without making a request. If `OUTLINE_URL` points somewhere other than the selected profile declares,
-precedence still applies (env beats the file) but a warning goes to stderr, since the profile's
-credential is then travelling to an instance the profile did not name; `--url` is the deliberate way to
-redirect a profile and is not warned about.
+without making a request.
+
+The same rule applies to the *other* half of a request. With a profile in effect the base URL comes from
+that profile's `url`, or from `--url` when you override it deliberately in the same command;
+`OUTLINE_URL` is not a source, and one that disagrees is an error rather than a silent redirect. This is
+the single place where resolution is not simply flag > env > file: an ambient variable left over from an
+earlier shell session must not be able to point a profile's credential at a server the profile never
+named, and a warning would not help — a credential that has been sent cannot be recalled. Without a
+profile, `OUTLINE_URL` behaves exactly as before.
 
 The config file holds no secrets, by construction: an `api_key` or `token` key — at the top level or in a
 profile — is a hard error pointing at `credentials.toml`, and any other unrecognized key (including a

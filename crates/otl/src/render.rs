@@ -127,9 +127,14 @@ fn try_render_table(payload: &Value, schema: &[FieldSpec]) -> Option<String> {
 /// would therefore print columns that are empty in every row while crowding
 /// out fields the response does carry.
 ///
-/// So a schema field becomes a candidate only if some row has it, and the
-/// top [`MAX_TABLE_COLUMNS`] candidates win, in ranked order. Neither row
-/// order nor map iteration order can influence the result.
+/// So a schema field becomes a candidate only if some row HAS CONTENT for
+/// it, and the top [`MAX_TABLE_COLUMNS`] candidates win, in ranked order.
+/// Content, not mere presence: a nullable field is often present and
+/// explicitly `null` in every row, which renders as a blank cell, and a
+/// column that is blank in every row is exactly the noise this filter exists
+/// to remove - it would also consume one of the four slots and push out a
+/// field that does have something to show. Neither row order nor map
+/// iteration order can influence the result.
 ///
 /// The data-driven policy remains for payloads no schema describes - a raw
 /// `--body` call, an operation whose spec declares no response shape, or
@@ -137,13 +142,25 @@ fn try_render_table(payload: &Value, schema: &[FieldSpec]) -> Option<String> {
 fn select_columns<'a>(rows: &[&'a Map<String, Value>], schema: &'a [FieldSpec]) -> Vec<&'a str> {
     let from_schema: Vec<&'a str> = rank_schema_columns(schema)
         .into_iter()
-        .filter(|key| rows.iter().any(|row| row.contains_key(*key)))
+        .filter(|key| rows.iter().any(|row| has_content(row.get(*key))))
         .take(MAX_TABLE_COLUMNS)
         .collect();
     if from_schema.is_empty() {
         return select_data_columns(rows);
     }
     from_schema
+}
+
+/// Whether a value would render as anything at all.
+///
+/// Absent, `null` and blank strings all produce an empty cell. `false` and
+/// `0` do not: they are values a reader wants to see.
+fn has_content(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(_) => true,
+    }
 }
 
 /// Rank EVERY displayable schema field, best column first.

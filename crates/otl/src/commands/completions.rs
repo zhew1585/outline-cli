@@ -1,9 +1,13 @@
 //! `otl completions <shell>` - print a shell completion script.
 //!
 //! The script is generated from the same clap command tree the binary parses
-//! with, augmented with the operation names from the compiled IR table. So
-//! subcommands, flags and `otl api` operation names all complete, and the
-//! operation list can never drift from what the binary can actually call.
+//! with, augmented with the operation names from the compiled IR table, so
+//! nothing it offers can drift from what the binary can actually call.
+//!
+//! Subcommands and flag names complete in every supported shell. `otl api`
+//! OPERATION names complete in bash, zsh and fish only - see the per-shell
+//! coverage note below, and [`completes_operation_names`], which is the
+//! single source both the generated scripts and the tests read.
 //!
 //! The augmentation is applied to a CLONE of the command used for generation
 //! only: the real parser keeps accepting any operation name so that an
