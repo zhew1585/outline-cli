@@ -24,20 +24,32 @@
 //!   reads `OUTLINE_API_KEY_<PROFILE>` and refuses to fall back, because
 //!   falling back would send one workspace's key to another workspace's
 //!   server. See [`EnvApiKey`].
-//! - the ORIGIN comes from the profile's own scope too. With a profile in
-//!   effect the base URL is the profile's `url`, or `--url` when the caller
-//!   overrides it deliberately in this invocation; `OUTLINE_URL` is not a
-//!   source, and one that disagrees with the resolved origin is a hard
-//!   error rather than a silent redirect.
+//! - the credential is only RELEASED once it is bound to the origin the
+//!   request will use. Resolution itself is untouched - `OUTLINE_URL` is a
+//!   normal env layer for the base URL, and flag > env > file holds for
+//!   every key - but between resolution and handing the secret to the
+//!   request channel there is one gate, [`release_token`], which refuses to
+//!   release a profile's credential to an origin that profile never named.
 //!
-//! The second rule is the same argument as the first. An environment
-//! variable exported in some earlier shell session must not be able to
-//! point a profile's credential at a server the profile never named: a
-//! warning cannot recall a credential that has already been sent, so the
-//! request has to fail before it is made. This is the one place where
-//! precedence is not simply flag > env > file: for the base URL of a
-//! SELECTED PROFILE the environment is not a layer at all, it is a
-//! consistency check.
+//! The binding rules, applied only when a profile is in effect:
+//!
+//! | base URL came from | released? |
+//! |--------------------|-----------|
+//! | `--url`            | yes - stated in the same command, so the redirect is deliberate |
+//! | the profile's `url`| yes - the profile named the origin itself |
+//! | `OUTLINE_URL`      | only if its origin matches the profile's declared `url` |
+//! | `OUTLINE_URL`, profile declares no `url` | no - there is nothing to bind the credential to |
+//!
+//! Comparison is by normalized ORIGIN (`scheme://host[:port]`), so a
+//! trailing slash, host casing or a default port cannot produce a false
+//! conflict, and a path difference cannot hide the fact that it is the same
+//! server receiving the credential.
+//!
+//! The gate lives at the credential-release boundary rather than inside a
+//! [`TokenSource`], and [`TokenSource::fetch`] cannot be reached without
+//! passing it: the proof token it requires is only constructible here. A
+//! future credential-file source therefore inherits the check instead of
+//! having to remember it.
 //!
 //! # Nothing from the config file is echoed back
 //!
@@ -54,14 +66,16 @@
 
 mod error;
 mod file;
+mod release;
 
-pub use error::{sanitize_name, sanitize_path, ConfigError};
+pub use error::{sanitize_name, sanitize_path, sanitize_text, ConfigError};
 pub use file::{config_dir, default_config_path, load_file, load_from, locate, CONFIG_FILE_NAME};
+pub use release::{release_token, BindingChecked, EnvApiKey, TokenSource};
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::de::{Deserializer, IgnoredAny};
 use serde::Deserialize;
@@ -214,7 +228,7 @@ impl fmt::Debug for Overrides {
         f.debug_struct("Overrides")
             .field("profile", &redacted_name(self.profile.as_deref()))
             .field("url_origin", &redacted_origin(self.url.as_deref()))
-            .field("config_path", &self.config_path)
+            .field("config_path", &redacted_path(self.config_path.as_deref()))
             .finish()
     }
 }
@@ -245,7 +259,7 @@ impl fmt::Debug for EnvLayer {
             .field("profile", &redacted_name(self.profile.as_deref()))
             .field("url_origin", &redacted_origin(self.url.as_deref()))
             .field("api_key", &REDACTED)
-            .field("config_path", &self.config_path)
+            .field("config_path", &redacted_path(self.config_path.as_deref()))
             // Count only: the suffixes name profiles, but the values are
             // keys, and a map rendering would print them.
             .field("profile_api_keys", &self.profile_api_keys.len())
@@ -394,7 +408,7 @@ fn non_blank(value: Option<&str>) -> Option<String> {
 }
 
 /// Where the user config file was looked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConfigSource {
     /// The path, or `None` when the platform has no resolvable config
     /// directory (a headless account without a home directory).
@@ -405,14 +419,52 @@ pub struct ConfigSource {
     pub explicit: bool,
 }
 
+impl fmt::Debug for ConfigSource {
+    /// Manual impl: a config PATH is caller-supplied text that can carry a
+    /// secret in a directory name, so Debug reports only whether one is
+    /// set - see `redacted_path`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigSource")
+            .field("path", &redacted_path(self.path.as_deref()))
+            .field("explicit", &self.explicit)
+            .finish()
+    }
+}
+
 /// A loaded config file and the path it came from (`None` when no file was
 /// read).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct LoadedConfig {
     /// The parsed contents, empty when no file was read.
     pub file: ConfigFile,
     /// The file actually read, for error messages.
     pub path: Option<PathBuf>,
+}
+
+impl fmt::Debug for LoadedConfig {
+    /// Manual impl: delegates to [`ConfigFile`], and reports the path only
+    /// as set/unset - see `redacted_path`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedConfig")
+            .field("file", &self.file)
+            .field("path", &redacted_path(self.path.as_deref()))
+            .finish()
+    }
+}
+
+/// Which layer supplied the base URL.
+///
+/// Recorded because the credential-release gate treats them differently: a
+/// `--url` in the same command is a deliberate redirect, while an
+/// environment variable is ambient and has to agree with the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlSource {
+    /// `--url`.
+    Flag,
+    /// `OUTLINE_URL`.
+    Env,
+    /// The selected profile's `url`.
+    Profile,
 }
 
 /// Everything resolved except the secret itself.
@@ -422,6 +474,13 @@ pub struct Settings {
     pub profile: Option<String>,
     /// Base URL of the Outline instance.
     pub base_url: String,
+    /// Which layer supplied [`Settings::base_url`].
+    pub url_source: UrlSource,
+    /// The selected profile's own `url`, when it declared one.
+    ///
+    /// Kept so that [`release_token`] can compare origins without needing
+    /// the config file again.
+    pub profile_url: Option<String>,
     /// How to authenticate to it.
     pub auth: AuthMethod,
 }
@@ -432,6 +491,11 @@ impl fmt::Debug for Settings {
         f.debug_struct("Settings")
             .field("profile", &redacted_name(self.profile.as_deref()))
             .field("base_url_origin", &redacted_origin(Some(&self.base_url)))
+            .field("url_source", &self.url_source)
+            .field(
+                "profile_url_origin",
+                &redacted_origin(self.profile_url.as_deref()),
+            )
             .field("auth", &self.auth)
             .finish()
     }
@@ -476,66 +540,24 @@ fn redacted_name(name: Option<&str>) -> &'static str {
     }
 }
 
+/// Whether a config-file path is set, without disclosing it.
+///
+/// A path is caller-supplied text (`--config`, `OUTLINE_CONFIG`) and its
+/// directory names can carry secrets, so it gets the same treatment as a
+/// profile name: absent from Debug, and shown in `Display` only, where it is
+/// sanitized and length-capped.
+fn redacted_path(path: Option<&Path>) -> &'static str {
+    match path {
+        Some(_) => REDACTED,
+        None => "<unset>",
+    }
+}
+
 /// The origin (`scheme://host[:port]`) of a URL, or [`REDACTED`] when it
 /// cannot be determined safely.
 fn redacted_origin(url: Option<&str>) -> String {
     url.and_then(engine::base_url_origin)
         .unwrap_or_else(|| REDACTED.to_string())
-}
-
-/// Where the secret comes from.
-///
-/// The single interface point between profile resolution and credential
-/// storage: v1 ships [`EnvApiKey`], and the Epic 2 credential file becomes a
-/// second implementation without any change above this line.
-pub trait TokenSource {
-    /// The bearer token for `settings`, or a readable configuration error.
-    fn token(&self, settings: &Settings) -> Result<String, ConfigError>;
-}
-
-/// The v1 token source: an API key from the environment.
-///
-/// A credential belongs to ONE instance, and a profile names an instance, so
-/// the two are resolved from the same scope:
-///
-/// - no profile in effect: the global `OUTLINE_API_KEY` (the Epic 1 path,
-///   unchanged);
-/// - profile in effect: `OUTLINE_API_KEY_<PROFILE>` and nothing else.
-///
-/// The second rule deliberately does NOT fall back to the global variable.
-/// Falling back is what would send the key for the workspace whose variable
-/// happens to be exported to whichever instance the selected profile points
-/// at - a silent cross-origin credential disclosure produced by nothing more
-/// than `--profile`. Refusing is recoverable (the error names the variable to
-/// set); a key already sent to the wrong server is not.
-pub struct EnvApiKey<'layer>(pub &'layer EnvLayer);
-
-impl TokenSource for EnvApiKey<'_> {
-    fn token(&self, settings: &Settings) -> Result<String, ConfigError> {
-        if settings.auth != AuthMethod::ApiKey {
-            return Err(ConfigError::UnsupportedAuthMethod {
-                profile: settings.profile.clone(),
-                method: settings.auth,
-            });
-        }
-        let Some(profile) = settings.profile.as_deref() else {
-            return self.0.api_key.clone().ok_or(ConfigError::MissingApiKey);
-        };
-        let Some(suffix) = api_key_var_suffix(profile) else {
-            return Err(ConfigError::ProfileApiKeyVarUnnameable {
-                profile: profile.to_string(),
-            });
-        };
-        self.0
-            .profile_api_keys
-            .get(&suffix)
-            .cloned()
-            .ok_or_else(|| ConfigError::MissingProfileApiKey {
-                profile: profile.to_string(),
-                variable: format!("{ENV_API_KEY_PREFIX}{suffix}"),
-                global_set: self.0.api_key.is_some(),
-            })
-    }
 }
 
 /// Resolve everything but the secret, applying flag > env > file per key.
@@ -557,53 +579,25 @@ pub fn resolve_settings(
     if let Some((name, _)) = profile {
         check_api_key_var_is_unambiguous(name, loaded)?;
     }
-    let base_url = match profile {
-        Some((name, declared)) => profile_base_url(name, declared, overrides, env)?,
-        None => overrides
-            .url
-            .clone()
-            .or_else(|| env.url.clone())
-            .ok_or(ConfigError::MissingUrl { profile: None })?,
-    };
+    // Strict flag > env > file, for this key as for every other. Whether the
+    // resolved origin may receive the resolved credential is a separate
+    // question, asked once at the credential-release boundary
+    // ([`release_token`]) rather than by bending precedence here.
+    let profile_url = profile.and_then(|(_, p)| non_blank(p.url.as_deref()));
+    let (base_url, url_source) = non_blank(overrides.url.as_deref())
+        .map(|url| (url, UrlSource::Flag))
+        .or_else(|| env.url.clone().map(|url| (url, UrlSource::Env)))
+        .or_else(|| profile_url.clone().map(|url| (url, UrlSource::Profile)))
+        .ok_or_else(|| ConfigError::MissingUrl {
+            profile: profile.map(|(name, _)| name.to_string()),
+        })?;
     Ok(Settings {
         profile: profile.map(|(name, _)| name.to_string()),
         base_url,
+        url_source,
+        profile_url,
         auth: profile.and_then(|(_, p)| p.auth).unwrap_or_default(),
     })
-}
-
-/// The base URL for a SELECTED PROFILE: the profile's own `url`, or `--url`
-/// when the caller overrides it in this invocation.
-///
-/// `OUTLINE_URL` is deliberately not a source here, and one that disagrees
-/// with the result is an error rather than a redirect. The profile decides
-/// which credential is sent, so it must also decide where it is sent;
-/// otherwise a variable exported in some earlier shell session silently
-/// points this profile's key at a server the profile never named. A warning
-/// would not do, because it cannot recall a credential that has already
-/// been sent - the same reason a profile does not fall back to the global
-/// API key.
-///
-/// `--url` is exempt: it is stated in the same command as `--profile`, so
-/// the redirect is deliberate rather than ambient.
-fn profile_base_url(
-    name: &str,
-    profile: &Profile,
-    overrides: &Overrides,
-    env: &EnvLayer,
-) -> Result<String, ConfigError> {
-    if let Some(url) = non_blank(overrides.url.as_deref()) {
-        return Ok(url);
-    }
-    let declared = non_blank(profile.url.as_deref()).ok_or_else(|| ConfigError::MissingUrl {
-        profile: Some(name.to_string()),
-    })?;
-    match env.url.as_deref() {
-        Some(from_env) if from_env != declared => Err(ConfigError::ConflictingUrl {
-            profile: name.to_string(),
-        }),
-        _ => Ok(declared),
-    }
 }
 
 /// Refuse a selected profile whose API key variable another profile shares.
@@ -666,7 +660,7 @@ impl Config {
         let env = EnvLayer::from_process();
         let loaded = load_file(overrides, &env)?;
         let settings = resolve_settings(overrides, &env, &loaded)?;
-        let api_key = EnvApiKey(&env).token(&settings)?;
+        let api_key = release_token(&EnvApiKey(&env), &settings)?;
         Ok(Self::from_parts(&settings, api_key))
     }
 }

@@ -484,27 +484,75 @@ async fn a_matching_env_url_is_not_a_conflict() {
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
 }
 
-#[test]
-fn a_profile_without_a_url_is_not_rescued_by_the_env_var() {
-    // The same rule from the other side: an ambient OUTLINE_URL must not
-    // decide where a profile-scoped credential goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_without_a_url_cannot_bind_an_env_url() {
+    // The rule from the other side: the env URL is still the resolution
+    // result, but a profile that named no instance cannot have its credential
+    // bound to one, so the key is not released and nothing is sent.
+    let ambient = instance("from-ambient", "key-for-work").await;
     let (_dir, config) = config_file("[profiles.work]\nauth = \"api-key\"\n");
-    otl()
-        .env("OUTLINE_API_KEY_WORK", "key-for-work")
-        .env("OUTLINE_URL", "http://127.0.0.1:9")
-        .args([
-            "--config",
-            config.to_str().unwrap(),
-            "--profile",
-            "work",
-            "api",
-            "documents.info",
-            "id=doc-1",
-        ])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicate::str::contains("no base URL"));
+    let config_arg = config.to_str().unwrap().to_string();
+    let uri = ambient.uri();
+
+    let output = tokio::task::spawn_blocking(move || {
+        otl()
+            .env("OUTLINE_API_KEY_WORK", "key-for-work")
+            .env("OUTLINE_URL", &uri)
+            .args([
+                "--config",
+                &config_arg,
+                "--profile",
+                "work",
+                "api",
+                "documents.info",
+                "id=doc-1",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("declares no `url`"), "{stderr}");
+    assert!(!stderr.contains("key-for-work"), "key echoed: {stderr}");
+    let received = ambient.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "{} request(s) reached an unbound instance",
+        received.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_env_url_equivalent_to_the_profile_url_is_allowed() {
+    // R3 finding 4, end to end: a trailing slash is the same instance, so it
+    // must not be reported as a conflict.
+    let work = instance("from-work", "key-for-work").await;
+    let (_dir, config) = config_file(&format!("[profiles.work]\nurl = \"{}\"\n", work.uri()));
+    let config_arg = config.to_str().unwrap().to_string();
+    let with_slash = format!("{}/", work.uri());
+
+    tokio::task::spawn_blocking(move || {
+        otl()
+            .env("OUTLINE_API_KEY_WORK", "key-for-work")
+            .env("OUTLINE_URL", &with_slash)
+            .args([
+                "--config",
+                &config_arg,
+                "--profile",
+                "work",
+                "api",
+                "documents.info",
+                "id=doc-1",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("from-work"));
+    })
+    .await
+    .unwrap();
 }
 
 #[test]

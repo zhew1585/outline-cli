@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use otl::config::{
-    resolve_settings, AuthMethod, Config, ConfigError, ConfigSource, EnvLayer, Overrides,
-    TokenSource,
+    release_token, resolve_settings, AuthMethod, Config, ConfigError, ConfigSource, EnvLayer,
+    Overrides, Settings, UrlSource,
 };
 use tempfile::TempDir;
 
@@ -31,6 +31,27 @@ fn overrides_for(path: &Path) -> Overrides {
         config_path: Some(path.to_path_buf()),
         ..Overrides::default()
     }
+}
+
+/// A `Settings` for the cases that do not need a config file.
+fn settings_for(profile: Option<&str>, base_url: &str, url_source: UrlSource) -> Settings {
+    Settings {
+        profile: profile.map(str::to_string),
+        base_url: base_url.to_string(),
+        url_source,
+        profile_url: match url_source {
+            // A profile-sourced URL is by definition the declared one.
+            UrlSource::Profile => Some(base_url.to_string()),
+            _ => None,
+        },
+        auth: AuthMethod::ApiKey,
+    }
+}
+
+/// Release a credential the way the binary does: through the shared gate,
+/// never by calling a `TokenSource` directly (which the type system forbids).
+fn release(env: &EnvLayer, resolved: &Settings) -> Result<String, ConfigError> {
+    release_token(&otl::config::EnvApiKey(env), resolved)
 }
 
 /// Resolve settings from explicit layers, with the config file loaded from
@@ -167,18 +188,32 @@ fn precedence_is_applied_per_key_not_per_layer() {
 }
 
 #[test]
-fn an_env_url_pointing_away_from_the_profile_is_refused() {
-    // R2 finding 1: a warning cannot recall a credential that has already
-    // been sent, which is the same argument that makes a profile refuse the
-    // global API key. So the conflict fails the command instead.
+fn an_env_url_resolves_by_precedence_then_the_gate_refuses_the_credential() {
+    // R3 ruling: OUTLINE_URL stays a normal env layer for the URL, so
+    // resolution honours flag > env > file (AC2). Whether that origin may
+    // receive THIS profile's credential is a separate question, asked once at
+    // the credential-release boundary - which refuses, because a credential
+    // sent to the wrong server cannot be recalled.
     let (_dir, path) = config_file(TWO_PROFILES);
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
     let env = EnvLayer {
         url: Some("https://elsewhere.example.com".to_string()),
         ..EnvLayer::default()
-    };
-    let error = settings(&overrides, &env).unwrap_err();
+    }
+    .with_profile_api_key("work", "key-for-work");
+
+    // Resolution: the env layer wins the URL, as the AC requires.
+    let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.base_url, "https://elsewhere.example.com");
+    assert_eq!(resolved.url_source, UrlSource::Env);
+    assert_eq!(
+        resolved.profile_url.as_deref(),
+        Some("https://work.example.com")
+    );
+
+    // Release: refused, so no credential exists to send.
+    let error = release(&env, &resolved).unwrap_err();
     assert!(
         matches!(error, ConfigError::ConflictingUrl { .. }),
         "{error:?}"
@@ -186,44 +221,129 @@ fn an_env_url_pointing_away_from_the_profile_is_refused() {
     let message = error.to_string();
     assert!(message.contains("OUTLINE_URL"), "{message}");
     assert!(message.contains("work"), "{message}");
-    // Neither URL is printed: a base URL can carry credentials.
     assert!(!message.contains("elsewhere.example.com"), "{message}");
-    assert!(!message.contains("work.example.com"), "{message}");
-
-    // An env URL that agrees with the profile is not a conflict.
-    let same = EnvLayer {
-        url: Some("https://work.example.com".to_string()),
-        ..EnvLayer::default()
-    };
-    let resolved = settings(&overrides, &same).unwrap();
-    assert_eq!(resolved.base_url, "https://work.example.com");
-
-    // `--url` is the deliberate redirect and is exempt.
-    let mut redirected = overrides.clone();
-    redirected.url = Some("https://elsewhere.example.com".to_string());
-    let resolved = settings(&redirected, &env).unwrap();
-    assert_eq!(resolved.base_url, "https://elsewhere.example.com");
+    assert!(!message.contains("key-for-work"), "{message}");
 }
 
 #[test]
-fn an_env_url_cannot_supply_the_origin_for_a_profile_that_declares_none() {
-    // Same rule from the other side: a profile scopes the credential, so an
-    // ambient OUTLINE_URL must not be what decides where it goes. Without a
-    // profile `url` and without --url the command fails.
+fn an_env_url_matching_the_profile_origin_releases_the_credential() {
+    let (_dir, path) = config_file(TWO_PROFILES);
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    let env = EnvLayer {
+        url: Some("https://work.example.com".to_string()),
+        ..EnvLayer::default()
+    }
+    .with_profile_api_key("work", "key-for-work");
+    let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.url_source, UrlSource::Env);
+    assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
+}
+
+#[test]
+fn origin_equivalence_is_normalized_not_a_string_comparison() {
+    // R3 finding 4: the request channel tolerates and normalizes a trailing
+    // slash, host casing and a default port, so none of them may look like a
+    // different instance to the gate.
+    for (declared, from_env, bound) in [
+        ("http://127.0.0.1:9", "http://127.0.0.1:9/", true),
+        ("http://127.0.0.1:9/", "http://127.0.0.1:9", true),
+        ("https://Work.Example.COM", "https://work.example.com", true),
+        (
+            "https://work.example.com:443",
+            "https://work.example.com",
+            true,
+        ),
+        (
+            "http://work.example.com:80",
+            "http://work.example.com",
+            true,
+        ),
+        // A different path is still the same server receiving the key.
+        (
+            "https://work.example.com",
+            "https://work.example.com/sub",
+            true,
+        ),
+        // Genuinely different instances.
+        (
+            "https://work.example.com",
+            "https://other.example.com",
+            false,
+        ),
+        ("https://work.example.com", "http://work.example.com", false),
+        (
+            "https://work.example.com",
+            "https://work.example.com:8443",
+            false,
+        ),
+    ] {
+        let (_dir, path) = config_file(&format!("[profiles.work]\nurl = \"{declared}\"\n"));
+        let mut overrides = overrides_for(&path);
+        overrides.profile = Some("work".to_string());
+        let env = EnvLayer {
+            url: Some(from_env.to_string()),
+            ..EnvLayer::default()
+        }
+        .with_profile_api_key("work", "key-for-work");
+        let resolved = settings(&overrides, &env).unwrap();
+        assert_eq!(
+            release(&env, &resolved).is_ok(),
+            bound,
+            "declared {declared:?} vs env {from_env:?}"
+        );
+    }
+}
+
+#[test]
+fn a_profile_that_declares_no_url_cannot_bind_an_env_url() {
+    // The env URL is still the resolution result (AC2), but there is nothing
+    // to bind the profile's credential to, so it is not released.
     let (_dir, path) = config_file("[profiles.work]\nauth = \"api-key\"\n");
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
     let env = EnvLayer {
         url: Some("https://ambient.example.com".to_string()),
         ..EnvLayer::default()
-    };
-    let error = settings(&overrides, &env).unwrap_err();
-    assert!(matches!(error, ConfigError::MissingUrl { .. }), "{error:?}");
+    }
+    .with_profile_api_key("work", "key-for-work");
 
-    // --url still works.
+    let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.base_url, "https://ambient.example.com");
+    assert_eq!(resolved.url_source, UrlSource::Env);
+    assert_eq!(resolved.profile_url, None);
+
+    let error = release(&env, &resolved).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::UnboundProfileCredential { .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("work"), "{message}");
+    assert!(!message.contains("key-for-work"), "{message}");
+
+    // --url directs the run deliberately and does release the credential.
     overrides.url = Some("https://explicit.example.com".to_string());
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.base_url, "https://explicit.example.com");
+    assert_eq!(resolved.url_source, UrlSource::Flag);
+    assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
+}
+
+#[test]
+fn the_url_flag_is_a_deliberate_redirect_and_binds() {
+    let (_dir, path) = config_file(TWO_PROFILES);
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    overrides.url = Some("https://elsewhere.example.com".to_string());
+    let env = EnvLayer {
+        url: Some("https://third.example.com".to_string()),
+        ..EnvLayer::default()
+    }
+    .with_profile_api_key("work", "key-for-work");
+    let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.base_url, "https://elsewhere.example.com");
+    assert_eq!(resolved.url_source, UrlSource::Flag);
+    assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
 }
 
 #[test]
@@ -504,8 +624,16 @@ fn a_profile_without_a_url_and_no_override_is_a_readable_error() {
     overrides.profile = Some("work".to_string());
     let error = settings(&overrides, &EnvLayer::default()).unwrap_err();
     let message = error.to_string();
+    assert!(matches!(error, ConfigError::MissingUrl { .. }));
     assert!(message.contains("work"), "{message}");
-    assert!(message.contains("OUTLINE_URL"), "{message}");
+    // R3 finding 9: it must not recommend a fix the credential gate then
+    // refuses. Setting OUTLINE_URL would resolve, and then fail to bind.
+    assert!(
+        !message.contains("OUTLINE_URL"),
+        "recommends a fix that cannot work: {message}"
+    );
+    assert!(message.contains("url ="), "{message}");
+    assert!(message.contains("--url"), "{message}");
 }
 
 #[test]
@@ -527,7 +655,7 @@ fn oauth_profile_reports_that_only_api_keys_are_wired_up() {
         ..EnvLayer::default()
     }
     .with_profile_api_key("work", "work-key");
-    let error = otl::config::EnvApiKey(&env).token(&resolved).unwrap_err();
+    let error = release(&env, &resolved).unwrap_err();
     assert!(matches!(error, ConfigError::UnsupportedAuthMethod { .. }));
     let message = error.to_string();
     assert!(message.contains("work"), "{message}");
@@ -541,24 +669,15 @@ fn api_key_comes_from_the_environment_not_the_config_file() {
     overrides.profile = Some("work".to_string());
     let env = EnvLayer::default().with_profile_api_key("work", "work-key");
     let resolved = settings(&overrides, &env).unwrap();
-    let config = Config::from_parts(
-        &resolved,
-        otl::config::EnvApiKey(&env).token(&resolved).unwrap(),
-    );
+    let config = Config::from_parts(&resolved, release(&env, &resolved).unwrap());
     assert_eq!(config.base_url, "https://work.example.com");
     assert_eq!(config.api_key, "work-key");
 }
 
 #[test]
 fn missing_api_key_is_reported_before_any_request() {
-    let resolved = otl::config::Settings {
-        profile: None,
-        base_url: "https://x.example.com".to_string(),
-        auth: AuthMethod::ApiKey,
-    };
-    let error = otl::config::EnvApiKey(&EnvLayer::default())
-        .token(&resolved)
-        .unwrap_err();
+    let resolved = settings_for(None, "https://x.example.com", UrlSource::Env);
+    let error = release(&EnvLayer::default(), &resolved).unwrap_err();
     assert!(matches!(error, ConfigError::MissingApiKey));
     assert!(error.to_string().contains("OUTLINE_API_KEY"));
 }
@@ -579,11 +698,11 @@ fn env_layer_debug_redacts_the_api_key() {
 
 #[test]
 fn settings_debug_redacts_the_base_url() {
-    let resolved = otl::config::Settings {
-        profile: Some("work".to_string()),
-        base_url: "https://alice:pw-secret@example.com/PATH-SECRET".to_string(),
-        auth: AuthMethod::ApiKey,
-    };
+    let resolved = settings_for(
+        Some("work"),
+        "https://alice:pw-secret@example.com/PATH-SECRET",
+        UrlSource::Profile,
+    );
     let rendered = format!("{resolved:?}");
     assert!(!rendered.contains("pw-secret"), "{rendered}");
     assert!(!rendered.contains("PATH-SECRET"), "{rendered}");
@@ -746,7 +865,7 @@ fn a_profile_reads_its_own_api_key_variable() {
         overrides.profile = Some(profile.to_string());
         let resolved = settings(&overrides, &env).unwrap();
         assert_eq!(
-            otl::config::EnvApiKey(&env).token(&resolved).unwrap(),
+            release(&env, &resolved).unwrap(),
             expected,
             "{profile} got the wrong key"
         );
@@ -765,7 +884,7 @@ fn the_global_api_key_never_reaches_a_profile() {
         ..EnvLayer::default()
     };
     let resolved = settings(&overrides, &env).unwrap();
-    let error = otl::config::EnvApiKey(&env).token(&resolved).unwrap_err();
+    let error = release(&env, &resolved).unwrap_err();
     assert!(
         matches!(error, ConfigError::MissingProfileApiKey { .. }),
         "{error:?}"
@@ -784,7 +903,7 @@ fn one_profiles_key_is_not_reachable_by_another_profile() {
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("personal".to_string());
     let resolved = settings(&overrides, &env).unwrap();
-    let error = otl::config::EnvApiKey(&env).token(&resolved).unwrap_err();
+    let error = release(&env, &resolved).unwrap_err();
     assert!(matches!(error, ConfigError::MissingProfileApiKey { .. }));
     assert!(!error.to_string().contains("key-for-work"));
 }
@@ -801,10 +920,7 @@ fn the_global_api_key_still_serves_the_profile_less_path() {
     let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
     let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
     assert_eq!(resolved.profile, None);
-    assert_eq!(
-        otl::config::EnvApiKey(&env).token(&resolved).unwrap(),
-        "global-key"
-    );
+    assert_eq!(release(&env, &resolved).unwrap(), "global-key");
 }
 
 #[test]
@@ -838,7 +954,7 @@ fn a_profile_with_no_expressible_variable_name_is_refused_not_defaulted() {
         ..EnvLayer::default()
     };
     let resolved = settings(&overrides, &env).unwrap();
-    let error = otl::config::EnvApiKey(&env).token(&resolved).unwrap_err();
+    let error = release(&env, &resolved).unwrap_err();
     assert!(
         matches!(error, ConfigError::ProfileApiKeyVarUnnameable { .. }),
         "{error:?}"
@@ -886,7 +1002,7 @@ fn a_blank_profile_api_key_variable_counts_as_unset() {
     overrides.profile = Some("work".to_string());
     let env = EnvLayer::default().with_profile_api_key("work", "   ");
     let resolved = settings(&overrides, &env).unwrap();
-    let error = otl::config::EnvApiKey(&env).token(&resolved).unwrap_err();
+    let error = release(&env, &resolved).unwrap_err();
     assert!(matches!(error, ConfigError::MissingProfileApiKey { .. }));
 }
 
@@ -913,11 +1029,7 @@ fn no_configuration_type_leaks_a_url_through_debug() {
     let (_dir, path) = config_file(&format!("[profiles.work]\nurl = \"{SECRET_URL}\"\n"));
     let loaded = otl::config::load_file(&overrides_for(&path), &EnvLayer::default()).unwrap();
     let profile = loaded.file.profiles.get("work").unwrap();
-    let resolved = otl::config::Settings {
-        profile: Some("work".to_string()),
-        base_url: SECRET_URL.to_string(),
-        auth: AuthMethod::ApiKey,
-    };
+    let resolved = settings_for(Some("work"), SECRET_URL, UrlSource::Profile);
     let config = Config {
         base_url: SECRET_URL.to_string(),
         api_key: "KEY-SECRET".to_string(),
@@ -1110,6 +1222,21 @@ fn config_error_debug_never_exposes_raw_names_or_paths() {
         },
     ] {
         let rendered = format!("{error:?}");
+        // R3 finding 2: this is the assertion the previous version was
+        // missing. The secret WAS in `available`, and forwarding Debug to
+        // Display printed it.
+        assert!(
+            !rendered.contains(SECRET_NAME),
+            "Debug leaked a profile name: {rendered}"
+        );
+        assert!(
+            !rendered.contains(hostile),
+            "Debug leaked raw field text: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("tmp"),
+            "Debug leaked a path: {rendered:?}"
+        );
         assert!(
             !rendered.contains('\u{1b}'),
             "Debug carries ESC: {rendered:?}"
@@ -1121,9 +1248,113 @@ fn config_error_debug_never_exposes_raw_names_or_paths() {
             "Debug carries a forged diagnostic line: {rendered:?}"
         );
         assert!(
-            rendered.starts_with("ConfigError("),
-            "Debug is not the Display forward: {rendered}"
+            rendered.starts_with("ConfigError::"),
+            "Debug is not the structural rendering: {rendered}"
         );
+    }
+}
+
+#[test]
+fn config_error_debug_carries_no_field_text_for_any_variant() {
+    // Every variant, each with a recognizable secret in every string field.
+    const SECRET: &str = "KEY-SECRET-FIELD";
+    let secret = SECRET.to_string();
+    let path = PathBuf::from(format!("/tmp/{SECRET}/config.toml"));
+    for error in [
+        ConfigError::MissingUrl {
+            profile: Some(secret.clone()),
+        },
+        ConfigError::MissingApiKey,
+        ConfigError::MissingProfileApiKey {
+            profile: secret.clone(),
+            variable: secret.clone(),
+            global_set: true,
+        },
+        ConfigError::ProfileApiKeyVarUnnameable {
+            profile: secret.clone(),
+        },
+        ConfigError::UnboundProfileCredential {
+            profile: secret.clone(),
+        },
+        ConfigError::ConflictingUrl {
+            profile: secret.clone(),
+        },
+        ConfigError::AmbiguousProfileApiKeyVar {
+            profile: secret.clone(),
+            other: secret.clone(),
+            variable: secret.clone(),
+        },
+        ConfigError::UnknownProfile {
+            name: Some(secret.clone()),
+            path: Some(path.clone()),
+            available: vec![secret.clone()],
+        },
+        ConfigError::ConfigFileUnreadable {
+            path: path.clone(),
+            reason: secret.clone(),
+        },
+        ConfigError::MalformedConfigFile {
+            path: path.clone(),
+            reason: secret.clone(),
+        },
+        ConfigError::CredentialInConfigFile {
+            path: path.clone(),
+            location: secret.clone(),
+        },
+        ConfigError::UnsupportedAuthMethod {
+            profile: Some(secret.clone()),
+            method: AuthMethod::Oauth,
+        },
+    ] {
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "Debug leaked a field: {rendered}"
+        );
+        assert!(
+            rendered.starts_with("ConfigError::"),
+            "unexpected Debug shape: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn display_is_bounded_and_inert_for_any_construction_of_a_public_variant() {
+    // The variants are public, so their string fields are not guaranteed to
+    // be anything. Display must stay bounded and inert regardless.
+    let hostile = format!(
+        "{}\u{1b}[31m\u{202e}\n{}",
+        "z".repeat(5_000),
+        "y".repeat(5_000)
+    );
+    for error in [
+        ConfigError::MalformedConfigFile {
+            path: PathBuf::from(hostile.clone()),
+            reason: hostile.clone(),
+        },
+        ConfigError::ConfigFileUnreadable {
+            path: PathBuf::from(hostile.clone()),
+            reason: hostile.clone(),
+        },
+        ConfigError::CredentialInConfigFile {
+            path: PathBuf::from(hostile.clone()),
+            location: hostile.clone(),
+        },
+        ConfigError::MissingProfileApiKey {
+            profile: hostile.clone(),
+            variable: hostile.clone(),
+            global_set: false,
+        },
+    ] {
+        let shown = error.to_string();
+        assert!(
+            shown.chars().count() < 1_500,
+            "Display is unbounded ({} chars)",
+            shown.chars().count()
+        );
+        assert!(!shown.contains('\u{1b}'), "ESC survived: {shown:?}");
+        assert!(!shown.contains('\u{202e}'), "bidi survived: {shown:?}");
+        assert!(shown.lines().count() <= 6, "forged lines: {shown:?}");
     }
 }
 
@@ -1234,9 +1465,7 @@ fn an_overlong_profile_name_has_no_variable_and_makes_no_overlong_diagnostic() {
     ));
     let overrides = overrides_for(&path);
     let resolved = settings(&overrides, &EnvLayer::default()).unwrap();
-    let error = otl::config::EnvApiKey(&EnvLayer::default())
-        .token(&resolved)
-        .unwrap_err();
+    let error = release(&EnvLayer::default(), &resolved).unwrap_err();
     assert!(
         matches!(error, ConfigError::ProfileApiKeyVarUnnameable { .. }),
         "{error:?}"
@@ -1261,9 +1490,7 @@ fn a_missing_profile_key_diagnostic_stays_bounded() {
     let mut overrides = overrides_for(&path);
     overrides.profile = Some(profile.clone());
     let resolved = settings(&overrides, &EnvLayer::default()).unwrap();
-    let error = otl::config::EnvApiKey(&EnvLayer::default())
-        .token(&resolved)
-        .unwrap_err();
+    let error = release(&EnvLayer::default(), &resolved).unwrap_err();
     let message = error.to_string();
     assert!(matches!(error, ConfigError::MissingProfileApiKey { .. }));
     assert!(
@@ -1271,4 +1498,278 @@ fn a_missing_profile_key_diagnostic_stays_bounded() {
         "diagnostic is {} chars",
         message.chars().count()
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC2, on ONE key: flag > env > file for the base URL (R3 finding 1).
+//
+// The R2 attempt replaced this with a test where each layer supplied a
+// different key, which only shows that layers do not delete one another. This
+// is the same-key ladder, and it is what the acceptance criterion says.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_url_key_itself_resolves_flag_over_env_over_file() {
+    let (_dir, path) = config_file(TWO_PROFILES);
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+
+    // File only.
+    let file_only = settings(&overrides, &EnvLayer::default()).unwrap();
+    assert_eq!(file_only.base_url, "https://work.example.com");
+    assert_eq!(file_only.url_source, UrlSource::Profile);
+
+    // Env over file: the env value is the resolution result, and the source
+    // is recorded so the credential gate can have its separate say.
+    let env = EnvLayer {
+        url: Some("https://env.example.com".to_string()),
+        ..EnvLayer::default()
+    };
+    let env_over_file = settings(&overrides, &env).unwrap();
+    assert_eq!(env_over_file.base_url, "https://env.example.com");
+    assert_eq!(env_over_file.url_source, UrlSource::Env);
+
+    // Flag over env over file.
+    overrides.url = Some("https://flag.example.com".to_string());
+    let flag_over_all = settings(&overrides, &env).unwrap();
+    assert_eq!(flag_over_all.base_url, "https://flag.example.com");
+    assert_eq!(flag_over_all.url_source, UrlSource::Flag);
+}
+
+// ---------------------------------------------------------------------------
+// The binding check is at the shared boundary, not inside one TokenSource
+// (R3 ruling). Epic 2's credential file plugs in as another implementation
+// and inherits the check without knowing about it.
+// ---------------------------------------------------------------------------
+
+/// A stand-in for a future credential source (the Epic 2 credential file).
+/// It would happily hand out a secret for any settings at all.
+struct AlwaysYields(&'static str);
+
+impl otl::config::TokenSource for AlwaysYields {
+    fn fetch(
+        &self,
+        _settings: &Settings,
+        _checked: &otl::config::BindingChecked,
+    ) -> Result<String, ConfigError> {
+        Ok(self.0.to_string())
+    }
+}
+
+#[test]
+fn the_binding_gate_applies_to_every_token_source() {
+    let (_dir, path) = config_file(TWO_PROFILES);
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    let conflicting = EnvLayer {
+        url: Some("https://elsewhere.example.com".to_string()),
+        ..EnvLayer::default()
+    };
+    let resolved = settings(&overrides, &conflicting).unwrap();
+
+    // A source that never refuses anything is still refused by the gate.
+    let error = release_token(&AlwaysYields("secret-from-a-file"), &resolved).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::ConflictingUrl { .. }),
+        "the gate is inside EnvApiKey rather than at the boundary: {error:?}"
+    );
+    assert!(!error.to_string().contains("secret-from-a-file"));
+
+    // And it releases when the binding holds.
+    let ok = settings(&overrides, &EnvLayer::default()).unwrap();
+    assert_eq!(
+        release_token(&AlwaysYields("secret-from-a-file"), &ok).unwrap(),
+        "secret-from-a-file"
+    );
+}
+
+#[test]
+fn no_profile_means_no_binding_question() {
+    // The global credential and the global URL variable are one scope.
+    let dir = tempfile::tempdir().unwrap();
+    let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
+    let env = EnvLayer {
+        url: Some("https://env.example.com".to_string()),
+        api_key: Some("global-key".to_string()),
+        ..EnvLayer::default()
+    };
+    let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
+    assert_eq!(resolved.url_source, UrlSource::Env);
+    assert_eq!(release(&env, &resolved).unwrap(), "global-key");
+}
+
+// ---------------------------------------------------------------------------
+// Bidi and invisible characters (R3 finding 5).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bidi_and_invisible_characters_are_scrubbed_from_names_and_paths() {
+    // U+202E is not `char::is_control()`, but it reverses the visual order of
+    // everything after it - enough to make a path or a reason read as
+    // something else - and a truncated string can leave the state open.
+    for hostile in [
+        "safe\u{202e}txt",
+        "a\u{200f}b",
+        "a\u{2066}b\u{2069}c",
+        "a\u{200b}b",
+        "a\u{feff}b",
+        "a\u{00ad}b",
+    ] {
+        let name = otl::config::sanitize_name(hostile);
+        let path = otl::config::sanitize_path(Path::new(hostile));
+        let text = otl::config::sanitize_text(hostile);
+        for (label, cleaned) in [("name", name), ("path", path), ("text", text)] {
+            for bad in hostile.chars().filter(|c| {
+                matches!(*c as u32, 0x061c | 0x200b..=0x200f | 0x202a..=0x202e
+                    | 0x2060..=0x2069 | 0x00ad | 0x180e | 0xfeff)
+            }) {
+                assert!(
+                    !cleaned.contains(bad),
+                    "{label} kept U+{:04X} from {hostile:?}: {cleaned:?}",
+                    bad as u32
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_bidi_config_path_reaches_a_diagnostic_inert() {
+    let hostile = "/missing/safe\u{202e}txt";
+    let overrides = Overrides {
+        config_path: Some(PathBuf::from(hostile)),
+        ..Overrides::default()
+    };
+    let error = otl::config::load_file(&overrides, &EnvLayer::default()).unwrap_err();
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "bidi override survived: {rendered:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config paths stay out of every Debug rendering (R3 finding 3).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_configuration_type_leaks_a_config_path_through_debug() {
+    const SECRET: &str = "KEY-SECRET-DIR";
+    let dir = tempfile::tempdir().unwrap();
+    let secret_dir = dir.path().join(SECRET);
+    std::fs::create_dir(&secret_dir).unwrap();
+    let path = secret_dir.join("config.toml");
+    std::fs::write(&path, TWO_PROFILES).unwrap();
+
+    let overrides = Overrides {
+        config_path: Some(path.clone()),
+        ..Overrides::default()
+    };
+    let env = EnvLayer {
+        config_path: Some(path.clone()),
+        ..EnvLayer::default()
+    };
+    let source = otl::config::locate(&overrides, &env);
+    let loaded = otl::config::load_from(&source).unwrap();
+
+    for (label, rendered) in [
+        ("Overrides", format!("{overrides:?}")),
+        ("EnvLayer", format!("{env:?}")),
+        ("ConfigSource", format!("{source:?}")),
+        ("LoadedConfig", format!("{loaded:?}")),
+    ] {
+        assert!(
+            !rendered.contains(SECRET),
+            "{label} leaked the config path: {rendered}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Every error variant is registered in the public exit-code document
+// (R3 finding 8).
+//
+// The exit-code table is a published API, so a new failure mode must be
+// documented before release. The match below is exhaustive: adding a variant
+// stops this file compiling until its documentation keyword is chosen, and
+// the assertion then fails until the keyword actually appears in the doc.
+// ---------------------------------------------------------------------------
+
+/// The phrase `docs/exit-codes.md` must contain for this error class.
+fn exit_code_doc_keyword(error: &ConfigError) -> &'static str {
+    match error {
+        ConfigError::MissingUrl { .. } => "**missing URL**",
+        ConfigError::MissingApiKey => "`OUTLINE_API_KEY`",
+        ConfigError::MissingProfileApiKey { .. } => "**missing profile key**",
+        ConfigError::ProfileApiKeyVarUnnameable { .. } => "**unusable variable name**",
+        ConfigError::AmbiguousProfileApiKeyVar { .. } => "**ambiguous variable**",
+        ConfigError::ConflictingUrl { .. } => "**conflicting URL**",
+        ConfigError::UnboundProfileCredential { .. } => "**unbound credential**",
+        ConfigError::UnknownProfile { .. } => "naming a profile the file does not define",
+        ConfigError::ConfigFileUnreadable { .. } => "cannot be read or is",
+        ConfigError::MalformedConfigFile { .. } => "TOML that does not parse",
+        ConfigError::CredentialInConfigFile { .. } => "`api_key` / `token` key in the config file",
+        ConfigError::UnsupportedAuthMethod { .. } => "`auth` method the build cannot",
+    }
+}
+
+#[test]
+fn every_config_error_is_registered_in_the_exit_code_document() {
+    let doc = include_str!("../../../docs/exit-codes.md");
+    let path = PathBuf::from("/tmp/config.toml");
+    let name = "work".to_string();
+    for error in [
+        ConfigError::MissingUrl { profile: None },
+        ConfigError::MissingApiKey,
+        ConfigError::MissingProfileApiKey {
+            profile: name.clone(),
+            variable: "OUTLINE_API_KEY_WORK".to_string(),
+            global_set: false,
+        },
+        ConfigError::ProfileApiKeyVarUnnameable {
+            profile: name.clone(),
+        },
+        ConfigError::AmbiguousProfileApiKeyVar {
+            profile: name.clone(),
+            other: "w.ork".to_string(),
+            variable: "OUTLINE_API_KEY_WORK".to_string(),
+        },
+        ConfigError::ConflictingUrl {
+            profile: name.clone(),
+        },
+        ConfigError::UnboundProfileCredential {
+            profile: name.clone(),
+        },
+        ConfigError::UnknownProfile {
+            name: Some(name.clone()),
+            path: Some(path.clone()),
+            available: Vec::new(),
+        },
+        ConfigError::ConfigFileUnreadable {
+            path: path.clone(),
+            reason: "entity not found".to_string(),
+        },
+        ConfigError::MalformedConfigFile {
+            path: path.clone(),
+            reason: "line 1: unknown key".to_string(),
+        },
+        ConfigError::CredentialInConfigFile {
+            path: path.clone(),
+            location: "the top level".to_string(),
+        },
+        ConfigError::UnsupportedAuthMethod {
+            profile: Some(name.clone()),
+            method: AuthMethod::Oauth,
+        },
+    ] {
+        let keyword = exit_code_doc_keyword(&error);
+        assert!(
+            doc.contains(keyword),
+            "{:?} is not registered in docs/exit-codes.md (looked for {keyword:?})",
+            error
+        );
+    }
+    // And the code these all map to is documented as usage/configuration.
+    assert!(doc.contains("| 2 | Usage or configuration error |"));
 }

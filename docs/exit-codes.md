@@ -19,19 +19,31 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 
 Notes:
 
-- Every profile-credential failure is a configuration error (code 2), reported before any request: the
-  selected profile's `OUTLINE_API_KEY_<PROFILE>` is unset or blank, the profile name contains no ASCII
-  letter or digit and so names no variable, or two profiles map to the same variable. The global
-  `OUTLINE_API_KEY` is never used as a fallback for a profile - that would send one workspace's key to
-  another workspace's server - so its presence does not change any of these outcomes.
+- Every profile-scope failure is a configuration error (code 2), reported before any request:
+  - **missing profile key** - the selected profile's `OUTLINE_API_KEY_<PROFILE>` is unset or blank. The
+    global `OUTLINE_API_KEY` is never a fallback for a profile;
+  - **unusable variable name** - the profile name contains no ASCII letter or digit, or is longer than
+    64 characters, so it names no usable variable;
+  - **ambiguous variable** - two profiles map to the same variable;
+  - **conflicting URL** - the base URL was resolved from `OUTLINE_URL` and its origin differs from the
+    one the selected profile declares;
+  - **unbound credential** - the base URL was resolved from `OUTLINE_URL` and the selected profile
+    declares no `url`, so there is nothing to bind its credential to;
+  - **missing URL** - no layer supplied a base URL at all.
+
+  Resolution itself always follows flag > env > file, for the base URL as for every other key. The three
+  URL-related failures are raised at the credential-release boundary, which asks the separate question of
+  whether the resolved origin is one the resolved credential belongs to: a credential that has been sent
+  to the wrong server cannot be recalled, so a mismatch fails instead of warning. Origins are compared
+  normalized, so a trailing slash, host casing or a default port is never a conflict. `--url` is the
+  documented way to redirect a profile deliberately, and is stated in the same command as `--profile`.
 - Every user-config-file failure is a configuration error (code 2), never a new code: a file named
   explicitly with `--config` / `OUTLINE_CONFIG` that does not exist, one that cannot be read or is
   larger than the size cap, TOML that does not parse, an unknown key, an empty profile name, a
-  `--profile` / `OUTLINE_PROFILE` / `default_profile` naming a profile the file does not define, a
-  selected profile with no base URL and no `--url` / `OUTLINE_URL`, an `auth` method the build cannot
-  use yet, or an `api_key` / `token` key in the config file (credentials belong in `credentials.toml`).
-  A config file missing at the DEFAULT location is not an error at all: the environment-only path must
-  keep working on a fresh machine.
+  `--profile` / `OUTLINE_PROFILE` / `default_profile` naming a profile the file does not define, an
+  `auth` method the build cannot use yet, or an `api_key` / `token` key in the config file (credentials
+  belong in `credentials.toml`). A config file missing at the DEFAULT location is not an error at all:
+  the environment-only path must keep working on a fresh machine.
 - Config-file parse errors report a line number, a description this CLI owns, and the full config
   schema - never any text produced by the TOML parser. The parser's messages interpolate the offending
   VALUE (an unknown `auth` value, a type mismatch, an unknown bare key), so a credential wrongly placed

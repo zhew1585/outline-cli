@@ -11,8 +11,15 @@
 //!   terminal, where they forge hyperlinks, retitle the window or fake an
 //!   additional `error:` line.
 //!
-//! `Debug` deliberately does not render these fields at all: it forwards to
-//! `Display`, which is the only rendering that has passed both rules.
+//! `Debug` renders NO field content at all - only the variant name and
+//! non-textual scalars. Forwarding it to `Display` was not enough: `Display`
+//! has to name the profile the user must fix, so a name still reached the
+//! unbounded surface that lands in logs, panics and error chains.
+//!
+//! `Display` is also bounded for ANY construction of these variants, not
+//! just the ones this crate builds: every string field is passed through a
+//! sanitizer with a length cap on the way out, because the variants are
+//! public and their fields can hold arbitrary text.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -36,26 +43,63 @@ const MAX_LISTED_PROFILES: usize = 20;
 /// Larger than [`MAX_NAME_CHARS`]: a legitimate path is much longer than a
 /// legitimate profile name, and the point here is a bound, not brevity.
 const MAX_PATH_CHARS: usize = 200;
+/// Maximum number of characters kept from any other free-form text field.
+const MAX_TEXT_CHARS: usize = 300;
 
-/// or forge additional diagnostic lines on stderr. Applied even when stderr
-/// is not a terminal, because the consumer may be one.
-pub fn sanitize_name(name: &str) -> String {
-    let cleaned: String = name
+/// Whether a character must not be forwarded into a diagnostic.
+///
+/// `char::is_control()` alone is not enough. It covers C0/C1 (ESC, BEL,
+/// newline) but not the Unicode FORMAT characters, and those are just as
+/// effective in a terminal: a right-to-left override reverses the visual
+/// order of everything after it, so a path or a reason can be made to read
+/// as something else entirely, and truncating such a string can leave the
+/// direction state open for whatever is printed next. Zero-width characters
+/// are excluded for a related reason - they let two different names render
+/// identically.
+fn is_unsafe_in_diagnostic(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            // Bidirectional marks, embeddings, overrides and isolates.
+            '\u{061c}' | '\u{200e}' | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            // Zero-width and other invisible formatting.
+            | '\u{00ad}' | '\u{180e}' | '\u{200b}'..='\u{200d}'
+            | '\u{2060}'..='\u{2064}' | '\u{feff}')
+}
+
+/// Replace every unsafe character and cap the length.
+fn scrub(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text
         .chars()
         .map(|c| {
-            if c.is_control() {
+            if is_unsafe_in_diagnostic(c) {
                 CONTROL_PLACEHOLDER
             } else {
                 c
             }
         })
-        .take(MAX_NAME_CHARS)
+        .take(max_chars)
         .collect();
-    if name.chars().count() > MAX_NAME_CHARS {
+    if text.chars().count() > max_chars {
         format!("{cleaned}...")
     } else {
         cleaned
     }
+}
+
+/// or forge additional diagnostic lines on stderr. Applied even when stderr
+/// is not a terminal, because the consumer may be one.
+pub fn sanitize_name(name: &str) -> String {
+    scrub(name, MAX_NAME_CHARS)
+}
+
+/// Make free-form text safe to print in a diagnostic.
+///
+/// Applies to the string fields of this crate's own error variants too: they
+/// are public, so their contents are not guaranteed to be anything.
+pub fn sanitize_text(text: &str) -> String {
+    scrub(text, MAX_TEXT_CHARS)
 }
 
 /// Make a filesystem path safe to print in a diagnostic.
@@ -66,23 +110,7 @@ pub fn sanitize_name(name: &str) -> String {
 /// plants a clickable hyperlink in the user's terminal, and an embedded
 /// newline lets it forge a second `error:` line.
 pub fn sanitize_path(path: &Path) -> String {
-    let shown = path.display().to_string();
-    let cleaned: String = shown
-        .chars()
-        .map(|c| {
-            if c.is_control() {
-                CONTROL_PLACEHOLDER
-            } else {
-                c
-            }
-        })
-        .take(MAX_PATH_CHARS)
-        .collect();
-    if shown.chars().count() > MAX_PATH_CHARS {
-        format!("{cleaned}...")
-    } else {
-        cleaned
-    }
+    scrub(&path.display().to_string(), MAX_PATH_CHARS)
 }
 
 /// Configuration errors. Always reported before any network request.
@@ -107,6 +135,13 @@ pub enum ConfigError {
     },
     /// A profile name cannot be expressed as an environment variable name.
     ProfileApiKeyVarUnnameable {
+        /// The profile in effect.
+        profile: String,
+    },
+    /// A profile is in effect, the base URL came from `OUTLINE_URL`, and the
+    /// profile declares no `url` of its own - so there is nothing to bind
+    /// the profile's credential to.
+    UnboundProfileCredential {
         /// The profile in effect.
         profile: String,
     },
@@ -176,12 +211,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingUrl { profile } => write_missing_url(f, profile.as_deref()),
-            Self::MissingApiKey => write!(
-                f,
-                "{ENV_API_KEY} is not set.\n\
-                 Create an API key in Outline (Settings -> API) and set it, for example:\n\
-                 \x20 export {ENV_API_KEY}=<your-api-key>"
-            ),
+            Self::MissingApiKey => write_missing_api_key(f),
             Self::MissingProfileApiKey {
                 profile,
                 variable,
@@ -189,6 +219,7 @@ impl fmt::Display for ConfigError {
             } => write_missing_profile_key(f, profile, variable, *global_set),
             Self::ProfileApiKeyVarUnnameable { profile } => write_unnameable_var(f, profile),
             Self::ConflictingUrl { profile } => write_conflicting_url(f, profile),
+            Self::UnboundProfileCredential { profile } => write_unbound_credential(f, profile),
             Self::AmbiguousProfileApiKeyVar {
                 profile,
                 other,
@@ -199,29 +230,66 @@ impl fmt::Display for ConfigError {
                 path,
                 available,
             } => write_unknown_profile(f, name.as_deref(), path.as_deref(), available),
-            Self::ConfigFileUnreadable { path, reason } => write!(
-                f,
-                "cannot read the user config file {}: {reason}",
-                sanitize_path(path)
-            ),
-            Self::MalformedConfigFile { path, reason } => write!(
-                f,
-                "the user config file {} is not valid: {reason}",
-                sanitize_path(path)
-            ),
-            Self::CredentialInConfigFile { path, location } => write!(
-                f,
-                "the user config file {} sets {CREDENTIAL_KEYS} at {location}.\n\
-                 Credentials never live in the config file (which is meant to be \
-                 shareable); they belong in {CREDENTIALS_FILE_NAME} beside it, or in \
-                 {ENV_API_KEY}. Remove the key and re-run.",
-                sanitize_path(path)
-            ),
+            Self::ConfigFileUnreadable { path, reason } => {
+                write_file_problem(f, "cannot read the user config file", path, reason)
+            }
+            Self::MalformedConfigFile { path, reason } => write_malformed_file(f, path, reason),
+            Self::CredentialInConfigFile { path, location } => {
+                write_credential_in_file(f, path, location)
+            }
             Self::UnsupportedAuthMethod { profile, method } => {
                 write_unsupported_auth(f, profile.as_deref(), *method)
             }
         }
     }
+}
+
+fn write_missing_api_key(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+        f,
+        "{ENV_API_KEY} is not set.\n\
+         Create an API key in Outline (Settings -> API) and set it, for example:\n\
+         \x20 export {ENV_API_KEY}=<your-api-key>"
+    )
+}
+
+fn write_file_problem(
+    f: &mut fmt::Formatter<'_>,
+    what: &str,
+    path: &Path,
+    reason: &str,
+) -> fmt::Result {
+    write!(
+        f,
+        "{what} {}: {}",
+        sanitize_path(path),
+        sanitize_text(reason)
+    )
+}
+
+fn write_malformed_file(f: &mut fmt::Formatter<'_>, path: &Path, reason: &str) -> fmt::Result {
+    write!(
+        f,
+        "the user config file {} is not valid: {}",
+        sanitize_path(path),
+        sanitize_text(reason)
+    )
+}
+
+fn write_credential_in_file(
+    f: &mut fmt::Formatter<'_>,
+    path: &Path,
+    location: &str,
+) -> fmt::Result {
+    write!(
+        f,
+        "the user config file {} sets {CREDENTIAL_KEYS} at {}.\n\
+         Credentials never live in the config file (which is meant to be \
+         shareable); they belong in {CREDENTIALS_FILE_NAME} beside it, or in \
+         {ENV_API_KEY}. Remove the key and re-run.",
+        sanitize_path(path),
+        sanitize_text(location)
+    )
 }
 
 fn write_unnameable_var(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Result {
@@ -241,11 +309,22 @@ fn write_conflicting_url(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Resu
     // userinfo, path or query.
     write!(
         f,
-        "{ENV_URL} points at a different instance than profile {:?} declares, \
-         so it is unclear where that profile's API key should be sent - and \
-         sending it to the wrong instance cannot be undone.\n\
+        "{ENV_URL} names a different instance than profile {:?} declares, so \
+         that profile's API key was not sent: a credential that has gone to \
+         the wrong server cannot be recalled.\n\
          Unset {ENV_URL}, drop --profile to use {ENV_URL} on its own, or pass \
          --url to redirect this profile deliberately.",
+        sanitize_name(profile)
+    )
+}
+
+fn write_unbound_credential(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Result {
+    write!(
+        f,
+        "profile {:?} declares no `url`, so its API key cannot be tied to the \
+         instance {ENV_URL} names, and was not sent.\n\
+         Add `url = \"...\"` under that profile in {CONFIG_FILE_NAME} so the \
+         key has an instance, or pass --url to direct this run deliberately.",
         sanitize_name(profile)
     )
 }
@@ -258,11 +337,12 @@ fn write_ambiguous_var(
 ) -> fmt::Result {
     write!(
         f,
-        "profiles {:?} and {:?} both map to {variable}, so it is ambiguous \
-         which instance that API key belongs to.\n\
+        "profiles {:?} and {:?} both map to {}, so it is ambiguous which \
+         instance that API key belongs to.\n\
          Rename one of them so each profile has its own variable.",
         sanitize_name(profile),
-        sanitize_name(other)
+        sanitize_name(other),
+        sanitize_name(variable)
     )
 }
 
@@ -273,10 +353,13 @@ fn write_missing_url(f: &mut fmt::Formatter<'_>, profile: Option<&str>) -> fmt::
         let profile = sanitize_name(profile);
         write!(
             f,
-            "profile {profile:?} has no base URL, and neither --url nor \
-             {ENV_URL} supplied one.\n\
+            // Not "or set OUTLINE_URL": with a profile in effect an
+            // environment URL resolves but cannot be bound to that
+            // profile's credential, so recommending it would recommend the
+            // next error.
+            "profile {profile:?} has no base URL.\n\
              Add `url = \"https://docs.example.com\"` under that profile in \
-             {CONFIG_FILE_NAME}, or set {ENV_URL}."
+             {CONFIG_FILE_NAME}, or pass --url for a one-off."
         )
     } else {
         write!(
@@ -348,6 +431,7 @@ fn write_missing_profile_key(
     variable: &str,
     global_set: bool,
 ) -> fmt::Result {
+    let variable = sanitize_name(variable);
     write!(
         f,
         "profile {:?} has no API key: {variable} is not set.\n\
@@ -385,17 +469,50 @@ fn write_unsupported_auth(
     )
 }
 
+impl ConfigError {
+    /// The variant name, which is the bulk of this error's Debug rendering.
+    fn variant(&self) -> &'static str {
+        match self {
+            Self::MissingUrl { .. } => "MissingUrl",
+            Self::MissingApiKey => "MissingApiKey",
+            Self::MissingProfileApiKey { .. } => "MissingProfileApiKey",
+            Self::ProfileApiKeyVarUnnameable { .. } => "ProfileApiKeyVarUnnameable",
+            Self::UnboundProfileCredential { .. } => "UnboundProfileCredential",
+            Self::ConflictingUrl { .. } => "ConflictingUrl",
+            Self::AmbiguousProfileApiKeyVar { .. } => "AmbiguousProfileApiKeyVar",
+            Self::UnknownProfile { .. } => "UnknownProfile",
+            Self::ConfigFileUnreadable { .. } => "ConfigFileUnreadable",
+            Self::MalformedConfigFile { .. } => "MalformedConfigFile",
+            Self::CredentialInConfigFile { .. } => "CredentialInConfigFile",
+            Self::UnsupportedAuthMethod { .. } => "UnsupportedAuthMethod",
+        }
+    }
+}
+
 impl fmt::Debug for ConfigError {
-    /// Manual impl: forwards to `Display`.
+    /// Manual impl: the variant name and non-textual scalars only.
     ///
-    /// The derived Debug would print the raw fields, which is exactly what
-    /// the two rules in the module docs forbid: profile names and paths
-    /// unsanitized, and (via `available`) a whole list of them. `Display` is
-    /// the only rendering that has passed both, so Debug reuses it rather
-    /// than opening a second, unchecked surface - Debug is the one that ends
-    /// up in logs, panic messages and error chains.
+    /// Neither the derived Debug nor a forward to `Display` is safe here.
+    /// The derived one prints raw names, paths and the whole `available`
+    /// list; `Display` prints sanitized ones, but it MUST name the profile
+    /// the user has to fix, and Debug is the surface that ends up in logs,
+    /// panic messages and error chains, where nothing needs naming. So Debug
+    /// carries no field text at all: what remains identifies the failure
+    /// without disclosing anything about the configuration.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ConfigError({self})")
+        write!(f, "ConfigError::{}", self.variant())?;
+        match self {
+            Self::MissingProfileApiKey { global_set, .. } => {
+                write!(f, " {{ global_key_set: {global_set} }}")
+            }
+            Self::UnsupportedAuthMethod { method, .. } => {
+                write!(f, " {{ method: {method} }}")
+            }
+            Self::UnknownProfile { available, .. } => {
+                write!(f, " {{ defined_profiles: {} }}", available.len())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
