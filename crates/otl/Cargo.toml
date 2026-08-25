@@ -1,0 +1,29 @@
+[package]
+name = "otl"
+version = "0.1.0"
+description = "Outline CLI (otl): UX layer over the generic engine"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "otl"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
