@@ -192,3 +192,202 @@ fn a_closed_stdout_pipe_does_not_panic() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Generated scripts are executable text (R1 finding 4).
+//
+// An operation name reaches bash's `opts=` string, zsh's `_arguments` value
+// list and fish's `-a` argument. A name carrying a quote, `$(...)`, a
+// backtick, a newline or a control character would be command substitution or
+// quote escape when the user sources the script or presses Tab.
+// ---------------------------------------------------------------------------
+
+/// Names that must never be written into a script.
+const HOSTILE_NAMES: &[&str] = &[
+    "documents.info\"; touch /tmp/pwned; \"",
+    "documents.$(touch /tmp/pwned)",
+    "documents.`touch /tmp/pwned`",
+    "documents.info'\ndocuments.evil",
+    "documents.info\ntouch /tmp/pwned",
+    "documents.info;id",
+    "documents.info|id",
+    "documents.info&id",
+    "documents.info>out",
+    "documents.info)",
+    "documents.info}",
+    "documents.*",
+    "documents info",
+    "documents.info\u{1b}[31m",
+    "documents.info\u{0}",
+    "",
+];
+
+#[test]
+fn the_operation_name_filter_rejects_shell_metacharacters() {
+    for name in HOSTILE_NAMES {
+        assert!(
+            !otl::commands::completions::is_safe_operation_name(name),
+            "accepted hostile operation name {name:?}"
+        );
+    }
+    // The shapes a real RPC operation name takes are all accepted.
+    for name in [
+        "documents.info",
+        "documents.search_titles",
+        "collections.add_group",
+        "list",
+        "a-b.c_d1",
+    ] {
+        assert!(
+            otl::commands::completions::is_safe_operation_name(name),
+            "rejected legitimate operation name {name:?}"
+        );
+    }
+}
+
+#[test]
+fn every_compiled_operation_name_is_script_safe() {
+    // The build script refuses to compile an unsafe name, so this asserts
+    // the guarantee holds for what actually shipped.
+    let unsafe_names: Vec<&str> = otl::ops::OPS
+        .iter()
+        .map(|op| op.name.as_ref())
+        .filter(|name| !otl::commands::completions::is_safe_operation_name(name))
+        .collect();
+    assert!(unsafe_names.is_empty(), "unsafe in IR: {unsafe_names:?}");
+}
+
+#[test]
+fn no_generated_script_carries_control_or_null_bytes() {
+    // The generators' own code legitimately uses `$(...)` (bash's compgen
+    // calls), so the guarantee is about what CANDIDATE text can add: nothing
+    // outside the allow-list, and never a control byte.
+    for shell in SHELLS {
+        let script = script_for(shell);
+        assert!(
+            !script.contains('\u{0}'),
+            "{shell} script contains a NUL byte"
+        );
+        assert!(
+            !script.contains('\u{1b}'),
+            "{shell} script contains an ESC byte"
+        );
+    }
+}
+
+#[test]
+fn candidate_tokens_in_a_script_are_all_allow_listed() {
+    // Every operation-shaped token the script offers as a candidate must be
+    // one the filter accepts. Checked on fish, whose appended rules put each
+    // candidate in a `-a "<name>"` argument that can be extracted exactly.
+    let script = script_for("fish");
+    let offered: Vec<&str> = script
+        .lines()
+        .filter_map(|line| line.split(" -a \"").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(offered.len() > 100, "no candidates extracted");
+    for name in offered {
+        assert!(
+            otl::commands::completions::is_safe_operation_name(name),
+            "script offers an unsafe candidate {name:?}"
+        );
+    }
+}
+
+#[test]
+fn candidate_descriptions_carry_no_control_characters() {
+    // Summaries come from the vendored spec and end up inside fish's
+    // single-quoted description; an ESC there would reach the terminal when
+    // the candidate is displayed.
+    let script = script_for("fish");
+    assert!(
+        script.chars().all(|c| c == '\n' || !c.is_control()),
+        "control character in the fish script"
+    );
+}
+
+#[test]
+fn bash_and_zsh_scripts_pass_their_own_syntax_check() {
+    // A quoting bug in generated code is a syntax error at source time; only
+    // run the check when the shell is present.
+    for (shell, program, args) in [("bash", "bash", vec!["-n"]), ("zsh", "zsh", vec!["-n"])] {
+        if std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: {program} not installed");
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("otl.{shell}"));
+        std::fs::write(&path, script_for(shell)).unwrap();
+        let output = std::process::Command::new(program)
+            .args(&args)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shell} script fails {program} -n: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-shell coverage is stated, not implied (R1 finding 5).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn each_script_states_its_own_coverage() {
+    use clap_complete::Shell;
+    for (shell, name) in [
+        (Shell::Bash, "bash"),
+        (Shell::Zsh, "zsh"),
+        (Shell::Fish, "fish"),
+        (Shell::PowerShell, "powershell"),
+        (Shell::Elvish, "elvish"),
+    ] {
+        let script = script_for(name);
+        let header = script.lines().take(2).collect::<Vec<_>>().join(" ");
+        assert!(header.starts_with('#'), "{name}: no header comment");
+        let claims_operations = header.contains("operation names (from");
+        assert_eq!(
+            claims_operations,
+            otl::commands::completions::completes_operation_names(shell),
+            "{name}: header claim does not match what is delivered"
+        );
+        if !claims_operations {
+            assert!(
+                header.contains("NOT completed"),
+                "{name}: gap not stated: {header}"
+            );
+            assert!(
+                header.contains("otl api list"),
+                "{name}: no alternative offered: {header}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_shell_that_claims_operation_names_actually_carries_them() {
+    use clap_complete::Shell;
+    for (shell, name) in [
+        (Shell::Bash, "bash"),
+        (Shell::Zsh, "zsh"),
+        (Shell::Fish, "fish"),
+        (Shell::PowerShell, "powershell"),
+        (Shell::Elvish, "elvish"),
+    ] {
+        let script = script_for(name);
+        let has_operations = script.contains("documents.info");
+        assert_eq!(
+            has_operations,
+            otl::commands::completions::completes_operation_names(shell),
+            "{name}: coverage table disagrees with the generated script"
+        );
+    }
+}

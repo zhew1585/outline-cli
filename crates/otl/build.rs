@@ -24,6 +24,8 @@ const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
 const JSON_CONTENT_TYPE: &str = "application/json";
 /// Maximum `$ref`/`allOf` expansion depth (guards against reference cycles).
 const MAX_SCHEMA_DEPTH: usize = 8;
+/// Maximum length of a compiled operation name.
+const MAX_OP_NAME_CHARS: usize = 120;
 /// JSON pointer to the success response schema of an operation. `~1` is the
 /// pointer escape for the `/` in `application/json`.
 const SUCCESS_SCHEMA_POINTER: &str = "/responses/200/content/application~1json/schema";
@@ -122,11 +124,40 @@ fn extract_ops(spec: &Value) -> Vec<Op> {
         .iter()
         .filter_map(|(path, item)| item.get("post").map(|post| compile_op(path, post, spec)))
         .collect();
+    for op in &ops {
+        check_op_name(&op.name);
+    }
     ops.sort_by(|a, b| a.name.cmp(&b.name));
     if let Some(pair) = ops.windows(2).find(|pair| pair[0].name == pair[1].name) {
         panic!("duplicate operation name in spec: {}", pair[0].name);
     }
     ops
+}
+
+/// Refuse an operation name that is not a plain `resource.method` token.
+///
+/// Operation names are written verbatim into generated SHELL code (the
+/// completion scripts) and into CLI diagnostics, so a name carrying a quote,
+/// `$(...)`, a backtick, a newline or a control character would be command
+/// substitution or quote escape at completion time. Rejecting it here fails
+/// the build, which is the only place the whole problem can be excluded
+/// rather than filtered: the allow-list is the same one the completions
+/// command applies to whatever reaches it at runtime.
+fn check_op_name(name: &str) {
+    let safe = !name.is_empty()
+        && name.chars().count() <= MAX_OP_NAME_CHARS
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !safe {
+        panic!(
+            "operation name {name:?} is not a plain `resource.method` token \
+             (ASCII letters, digits, `.`, `_`, `-`, at most \
+             {MAX_OP_NAME_CHARS} characters). Such a name is written into \
+             generated shell completion scripts, where quotes, `$`, backticks \
+             or newlines would be executable text."
+        );
+    }
 }
 
 /// Compile one POST operation into an IR entry.

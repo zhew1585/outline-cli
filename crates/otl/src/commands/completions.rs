@@ -13,8 +13,19 @@
 //! Output is pipe-safe: the script goes to stdout, everything else to
 //! stderr, and no `print!` is used (a closed pipe must not panic).
 //!
-//! Per-shell coverage of the operation names is bounded by what the
-//! upstream generators can express:
+//! Candidate text is CONSTRAINED, not trusted: every operation name is
+//! checked against [`is_safe_operation_name`] before it is written into a
+//! script, and every description has its control characters stripped. The
+//! generated file is executable shell code, so a name carrying a quote,
+//! `$(...)`, a backtick or a newline would be command substitution or quote
+//! escape at completion time. The vendored spec is validated at build time
+//! (`build.rs` rejects such an operation name outright), but a name reaching
+//! the IR through a future `spec sync` cache would not be, and a filter here
+//! is the last line before the text is executable.
+//!
+//! Per-shell coverage of the operation names is bounded by what the upstream
+//! generators can express, and each script states its own coverage in a
+//! header comment so an installed file is self-describing:
 //!
 //! - bash, zsh: candidates for positional arguments are emitted natively.
 //! - fish: the generator "currently only supports named options
@@ -24,7 +35,9 @@
 //! - powershell, elvish: those generators emit flags and subcommands only,
 //!   for any positional value (they do not complete `otl completions
 //!   <shell>` either). Subcommands and flags complete; operation names do
-//!   not.
+//!   not. Splicing candidates into their nested script structures would mean
+//!   hand-writing shell code in two more dialects - the exact hazard the
+//!   paragraph above is about - so the gap is reported instead.
 
 use std::fmt::Write as _;
 
@@ -46,11 +59,22 @@ const OPERATION_ARG: &str = "operation";
 const LIST_OPERATION: &str = "list";
 /// Summary shown for [`LIST_OPERATION`] in shells that display one.
 const LIST_SUMMARY: &str = "List every callable operation";
+/// Maximum length of a candidate description written into a script.
+const MAX_DESCRIPTION_CHARS: usize = 120;
+/// Comment marker for the coverage notice. `#` starts a line comment in
+/// bash, zsh, fish, elvish and powershell alike.
+const COMMENT: &str = "#";
 
 /// Arguments for `otl completions`.
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
     /// Shell to generate a completion script for.
+    ///
+    /// All five shells complete subcommands and flag names. `api` operation
+    /// names are completed for bash, zsh and fish only: the upstream
+    /// generators for powershell and elvish emit no candidates for
+    /// positional arguments. Each generated script repeats its own coverage
+    /// in a header comment.
     #[arg(value_enum)]
     pub shell: Shell,
 }
@@ -63,25 +87,72 @@ pub fn run(cmd: &CompletionsArgs, root: Command) -> Result<(), CliError> {
     let name = root.get_name().to_string();
     let mut buffer: Vec<u8> = Vec::new();
     clap_complete::generate(cmd.shell, &mut root, &name, &mut buffer);
-    let mut script = String::from_utf8(buffer).map_err(|_| {
+    let generated = String::from_utf8(buffer).map_err(|_| {
         CliError::failure(anyhow!(
             "the generated completion script is not valid UTF-8"
         ))
     })?;
+    let mut script = coverage_notice(cmd.shell, &name);
+    script.push_str(&generated);
     if cmd.shell == Shell::Fish {
-        let rules = fish_operation_rules(&script, &name);
+        let rules = fish_operation_rules(&generated, &name);
         script.push_str(&rules);
     }
     stdio::write_data(&script)
 }
 
+/// Header comment stating what this shell's script does and does not
+/// complete, so an installed file never over-claims.
+fn coverage_notice(shell: Shell, name: &str) -> String {
+    let operations = completes_operation_names(shell);
+    let detail = if operations {
+        "subcommands, flags and `api` operation names (from the compiled \
+         operation table)"
+    } else {
+        "subcommands and flags only: the upstream clap_complete generator for \
+         this shell emits no candidates for positional arguments, so `api` \
+         operation names are NOT completed here (use bash, zsh or fish for \
+         those, or `otl api list`)"
+    };
+    format!("{COMMENT} {name} completion script for {shell}.\n{COMMENT} Completes {detail}.\n")
+}
+
+/// Whether this shell's generated script carries the operation names.
+///
+/// Public so the surface can be asserted in tests and reported by the
+/// command's own help rather than only documented in prose.
+pub fn completes_operation_names(shell: Shell) -> bool {
+    matches!(shell, Shell::Bash | Shell::Zsh | Shell::Fish)
+}
+
 /// Operation names offered as completion candidates, with their summaries.
+///
+/// Names that are not [`is_safe_operation_name`] are dropped: a candidate
+/// that cannot be written safely is worth less than a script that misbehaves.
 fn operation_candidates() -> impl Iterator<Item = (&'static str, &'static str)> {
-    std::iter::once((LIST_OPERATION, LIST_SUMMARY)).chain(
-        ops::OPS
-            .iter()
-            .map(|op| (op.name.as_ref(), op.summary.as_ref())),
-    )
+    std::iter::once((LIST_OPERATION, LIST_SUMMARY))
+        .chain(
+            ops::OPS
+                .iter()
+                .map(|op| (op.name.as_ref(), op.summary.as_ref())),
+        )
+        .filter(|(name, _)| is_safe_operation_name(name))
+}
+
+/// Whether an operation name is safe to write into generated shell code.
+///
+/// The allowed set is exactly what an RPC operation name needs -
+/// `resource.method`, with `-` and `_` tolerated - so nothing that any of
+/// the five shells treats specially can appear: no quote, backslash,
+/// backtick, `$`, parenthesis, brace, bracket, semicolon, pipe, redirect,
+/// glob, whitespace or control character. Enforced as an allow-list, because
+/// a deny-list would have to be right about five dialects at once.
+pub fn is_safe_operation_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_DESCRIPTION_CHARS
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// `complete` rules adding the IR operation names to fish's `otl api`
@@ -116,8 +187,22 @@ fn fish_operation_rules(script: &str, name: &str) -> String {
 }
 
 /// Escape a description for a fish single-quoted string.
+///
+/// Backslash and quote are escaped as fish requires, and control characters
+/// are dropped: a summary comes from the spec, and an ESC byte surviving into
+/// a completion description would be an escape sequence the terminal renders
+/// when the candidate is displayed. The length is capped for the same reason
+/// a table cell is.
 fn fish_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('\'', "\\'")
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_DESCRIPTION_CHARS)
+        .flat_map(|c| match c {
+            '\\' => vec!['\\', '\\'],
+            '\'' => vec!['\\', '\''],
+            other => vec![other],
+        })
+        .collect()
 }
 
 /// Attach the IR's operation names to `api`'s operation positional, so the
