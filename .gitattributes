@@ -1,0 +1,9 @@
+# Keep LF in the working tree on every platform. rustfmt.toml pins
+# newline_style = "Unix", so a CRLF checkout on Windows fails `cargo fmt --check`.
+* text=auto eol=lf
+
+# Golden files are compared byte for byte; never let git rewrite their line endings.
+crates/otl/tests/golden/* -text
+
+# The vendored spec is upstream's bytes; leave them alone.
+crates/otl/spec/spec3.json -text
