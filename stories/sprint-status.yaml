@@ -57,7 +57,7 @@ development_status:
   1-5b-schema-driven-columns: backlog  # follow-up: thread OpSpec/response schema into table renderer after 1-2 IR merges
   1-6-auto-pagination: in-progress
   1-7-rate-limit-backoff: in-progress
-  1-8-performance-ci-baseline: in-progress
+  1-8-performance-ci-baseline: done
   epic-1-retrospective: optional
   epic-2: backlog
   2-1-oauth-browser-login: backlog
