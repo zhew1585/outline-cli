@@ -288,6 +288,69 @@ async fn response_without_data_prints_whole_body() {
         .stdout(predicate::eq(include_str!("golden/no_data_envelope.txt")));
 }
 
+/// Mount a canned `documents.list` response and return the server.
+async fn documents_list_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                { "id": "doc-1", "title": "Welcome", "updatedAt": "2026-08-01T10:00:00.000Z" },
+                { "id": "doc-2", "title": "Roadmap", "updatedAt": "2026-08-20T15:30:00.000Z" }
+            ],
+            "pagination": { "offset": 0, "limit": 25 },
+            "status": 200,
+            "ok": true
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_flag_prints_raw_json_for_lists() {
+    let server = documents_list_server().await;
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl()
+            .env("OUTLINE_URL", uri)
+            .env("OUTLINE_API_KEY", "test-key")
+            .args(["api", "--json", "documents.list"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    // Golden file: jq-consumable pretty JSON, no color or decoration.
+    assert.success().stdout(predicate::eq(include_str!(
+        "golden/documents_list_json.txt"
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_tty_stdout_defaults_to_raw_json() {
+    // assert_cmd pipes stdout (not a TTY), so without --json the output
+    // must be byte-identical to the --json output: raw JSON, no ANSI.
+    let server = documents_list_server().await;
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl()
+            .env("OUTLINE_URL", uri)
+            .env("OUTLINE_API_KEY", "test-key")
+            .args(["api", "documents.list"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert
+        .success()
+        .stdout(predicate::eq(include_str!(
+            "golden/documents_list_json.txt"
+        )))
+        .stdout(predicate::str::contains('\u{1b}').not());
+}
+
 #[test]
 fn base_url_path_secret_never_reaches_stderr() {
     // Reviewer PoC: a secret in the base URL PATH (token-in-path auth) plus

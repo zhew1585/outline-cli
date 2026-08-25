@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::errors::map_engine_error;
 use crate::exit::CliError;
 use crate::ops;
+use crate::render::{self, OutputMode};
 
 /// Arguments for `otl api`.
 #[derive(Debug, Args)]
@@ -26,7 +27,7 @@ pub struct ApiArgs {
 
 /// Run the `api` subcommand. Configuration and argument validation happen
 /// before any network request.
-pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
+pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
     let op = ops::find(&cmd.operation).ok_or_else(|| {
         CliError::usage(anyhow!(
             "unknown API operation {:?}; operation names follow the \
@@ -40,7 +41,7 @@ pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
     let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
     let response = client.execute(op, &args).map_err(map_engine_error)?;
 
-    print_response(&response)
+    print_response(&response, mode)
 }
 
 /// Parse raw `key=value` CLI arguments; reject malformed ones fail-fast.
@@ -57,10 +58,11 @@ fn parse_key_value_args(raw: &[String]) -> Result<Vec<(String, String)>, CliErro
         .collect()
 }
 
-/// Pretty-print the `data` field (or the whole envelope if absent) to stdout.
-fn print_response(response: &Value) -> Result<(), CliError> {
+/// Print the `data` field (or the whole envelope if absent) to stdout in
+/// the resolved output mode (raw JSON, or a table for list-shaped data).
+fn print_response(response: &Value, mode: OutputMode) -> Result<(), CliError> {
     let payload = response.get("data").unwrap_or(response);
-    let rendered = serde_json::to_string_pretty(payload)
+    let rendered = render::render(payload, mode)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
     println!("{rendered}");
     Ok(())
