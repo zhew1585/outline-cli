@@ -1,0 +1,105 @@
+# CI baseline (Story 1.8): three-platform matrix, lint gates, startup
+# performance gate, runtime-YAML guard, and a secrets-gated contract job.
+#
+# Phone-home policy: only standard actions (checkout, rust-toolchain,
+# rust-cache) - no telemetry or update-check actions.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+
+  runtime-yaml-guard:
+    name: no runtime YAML/OpenAPI parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: forbid YAML/OpenAPI crates in the runtime dependency graph
+        shell: bash
+        run: |
+          # SPEC constraint: the runtime never parses OpenAPI/YAML - build.rs
+          # compiles the vendored spec to a static IR table at build time.
+          # `-e normal` excludes dev- and build-dependencies, so this fails
+          # only when a YAML/OpenAPI parser leaks into the shipped binary.
+          if cargo tree -p outline-cli -e normal --prefix none | grep -iE 'yaml|openapi'; then
+            echo "::error::YAML/OpenAPI parser found in the runtime dependency graph"
+            exit 1
+          fi
+          echo "runtime dependency graph is clean"
+
+  startup-bench:
+    name: startup time gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install hyperfine
+        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: bench otl --help cold start
+        env:
+          # Local target (SPEC.md Constraints) is a 10ms mean; shared CI
+          # runners are noisy, so the CI gate allows 25ms. The default
+          # threshold in scripts/bench-startup.sh stays at 10ms.
+          STARTUP_THRESHOLD_MS: "25"
+        run: ./scripts/bench-startup.sh
+
+  contract:
+    # Contract tests hit a real Outline workspace and only run when the
+    # OUTLINE_TEST_* secrets are configured (skipped otherwise, per project
+    # rule). No credentials are stored in the repository.
+    name: contract tests (real workspace)
+    runs-on: ubuntu-latest
+    env:
+      OUTLINE_TEST_URL: ${{ secrets.OUTLINE_TEST_URL }}
+      OUTLINE_TEST_API_KEY: ${{ secrets.OUTLINE_TEST_API_KEY }}
+    steps:
+      - name: check for contract-test credentials
+        id: creds
+        shell: bash
+        run: |
+          if [[ -n "${OUTLINE_TEST_URL}" && -n "${OUTLINE_TEST_API_KEY}" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "OUTLINE_TEST_URL / OUTLINE_TEST_API_KEY not configured; contract tests skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.creds.outputs.present == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.creds.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.creds.outputs.present == 'true'
+      - name: run contract smoke tests
+        if: steps.creds.outputs.present == 'true'
+        run: cargo test -p outline-cli --test contract_smoke -- --ignored
