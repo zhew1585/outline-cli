@@ -2,13 +2,19 @@
 //!
 //! Output format of this command is explicitly unstable (not covered by
 //! semver, per the CLI contract).
+//!
+//! Two flags exist for the cases where the compiled spec or the CLI's own
+//! caution gets in the way: `--no-validate` sends a request whose values
+//! the vendored spec rejects (spec drift), and `--show-server-message`
+//! restores the server's error text for a `--body` request, which is
+//! withheld by default because it may quote the body.
 
 use std::fs::File;
 use std::io::Read;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{BodyMode, Client, EngineError};
+use engine::{BodyMode, Client, EngineError, ErrorDetail, ValidationMode};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -17,6 +23,10 @@ use crate::ops;
 
 /// Hint appended to validation errors that only a raw body can express.
 const BODY_HINT: &str = "pass the whole request body as JSON with `--body @file.json`";
+
+/// Hint appended when a server message was withheld for a `--body` call.
+const SHOW_MESSAGE_HINT: &str =
+    "pass --show-server-message to display it (it may echo your request body)";
 
 /// Hint appended when an operation cannot be called generically at all.
 const DEDICATED_COMMAND_HINT: &str =
@@ -50,6 +60,17 @@ pub struct ApiArgs {
     /// verbatim. Mutually exclusive with `key=value` arguments.
     #[arg(long, value_name = "@FILE")]
     pub body: Option<String>,
+
+    /// Show the server's error message for a `--body` request. The server
+    /// may quote your request body, so this can echo secrets it contains.
+    #[arg(long)]
+    pub show_server_message: bool,
+
+    /// Skip local schema-facet checks (enum, numeric bounds, format) and
+    /// send the request anyway. Use it when the vendored spec disagrees
+    /// with your Outline instance.
+    #[arg(long)]
+    pub no_validate: bool,
 }
 
 /// How the request body is supplied.
@@ -78,13 +99,37 @@ pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
     let config = Config::from_env().map_err(CliError::usage)?;
 
     let client = Client::new(&config.base_url, &config.api_key).map_err(client_error)?;
+    let detail = error_detail(cmd);
     let response = match &payload {
-        Payload::KeyValue(args) => client.execute(op, args),
-        Payload::Raw(body) => client.execute_raw(op, body),
+        Payload::KeyValue(args) => client.execute(op, args, validation_mode(cmd)),
+        Payload::Raw(body) => client.execute_raw(op, body, detail),
     }
-    .map_err(execute_error)?;
+    .map_err(|error| execute_error(error, detail))?;
 
     print_response(&response)
+}
+
+/// How strictly to validate locally: `--no-validate` keeps the structural
+/// checks but skips the schema facets (the spec-drift escape hatch).
+fn validation_mode(cmd: &ApiArgs) -> ValidationMode {
+    if cmd.no_validate {
+        ValidationMode::SkipFacets
+    } else {
+        ValidationMode::Strict
+    }
+}
+
+/// How much of a server error may be shown.
+///
+/// A `--body` request is the one case where server text can quote values
+/// the CLI never saw as arguments, so its free-form message is withheld
+/// unless the user opts in with `--show-server-message`.
+fn error_detail(cmd: &ApiArgs) -> ErrorDetail {
+    if cmd.body.is_some() && !cmd.show_server_message {
+        ErrorDetail::CodeOnly
+    } else {
+        ErrorDetail::Full
+    }
 }
 
 /// Resolve the request payload from CLI arguments: either `key=value`
@@ -159,9 +204,14 @@ fn read_capped(path: &str) -> Result<String, CliError> {
 /// body can fix gain the `--body` hint, and an operation the generic
 /// client cannot call at all is reported as awaiting a dedicated command.
 /// Everything else (transport, server) is a generic failure (exit code 1).
-fn execute_error(error: EngineError) -> CliError {
+fn execute_error(error: EngineError, detail: ErrorDetail) -> CliError {
     if !error.is_validation() {
-        return CliError::failure(error);
+        let withheld = detail == ErrorDetail::CodeOnly && matches!(error, EngineError::Api { .. });
+        return if withheld {
+            CliError::failure(anyhow!("{error}; {SHOW_MESSAGE_HINT}"))
+        } else {
+            CliError::failure(error)
+        };
     }
     if matches!(error, EngineError::UnsupportedBodyType { .. }) {
         return CliError::usage(anyhow!("{error}; {DEDICATED_COMMAND_HINT}"));
@@ -178,9 +228,10 @@ fn execute_error(error: EngineError) -> CliError {
 /// Operations the generic client cannot call are listed too, but flagged
 /// with the content type they need.
 fn run_list(cmd: &ApiArgs) -> Result<(), CliError> {
-    if !cmd.args.is_empty() || cmd.body.is_some() {
+    let request_flags = cmd.body.is_some() || cmd.show_server_message || cmd.no_validate;
+    if !cmd.args.is_empty() || request_flags {
         return Err(CliError::usage(anyhow!(
-            "`otl api list` takes no further arguments"
+            "`otl api list` takes no further arguments or request flags"
         )));
     }
     let mut out = String::new();

@@ -11,9 +11,9 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
 use serde_json::Value;
 
-use crate::body::{build_request_body, ensure_dispatchable, sensitive_values};
+use crate::body::{build_request_body, ensure_dispatchable};
 use crate::error::{EngineError, TransportKind};
-use crate::ir::OpSpec;
+use crate::ir::{OpSpec, ValidationMode};
 
 /// Placeholder shown instead of secrets in Debug output.
 const REDACTED: &str = "***";
@@ -25,6 +25,24 @@ const MAX_ERROR_BODY_BYTES: u64 = 8 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 /// Fallback message when an error response carries no usable text.
 const NO_ERROR_DETAILS: &str = "no error details in response body";
+/// Maximum length of a string still accepted as a structured error code.
+const MAX_ERROR_CODE_CHARS: usize = 64;
+/// Explanation used in place of withheld server text.
+const SERVER_MESSAGE_WITHHELD: &str =
+    "server message withheld: it may quote the request body, which can contain secrets";
+
+/// How much of a server error response may be surfaced to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorDetail {
+    /// Report the server's free-form message (bearer token redacted).
+    ///
+    /// Safe when every value in the request came from the caller's own
+    /// arguments, and available as an explicit opt-in otherwise.
+    #[default]
+    Full,
+    /// Report only the structured error code, never free-form text.
+    CodeOnly,
+}
 
 /// A blocking RPC client bound to one API base URL and one bearer token.
 pub struct Client {
@@ -76,12 +94,19 @@ impl Client {
     /// `POST {base}{op.path}` and returns the parsed JSON response. The
     /// operation path comes from the IR verbatim; the engine imposes no
     /// URL convention of its own.
-    pub fn execute(&self, op: &OpSpec, args: &[(String, String)]) -> Result<Value, EngineError> {
-        let body = build_request_body(op, args)?;
+    pub fn execute(
+        &self,
+        op: &OpSpec,
+        args: &[(String, String)],
+        validation: ValidationMode,
+    ) -> Result<Value, EngineError> {
+        let body = build_request_body(op, args, validation)?;
         let bytes = serde_json::to_vec(&body).map_err(|error| EngineError::InvalidRequestBody {
             reason: error.to_string(),
         })?;
-        self.send(&op.path, bytes, &[])
+        // Every value came from the caller's own command line, so server
+        // error text may be surfaced in full (minus the bearer token).
+        self.send(&op.path, bytes, ErrorDetail::Full)
     }
 
     /// Execute one RPC operation with a caller-supplied raw JSON body.
@@ -90,29 +115,40 @@ impl Client {
     /// request) and is sent byte-for-byte verbatim, bypassing `key=value`
     /// assembly and parameter validation entirely.
     ///
-    /// Because the body may carry credentials this client knows nothing
-    /// about, its long string values are treated as sensitive and redacted
-    /// from any error text the server sends back.
-    pub fn execute_raw(&self, op: &OpSpec, body: &str) -> Result<Value, EngineError> {
+    /// A raw body may carry credentials this client knows nothing about,
+    /// and a server error response may quote the request it rejected.
+    /// There is no way to recognize such a quote after the fact - a secret
+    /// can be short, escaped differently, or overlap another value - so
+    /// the decision is categorical: with [`ErrorDetail::CodeOnly`] the
+    /// server's free-form text is withheld and only its structured error
+    /// code is reported. [`ErrorDetail::Full`] is the caller's explicit
+    /// opt-in to seeing text that may echo the body.
+    pub fn execute_raw(
+        &self,
+        op: &OpSpec,
+        body: &str,
+        detail: ErrorDetail,
+    ) -> Result<Value, EngineError> {
         ensure_dispatchable(op)?;
-        let parsed = serde_json::from_str::<Value>(body).map_err(|error| {
-            EngineError::InvalidRequestBody {
+        // Well-formedness only: no value tree is built, so a large body
+        // costs one pass and no per-value work.
+        if let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(body) {
+            return Err(EngineError::InvalidRequestBody {
                 reason: error.to_string(),
-            }
-        })?;
-        let secrets = sensitive_values(&parsed);
-        self.send(&op.path, body.as_bytes().to_vec(), &secrets)
+            });
+        }
+        self.send(&op.path, body.as_bytes().to_vec(), detail)
     }
 
     /// The single wire path: POST a JSON payload and parse the response.
     ///
-    /// `body_secrets` are caller-supplied values redacted from server
-    /// error text in addition to this client's bearer token.
+    /// `detail` decides how much of a server error response may be
+    /// surfaced (see [`Client::execute_raw`]).
     fn send(
         &self,
         op_path: &str,
         body: Vec<u8>,
-        body_secrets: &[String],
+        detail: ErrorDetail,
     ) -> Result<Value, EngineError> {
         let url = format!("{}{}", self.base_url, op_path);
         let response = self
@@ -137,7 +173,7 @@ impl Client {
         if !status.is_success() {
             return Err(EngineError::Api {
                 status: status.as_u16(),
-                message: extract_error_message(response, &self.token, body_secrets),
+                message: extract_error_message(response, &self.token, detail),
             });
         }
 
@@ -212,19 +248,23 @@ fn validate_base_url(base_url: &str) -> Result<Url, EngineError> {
     Ok(parsed)
 }
 
-/// Pull a best-effort human-readable message out of an error response.
+/// Pull a reportable description out of an error response.
 ///
-/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. Every sensitive
-/// value - the client's own bearer token plus any caller-supplied
-/// `extra_secrets` (e.g. credentials inside a raw request body) that a
-/// server or proxy may reflect back - is redacted BEFORE sanitization and
-/// truncation, so not even a prefix can survive the length cap. The result
-/// is then sanitized (control characters stripped, whitespace collapsed)
-/// and capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
+/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. The client's own
+/// bearer token (which a server or proxy may reflect back) is redacted
+/// BEFORE sanitization and truncation, so not even a token prefix can
+/// survive the length cap. The result is then sanitized (control
+/// characters stripped, whitespace collapsed) and capped at
+/// [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
+///
+/// With [`ErrorDetail::CodeOnly`] the server's free-form text is dropped
+/// entirely and only its structured error code is reported: free-form text
+/// may quote the request body, and no filter can reliably recognize a
+/// caller's secret inside it after the fact.
 fn extract_error_message(
     response: reqwest::blocking::Response,
     secret: &str,
-    extra_secrets: &[String],
+    detail: ErrorDetail,
 ) -> String {
     let mut raw = Vec::new();
     if response
@@ -235,26 +275,54 @@ fn extract_error_message(
         return NO_ERROR_DETAILS.to_string();
     }
     let body = String::from_utf8_lossy(&raw);
-    let candidate = match serde_json::from_str::<Value>(&body) {
-        Ok(json) => json
+    let parsed = serde_json::from_str::<Value>(&body).ok();
+    if detail == ErrorDetail::CodeOnly {
+        return withheld_message(parsed.as_ref());
+    }
+    let candidate = match parsed {
+        Some(json) => json
             .get("message")
             .or_else(|| json.get("error"))
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_default(),
-        Err(_) => body.into_owned(),
+        None => body.into_owned(),
     };
-    let redacted = extra_secrets
-        .iter()
-        .fold(redact_secret(&candidate, secret), |text, extra| {
-            redact_secret(&text, extra)
-        });
-    let sanitized = sanitize_message(&redacted);
+    let sanitized = sanitize_message(&redact_secret(&candidate, secret));
     if sanitized.is_empty() {
         NO_ERROR_DETAILS.to_string()
     } else {
         sanitized
     }
+}
+
+/// Describe an error response without repeating any free-form text.
+///
+/// The structured error code is reported when the response carries one in
+/// a code-shaped field ([`is_error_code`]); a server that puts prose - or
+/// a quoted request body - there is treated as having sent no code.
+fn withheld_message(parsed: Option<&Value>) -> String {
+    let code = parsed
+        .and_then(|json| json.get("error").or_else(|| json.get("code")))
+        .and_then(Value::as_str)
+        .filter(|code| is_error_code(code));
+    match code {
+        Some(code) => format!("error code {code:?} ({SERVER_MESSAGE_WITHHELD})"),
+        None => SERVER_MESSAGE_WITHHELD.to_string(),
+    }
+}
+
+/// Whether `text` has the shape of a machine-readable error code: a short
+/// run of ASCII alphanumerics and `_`, `-`, `.` separators.
+///
+/// Deliberately strict: it is what separates a stable code from arbitrary
+/// server text that might embed the request body.
+fn is_error_code(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_ERROR_CODE_CHARS
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 /// Replace every occurrence of `secret` in `text` with [`REDACTED`].

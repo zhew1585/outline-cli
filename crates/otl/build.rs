@@ -17,7 +17,7 @@ use serde_json::Value;
 /// in the engine - the engine joins `base_url + op.path` verbatim.
 const API_PATH_PREFIX: &str = "/api";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 3;
+const IR_SCHEMA_VERSION: u32 = 4;
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
 /// The only request content type the generic engine can assemble.
@@ -48,6 +48,7 @@ struct Param {
 struct Facets {
     nullable: bool,
     enum_values: Vec<String>,
+    format: String,
     minimum: Option<f64>,
     maximum: Option<f64>,
 }
@@ -290,7 +291,8 @@ fn param_type(prop: &Value, spec: &Value, depth: usize) -> &'static str {
 /// `oneOf`/`anyOf` branches are deliberately not followed: their
 /// constraints are alternatives, not requirements.
 ///
-/// TODO: `format` and `pattern` are not compiled yet (see `ParamSpec`).
+/// TODO: `pattern` is deliberately not compiled - see `ParamSpec` for why
+/// (a regex engine would cost about a megabyte for two constraints).
 fn extract_facets(prop: &Value, spec: &Value) -> Facets {
     let mut facets = Facets::default();
     collect_facets(prop, spec, 0, &mut facets);
@@ -307,6 +309,11 @@ fn collect_facets(schema: &Value, spec: &Value, depth: usize, facets: &mut Facet
     if facets.enum_values.is_empty() {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
             facets.enum_values = values.iter().map(enum_literal).collect();
+        }
+    }
+    if facets.format.is_empty() {
+        if let Some(format) = schema.get("format").and_then(Value::as_str) {
+            facets.format = format.to_string();
         }
     }
     facets.minimum = facets
@@ -401,6 +408,11 @@ fn render_param(out: &mut String, param: &Param) {
         out,
         "                nullable: {}, enum_values: ::std::borrow::Cow::Borrowed(&[{enum_values}]),",
         param.facets.nullable
+    );
+    let _ = writeln!(
+        out,
+        "                format: ::std::borrow::Cow::Borrowed({:?}),",
+        param.facets.format
     );
     let _ = writeln!(
         out,

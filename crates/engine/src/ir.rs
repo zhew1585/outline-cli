@@ -17,8 +17,24 @@ use serde::{Deserialize, Serialize};
 ///
 /// Version history: 2 added `OpSpec::summary`; 3 added
 /// `OpSpec::content_type`, `OpSpec::body_mode` and the `ParamSpec`
-/// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`).
-pub const IR_SCHEMA_VERSION: u32 = 3;
+/// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`);
+/// 4 added `ParamSpec::format`.
+pub const IR_SCHEMA_VERSION: u32 = 4;
+
+/// How strictly a request is validated against the IR before being sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidationMode {
+    /// Enforce every compiled schema facet (enum, bounds, format).
+    #[default]
+    Strict,
+    /// Skip the facet checks, keeping type coercion and the structural
+    /// checks (unknown/missing/complex parameters).
+    ///
+    /// The escape hatch for a spec that disagrees with the live server:
+    /// without it a stale or wrong constraint would make an operation
+    /// uncallable.
+    SkipFacets,
+}
 
 /// The wire type of a single request parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,9 +85,10 @@ pub enum BodyMode {
 /// Constraint facets mirror the source schema so that invalid values are
 /// rejected locally, before any request is sent.
 ///
-/// TODO: `format` and `pattern` are not compiled yet, so values that are
-/// well-typed but malformed (e.g. a non-UUID id, a bad hex color) still
-/// reach the server.
+/// TODO: `pattern` is deliberately not compiled. Validating it needs a
+/// regex engine, roughly a megabyte of binary against a 5 MB budget, to
+/// serve the two `pattern` constraints in the whole vendored spec; such
+/// values are left for the server to reject.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamSpec {
     /// Parameter name as it appears in the JSON request body.
@@ -90,6 +107,11 @@ pub struct ParamSpec {
     /// Allowed values, when the schema constrains the parameter to an
     /// enumeration. Empty means unconstrained.
     pub enum_values: Cow<'static, [Cow<'static, str>]>,
+    /// Declared `format` (e.g. `uuid`, `date-time`), empty when absent.
+    ///
+    /// Only formats with an unambiguous definition are enforced; any other
+    /// value is carried for diagnostics but passed through unchecked.
+    pub format: Cow<'static, str>,
     /// Inclusive lower bound for numeric parameters, if any.
     pub minimum: Option<f64>,
     /// Inclusive upper bound for numeric parameters, if any.

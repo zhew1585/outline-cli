@@ -12,23 +12,22 @@ use std::borrow::Cow;
 use serde_json::{Map, Value};
 
 use crate::error::EngineError;
-use crate::ir::{BodyMode, OpSpec, ParamSpec, ParamType};
+use crate::format;
+use crate::ir::{BodyMode, OpSpec, ParamSpec, ParamType, ValidationMode};
 use crate::scalar;
-
-/// Minimum length of a request-body string value considered sensitive.
-///
-/// Shorter values (ids, short flags, single words) are left alone so that
-/// redaction cannot swallow whole server messages.
-pub const MIN_SENSITIVE_VALUE_CHARS: usize = 8;
 
 /// Assemble and validate the JSON request body for `op` from raw
 /// `key=value` pairs.
 ///
 /// Scalar values are coerced to their declared wire type (native JSON
-/// integers/booleans/numbers, never strings-in-disguise) and checked
-/// against the schema facets carried by the IR. Purely local: never
-/// touches the network.
-pub fn build_request_body(op: &OpSpec, args: &[(String, String)]) -> Result<Value, EngineError> {
+/// integers/booleans/numbers, never strings-in-disguise) and, unless
+/// `validation` says otherwise, checked against the schema facets carried
+/// by the IR. Purely local: never touches the network.
+pub fn build_request_body(
+    op: &OpSpec,
+    args: &[(String, String)],
+    validation: ValidationMode,
+) -> Result<Value, EngineError> {
     ensure_dispatchable(op)?;
     if op.body_mode == BodyMode::RawJsonOnly {
         return Err(EngineError::UnionBody {
@@ -44,7 +43,7 @@ pub fn build_request_body(op: &OpSpec, args: &[(String, String)]) -> Result<Valu
                 reason: "parameter given more than once".to_string(),
             });
         }
-        body.insert(key.clone(), typed_value(op, param, raw)?);
+        body.insert(key.clone(), typed_value(op, param, raw, validation)?);
     }
     if let Some(missing) = first_missing_required(op, &body) {
         return Err(EngineError::MissingParam {
@@ -68,30 +67,6 @@ pub(crate) fn ensure_dispatchable(op: &OpSpec) -> Result<(), EngineError> {
         });
     }
     Ok(())
-}
-
-/// Collect the string leaves of a request body that are long enough to be
-/// treated as potentially sensitive.
-///
-/// Used to redact caller-supplied secrets that a server (or proxy) echoes
-/// back in an error response.
-pub(crate) fn sensitive_values(body: &Value) -> Vec<String> {
-    let mut found = Vec::new();
-    collect_sensitive(body, &mut found);
-    found
-}
-
-fn collect_sensitive(value: &Value, found: &mut Vec<String>) {
-    match value {
-        Value::String(text) if text.chars().count() >= MIN_SENSITIVE_VALUE_CHARS => {
-            found.push(text.clone());
-        }
-        Value::Array(items) => items.iter().for_each(|item| collect_sensitive(item, found)),
-        Value::Object(entries) => entries
-            .values()
-            .for_each(|entry| collect_sensitive(entry, found)),
-        _ => {}
-    }
 }
 
 /// The first required parameter not present in the assembled body, if any.
@@ -120,7 +95,17 @@ fn unknown_param(op: &OpSpec, key: &str) -> EngineError {
 }
 
 /// Coerce one raw value and check it against the parameter's facets.
-fn typed_value(op: &OpSpec, param: &ParamSpec, raw: &str) -> Result<Value, EngineError> {
+///
+/// Type coercion always applies - a wrongly typed value cannot be put on
+/// the wire at all. Only the facet checks (enum, bounds, format) honour
+/// [`ValidationMode::SkipFacets`], the escape hatch for a spec that
+/// disagrees with the live server.
+fn typed_value(
+    op: &OpSpec,
+    param: &ParamSpec,
+    raw: &str,
+    validation: ValidationMode,
+) -> Result<Value, EngineError> {
     // Clearing a nullable field is expressible as key=value whatever the
     // parameter's type, so this precedes the complex-type rejection.
     if scalar::is_null_literal(param, raw) {
@@ -133,8 +118,11 @@ fn typed_value(op: &OpSpec, param: &ParamSpec, raw: &str) -> Result<Value, Engin
         });
     }
     let value = scalar::coerce(param, raw)?;
-    check_enum(param, &value)?;
-    check_bounds(param, &value)?;
+    if validation == ValidationMode::Strict {
+        check_enum(param, &value)?;
+        check_bounds(param, &value)?;
+        format::check(param, &value)?;
+    }
     Ok(value)
 }
 

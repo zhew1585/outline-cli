@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use engine::{Client, EngineError, OpSpec, ParamSpec, ParamType};
+use engine::{Client, EngineError, OpSpec, ParamSpec, ParamType, ValidationMode};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -22,6 +22,7 @@ fn op_with_path(op_path: &'static str) -> OpSpec {
             required: false,
             nullable: false,
             enum_values: Cow::Borrowed(&[]),
+            format: Cow::Borrowed(""),
             minimum: None,
             maximum: None,
         }]),
@@ -50,6 +51,7 @@ async fn execute_posts_json_with_bearer_auth() {
         client.execute(
             &op_with_path("/api/things.info"),
             &[("id".to_string(), "doc-123".to_string())],
+            ValidationMode::Strict,
         )
     })
     .await
@@ -73,7 +75,7 @@ async fn execute_uses_ir_path_verbatim_not_name_convention() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/rpc/custom"), &[])
+        client.execute(&op_with_path("/rpc/custom"), &[], ValidationMode::Strict)
     })
     .await
     .unwrap();
@@ -97,7 +99,11 @@ async fn execute_maps_error_status_to_api_error() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -127,7 +133,11 @@ async fn error_message_is_sanitized_and_capped() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -160,7 +170,11 @@ async fn reflected_bearer_token_is_redacted_from_error_message() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "reflected-secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -195,7 +209,11 @@ async fn token_prefix_cut_by_body_cap_is_redacted() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, token)?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -281,7 +299,11 @@ fn transport_error_display_shows_origin_only() {
     // path (which may carry secrets), and never raw reqwest error text.
     let client = Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
     assert!(
         matches!(error, EngineError::Transport { .. }),
@@ -319,7 +341,11 @@ fn transport_error_debug_and_source_chain_are_credential_free() {
     // callers formatting {:?} or walking source() never see a path secret.
     let client = Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
     let rendered = render_full_error_chain(&error);
     assert_eq!(

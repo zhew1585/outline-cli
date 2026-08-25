@@ -312,7 +312,7 @@ fn unknown_enum_value_exits_2_listing_allowed_values() {
         .args([
             "api",
             "accessRequests.approve",
-            "id=x",
+            "id=d8f7a1b2-3c4d-5e6f-7081-92a3b4c5d6e7",
             "permission=definitely-not-enum",
         ])
         .assert()
@@ -363,19 +363,29 @@ async fn nullable_param_sends_json_null() {
     assert.success();
 }
 
-// --- Finding 4: secrets inside a raw body -------------------------------
+// --- Finding 4: server error text on raw-body requests ------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn body_secret_echoed_by_the_server_never_reaches_stderr() {
-    let secret = "BODY-SECRET-9f3d";
+/// A wiremock server that rejects everything, echoing `message` back.
+async fn rejecting_server(message: &str) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "message": format!("server echoed {{\"password\":\"{secret}\"}}")
+            "ok": false,
+            "error": "validation_error",
+            "message": message,
         })))
         .mount(&server)
         .await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_request_withholds_the_server_message() {
+    // A short secret defeats any length-based redaction, so the rule is
+    // categorical: free-form server text is not echoed for --body calls.
+    let secret = "s3cr3t!";
+    let server = rejecting_server(&format!("rejected {{\"password\":\"{secret}\"}}")).await;
 
     let uri = server.uri();
     let output = tokio::task::spawn_blocking(move || {
@@ -392,12 +402,183 @@ async fn body_secret_echoed_by_the_server_never_reaches_stderr() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
-    assert_eq!(
-        stderr.matches("BODY-SECRET").count(),
-        0,
-        "body secret leaked: {stderr}"
+    assert_eq!(stderr.matches(secret).count(), 0, "secret leaked: {stderr}");
+    assert!(!stdout.contains(secret), "stdout leaked: {stdout}");
+    // The user still sees the status, the structured code, and the way in.
+    assert!(stderr.contains("400"), "no status: {stderr}");
+    assert!(stderr.contains("validation_error"), "no code: {stderr}");
+    assert!(
+        stderr.contains("--show-server-message"),
+        "no opt-in hint: {stderr}"
     );
-    assert!(!stdout.contains("BODY-SECRET"), "stdout leaked: {stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_request_withholds_escaped_and_overlapping_secrets() {
+    // Both PoCs that defeated substring redaction: a secret whose JSON
+    // encoding differs from its decoded form, and overlapping values.
+    let cases = [
+        (
+            r#"{"password":"LONG\"SECRET-123"}"#,
+            "rejected LONG\\\"SECRET-123",
+            "SECRET-123",
+        ),
+        (
+            r#"["password","passwordSUPERSECRET"]"#,
+            "rejected passwordSUPERSECRET",
+            "SUPERSECRET",
+        ),
+    ];
+    for (body, message, secret) in cases {
+        let server = rejecting_server(message).await;
+        let uri = server.uri();
+        let output = tokio::task::spawn_blocking(move || {
+            let file = temp_json(body);
+            let body_arg = format!("@{}", file.path().display());
+            otl_online(&uri)
+                .args(["api", "documents.update", "--body", &body_arg])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+        assert_eq!(
+            stderr.matches(secret).count(),
+            0,
+            "secret {secret} leaked: {stderr}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_server_message_restores_the_server_text() {
+    let server = rejecting_server("document doc-1 is archived").await;
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        let file = temp_json(r#"{"id":"doc-1"}"#);
+        let body_arg = format!("@{}", file.path().display());
+        otl_online(&uri)
+            .args([
+                "api",
+                "documents.update",
+                "--body",
+                &body_arg,
+                "--show-server-message",
+            ])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("document doc-1 is archived"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn key_value_request_still_shows_the_server_message() {
+    let server = rejecting_server("invalid permission").await;
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl_online(&uri)
+            .args(["api", "documents.update", "id=doc-1"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("invalid permission"))
+        .stderr(predicate::str::contains("withheld").not());
+}
+
+// --- format validation and the --no-validate escape hatch ---------------
+
+#[test]
+fn invalid_uuid_format_exits_2_naming_the_format() {
+    otl_offline()
+        .args(["api", "accessRequests.approve", "id=not-a-uuid"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("uuid"))
+        .stderr(predicate::str::contains("id"))
+        .stdout(predicate::str::is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pattern_constrained_value_is_still_sent() {
+    // Documented deferral: `templates.update` color declares a regex
+    // pattern that is deliberately not compiled into the IR, so `red`
+    // reaches the server instead of being rejected locally.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/templates.update"))
+        .and(body_json(json!({ "id": "doc-1", "color": "red" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": { "ok": true } })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl_online(&uri)
+            .args(["api", "templates.update", "id=doc-1", "color=red"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert.success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_validate_bypasses_facet_checks() {
+    // The spec-drift escape hatch: an enum value and a format the vendored
+    // spec rejects are sent anyway.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/accessRequests.approve"))
+        .and(body_json(
+            json!({ "id": "not-a-uuid", "permission": "future_role" }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": { "ok": true } })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl_online(&uri)
+            .args([
+                "api",
+                "accessRequests.approve",
+                "id=not-a-uuid",
+                "permission=future_role",
+                "--no-validate",
+            ])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert.success();
+}
+
+#[test]
+fn no_validate_still_rejects_unknown_and_missing_params() {
+    for extra in [vec!["bogus=1"], vec![]] {
+        let mut cmd = otl_offline();
+        cmd.args(["api", "documents.update", "--no-validate"])
+            .args(&extra);
+        cmd.assert().failure().code(2);
+    }
 }
 
 // --- Finding 5: malformed key=value must not echo the argument -----------

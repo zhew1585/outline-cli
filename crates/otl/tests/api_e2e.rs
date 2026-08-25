@@ -243,7 +243,9 @@ fn cli_error_debug_and_chain_are_credential_free() {
         body_mode: engine::BodyMode::KeyValue,
         params: Cow::Borrowed(&[]),
     };
-    let engine_error = client.execute(&op, &[]).unwrap_err();
+    let engine_error = client
+        .execute(&op, &[], engine::ValidationMode::Strict)
+        .unwrap_err();
     let cli_error = otl::exit::CliError::failure(engine_error);
 
     let chain: String = cli_error

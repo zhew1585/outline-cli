@@ -250,6 +250,62 @@ fn nullable_params_are_flagged() {
 }
 
 #[test]
+fn formats_are_compiled_into_the_ir() {
+    let approve = ops::find("accessRequests.approve").unwrap();
+    assert_eq!(approve.param("id").unwrap().format.as_ref(), "uuid");
+    assert_eq!(
+        ops::find("documents.insights")
+            .unwrap()
+            .param("startDate")
+            .unwrap()
+            .format
+            .as_ref(),
+        "date-time"
+    );
+    assert_eq!(
+        ops::find("shares.update")
+            .unwrap()
+            .param("iconUrl")
+            .unwrap()
+            .format
+            .as_ref(),
+        "uri"
+    );
+    // A vendor-specific format is carried but not enforced at runtime.
+    assert_eq!(
+        ops::find("users.update")
+            .unwrap()
+            .param("language")
+            .unwrap()
+            .format
+            .as_ref(),
+        "BCP47"
+    );
+    // An unconstrained string carries no format.
+    assert!(ops::find("documents.update")
+        .unwrap()
+        .param("title")
+        .unwrap()
+        .format
+        .is_empty());
+}
+
+#[test]
+fn pattern_constraints_are_deliberately_not_compiled() {
+    // templates.update `color` declares `pattern: ^#[0-9A-Fa-f]{6}$`.
+    // Validating it would need a regex engine (about a megabyte of binary
+    // for the two pattern constraints in the whole spec), so the value is
+    // left for the server to reject. This test documents that choice.
+    let color = ops::find("templates.update")
+        .unwrap()
+        .param("color")
+        .unwrap();
+    assert!(color.format.is_empty(), "no format facet on color");
+    assert_eq!(color.ty, ParamType::String);
+    assert!(color.nullable);
+}
+
+#[test]
 fn numeric_bounds_are_compiled_into_the_ir() {
     let size = ops::find("attachments.create")
         .unwrap()
