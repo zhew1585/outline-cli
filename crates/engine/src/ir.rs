@@ -46,7 +46,9 @@ pub struct ParamSpec {
 pub struct OpSpec {
     /// Operation name in `resource.method` form (e.g. `things.info`).
     pub name: Cow<'static, str>,
-    /// URL path of the operation relative to the API base (e.g. `/things.info`).
+    /// URL path joined verbatim onto the client base URL (e.g.
+    /// `/rpc/things.info`). Any service-specific prefix convention is
+    /// applied by the spec compiler that emits the IR, never by the engine.
     pub path: Cow<'static, str>,
     /// Request-body parameters.
     pub params: Cow<'static, [ParamSpec]>,

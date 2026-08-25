@@ -1,15 +1,20 @@
 //! Typed errors for the engine request channel.
+//!
+//! Error messages never echo credentials: base-URL problems report only a
+//! reason (the raw value may embed userinfo), and request URLs are built
+//! from a validated, credential-free base.
 
 use thiserror::Error;
 
 /// Errors produced by the engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
-    /// The configured base URL could not be parsed or used.
-    #[error("invalid base URL {url:?}: {reason}")]
+    /// The configured base URL could not be parsed or is not usable.
+    ///
+    /// Deliberately does not carry the offending URL: a malformed value may
+    /// contain embedded credentials which must never reach logs or stderr.
+    #[error("invalid base URL: {reason}")]
     InvalidBaseUrl {
-        /// The offending URL string.
-        url: String,
         /// Human-readable reason.
         reason: String,
     },
@@ -21,7 +26,7 @@ pub enum EngineError {
     /// A transport-level failure (DNS, TLS, connection, timeout, ...).
     #[error("request to {url} failed: {source}")]
     Transport {
-        /// The URL that was requested.
+        /// The URL that was requested (credential-free by construction).
         url: String,
         /// The underlying transport error.
         #[source]
@@ -33,7 +38,7 @@ pub enum EngineError {
     Api {
         /// HTTP status code.
         status: u16,
-        /// Best-effort human-readable message extracted from the response.
+        /// Sanitized, length-capped message extracted from the response.
         message: String,
     },
 

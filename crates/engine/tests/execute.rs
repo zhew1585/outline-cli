@@ -9,10 +9,10 @@ use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn sample_op() -> OpSpec {
+fn op_with_path(op_path: &'static str) -> OpSpec {
     OpSpec {
         name: Cow::Borrowed("things.info"),
-        path: Cow::Borrowed("/things.info"),
+        path: Cow::Borrowed(op_path),
         params: Cow::Borrowed(&[ParamSpec {
             name: Cow::Borrowed("id"),
             ty: ParamType::String,
@@ -40,13 +40,38 @@ async fn execute_posts_json_with_bearer_auth() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&sample_op(), &[("id".to_string(), "doc-123".to_string())])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[("id".to_string(), "doc-123".to_string())],
+        )
     })
     .await
     .unwrap();
 
     let value = result.unwrap();
     assert_eq!(value["data"]["title"], "Hello");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn execute_uses_ir_path_verbatim_not_name_convention() {
+    // The engine must join base + op.path; op.name plays no role in the URL.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rpc/custom"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": { "ok": true } })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "secret-token")?;
+        client.execute(&op_with_path("/rpc/custom"), &[])
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.unwrap()["data"]["ok"], true);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -65,7 +90,7 @@ async fn execute_maps_error_status_to_api_error() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&sample_op(), &[])
+        client.execute(&op_with_path("/api/things.info"), &[])
     })
     .await
     .unwrap();
@@ -79,10 +104,81 @@ async fn execute_maps_error_status_to_api_error() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn error_message_is_sanitized_and_capped() {
+    let forged = format!(
+        "remote failure\nFORGED-DIAGNOSTIC\x1b[31mRED{}",
+        "x".repeat(500)
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "message": forged })))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { message, .. }) => {
+            assert!(!message.contains('\n'), "newline not stripped: {message:?}");
+            assert!(!message.contains('\x1b'), "ESC not stripped: {message:?}");
+            assert!(message.chars().count() <= 200, "message not capped");
+            assert!(message.starts_with("remote failure FORGED-DIAGNOSTIC"));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
 #[test]
 fn new_rejects_non_http_base_url() {
     let error = Client::new("ftp://example.com", "token").unwrap_err();
     assert!(matches!(error, EngineError::InvalidBaseUrl { .. }));
+}
+
+#[test]
+fn new_rejects_unparseable_and_structured_urls() {
+    for bad in [
+        "http://[::1",                  // unparseable
+        "not a url",                    // no scheme
+        "http://example.com?tenant=x",  // query
+        "http://example.com/#fragment", // fragment
+    ] {
+        let error = Client::new(bad, "token").unwrap_err();
+        assert!(
+            matches!(error, EngineError::InvalidBaseUrl { .. }),
+            "expected InvalidBaseUrl for {bad:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn new_rejects_userinfo_and_never_echoes_credentials() {
+    let error = Client::new("http://alice:url-password@example.com", "token").unwrap_err();
+    assert!(matches!(error, EngineError::InvalidBaseUrl { .. }));
+    let rendered = format!("{error} / {error:?}");
+    assert!(
+        !rendered.contains("url-password"),
+        "credential leaked: {rendered}"
+    );
+    assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+}
+
+#[test]
+fn debug_output_redacts_token() {
+    let client = Client::new("https://example.com", "super-secret-token").unwrap();
+    let rendered = format!("{client:?}");
+    assert!(
+        !rendered.contains("super-secret-token"),
+        "token leaked: {rendered}"
+    );
+    assert!(rendered.contains("***"));
 }
 
 #[test]
