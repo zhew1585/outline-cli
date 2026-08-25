@@ -14,7 +14,41 @@ single-digit milliseconds.
 
 ## Install
 
-No published release yet. Build from source (Rust stable):
+Releases are cut from git tags and publish one static binary per platform, plus a Homebrew formula, a
+shell installer, and a Windows MSI. There is no published release yet — the commands below are the
+contract the release pipeline implements, and they start working with the first tag.
+
+**Homebrew** (macOS and Linux):
+
+```sh
+brew install weizhesafeheron/tap/outline-cli
+```
+
+**Shell installer** (macOS and Linux; installs into `$CARGO_HOME/bin`):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/weizhesafeheron/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
+```
+
+**Windows**: download `outline-cli-x86_64-pc-windows-msvc.msi` from the
+[latest release](https://github.com/weizhesafeheron/outline-cli/releases/latest) and run it. The MSI adds
+`otl` to `PATH` and uninstalls through Settings → Apps like any other Windows program.
+
+Prebuilt archives are attached to every release for these targets:
+
+| Platform | Target triple | Notes |
+|----------|---------------|-------|
+| macOS (Apple Silicon) | `aarch64-apple-darwin` | |
+| macOS (Intel) | `x86_64-apple-darwin` | |
+| Linux (x86-64) | `x86_64-unknown-linux-musl` | statically linked, no glibc version floor |
+| Windows (x86-64) | `x86_64-pc-windows-msvc` | also shipped as an MSI |
+
+**`otl` never checks for updates.** No telemetry, no update ping, no background spec fetch — the binary
+makes exactly the network requests your command implies. Upgrading is something you do: `brew upgrade`,
+re-run the shell installer, or install the newer MSI.
+
+**From source** (Rust stable, `rust-version` 1.85):
 
 ```sh
 git clone https://github.com/weizhesafeheron/outline-cli
@@ -65,8 +99,58 @@ completion, not a crash.
 ceiling, an exhausted offset space — produces an explicit stderr warning, and the wording distinguishes
 "definitely truncated" from "may be truncated".
 
-**Exit codes are a public API.** See [docs/exit-codes.md](docs/exit-codes.md). Published codes never
-change meaning.
+**Exit codes are a public API.** See [Stability and versioning](#stability-and-versioning) below.
+Published codes never change meaning.
+
+## Stability and versioning
+
+`otl` follows [semantic versioning](https://semver.org/), and is explicit about which surfaces the
+version number is a promise about. While the version is `0.x` the promise is intent, not yet a
+guarantee: breaking changes may land in a minor release until `1.0`.
+
+**Covered by semver** — a breaking change here requires a major version:
+
+- The **curated commands** (`otl docs search`, `otl docs get`, …): their names, their flags, and the
+  shape of their output, both the human-readable rendering and `--json`.
+- The **exit-code table** below. Published codes never change meaning; new error classes get new codes.
+- Environment variables (`OUTLINE_URL`, `OUTLINE_API_KEY`, …) and the location and key names of the
+  config and credential files.
+
+**Not covered by semver** — these may change in any release:
+
+- **`otl api` output.** The generic escape hatch is explicitly unstable. It prints whatever the Outline
+  API returned, so its shape is the *server's* contract, not this CLI's: it changes when your Outline
+  instance changes, when the vendored OpenAPI spec is updated, and when `otl spec sync` pulls a newer
+  spec on your machine. The set of operations `otl api` exposes shifts for the same reason. Scripts that
+  need a stable interface should use a curated command; scripts that use `otl api` should pin a version
+  of `otl` and re-check on upgrade.
+- Diagnostic wording on stderr, including warning and error message text.
+- Which columns the generic table renderer picks, and how it lays them out.
+- Anything on disk that is a cache rather than configuration (the spec/IR cache and its format).
+
+### Exit codes
+
+Full detail, including which errors map to which code, is in
+[docs/exit-codes.md](docs/exit-codes.md) — the table there is the source of truth and this one is
+checked against it by `cargo test`, so the two cannot drift.
+
+<!-- BEGIN GENERATED EXIT CODES: regenerate with `UPDATE_README_EXIT_CODES=1 cargo test -p outline-cli --test readme_exit_codes` -->
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Generic failure |
+| 2 | Usage or configuration error |
+| 3 | API request rejected |
+| 4 | Authentication or permission error |
+| 5 | Resource not found |
+| 6 | Server error |
+| 7 | Network error |
+| 8 | Rate limited |
+
+<!-- END GENERATED EXIT CODES -->
+
+A closed stdout pipe is not a failure: `otl ... | head -1` exits **0**.
 
 ## Credential handling
 
@@ -94,7 +178,15 @@ cargo test --workspace                                  # unit, wiremock, golden
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 bash scripts/bench-startup.sh                           # asserts otl --help stays under 10ms
+bash scripts/check-binary-size.sh                       # asserts the shipped binary stays under 4 MiB
 ```
+
+Releasing is `git tag`: [`dist-workspace.toml`](dist-workspace.toml) is the single description of every
+distribution channel, and `.github/workflows/release.yml` is generated from it by
+[cargo-dist](https://axodotdev.github.io/cargo-dist) — edit the config and run `dist generate`, never the
+workflow. `release-guards.yml` runs the parts that can be checked before tagging: the binary-size budget
+on all three platforms (building the real musl target on Linux), `dist plan`, that the generated workflow
+is in sync, and that no updater artifact has crept into the release.
 
 CI runs the matrix on macOS, Linux, and Windows, guards the startup budget, and asserts that no
 YAML/OpenAPI parser ever enters the runtime dependency graph. Contract tests against a real workspace run
