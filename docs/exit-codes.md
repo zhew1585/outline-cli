@@ -8,13 +8,13 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 | Code | Meaning | Examples |
 |------|---------|----------|
 | 0 | Success | Command completed normally |
-| 1 | Generic failure | Invalid JSON in a response, unexpected internal error, HTTP status outside 4xx/5xx, failure writing to stdout other than a closed pipe |
-| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, invalid base URL, API key that cannot be sent as an HTTP header (e.g. it contains a newline), local parameter-validation failure (unknown/missing/complex parameter, value violating its schema facets, inexact number, oversized or invalid `--body` file, operation requiring a non-JSON body or a `oneOf`/`anyOf` request body) |
+| 1 | Generic failure | Invalid JSON in a response, unexpected internal error, HTTP status outside 4xx/5xx, failure writing to stdout other than a closed pipe, a fetched OpenAPI document that cannot be compiled, a spec cache that cannot be written or deleted, a fetched document that is too large or not UTF-8 |
+| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, invalid base URL, API key that cannot be sent as an HTTP header (e.g. it contains a newline), local parameter-validation failure (unknown/missing/complex parameter, value violating its schema facets, inexact number, oversized or invalid `--body` file, operation requiring a non-JSON body or a `oneOf`/`anyOf` request body), unusable `otl spec sync` source (a `--spec` file that is missing, unreadable, oversized or not a usable OpenAPI document; a `--url` that is not a plain `http`/`https` URL) |
 | 3 | API request rejected | 4xx other than auth, not-found, and exhausted rate limits: validation error (400), a 429 that was not retried to exhaustion |
 | 4 | Authentication or permission error | Invalid or expired API key (401), operation forbidden for this key (403) |
-| 5 | Resource not found | Unknown document, collection, or other resource (404) |
-| 6 | Server error | Outline instance failed to process the request (5xx) |
-| 7 | Network error | DNS failure, connection refused, TLS failure, request timeout, response body that times out or is cut mid-transfer |
+| 5 | Resource not found | Unknown document, collection, or other resource (404), spec document missing at its source URL (404) |
+| 6 | Server error | Outline instance failed to process the request (5xx), spec host failed to serve the document (5xx) |
+| 7 | Network error | DNS failure, connection refused, TLS failure, request timeout, response body that times out or is cut mid-transfer, unreachable spec source |
 | 8 | Rate limited | The server kept answering HTTP 429 until the retry budget was exhausted; retry later |
 
 Notes:
@@ -25,4 +25,6 @@ Notes:
 - `clap` usage errors (bad flags, missing subcommand) also exit with code 2.
 - API errors (codes 3-6) print the sanitized server-provided message on stderr, plus the machine-readable error code (e.g. `[validation_error]`) when the server sent one. For a `--body` request the free-form message is withheld (it may quote the request body, which can contain secrets) and only a shape-validated error code is printed; `--show-server-message` opts back in. The exit code is unaffected either way.
 - Network errors (code 7) and server errors (code 6) include a retry suggestion in the stderr message; only code 7 means the request may never have reached the server.
+- A spec cache that cannot be used is **not** an error: `otl` discards it, falls back to the spec compiled into the binary, prints one warning on stderr naming the remedy, and the command's exit code is whatever it would have been anyway. This covers a damaged, truncated, foreign or version-mismatched cache file - a bad cache must never make the CLI unusable. `otl spec reset` (exit 0 whether or not a cache existed) is the explicit way to drop it.
+- `otl spec sync` classifies an unusable document by who chose it: a `--spec` file the user named is a usage error (code 2), like an invalid `--body` file, while a document fetched from a URL is a failure of that source (code 1). Transport and HTTP failures while fetching map to the same codes as any other request (7, 5, 6, 3).
 - Rate limiting has two outcomes: a 429 the retry budget absorbed succeeds normally, and a 429 that outlasted the budget exits **8**. Code 3 remains for any 429 surfaced without exhausting retries.
