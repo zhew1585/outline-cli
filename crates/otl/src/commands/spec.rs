@@ -14,6 +14,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -34,6 +36,10 @@ use crate::stdio;
 /// Longer than an API call: this is a several-megabyte document from a
 /// CDN, on a command the user is watching.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a `--spec` open may take before it is treated as a file that
+/// cannot be read. Generous: it only has to outlast a slow disk.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest list of changed operation names printed in human output.
 const MAX_LISTED_CHANGES: usize = 8;
@@ -193,6 +199,13 @@ fn read_local(path: &Path) -> Result<String, CliError> {
 /// FIFO blocks until a writer appears and no read cap can interrupt that;
 /// after, through the open handle, so a path swapped between the two calls
 /// cannot slip something else past the first check.
+///
+/// The open itself runs under a watchdog, because those two checks leave a
+/// window: a path that is a regular file when it is examined and a FIFO
+/// when it is opened would block forever, and the handle check would never
+/// get to run. A blocking open is reported as an error instead. (The
+/// alternative, `O_NONBLOCK`, needs a platform-specific flag value and
+/// therefore a `libc` dependency for one call.)
 fn open_regular(path: &Path) -> Result<fs::File, CliError> {
     let not_regular = || {
         CliError::usage(anyhow!(
@@ -211,7 +224,7 @@ fn open_regular(path: &Path) -> Result<fs::File, CliError> {
     if metadata.len() > MAX_DOCUMENT_BYTES {
         return Err(too_large(path));
     }
-    let file = fs::File::open(path).map_err(|error| read_error(path, error))?;
+    let file = open_with_timeout(path, OPEN_TIMEOUT)?;
     let opened = file.metadata().map_err(|error| read_error(path, error))?;
     if !opened.is_file() {
         return Err(not_regular());
@@ -220,6 +233,32 @@ fn open_regular(path: &Path) -> Result<fs::File, CliError> {
         return Err(too_large(path));
     }
     Ok(file)
+}
+
+/// Open a file, giving up if the open itself does not return in time.
+///
+/// The open runs on another thread and the result comes back over a
+/// channel. If it never arrives the thread stays blocked in the kernel,
+/// which is harmless: the process is about to exit with an error, and
+/// exiting tears the thread down.
+fn open_with_timeout(path: &Path, timeout: Duration) -> Result<fs::File, CliError> {
+    let (sender, receiver) = mpsc::channel();
+    let owned = path.to_path_buf();
+    thread::spawn(move || {
+        // The receiver may already be gone (we timed out); ignore that.
+        let _ = sender.send(fs::File::open(owned));
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(file)) => Ok(file),
+        Ok(Err(error)) => Err(read_error(path, error)),
+        Err(_) => Err(CliError::usage(anyhow!(
+            "opening the spec file {} did not complete within {} seconds; it \
+             is not a plain readable file (a pipe with no writer blocks \
+             forever, and so can an unresponsive network filesystem)",
+            path.display(),
+            timeout.as_secs()
+        ))),
+    }
 }
 
 /// A filesystem failure on the `--spec` path, reduced to its error kind.
@@ -432,6 +471,40 @@ mod tests {
             compile_error("not JSON", Source::Remote).code,
             ExitCode::Failure
         );
+    }
+
+    /// The watchdog is what closes the window between the file-type check
+    /// and the open. Tested directly, because the pre-check means the race
+    /// cannot be provoked through the normal path.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_that_blocks_is_reported_instead_of_hanging() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let fifo = dir.path().join("blocking.pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success());
+
+        let started = std::time::Instant::now();
+        let error = open_with_timeout(&fifo, Duration::from_millis(200))
+            .expect_err("a pipe with no writer must not open");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "did not give up"
+        );
+        assert!(
+            error.to_string().contains("did not complete"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_normal_file_opens_through_the_watchdog() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut file, b"{}").expect("write");
+        assert!(open_with_timeout(file.path(), Duration::from_secs(5)).is_ok());
     }
 
     #[test]

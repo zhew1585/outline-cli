@@ -195,27 +195,186 @@ fn allowlisted_files_all_exist() {
     }
 }
 
+/// HTTP clients and TLS backends that must not appear anywhere in the
+/// dependency graph. `hyper` and `rustls` are deliberately absent from the
+/// list: they are reqwest's own.
+const FORBIDDEN_CRATES: &[&str] = &[
+    "ureq",
+    "curl",
+    "isahc",
+    "attohttpc",
+    "surf",
+    "minreq",
+    "native-tls",
+    "openssl",
+    "openssl-sys",
+];
+
 /// No new dependency may bring a second HTTP stack or TLS client in
 /// through the back door, which would make the source rules above moot.
+///
+/// Every manifest in the workspace is checked, not just the root one - a
+/// member crate can declare its own dependencies - and so is `Cargo.lock`,
+/// which is where anything that actually got resolved shows up, including
+/// transitively.
 #[test]
-fn no_second_http_stack_is_declared() {
-    let manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml")).unwrap();
-    for forbidden in [
-        "ureq",
-        "curl",
-        "hyper =",
-        "isahc",
-        "attohttpc",
-        "surf",
-        "native-tls",
-        "openssl",
-    ] {
+fn no_second_http_stack_reaches_the_dependency_graph() {
+    let root = workspace_root();
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+        let manifest = entry.unwrap().path().join("Cargo.toml");
+        if manifest.is_file() {
+            manifests.push(manifest);
+        }
+    }
+    assert!(manifests.len() >= 4, "found only {manifests:?}");
+    for manifest in &manifests {
+        let text = std::fs::read_to_string(manifest).unwrap();
+        for forbidden in FORBIDDEN_CRATES {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden:?} appears in {}: a second HTTP/TLS stack would \
+                 sidestep the single-channel rule",
+                manifest.display()
+            );
+        }
+    }
+
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    for forbidden in FORBIDDEN_CRATES {
         assert!(
-            !manifest.contains(forbidden),
-            "{forbidden:?} appears in the workspace manifest: a second HTTP/TLS \
-             stack would sidestep the single-channel rule"
+            !lock.contains(&format!("name = \"{forbidden}\"")),
+            "{forbidden:?} is in Cargo.lock: something pulled a second \
+             HTTP/TLS stack into the graph"
         );
     }
+}
+
+/// One request-sending call per channel, and no more.
+///
+/// A file-wide allowlist cannot express "this module makes exactly one
+/// request": a second `.send()`, or a call into the OTHER channel, would
+/// pass it. Counting per file does, and it is the invariant the
+/// single-channel rule actually rests on.
+#[test]
+fn each_channel_has_exactly_one_send() {
+    for (file, expected) in [
+        ("crates/engine/src/client.rs", 1),
+        ("crates/engine/src/fetch.rs", 1),
+    ] {
+        let source = std::fs::read_to_string(workspace_root().join(file)).unwrap();
+        let sends = source
+            .lines()
+            // Skip doc comments: they discuss the rule.
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(".send()"))
+            .count();
+        assert_eq!(
+            sends, expected,
+            "{file} has {sends} `.send()` calls, expected {expected}: each \
+             channel must have exactly one place where a request is made"
+        );
+    }
+}
+
+/// The two channels may not call each other.
+///
+/// The document channel must not reach for the credential-carrying client
+/// (that would send the bearer token to a document host, the very thing
+/// the split exists to prevent), and the RPC channel must not fetch
+/// documents.
+#[test]
+fn the_two_channels_do_not_compose() {
+    // Code only: the doc comments in both files discuss the other channel
+    // on purpose, which is how the split stays explained.
+    let code = |file: &str| -> String {
+        std::fs::read_to_string(workspace_root().join(file))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let fetch = code("crates/engine/src/fetch.rs");
+    // Note: `reqwest::blocking::Client` is not the engine's client; the
+    // needles below name the engine's own type and module.
+    for forbidden in [
+        "crate::client",
+        "client::Client",
+        "crate::Client",
+        "execute(",
+    ] {
+        assert!(
+            !fetch.contains(forbidden),
+            "{forbidden:?} in fetch.rs: the document channel must not use the \
+             credential-carrying client"
+        );
+    }
+    let client = code("crates/engine/src/client.rs");
+    for forbidden in ["crate::fetch", "fetch::", "DocumentFetch", "get_text"] {
+        assert!(
+            !client.contains(forbidden),
+            "{forbidden:?} in client.rs: the RPC channel must not fetch documents"
+        );
+    }
+}
+
+/// The document channel's public surface is pinned.
+///
+/// This is what closes the "add a new entry point inside an allowlisted
+/// file" route: a new `pub fn` there is a new way to make a request, and
+/// it has to be added here deliberately - which is exactly the review this
+/// module is standing in for.
+#[test]
+fn the_document_channel_exports_only_what_is_reviewed() {
+    const EXPECTED: &[&str] = &[
+        "pub const MAX_DOCUMENT_BYTES",
+        "pub enum FetchError",
+        "pub struct DocumentFetch",
+        "pub fn new",
+        "pub fn with_retry_policy",
+        "pub fn with_throttle",
+        "pub fn with_max_bytes",
+        "pub fn get_text",
+        "pub fn fetch_document",
+        "pub fn document_origin",
+    ];
+    let source =
+        std::fs::read_to_string(workspace_root().join("crates/engine/src/fetch.rs")).unwrap();
+    let exported: Vec<String> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub "))
+        // Struct/enum FIELDS are `pub` too but are not entry points.
+        .filter(|line| {
+            line.starts_with("pub fn")
+                || line.starts_with("pub const")
+                || line.starts_with("pub struct")
+                || line.starts_with("pub enum")
+        })
+        .map(|line| {
+            let end = line
+                .find(['(', ':', '<', ' ', '{'].as_ref())
+                .unwrap_or(line.len());
+            let name_end = line[end..]
+                .find(['(', ':', '<', '{'].as_ref())
+                .map_or(line.len(), |offset| end + offset);
+            line[..name_end].trim().to_string()
+        })
+        .collect();
+    for item in &exported {
+        assert!(
+            EXPECTED.iter().any(|expected| item.starts_with(expected)),
+            "fetch.rs exports {item:?}, which is not in the reviewed list: a \
+             new public item in the document channel is a new way to make a \
+             request"
+        );
+    }
+    assert!(
+        exported.len() >= EXPECTED.len(),
+        "expected at least {} exports, found {exported:?}",
+        EXPECTED.len()
+    );
 }
 
 /// A local command must not need the network at all. Both proxy variables

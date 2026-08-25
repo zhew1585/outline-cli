@@ -201,21 +201,42 @@ const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
     },
 ];
 
-/// Patterns that must not appear in a runtime source at all, because the
-/// runtime has no data file of its own to read. Kept separate from the
-/// spec-specific list above so an exception for one cannot widen another.
-const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[(
-    "read_to_string",
-    "reading a file by name; only the `--spec` path the user typed and the \
-     IR cache are read at runtime",
-)];
+/// Ways to get at a file's contents. None of them may appear in a runtime
+/// source outside [`FILE_READ_ALLOWLIST`].
+///
+/// This is the rule that makes the literal-string rules above hard to
+/// dodge. A path can always be assembled out of pieces
+/// (`["spec/spec3", ".json"].concat()`), so no amount of substring
+/// matching on path literals is conclusive - but a read still has to go
+/// through one of these, and there are only so many of them. Whoever needs
+/// a new one has to add it here and say why, which is the review this
+/// module stands in for.
+const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
+    ("read_to_string", "reading a file by name"),
+    ("File::open", "opening a file by name"),
+    ("OpenOptions", "opening a file by name"),
+    ("fs::read", "reading a file by name"),
+    // `read_to_end`/`read` on an already-open handle are deliberately NOT
+    // here: they are how a response body is read, and getting a FILE handle
+    // to use them on requires one of the patterns above.
+    ("read_dir", "enumerating a directory to find a file"),
+    ("include_str!", "embedding a file at compile time"),
+    ("include_bytes!", "embedding a file at compile time"),
+];
 
 /// Files allowed to read a file at runtime, with the reason.
+///
+/// All three read a path the USER supplied on the command line, or a file
+/// this process itself wrote. None of them can reach the vendored spec:
+/// that would need a path derived from the build, which
+/// `manifest_dir_absent_from_release_binary` forbids.
 const FILE_READ_ALLOWLIST: &[&str] = &[
     // The `--spec <PATH>` document, named by the user on the command line.
     "crates/otl/src/commands/spec.rs",
     // The `--body @file.json` request body, likewise user-named (Story 1.3).
     "crates/otl/src/commands/api.rs",
+    // The IR cache, written by this process into its own cache directory.
+    "crates/otl/src/spec/cache.rs",
 ];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
