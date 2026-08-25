@@ -9,8 +9,8 @@ single-digit milliseconds.
 
 > **Status: work in progress.** The engine (Epic 1) is complete: authentication with an API key, the
 > generic `otl api` escape hatch, schema validation, dual-state output, auto-pagination, and rate-limit
-> backoff. OAuth login, the six polished day-to-day commands, and multi-workspace profiles are next.
-> Command surfaces may still change before 1.0.
+> backoff. Multi-workspace profiles and shell completions are in place too. OAuth login and the six
+> polished day-to-day commands are next. Command surfaces may still change before 1.0.
 
 ## Install
 
@@ -57,7 +57,9 @@ implemented exactly once. There is one `.send()` call in the whole crate.
 contains neither the spec file nor its path, which a test asserts against the built artifact.
 
 **Output is two-state.** Data goes to stdout, diagnostics to stderr, always. On a terminal you get a
-table with columns picked from the data and widths measured in grapheme clusters; piped or with
+table whose columns come from the operation's response schema — one generic policy over the schema's own
+facets (identity, writable label, timestamps), so the same operation always renders the same columns and
+no endpoint has rendering code of its own — with widths measured in grapheme clusters; piped or with
 `--json`, you get raw JSON for `jq`. A reader that closes the pipe early (`otl ... | head -1`) is normal
 completion, not a crash.
 
@@ -67,6 +69,49 @@ ceiling, an exhausted offset space — produces an explicit stderr warning, and 
 
 **Exit codes are a public API.** See [docs/exit-codes.md](docs/exit-codes.md). Published codes never
 change meaning.
+
+## Configuration and profiles
+
+Configuration comes from three layers, resolved **flag > environment > user config file, key by key** —
+an `OUTLINE_URL` in the environment does not discard the rest of the selected profile:
+
+```toml
+# config.toml in your config directory (~/.config/outline-cli on Linux,
+# ~/Library/Application Support/outline-cli on macOS,
+# %APPDATA%\outline-cli\config on Windows). `otl --config FILE` overrides it.
+default_profile = "work"
+
+[profiles.work]
+url = "https://outline.example.com"
+auth = "api-key"                      # "oauth" arrives with `otl auth login`
+
+[profiles.personal]
+url = "https://notes.example.net"
+```
+
+```sh
+otl --profile personal api documents.list     # or: OUTLINE_PROFILE=personal
+otl --url https://other.example.com api auth.info
+OUTLINE_CONFIG= otl api auth.info             # empty value: ignore the config file entirely
+```
+
+The config file holds no secrets, by construction: an `api_key` or `token` key anywhere in it is a hard
+error pointing at `credentials.toml`. A missing config file is not an error — the environment-only path
+works on a fresh machine — but a file named explicitly with `--config`/`OUTLINE_CONFIG` must exist, and
+an unknown key, an unknown profile, or malformed TOML fails with exit code 2 before any request. Parse
+errors report a location and a kind, never a quoted line, so a secret wrongly placed in the file is not
+echoed back.
+
+## Shell completions
+
+```sh
+otl completions zsh > ~/.zfunc/_otl          # bash, zsh, fish, powershell, elvish
+```
+
+Candidates are generated from the same command tree the binary parses with, so subcommands and flags can
+never drift from the build; `otl api` operation names come from the compiled IR table. bash, zsh and fish
+complete operation names; powershell and elvish get subcommands and flags only, because their upstream
+generators emit no candidates for positional arguments.
 
 ## Credential handling
 
