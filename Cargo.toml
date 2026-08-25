@@ -25,6 +25,9 @@ clap = { version = "4.6", features = ["derive"] }
 # Terminal column width of a string is not its char count (CJK is 2
 # columns wide, combining marks 0); table alignment depends on this.
 unicode-width = "0.2"
+# Emoji ligatures (ZWJ sequences, skin-tone modifiers) are one grapheme
+# cluster of width 2, not the sum of their codepoints' widths.
+unicode-segmentation = "1.12"
 
 # dev / test
 wiremock = "0.6"

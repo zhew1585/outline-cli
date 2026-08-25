@@ -240,6 +240,97 @@ fn table_aligns_cjk_emoji_and_combining_characters() {
     );
 }
 
+/// Display width of a string, measured per grapheme cluster (the only way
+/// emoji ligature widths come out right).
+fn cluster_width(text: &str) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+#[test]
+fn table_aligns_emoji_ligatures() {
+    // Re-review PoC: per-codepoint width sums are wrong for ligatures -
+    // skin-tone modifiers, ZWJ sequences and family emoji all render as 2
+    // columns but sum to 4-8 per codepoint. Every row's last column must
+    // still start at the same display column.
+    let payload = json!([
+        { "id": "1", "title": "\u{1f600}", "updatedAt": "2026-08-01" },
+        { "id": "2", "title": "\u{1f44d}\u{1f3fd}", "updatedAt": "2026-08-02" },
+        { "id": "3", "title": "\u{1f469}\u{200d}\u{1f4bb}", "updatedAt": "2026-08-03" },
+        {
+            "id": "4",
+            "title": "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+            "updatedAt": "2026-08-04"
+        }
+    ]);
+    assert_golden(&payload, OutputMode::Table, "table_emoji.txt");
+
+    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let starts: Vec<usize> = rendered
+        .lines()
+        .map(|line| {
+            let last = line.rsplit("  ").next().unwrap_or("");
+            cluster_width(&line[..line.len() - last.len()])
+        })
+        .collect();
+    assert!(
+        starts.windows(2).all(|pair| pair[0] == pair[1]),
+        "columns misaligned: {starts:?} in\n{rendered}"
+    );
+}
+
+#[test]
+fn table_never_splits_a_grapheme_cluster() {
+    // A long run of ZWJ sequences must be cut between clusters, never
+    // inside one (which would emit a mangled fragment).
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    let payload = json!([{ "id": "1", "title": family.repeat(40) }]);
+    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let cell = rendered.lines().nth(1).unwrap();
+    // Every emoji present must appear as a whole family cluster: no bare
+    // ZWJ at a cut point, and no dangling joiner before the ellipsis.
+    assert!(
+        !cell.contains("\u{200d}\u{2026}"),
+        "cut inside cluster: {cell:?}"
+    );
+    assert!(!cell.ends_with('\u{200d}'), "dangling joiner: {cell:?}");
+    assert!(rendered.contains('\u{2026}'), "not truncated: {rendered:?}");
+}
+
+#[test]
+fn table_caps_zero_width_codepoint_floods() {
+    // Re-review PoC: 100k combining accents are one grapheme cluster of
+    // display width 1, so a width-only cap lets a cell carry ~200 KB.
+    // Absolute cluster and codepoint caps must bound it.
+    let flood = format!("a{}", "\u{301}".repeat(100_000));
+    let payload = json!([{ "id": "1", "title": flood, "updatedAt": "2026-08-01" }]);
+    let rendered = render(&payload, OutputMode::Table).unwrap();
+    assert!(
+        rendered.len() < 4_000,
+        "output not bounded: {} bytes",
+        rendered.len()
+    );
+    assert!(rendered.contains('\u{2026}'), "not truncated: {rendered:?}");
+    // Rows stay aligned even after the flood is cut.
+    assert!(rendered.contains("2026-08-01"), "row lost: {rendered:?}");
+}
+
+#[test]
+fn table_caps_many_zero_width_clusters() {
+    // The same flood spread over many clusters (each accent on its own
+    // base character) must be bounded too.
+    let flood = "a\u{301}".repeat(100_000);
+    let payload = json!([{ "id": "1", "title": flood }]);
+    let rendered = render(&payload, OutputMode::Table).unwrap();
+    assert!(
+        rendered.len() < 4_000,
+        "output not bounded: {} bytes",
+        rendered.len()
+    );
+    assert!(rendered.contains('\u{2026}'), "not truncated: {rendered:?}");
+}
+
 #[test]
 fn table_truncates_wide_characters_by_display_width() {
     // 40 CJK characters are 80 columns wide; truncation must cut to the

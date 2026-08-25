@@ -14,15 +14,27 @@
 //! [`OutputMode::Table`] so that non-TTY output stays decoration-free.
 
 use serde_json::Value;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Maximum number of columns shown in a table.
 const MAX_TABLE_COLUMNS: usize = 4;
 /// Maximum terminal width (in columns, not characters) of one table cell,
 /// including the truncation marker.
 const MAX_CELL_WIDTH: usize = 40;
+/// Maximum number of grapheme clusters kept in one table cell.
+///
+/// Display width alone is not a resource bound: zero-width codepoints
+/// (combining marks, joiners) let a visually tiny cell carry an unbounded
+/// number of them.
+const MAX_CELL_CLUSTERS: usize = 200;
+/// Maximum number of codepoints kept in one table cell.
+///
+/// A single grapheme cluster can absorb an unlimited number of combining
+/// marks, so a cluster count is not a resource bound on its own either.
+const MAX_CELL_CHARS: usize = 400;
 /// Marker appended to truncated cells.
-const TRUNCATION_MARK: char = '\u{2026}'; // …
+const TRUNCATION_MARK: &str = "\u{2026}"; // …
 /// Gap between table columns.
 const COLUMN_GAP: &str = "  ";
 /// Placeholder printed for an empty list in table mode.
@@ -156,45 +168,66 @@ fn cell_text(value: Option<&Value>) -> String {
 }
 
 /// Replace control characters (ANSI escapes, newlines, tabs) with spaces
-/// and truncate to [`MAX_CELL_WIDTH`] terminal columns.
+/// and truncate the cell to fit every cell limit.
 ///
-/// Truncation counts display width, not characters, so a cell of CJK text
-/// occupies the same number of columns as an ASCII one; it always cuts on a
-/// character boundary.
+/// Truncation works on GRAPHEME CLUSTERS, never on codepoints: an emoji
+/// ligature (skin-tone modifier, ZWJ sequence, family emoji) is one cluster
+/// two columns wide, whose codepoint widths sum to far more, and splitting
+/// it would emit a mangled fragment.
+///
+/// Three independent limits apply, and whichever trips first truncates:
+/// display width ([`MAX_CELL_WIDTH`]), cluster count
+/// ([`MAX_CELL_CLUSTERS`]) and codepoint count ([`MAX_CELL_CHARS`]). Width
+/// alone bounds neither the terminal's work nor our output size, because
+/// zero-width codepoints are free in width terms.
 fn sanitize_cell(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    if display_width(&cleaned) <= MAX_CELL_WIDTH {
+    if fits_cell(&cleaned) {
         return cleaned;
     }
-    let budget = MAX_CELL_WIDTH.saturating_sub(char_display_width(TRUNCATION_MARK));
+
+    let width_budget = MAX_CELL_WIDTH.saturating_sub(display_width_of(TRUNCATION_MARK));
     let mut truncated = String::new();
     let mut width = 0;
-    for c in cleaned.chars() {
-        let next = width + char_display_width(c);
-        if next > budget {
+    let mut chars = 0;
+    for (index, cluster) in cleaned.graphemes(true).enumerate() {
+        let next_width = width + display_width_of(cluster);
+        let next_chars = chars + cluster.chars().count();
+        if next_width > width_budget
+            || index + 1 >= MAX_CELL_CLUSTERS
+            || next_chars > MAX_CELL_CHARS
+        {
             break;
         }
-        truncated.push(c);
-        width = next;
+        truncated.push_str(cluster);
+        width = next_width;
+        chars = next_chars;
     }
-    truncated.push(TRUNCATION_MARK);
+    truncated.push_str(TRUNCATION_MARK);
     truncated
 }
 
-/// Terminal column width of a string.
-fn display_width(text: &str) -> usize {
-    text.chars().map(char_display_width).sum()
+/// Whether a cell needs no truncation.
+fn fits_cell(text: &str) -> bool {
+    display_width(text) <= MAX_CELL_WIDTH
+        && text.graphemes(true).count() <= MAX_CELL_CLUSTERS
+        && text.chars().count() <= MAX_CELL_CHARS
 }
 
-/// Terminal column width of one character.
+/// Terminal column width of a string, summed over grapheme clusters.
 ///
-/// Unassigned/unknown characters are counted as one column, which keeps
-/// alignment sane for text the width tables do not cover.
-fn char_display_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(1)
+/// Per-codepoint sums are wrong for emoji ligatures: `UnicodeWidthStr`'s
+/// rules only hold when applied to a whole cluster.
+fn display_width(text: &str) -> usize {
+    text.graphemes(true).map(display_width_of).sum()
+}
+
+/// Terminal column width of one grapheme cluster.
+fn display_width_of(cluster: &str) -> usize {
+    UnicodeWidthStr::width(cluster)
 }
 
 /// Lay out header and body cells with padded, gap-separated columns.
