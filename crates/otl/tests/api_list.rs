@@ -62,6 +62,29 @@ fn api_list_includes_known_operation_with_summary() {
 }
 
 #[test]
+fn api_list_flags_operations_that_are_not_callable() {
+    // documents.import needs multipart/form-data: it is still listed, but
+    // flagged so nobody scripts against it expecting a JSON call.
+    let output = otl().args(["api", "list"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("documents.import\t"))
+        .expect("documents.import missing from listing");
+    assert!(
+        line.contains("multipart/form-data"),
+        "unflagged line: {line}"
+    );
+    assert!(line.contains("not callable"), "unflagged line: {line}");
+    // Ordinary operations carry no flag.
+    let info = stdout
+        .lines()
+        .find(|line| line.starts_with("documents.info\t"))
+        .expect("documents.info missing");
+    assert!(!info.contains("not callable"), "false flag: {info}");
+}
+
+#[test]
 fn api_list_rejects_extra_arguments() {
     otl()
         .args(["api", "list", "id=x"])

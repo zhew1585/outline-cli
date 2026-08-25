@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use engine::ParamType;
+use engine::{BodyMode, ParamType};
 use otl::ops;
 use serde_json::Value;
 
@@ -161,17 +161,113 @@ fn ref_and_all_of_wrapped_scalars_resolve_to_scalar_types() {
 }
 
 #[test]
-fn one_of_required_branches_do_not_leak_into_required() {
-    // shares.create constrains via top-level oneOf(required: documentId |
-    // required: collectionId); neither may be marked unconditionally
-    // required, but both properties must exist as string params.
+fn root_level_one_of_marks_the_operation_raw_body_only() {
+    // shares.create constrains via a root-level oneOf(required: documentId
+    // | required: collectionId): exactly one of the two must be present, a
+    // rule key=value assembly cannot express. The operation is therefore
+    // compiled as raw-body-only, with both properties still described.
     let op = ops::find("shares.create").unwrap();
-    let document_id = op.param("documentId").unwrap();
-    assert_eq!(document_id.ty, ParamType::String);
-    assert!(!document_id.required);
-    let collection_id = op.param("collectionId").unwrap();
-    assert_eq!(collection_id.ty, ParamType::String);
-    assert!(!collection_id.required);
+    assert_eq!(op.body_mode, BodyMode::RawJsonOnly);
+    assert_eq!(op.param("documentId").unwrap().ty, ParamType::String);
+    assert_eq!(op.param("collectionId").unwrap().ty, ParamType::String);
+}
+
+#[test]
+fn only_root_level_unions_are_raw_body_only() {
+    // A oneOf nested inside a property (e.g. documents.list `filters`)
+    // must not make the whole operation raw-body-only.
+    assert_eq!(
+        ops::find("documents.list").unwrap().body_mode,
+        BodyMode::KeyValue
+    );
+    let raw_only: Vec<&str> = ops::OPS
+        .iter()
+        .filter(|op| op.body_mode == BodyMode::RawJsonOnly)
+        .map(|op| op.name.as_ref())
+        .collect();
+    assert_eq!(raw_only, vec!["shares.create"]);
+}
+
+#[test]
+fn non_json_request_bodies_are_marked_unsupported() {
+    // documents.import only accepts multipart/form-data, which the generic
+    // engine cannot assemble; it must be marked, not silently callable.
+    let op = ops::find("documents.import").unwrap();
+    assert_eq!(op.body_mode, BodyMode::Unsupported);
+    assert_eq!(op.content_type.as_ref(), "multipart/form-data");
+    assert!(op.params.is_empty(), "no params for an unsupported body");
+
+    let unsupported: Vec<&str> = ops::OPS
+        .iter()
+        .filter(|op| op.body_mode == BodyMode::Unsupported)
+        .map(|op| op.name.as_ref())
+        .collect();
+    assert_eq!(unsupported, vec!["documents.import"]);
+}
+
+#[test]
+fn json_and_bodyless_operations_carry_the_expected_content_type() {
+    for op in ops::OPS {
+        match op.body_mode {
+            BodyMode::Unsupported => assert_ne!(op.content_type.as_ref(), "application/json"),
+            _ => assert!(
+                op.content_type.as_ref() == "application/json" || op.content_type.is_empty(),
+                "{} has content type {:?}",
+                op.name,
+                op.content_type
+            ),
+        }
+    }
+    // Operations without any request body carry no content type.
+    assert!(ops::find("auth.info").unwrap().content_type.is_empty());
+}
+
+#[test]
+fn enum_variants_are_compiled_into_the_ir() {
+    let op = ops::find("accessRequests.approve").unwrap();
+    let permission = op.param("permission").unwrap();
+    assert_eq!(
+        permission.enum_values.as_ref(),
+        ["read", "read_write", "admin"]
+    );
+    // Enums reached through allOf/$ref wrappers are compiled too.
+    let create = ops::find("collections.create").unwrap();
+    assert_eq!(
+        create.param("permission").unwrap().enum_values.as_ref(),
+        ["read", "read_write"]
+    );
+    // A plain string param has no enum constraint.
+    assert!(op.param("id").unwrap().enum_values.is_empty());
+}
+
+#[test]
+fn nullable_params_are_flagged() {
+    let op = ops::find("documents.update").unwrap();
+    assert!(op.param("collectionId").unwrap().nullable);
+    assert!(op.param("icon").unwrap().nullable);
+    assert!(!op.param("id").unwrap().nullable);
+    assert!(!op.param("title").unwrap().nullable);
+}
+
+#[test]
+fn numeric_bounds_are_compiled_into_the_ir() {
+    let size = ops::find("attachments.create")
+        .unwrap()
+        .param("size")
+        .unwrap();
+    assert_eq!(size.minimum, Some(0.0));
+    assert_eq!(size.maximum, None);
+    let revision = ops::find("documents.update")
+        .unwrap()
+        .param("lastRevision")
+        .unwrap();
+    assert_eq!(revision.minimum, Some(0.0));
+    // An unbounded number carries no bounds.
+    let limit = ops::find("documents.search")
+        .unwrap()
+        .param("limit")
+        .unwrap();
+    assert_eq!((limit.minimum, limit.maximum), (None, None));
 }
 
 #[test]

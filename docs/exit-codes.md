@@ -9,7 +9,7 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 |------|---------|----------|
 | 0 | Success | Command completed normally |
 | 1 | Generic failure | Network/transport error, server-side API error, unexpected internal error |
-| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, missing `OUTLINE_URL` / `OUTLINE_API_KEY` |
+| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, local parameter-validation failure (unknown/missing/complex parameter, value violating its schema, oversized or invalid `--body` file, operation requiring a non-JSON body) |
 
 Notes:
 

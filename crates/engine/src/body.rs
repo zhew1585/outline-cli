@@ -2,22 +2,39 @@
 //!
 //! This is the local-validation half of the single request channel: every
 //! `key=value` invocation flows through [`build_request_body`] before any
-//! network activity, so unknown parameters, missing required parameters,
-//! complex parameters, and malformed scalar values are all rejected
-//! without a request being sent.
+//! network activity, so operations that cannot be called generically,
+//! unknown parameters, missing required parameters, complex parameters,
+//! and values violating their schema facets are all rejected without a
+//! request being sent.
 
-use serde_json::{Map, Number, Value};
+use std::borrow::Cow;
+
+use serde_json::{Map, Value};
 
 use crate::error::EngineError;
-use crate::ir::{OpSpec, ParamSpec, ParamType};
+use crate::ir::{BodyMode, OpSpec, ParamSpec, ParamType};
+use crate::scalar;
+
+/// Minimum length of a request-body string value considered sensitive.
+///
+/// Shorter values (ids, short flags, single words) are left alone so that
+/// redaction cannot swallow whole server messages.
+pub const MIN_SENSITIVE_VALUE_CHARS: usize = 8;
 
 /// Assemble and validate the JSON request body for `op` from raw
 /// `key=value` pairs.
 ///
 /// Scalar values are coerced to their declared wire type (native JSON
-/// integers/booleans/numbers, never strings-in-disguise). Purely local:
-/// never touches the network.
+/// integers/booleans/numbers, never strings-in-disguise) and checked
+/// against the schema facets carried by the IR. Purely local: never
+/// touches the network.
 pub fn build_request_body(op: &OpSpec, args: &[(String, String)]) -> Result<Value, EngineError> {
+    ensure_dispatchable(op)?;
+    if op.body_mode == BodyMode::RawJsonOnly {
+        return Err(EngineError::UnionBody {
+            operation: op.name.to_string(),
+        });
+    }
     let mut body = Map::new();
     for (key, raw) in args {
         let param = op.param(key).ok_or_else(|| unknown_param(op, key))?;
@@ -27,7 +44,7 @@ pub fn build_request_body(op: &OpSpec, args: &[(String, String)]) -> Result<Valu
                 reason: "parameter given more than once".to_string(),
             });
         }
-        body.insert(key.clone(), coerce_scalar(op, param, raw)?);
+        body.insert(key.clone(), typed_value(op, param, raw)?);
     }
     if let Some(missing) = first_missing_required(op, &body) {
         return Err(EngineError::MissingParam {
@@ -39,6 +56,44 @@ pub fn build_request_body(op: &OpSpec, args: &[(String, String)]) -> Result<Valu
     Ok(Value::Object(body))
 }
 
+/// Reject operations this generic client cannot call at all.
+///
+/// Applies to both `key=value` and raw-body requests: a non-JSON content
+/// type cannot be produced from either.
+pub(crate) fn ensure_dispatchable(op: &OpSpec) -> Result<(), EngineError> {
+    if op.body_mode == BodyMode::Unsupported {
+        return Err(EngineError::UnsupportedBodyType {
+            operation: op.name.to_string(),
+            content_type: op.content_type.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Collect the string leaves of a request body that are long enough to be
+/// treated as potentially sensitive.
+///
+/// Used to redact caller-supplied secrets that a server (or proxy) echoes
+/// back in an error response.
+pub(crate) fn sensitive_values(body: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_sensitive(body, &mut found);
+    found
+}
+
+fn collect_sensitive(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::String(text) if text.chars().count() >= MIN_SENSITIVE_VALUE_CHARS => {
+            found.push(text.clone());
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_sensitive(item, found)),
+        Value::Object(entries) => entries
+            .values()
+            .for_each(|entry| collect_sensitive(entry, found)),
+        _ => {}
+    }
+}
+
 /// The first required parameter not present in the assembled body, if any.
 fn first_missing_required<'a>(op: &'a OpSpec, body: &Map<String, Value>) -> Option<&'a ParamSpec> {
     op.params
@@ -47,6 +102,9 @@ fn first_missing_required<'a>(op: &'a OpSpec, body: &Map<String, Value>) -> Opti
 }
 
 /// Build the error for an argument that names no parameter of `op`.
+///
+/// Deliberately carries the key only, never the value: a mistyped key can
+/// still be paired with a secret.
 fn unknown_param(op: &OpSpec, key: &str) -> EngineError {
     let valid = if op.params.is_empty() {
         "this operation takes no key=value parameters".to_string()
@@ -61,35 +119,62 @@ fn unknown_param(op: &OpSpec, key: &str) -> EngineError {
     }
 }
 
-/// Coerce one raw CLI value to the parameter's declared scalar type.
-///
-/// Complex (`Json`) parameters are rejected outright: they cannot be
-/// expressed as a scalar `key=value` argument.
-fn coerce_scalar(op: &OpSpec, param: &ParamSpec, raw: &str) -> Result<Value, EngineError> {
-    let invalid = |reason: &str| EngineError::InvalidParamValue {
-        name: param.name.to_string(),
-        reason: reason.to_string(),
-    };
-    match param.ty {
-        ParamType::String => Ok(Value::String(raw.to_string())),
-        ParamType::Integer => raw
-            .parse::<i64>()
-            .map(Value::from)
-            .map_err(|_| invalid("expected an integer")),
-        ParamType::Boolean => match raw {
-            "true" => Ok(Value::Bool(true)),
-            "false" => Ok(Value::Bool(false)),
-            _ => Err(invalid("expected a boolean (true or false)")),
-        },
-        ParamType::Number => raw
-            .parse::<f64>()
-            .ok()
-            .and_then(Number::from_f64)
-            .map(Value::Number)
-            .ok_or_else(|| invalid("expected a finite number")),
-        ParamType::Json => Err(EngineError::ComplexParam {
+/// Coerce one raw value and check it against the parameter's facets.
+fn typed_value(op: &OpSpec, param: &ParamSpec, raw: &str) -> Result<Value, EngineError> {
+    // Clearing a nullable field is expressible as key=value whatever the
+    // parameter's type, so this precedes the complex-type rejection.
+    if scalar::is_null_literal(param, raw) {
+        return Ok(Value::Null);
+    }
+    if param.ty == ParamType::Json {
+        return Err(EngineError::ComplexParam {
             operation: op.name.to_string(),
             name: param.name.to_string(),
-        }),
+        });
     }
+    let value = scalar::coerce(param, raw)?;
+    check_enum(param, &value)?;
+    check_bounds(param, &value)?;
+    Ok(value)
+}
+
+/// Reject a value outside the parameter's declared enumeration.
+fn check_enum(param: &ParamSpec, value: &Value) -> Result<(), EngineError> {
+    if param.enum_values.is_empty() || value.is_null() {
+        return Ok(());
+    }
+    let candidate = match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    if param
+        .enum_values
+        .iter()
+        .any(|allowed| *allowed == candidate)
+    {
+        return Ok(());
+    }
+    let allowed: Vec<&str> = param.enum_values.iter().map(Cow::as_ref).collect();
+    Err(EngineError::InvalidParamValue {
+        name: param.name.to_string(),
+        reason: format!("allowed values are: {}", allowed.join(", ")),
+    })
+}
+
+/// Reject a numeric value outside the parameter's declared bounds.
+fn check_bounds(param: &ParamSpec, value: &Value) -> Result<(), EngineError> {
+    let Some(number) = value.as_f64() else {
+        return Ok(());
+    };
+    let out_of_range = |reason: String| EngineError::InvalidParamValue {
+        name: param.name.to_string(),
+        reason,
+    };
+    if let Some(minimum) = param.minimum.filter(|minimum| number < *minimum) {
+        return Err(out_of_range(format!("must be at least {minimum}")));
+    }
+    if let Some(maximum) = param.maximum.filter(|maximum| number > *maximum) {
+        return Err(out_of_range(format!("must be at most {maximum}")));
+    }
+    Ok(())
 }

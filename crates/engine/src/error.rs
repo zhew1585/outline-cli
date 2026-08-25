@@ -134,6 +134,46 @@ pub enum EngineError {
         reason: String,
     },
 
+    /// A `key=value` value cannot be sent exactly as a JSON number.
+    ///
+    /// Detected locally, before any network request. Raised instead of
+    /// silently rounding the value on the wire.
+    #[error("value for parameter {name:?} cannot be sent exactly as a JSON number: {reason}")]
+    InexactNumber {
+        /// The parameter name.
+        name: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// The operation's request body cannot be assembled from `key=value`
+    /// arguments because a root-level `oneOf`/`anyOf` union constrains it.
+    ///
+    /// Detected locally, before any network request.
+    #[error(
+        "operation {operation:?} constrains its request body with a JSON union \
+         (oneOf/anyOf), which key=value arguments cannot express"
+    )]
+    UnionBody {
+        /// Operation name.
+        operation: String,
+    },
+
+    /// The operation requires a request content type this client cannot
+    /// assemble (e.g. `multipart/form-data`).
+    ///
+    /// Detected locally, before any network request.
+    #[error(
+        "operation {operation:?} requires request content type {content_type}, \
+         which this client cannot assemble"
+    )]
+    UnsupportedBodyType {
+        /// Operation name.
+        operation: String,
+        /// The content type declared by the spec.
+        content_type: String,
+    },
+
     /// A raw request body is not valid JSON.
     ///
     /// Detected locally, before any network request. The reason is a
@@ -156,7 +196,26 @@ impl EngineError {
                 | Self::MissingParam { .. }
                 | Self::ComplexParam { .. }
                 | Self::InvalidParamValue { .. }
+                | Self::InexactNumber { .. }
+                | Self::UnionBody { .. }
+                | Self::UnsupportedBodyType { .. }
                 | Self::InvalidRequestBody { .. }
+        )
+    }
+
+    /// Whether the caller should be pointed at supplying a raw JSON body
+    /// instead: the value or shape at fault cannot be expressed as
+    /// `key=value` arguments at all.
+    pub fn suggests_raw_body(&self) -> bool {
+        matches!(
+            self,
+            Self::ComplexParam { .. }
+                | Self::UnionBody { .. }
+                | Self::InexactNumber { .. }
+                | Self::MissingParam {
+                    ty: ParamType::Json,
+                    ..
+                }
         )
     }
 }

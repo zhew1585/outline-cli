@@ -11,7 +11,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
 use serde_json::Value;
 
-use crate::body::build_request_body;
+use crate::body::{build_request_body, ensure_dispatchable, sensitive_values};
 use crate::error::{EngineError, TransportKind};
 use crate::ir::OpSpec;
 
@@ -81,7 +81,7 @@ impl Client {
         let bytes = serde_json::to_vec(&body).map_err(|error| EngineError::InvalidRequestBody {
             reason: error.to_string(),
         })?;
-        self.send(&op.path, bytes)
+        self.send(&op.path, bytes, &[])
     }
 
     /// Execute one RPC operation with a caller-supplied raw JSON body.
@@ -89,17 +89,31 @@ impl Client {
     /// The body must be valid JSON (checked locally, before any network
     /// request) and is sent byte-for-byte verbatim, bypassing `key=value`
     /// assembly and parameter validation entirely.
+    ///
+    /// Because the body may carry credentials this client knows nothing
+    /// about, its long string values are treated as sensitive and redacted
+    /// from any error text the server sends back.
     pub fn execute_raw(&self, op: &OpSpec, body: &str) -> Result<Value, EngineError> {
-        if let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(body) {
-            return Err(EngineError::InvalidRequestBody {
+        ensure_dispatchable(op)?;
+        let parsed = serde_json::from_str::<Value>(body).map_err(|error| {
+            EngineError::InvalidRequestBody {
                 reason: error.to_string(),
-            });
-        }
-        self.send(&op.path, body.as_bytes().to_vec())
+            }
+        })?;
+        let secrets = sensitive_values(&parsed);
+        self.send(&op.path, body.as_bytes().to_vec(), &secrets)
     }
 
     /// The single wire path: POST a JSON payload and parse the response.
-    fn send(&self, op_path: &str, body: Vec<u8>) -> Result<Value, EngineError> {
+    ///
+    /// `body_secrets` are caller-supplied values redacted from server
+    /// error text in addition to this client's bearer token.
+    fn send(
+        &self,
+        op_path: &str,
+        body: Vec<u8>,
+        body_secrets: &[String],
+    ) -> Result<Value, EngineError> {
         let url = format!("{}{}", self.base_url, op_path);
         let response = self
             .http
@@ -123,7 +137,7 @@ impl Client {
         if !status.is_success() {
             return Err(EngineError::Api {
                 status: status.as_u16(),
-                message: extract_error_message(response, &self.token),
+                message: extract_error_message(response, &self.token, body_secrets),
             });
         }
 
@@ -200,13 +214,18 @@ fn validate_base_url(base_url: &str) -> Result<Url, EngineError> {
 
 /// Pull a best-effort human-readable message out of an error response.
 ///
-/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. Any occurrence of
-/// `secret` (the client's own bearer token, which a server or proxy may
-/// reflect back) is redacted BEFORE sanitization and truncation, so not
-/// even a token prefix can survive the length cap. The result is then
-/// sanitized (control characters stripped, whitespace collapsed) and
-/// capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
-fn extract_error_message(response: reqwest::blocking::Response, secret: &str) -> String {
+/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. Every sensitive
+/// value - the client's own bearer token plus any caller-supplied
+/// `extra_secrets` (e.g. credentials inside a raw request body) that a
+/// server or proxy may reflect back - is redacted BEFORE sanitization and
+/// truncation, so not even a prefix can survive the length cap. The result
+/// is then sanitized (control characters stripped, whitespace collapsed)
+/// and capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
+fn extract_error_message(
+    response: reqwest::blocking::Response,
+    secret: &str,
+    extra_secrets: &[String],
+) -> String {
     let mut raw = Vec::new();
     if response
         .take(MAX_ERROR_BODY_BYTES)
@@ -225,7 +244,12 @@ fn extract_error_message(response: reqwest::blocking::Response, secret: &str) ->
             .unwrap_or_default(),
         Err(_) => body.into_owned(),
     };
-    let sanitized = sanitize_message(&redact_secret(&candidate, secret));
+    let redacted = extra_secrets
+        .iter()
+        .fold(redact_secret(&candidate, secret), |text, extra| {
+            redact_secret(&text, extra)
+        });
+    let sanitized = sanitize_message(&redacted);
     if sanitized.is_empty() {
         NO_ERROR_DETAILS.to_string()
     } else {

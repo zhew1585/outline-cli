@@ -14,10 +14,16 @@ fn op_with_path(op_path: &'static str) -> OpSpec {
         name: Cow::Borrowed("things.info"),
         path: Cow::Borrowed(op_path),
         summary: Cow::Borrowed("Retrieve a thing"),
+        content_type: Cow::Borrowed("application/json"),
+        body_mode: engine::BodyMode::KeyValue,
         params: Cow::Borrowed(&[ParamSpec {
             name: Cow::Borrowed("id"),
             ty: ParamType::String,
             required: false,
+            nullable: false,
+            enum_values: Cow::Borrowed(&[]),
+            minimum: None,
+            maximum: None,
         }]),
     }
 }

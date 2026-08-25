@@ -17,8 +17,9 @@ pub mod body;
 pub mod client;
 pub mod error;
 pub mod ir;
+mod scalar;
 
-pub use body::build_request_body;
+pub use body::{build_request_body, MIN_SENSITIVE_VALUE_CHARS};
 pub use client::{base_url_origin, is_valid_base_url, Client};
 pub use error::{EngineError, TransportKind};
-pub use ir::{OpSpec, ParamSpec, ParamType, IR_SCHEMA_VERSION};
+pub use ir::{BodyMode, OpSpec, ParamSpec, ParamType, IR_SCHEMA_VERSION};

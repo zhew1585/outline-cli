@@ -220,3 +220,289 @@ fn body_with_invalid_json_exits_2_naming_the_file() {
         .code(2)
         .stderr(predicate::str::contains("not valid JSON"));
 }
+
+// --- Finding 1: operations whose body is not application/json ------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_operation_exits_2_without_making_a_request() {
+    // A catch-all mock that must never be hit: wiremock verifies the
+    // expectation when the server is dropped at the end of the test.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl_online(&uri).args(["api", "documents.import"]).assert()
+    })
+    .await
+    .unwrap();
+
+    assert
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("multipart/form-data"))
+        .stderr(predicate::str::contains("dedicated command"))
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn multipart_operation_rejects_a_raw_body_too() {
+    let file = temp_json(r#"{"file": "x"}"#);
+    let body_arg = format!("@{}", file.path().display());
+    otl_offline()
+        .args(["api", "documents.import", "--body", &body_arg])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("multipart/form-data"));
+}
+
+// --- Finding 2: root-level oneOf/anyOf operations ------------------------
+
+#[test]
+fn union_body_operation_refuses_key_value_args() {
+    // shares.create requires exactly one of documentId/collectionId; both
+    // the empty call and a two-key call must fail locally, before network.
+    for extra in [vec![], vec!["documentId=a", "collectionId=b"]] {
+        let mut cmd = otl_offline();
+        cmd.args(["api", "shares.create"]).args(&extra);
+        cmd.assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("--body"))
+            .stdout(predicate::str::is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn union_body_operation_accepts_a_raw_body() {
+    let raw = r#"{"documentId":"doc-1"}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/shares.create"))
+        .and(body_string(raw.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": { "ok": true } })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        let file = temp_json(raw);
+        let body_arg = format!("@{}", file.path().display());
+        otl_online(&uri)
+            .args(["api", "shares.create", "--body", &body_arg])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert.success();
+}
+
+// --- Finding 3: enum, nullable and numeric bounds ------------------------
+
+#[test]
+fn unknown_enum_value_exits_2_listing_allowed_values() {
+    otl_offline()
+        .args([
+            "api",
+            "accessRequests.approve",
+            "id=x",
+            "permission=definitely-not-enum",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("read_write"))
+        .stderr(predicate::str::contains("admin"))
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn out_of_range_number_exits_2() {
+    otl_offline()
+        .args([
+            "api",
+            "attachments.create",
+            "name=x",
+            "contentType=text/plain",
+            "size=-1",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("size"))
+        .stdout(predicate::str::is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nullable_param_sends_json_null() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.update"))
+        .and(body_json(json!({ "id": "doc-1", "collectionId": null })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": { "ok": true } })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl_online(&uri)
+            .args(["api", "documents.update", "id=doc-1", "collectionId=null"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert.success();
+}
+
+// --- Finding 4: secrets inside a raw body -------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_secret_echoed_by_the_server_never_reaches_stderr() {
+    let secret = "BODY-SECRET-9f3d";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.update"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "message": format!("server echoed {{\"password\":\"{secret}\"}}")
+        })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let output = tokio::task::spawn_blocking(move || {
+        let file = temp_json(&format!(r#"{{"password":"{secret}"}}"#));
+        let body_arg = format!("@{}", file.path().display());
+        otl_online(&uri)
+            .args(["api", "documents.update", "--body", &body_arg])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(
+        stderr.matches("BODY-SECRET").count(),
+        0,
+        "body secret leaked: {stderr}"
+    );
+    assert!(!stdout.contains("BODY-SECRET"), "stdout leaked: {stdout}");
+}
+
+// --- Finding 5: malformed key=value must not echo the argument -----------
+
+#[test]
+fn malformed_argument_never_echoes_its_text() {
+    for bad in ["=LEAK-ME-82dd", "MALFORMED-SECRET-7c2e"] {
+        let output = otl_offline()
+            .args(["api", "documents.info", bad])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+        for secret in ["LEAK-ME-82dd", "MALFORMED-SECRET-7c2e"] {
+            assert_eq!(
+                stderr.matches(secret).count(),
+                0,
+                "argument text leaked: {stderr}"
+            );
+            assert!(!stdout.contains(secret), "stdout leaked: {stdout}");
+        }
+        // The user still learns which argument and what shape is expected.
+        assert!(
+            stderr.contains("argument #1") && stderr.contains("key=value"),
+            "unhelpful message: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn unknown_param_error_never_echoes_the_value() {
+    let output = otl_offline()
+        .args(["api", "documents.info", "bogus=VALUE-SECRET-4a1b"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("bogus"), "no key named: {stderr}");
+    assert_eq!(
+        stderr.matches("VALUE-SECRET").count(),
+        0,
+        "value leaked: {stderr}"
+    );
+}
+
+// --- Finding 6: exact JSON numbers --------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_integer_is_sent_without_precision_loss() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.search"))
+        .and(body_string(r#"{"limit":9007199254740993}"#.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl_online(&uri)
+            .args(["api", "documents.search", "limit=9007199254740993"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert.success();
+}
+
+#[test]
+fn inexact_number_exits_2() {
+    otl_offline()
+        .args(["api", "documents.search", "limit=9007199254740993.0"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("--body"));
+}
+
+// --- Finding 7: --body size cap -----------------------------------------
+
+#[test]
+fn oversize_body_file_exits_2_before_reading_it_all() {
+    // Build a valid JSON array just over the cap in a temp dir (never in
+    // the repo), then assert a clean usage error rather than an OOM.
+    let cap = otl::commands::api::MAX_BODY_FILE_BYTES;
+    let filler = "\"aaaaaaaa\",";
+    let count = (cap as usize / filler.len()) + 2;
+    let mut content = String::with_capacity(count * filler.len() + 8);
+    content.push('[');
+    for _ in 0..count {
+        content.push_str(filler);
+    }
+    content.push_str("\"end\"]");
+    assert!(content.len() as u64 > cap, "test fixture below the cap");
+
+    let file = temp_json(&content);
+    let body_arg = format!("@{}", file.path().display());
+    otl_offline()
+        .args(["api", "documents.update", "--body", &body_arg])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("too large"))
+        .stdout(predicate::str::is_empty());
+}

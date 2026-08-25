@@ -239,6 +239,8 @@ fn cli_error_debug_and_chain_are_credential_free() {
         name: Cow::Borrowed("documents.info"),
         path: Cow::Borrowed("/api/documents.info"),
         summary: Cow::Borrowed(""),
+        content_type: Cow::Borrowed("application/json"),
+        body_mode: engine::BodyMode::KeyValue,
         params: Cow::Borrowed(&[]),
     };
     let engine_error = client.execute(&op, &[]).unwrap_err();

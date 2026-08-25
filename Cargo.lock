@@ -963,6 +963,7 @@ dependencies = [
  "clap",
  "engine",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
