@@ -1,0 +1,112 @@
+# Story 3.6: docs export
+
+Status: done
+
+## Story
+
+As a 备份与迁移者,
+I want 整个 collection 批量导出为本地 markdown,
+so that 内容可进 git 或离线阅读。
+
+## Acceptance Criteria
+
+1. **Given** `otl docs export --collection <id> --out ./docs-backup`
+   **When** 执行
+   **Then** 该 collection 全部文档经自动分页完整导出为 .md 文件，文件名安全化处理，目录结构反映文档层级
+2. **Given** 导出中途某文档失败
+   **When** 继续执行
+   **Then** 失败文档汇总在结尾报告，退出码反映部分失败
+
+## Tasks / Subtasks
+
+- [x] Task 1: 文件名安全化 (AC: 1)
+  - [x] `crates/otl/src/export.rs`（纯函数，全单测）：`safe_stem` + `Names`
+  - [x] 路径穿越：分隔符 `/` `\` 替换，2 个以上连续点整段替换，首尾点/空白/连字符裁掉
+  - [x] Windows 保留名：CON/PRN/AUX/NUL/COM0-9/LPT0-9/CLOCK$/CONIN$/CONOUT$，忽略大小写与扩展名，加 `_` 前缀
+  - [x] 非法字符 `< > : " / \ | ? *` + 控制符 → `-`；不可见重排字符（RLO/ZWJ/BOM 等）直接丢弃
+  - [x] 长度上限按**字节**（96 B），按 char 边界截断，截断后再裁一次尾部点
+  - [x] 大小写不敏感文件系统重名：`Names` 以小写键去重，冲突加 `-2`/`-3`…（后缀也守字节上限）
+- [x] Task 2: 层级重建 (AC: 1)
+  - [x] `commands/docs/tree.rs`（纯函数）：由 `parentDocumentId` 建森林
+  - [x] 父不在清单内 / 自己是自己的父 / 父链成环 → 一律提升为 root（环用三色状态机在一点切断）
+  - [x] 无 id 的行丢弃并警告；重复 id 保留首次出现
+  - [x] 兄弟按 (title, id) 排序 → 同一 collection 重复导出得到同一棵树（对 git 友好）
+- [x] Task 3: 写盘 (AC: 1)
+  - [x] `commands/docs/export.rs`：`documents.list collectionId=` 自动分页枚举 → 每篇 `documents.info` 取 markdown
+  - [x] 有子文档的节点 → 目录 `Stem/`，自身写成 `Stem/Stem.md`，子文档写在其中（子目录有独立 `Names`）
+  - [x] 每篇正文前置 `# <title>`（文件名已被安全化，标题靠这行保真），已以 `# ` 开头则不重复加
+  - [x] 目录深度上限 8 层，更深的**用队列**（不是递归）平铺到该层并警告一次
+  - [x] 不跟随符号链接：子目录 `create_dir` + `symlink_metadata` 校验；文件遇 symlink 直接拒写
+  - [x] `--out` 非空目录在**任何请求之前**拒绝（退出码 2），`--overwrite` 才允许覆盖
+- [x] Task 4: 部分失败 (AC: 2)
+  - [x] 失败逐条收集（id + 原因），结尾汇总到 stderr（最多列 20 条 + "and N more"）
+  - [x] 有失败 → 退出码 9（新增），已登记 `docs/exit-codes.md`
+  - [x] 枚举本身失败 → 沿用其自身退出码（3-7），不写任何文件，不报 9
+  - [x] stdout：Table 模式逐行输出相对路径；JSON 模式输出 `{out, exported[], failed[]}`
+- [x] Task 5: 测试 (AC: 1, 2)
+  - [x] `export.rs` 单测 17 项：穿越/非法字符/控制符/不可见字符/保留名/尾点/空标题/字节上限/去重/大小写冲突/500 次冲突全唯一
+  - [x] `tree.rs` 单测 11 项：扁平/嵌套/父缺失/自环/双环/长环/无 id/重复 id/确定性排序/空清单
+  - [x] `tests/docs_export.rs`（tempfile）：层级落盘、跨页 101 篇全导出、恶意标题不越界（含 out 目录外哨兵文件）、
+        同名三文档三文件、单篇失败→9 且其余落盘、枚举失败→5 且零写入、非空目录→2 且零请求、
+        `--overwrite`、JSON 摘要、空 collection
+
+## Dev Notes
+
+- **为什么用 `documents.list` 而不是 `collections.documents`**：AC 明确要求"经自动分页完整导出"。
+  `collections.documents` 一次返回整棵导航树，没有 offset/limit，用它就没有分页可言；
+  `documents.list` 带 Pagination 且返回 `parentDocumentId`，层级可以由它重建。
+  代价是层级来自父指针而非服务端的导航结构（排序信息 `index` 不用），换来的是分页保证与更强的防御性。
+- **正文单独取**：`documents.list` 的行里也有 `text`，但精选命令选择每篇 `documents.info`，
+  这样"某篇失败"是天然的部分失败单元，且不依赖 list 是否裁剪正文。
+  代价是 1+N 次请求（engine 的令牌桶 10 req/s 会限速）。**这是已知的性能缺口**，见下。
+- **递归的两处风险都堵住了**：
+  1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
+  2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
+     递归深度因此被 `MAX_DEPTH` 硬性封顶。
+- **符号链接**：`--overwrite` 下 `File::create` 会跟随符号链接写到目录树之外。
+  因此写前用 `symlink_metadata` 判定，是链接就报该篇失败；子目录同理。
+  另外所有路径都是 `root.join(<安全组件>)`，安全组件里不可能出现分隔符或 `..`。
+- **退出码 9 是新增的公共 API**：已写入 `docs/exit-codes.md`，并明确"批量还没开始就失败的用原错误码"。
+- **Windows 路径长度**：8 层 × 96 B 的 stem 可能越过传统 `MAX_PATH`(260)。
+  这类失败会变成该篇文档的 I/O 失败并进结尾汇总（而不是静默丢失），深度上限也是为此存在。
+
+### 已知缺口（刻意留下）
+
+- **顺序导出，无并发**：SPEC 的依赖基线提到"批量导出并发"是选 reqwest 的理由之一，
+  但 v1 用 blocking client + 进程级令牌桶。并发需要重新设计限速与错误聚合，
+  收益（墙钟时间）不值得在本 epic 引入 async 运行时；结构上没有阻碍后续加。
+- **不导出附件/图片**：正文里的附件仍是 Outline URL。附件是两步协议（SPEC 明列的手写特例预算），
+  不在本 story 范围。
+- **不写 manifest**：没有 id → 路径的映射文件，因此二次导出后无法按 id 定位旧文件。
+  v2 的 pull/push 才需要这个。
+- **`index` 排序信息未使用**：兄弟按标题排序（确定性、git 友好），不复刻 Outline 侧边栏顺序。
+
+### References
+
+- [Source: planning/epics.md#Story 3.6]
+- [Source: specs/spec-outline-cli/SPEC.md#CAP-6、#Constraints（两步协议不覆盖）、#Non-goals（pull/push）]
+- [Source: specs/spec-outline-cli/failure-modes.md #5 #7]
+- [Source: docs/exit-codes.md#9]
+
+## Dev Agent Record
+
+### Agent Model Used
+
+claude-opus-5[1m] (Claude Code agent), 2026-08-26
+
+### Completion Notes List
+
+- `startup_guard.rs` 的源码扫描禁止 `read_dir`（防运行时发现数据文件）与 `include_str!`。
+  本 story 给出 4 条带理由的 allowlist 条目：export 需要枚举用户给的 `--out` 目录，
+  三处 `include_str!` 是 `#[cfg(test)]` 里的 golden fixture。
+  该文件对二进制本体的断言（不含 spec 路径/内容）未放宽，仍是硬证据。
+- 单篇文档失败的原因字符串来自 `CliError`/`io::ErrorKind`，都是已消毒文本，不会把服务端原文或路径秘密带进汇总。
+
+### File List
+
+- crates/otl/src/export.rs（文件名安全化，纯函数）
+- crates/otl/src/commands/docs/{export.rs, tree.rs}
+- crates/otl/src/exit.rs（`ExitCode::Partial = 9` + `CliError::partial`）
+- docs/exit-codes.md
+- crates/otl/tests/docs_export.rs
+- crates/otl/tests/startup_guard.rs（allowlist 追加）

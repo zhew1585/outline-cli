@@ -43,6 +43,46 @@ otl api documents.info id=not-a-uuid             # exits 2, no request sent
 otl api shares.create --body @share.json         # oneOf/anyOf bodies go through --body verbatim
 ```
 
+## Everyday commands
+
+Six polished commands cover the day-to-day work. Unlike `otl api`, their flags and output are a stable
+(semver) contract.
+
+```sh
+otl collections list                          # name / id / document count, every page fetched
+otl docs search deploy                        # title / collection / updated / matching snippet
+otl docs search deploy --json | jq '.[].document.id'
+
+otl docs view <doc-id>                        # markdown; $PAGER on a terminal, plain in a pipe
+otl docs view <doc-id> --raw                  # never paged
+otl docs view <doc-id> --web                  # prints the URL and opens a browser
+
+cat notes.md | otl docs create --title Notes --collection <collection-id>
+otl docs create --title Notes --collection <collection-id> --file notes.md   # equivalent
+otl docs update <doc-id> --title "New title"
+cat revised.md | otl docs update <doc-id>
+
+otl docs export --collection <collection-id> --out ./backup
+```
+
+Notes worth knowing:
+
+- **`docs view` is markdown-first.** A pipe gets the document body, not JSON — the body *is* the data
+  here. Ask for `--json` explicitly to get the document object. Every other command follows the usual
+  rule (JSON whenever stdout is not a terminal).
+- **`docs create` publishes** when you give it a `--collection` or `--parent`, because a draft is
+  invisible to everyone else; `--draft` opts out. Without a destination Outline cannot publish at all,
+  and the command says so.
+- **A blank body means "no body".** `otl docs update <id> --title X` from a script (where stdin is
+  `/dev/null`) can never be read as "replace the body with nothing". Clearing a body is possible, but
+  only by spelling it out: `otl api documents.update id=<id> text=`.
+- **`docs export`** rebuilds the document hierarchy as directories, sanitizes every file name (path
+  traversal, Windows device names, case-insensitive collisions, length limits), refuses a non-empty
+  output directory unless `--overwrite` is given, and keeps going when one document fails — the
+  failures are summarized at the end and the exit code is 9 (partial failure).
+- **Pagination never truncates silently.** `--limit N` on a list command caps the total rows and prints
+  a warning on stderr saying so.
+
 ## Design
 
 **Two crates.** `engine` is a generic OpenAPI RPC client with no knowledge of Outline whatsoever — the
