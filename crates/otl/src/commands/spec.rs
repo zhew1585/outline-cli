@@ -175,41 +175,68 @@ fn origin_of(url: &str) -> String {
 /// (cheap rejection) and the read itself is bounded too, so a file that
 /// grows in between cannot exhaust memory.
 fn read_local(path: &Path) -> Result<String, CliError> {
-    let display = path.display();
-    let io_error = |error: std::io::Error| {
-        CliError::usage(anyhow!(
-            "cannot read the spec file {display}: {}",
-            error.kind()
-        ))
-    };
-    let too_large = || {
-        CliError::usage(anyhow!(
-            "the spec file {display} is too large: the limit is {MAX_DOCUMENT_BYTES} bytes"
-        ))
-    };
-    // Follows symlinks (a symlink to a regular file is fine) but reports
-    // the TYPE of the target, which is what matters here.
-    let metadata = fs::metadata(path).map_err(io_error)?;
-    if !metadata.is_file() {
-        return Err(CliError::usage(anyhow!(
-            "the spec path {display} is not a regular file; pass a saved \
-             OpenAPI document (a pipe, socket, device or directory cannot be \
-             read safely: opening one can block forever)"
-        )));
-    }
-    if metadata.len() > MAX_DOCUMENT_BYTES {
-        return Err(too_large());
-    }
-    let file = fs::File::open(path).map_err(io_error)?;
+    let file = open_regular(path)?;
     let mut raw = String::new();
     let read = file
         .take(MAX_DOCUMENT_BYTES + 1)
         .read_to_string(&mut raw)
-        .map_err(io_error)?;
+        .map_err(|error| read_error(path, error))?;
     if read as u64 > MAX_DOCUMENT_BYTES {
-        return Err(too_large());
+        return Err(too_large(path));
     }
     Ok(raw)
+}
+
+/// Open a path only if it is a regular file of plausible size.
+///
+/// The type is checked before AND after opening. Before, because opening a
+/// FIFO blocks until a writer appears and no read cap can interrupt that;
+/// after, through the open handle, so a path swapped between the two calls
+/// cannot slip something else past the first check.
+fn open_regular(path: &Path) -> Result<fs::File, CliError> {
+    let not_regular = || {
+        CliError::usage(anyhow!(
+            "the spec path {} is not a regular file; pass a saved OpenAPI \
+             document (a pipe, socket, device or directory cannot be read \
+             safely: opening one can block forever)",
+            path.display()
+        ))
+    };
+    // Follows symlinks (a symlink to a regular file is fine) but reports
+    // the TYPE of the target, which is what matters here.
+    let metadata = fs::metadata(path).map_err(|error| read_error(path, error))?;
+    if !metadata.is_file() {
+        return Err(not_regular());
+    }
+    if metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(too_large(path));
+    }
+    let file = fs::File::open(path).map_err(|error| read_error(path, error))?;
+    let opened = file.metadata().map_err(|error| read_error(path, error))?;
+    if !opened.is_file() {
+        return Err(not_regular());
+    }
+    if opened.len() > MAX_DOCUMENT_BYTES {
+        return Err(too_large(path));
+    }
+    Ok(file)
+}
+
+/// A filesystem failure on the `--spec` path, reduced to its error kind.
+fn read_error(path: &Path, error: std::io::Error) -> CliError {
+    CliError::usage(anyhow!(
+        "cannot read the spec file {}: {}",
+        path.display(),
+        error.kind()
+    ))
+}
+
+/// The `--spec` document exceeds the document size cap.
+fn too_large(path: &Path) -> CliError {
+    CliError::usage(anyhow!(
+        "the spec file {} is too large: the limit is {MAX_DOCUMENT_BYTES} bytes",
+        path.display()
+    ))
 }
 
 /// Compile a document into IR, treating it as untrusted input.
