@@ -6,6 +6,7 @@
 //! There is deliberately no per-endpoint generated code.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,20 @@ pub enum ParamType {
     Number,
     /// Any complex JSON value (objects, arrays, unions).
     Json,
+}
+
+impl fmt::Display for ParamType {
+    /// Lowercase JSON-schema-style type name, used in error messages.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Json => "json",
+        };
+        f.write_str(text)
+    }
 }
 
 /// A single request-body parameter of an operation.

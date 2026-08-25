@@ -7,12 +7,13 @@
 use std::fmt;
 use std::io::Read;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
+use crate::body::build_request_body;
 use crate::error::{EngineError, TransportKind};
-use crate::ir::{OpSpec, ParamType};
+use crate::ir::OpSpec;
 
 /// Placeholder shown instead of secrets in Debug output.
 const REDACTED: &str = "***";
@@ -69,19 +70,44 @@ impl Client {
 
     /// Execute one RPC operation with `key=value` arguments.
     ///
-    /// Sends `POST {base}{op.path}` with a JSON body assembled from `args`
-    /// and returns the parsed JSON response. The operation path comes from
-    /// the IR verbatim; the engine imposes no URL convention of its own.
+    /// Arguments are validated against the operation's parameter specs and
+    /// coerced to their declared JSON types locally - any validation error
+    /// is returned before a single byte goes on the wire. Then sends
+    /// `POST {base}{op.path}` and returns the parsed JSON response. The
+    /// operation path comes from the IR verbatim; the engine imposes no
+    /// URL convention of its own.
     pub fn execute(&self, op: &OpSpec, args: &[(String, String)]) -> Result<Value, EngineError> {
-        let url = format!("{}{}", self.base_url, op.path);
-        let body = build_body(op, args);
+        let body = build_request_body(op, args)?;
+        let bytes = serde_json::to_vec(&body).map_err(|error| EngineError::InvalidRequestBody {
+            reason: error.to_string(),
+        })?;
+        self.send(&op.path, bytes)
+    }
 
+    /// Execute one RPC operation with a caller-supplied raw JSON body.
+    ///
+    /// The body must be valid JSON (checked locally, before any network
+    /// request) and is sent byte-for-byte verbatim, bypassing `key=value`
+    /// assembly and parameter validation entirely.
+    pub fn execute_raw(&self, op: &OpSpec, body: &str) -> Result<Value, EngineError> {
+        if let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(body) {
+            return Err(EngineError::InvalidRequestBody {
+                reason: error.to_string(),
+            });
+        }
+        self.send(&op.path, body.as_bytes().to_vec())
+    }
+
+    /// The single wire path: POST a JSON payload and parse the response.
+    fn send(&self, op_path: &str, body: Vec<u8>) -> Result<Value, EngineError> {
+        let url = format!("{}{}", self.base_url, op_path);
         let response = self
             .http
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(ACCEPT, "application/json")
-            .json(&body)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .map_err(|source| EngineError::Transport {
                 origin: self.display_origin(),
@@ -170,30 +196,6 @@ fn validate_base_url(base_url: &str) -> Result<Url, EngineError> {
         return Err(invalid("URL must not contain a fragment"));
     }
     Ok(parsed)
-}
-
-/// Assemble the JSON request body from `key=value` argument pairs.
-///
-/// Dispatch is structured by [`ParamType`]; in this milestone every type is
-/// passed through as a JSON string (typed conversion is a later story).
-/// Arguments without a matching parameter spec are passed through as strings.
-fn build_body(op: &OpSpec, args: &[(String, String)]) -> Value {
-    let entries = args.iter().map(|(key, raw)| {
-        let ty = op.param(key).map_or(ParamType::Json, |p| p.ty);
-        (key.clone(), encode_scalar(ty, raw))
-    });
-    Value::Object(entries.collect::<Map<String, Value>>())
-}
-
-/// Encode one raw CLI value according to its declared wire type.
-fn encode_scalar(ty: ParamType, raw: &str) -> Value {
-    match ty {
-        ParamType::String
-        | ParamType::Integer
-        | ParamType::Boolean
-        | ParamType::Number
-        | ParamType::Json => Value::String(raw.to_string()),
-    }
 }
 
 /// Pull a best-effort human-readable message out of an error response.
