@@ -151,16 +151,35 @@ fn select_columns<'a>(rows: &[&'a Map<String, Value>], schema: &'a [FieldSpec]) 
     from_schema
 }
 
-/// Whether a value would render as anything at all.
+/// Whether a value would render as anything the reader can see.
 ///
-/// Absent, `null` and blank strings all produce an empty cell. `false` and
-/// `0` do not: they are values a reader wants to see.
+/// The question is about the CELL, not the raw value: [`sanitize_cell`] turns
+/// control characters into spaces, so `"\u{1b}"` is content by any
+/// string-level test and blank on screen, and a zero-width character such as
+/// `"\u{200b}"` survives sanitizing but occupies no column. Several such
+/// fields in a row could otherwise fill all four columns with nothing.
+///
+/// Absent and `null` are empty by definition. `false` and `0` are content:
+/// they are values a reader wants to see.
 fn has_content(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
-        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::String(text)) => renders_visibly(text),
         Some(_) => true,
     }
+}
+
+/// Whether the cell this text renders to would occupy any terminal column.
+///
+/// Mirrors [`sanitize_cell`] - control characters become spaces - and then
+/// asks whether any grapheme cluster is both printable and non-zero-width.
+fn renders_visibly(raw: &str) -> bool {
+    raw.graphemes(true).any(|cluster| {
+        let printable = cluster
+            .chars()
+            .any(|c| !c.is_control() && !c.is_whitespace());
+        printable && display_width_of(cluster) > 0
+    })
 }
 
 /// Rank EVERY displayable schema field, best column first.

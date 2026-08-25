@@ -394,40 +394,87 @@ fn a_shell_that_claims_operation_names_actually_carries_them() {
 
 #[test]
 fn the_public_module_documentation_matches_the_delivered_coverage() {
-    // R2 finding 5: help, README and the script headers were narrowed, but
-    // the module rustdoc still claimed every operation name completes
-    // everywhere. Documentation is a claim like any other, so it is checked.
-    let source = include_str!("../src/commands/completions.rs");
-    let doc: String = source
+    // R2 finding 5 / R3 finding 7: help, README and the script headers were
+    // narrowed, but the module rustdoc still claimed every operation name
+    // completes everywhere - and the first version of this test only checked
+    // that the SUPPORTED shells were mentioned, so appending "powershell and
+    // elvish operation names complete" would still have passed. Both
+    // directions are now checked, by sentence.
+    let doc = module_doc();
+    assert!(!doc.is_empty(), "no module documentation found");
+
+    // 1. The covered shells are named, exactly as the predicate says.
+    let covered = shell_names(true).join(", ");
+    assert!(
+        doc.contains(&covered),
+        "rustdoc does not name the covered shells ({covered}): {doc}"
+    );
+
+    // 2. No sentence that positively claims operation-name completion may
+    //    name a shell that does not deliver it.
+    for sentence in doc.split(['.', ';']) {
+        let claims = sentence.contains("OPERATION")
+            || (sentence.contains("operation") && sentence.contains("complete"));
+        let denies = sentence.contains("NOT")
+            || sentence.contains("not complete")
+            || sentence.contains("no candidates")
+            || sentence.contains("only");
+        if !claims || denies {
+            continue;
+        }
+        for uncovered in shell_names(false) {
+            assert!(
+                !sentence.contains(uncovered),
+                "rustdoc claims {uncovered} completes operation names: {sentence:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_coverage_test_would_catch_an_over_claiming_sentence() {
+    // Guards the guard: the check above must reject the exact sentence the
+    // review used to show the previous version was vacuous.
+    let over_claiming = "powershell and elvish operation names complete";
+    let denies = over_claiming.contains("NOT")
+        || over_claiming.contains("not complete")
+        || over_claiming.contains("no candidates")
+        || over_claiming.contains("only");
+    assert!(!denies, "the sentence would be skipped as a denial");
+    let claims = over_claiming.contains("operation") && over_claiming.contains("complete");
+    assert!(claims, "the sentence would not be seen as a claim");
+    for uncovered in shell_names(false) {
+        assert!(
+            over_claiming.contains(uncovered),
+            "{uncovered} is not named by the sample sentence"
+        );
+    }
+}
+
+/// The module-level `//!` documentation of the completions module.
+fn module_doc() -> String {
+    include_str!("../src/commands/completions.rs")
         .lines()
         .take_while(|line| line.starts_with("//!") || line.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!doc.is_empty(), "no module documentation found");
-    assert!(
-        !doc.contains("operation names all complete"),
-        "rustdoc over-claims: {doc}"
-    );
-    // It must name the shells that do get operation names.
-    assert!(
-        doc.contains("bash, zsh and fish"),
-        "rustdoc does not state the coverage: {doc}"
-    );
-    // Every shell named as covered must actually be covered, and every one
-    // not named must not be.
+        .join("\n")
+}
+
+/// Shell names whose scripts do (or do not) carry the operation names,
+/// straight from the predicate the generator uses.
+fn shell_names(with_operations: bool) -> Vec<&'static str> {
     use clap_complete::Shell;
-    for (shell, name) in [
+    [
         (Shell::Bash, "bash"),
         (Shell::Zsh, "zsh"),
         (Shell::Fish, "fish"),
         (Shell::PowerShell, "powershell"),
         (Shell::Elvish, "elvish"),
-    ] {
-        let claimed_in_doc = doc.contains(&format!("{name} "))
-            || doc.contains(&format!("{name},"))
-            || doc.contains(&format!("{name}."));
-        if otl::commands::completions::completes_operation_names(shell) {
-            assert!(claimed_in_doc, "{name} is covered but unmentioned: {doc}");
-        }
-    }
+    ]
+    .into_iter()
+    .filter(|(shell, _)| {
+        otl::commands::completions::completes_operation_names(*shell) == with_operations
+    })
+    .map(|(_, name)| name)
+    .collect()
 }

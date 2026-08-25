@@ -111,13 +111,17 @@ instance the selected profile points at, which is one workspace's credential goi
 workspace's server. When a profile is missing its key, `otl` says which variable to set and exits 2
 without making a request.
 
-The same rule applies to the *other* half of a request. With a profile in effect the base URL comes from
-that profile's `url`, or from `--url` when you override it deliberately in the same command;
-`OUTLINE_URL` is not a source, and one that disagrees is an error rather than a silent redirect. This is
-the single place where resolution is not simply flag > env > file: an ambient variable left over from an
-earlier shell session must not be able to point a profile's credential at a server the profile never
-named, and a warning would not help — a credential that has been sent cannot be recalled. Without a
-profile, `OUTLINE_URL` behaves exactly as before.
+The same rule applies to the *other* half of a request, without bending the precedence model.
+Resolution is always flag > env > file, for the base URL as for every other key. What changes is that
+the credential is only handed to the request channel once it is bound to the origin that request will
+use: with a profile in effect, `otl` releases the key when the base URL came from the profile's own
+`url` or from `--url` (stated in the same command, so the redirect is deliberate), and refuses when it
+came from `OUTLINE_URL` and names a different instance — or when the profile declares no `url` at all,
+leaving nothing to bind to. An ambient variable left over from an earlier shell session must not be able
+to point a profile's credential at a server the profile never named, and a warning would not help: a
+credential that has been sent cannot be recalled. Origins are compared normalized, so a trailing slash,
+host casing or a default port is never a false conflict. Without a profile there is nothing to bind and
+`OUTLINE_URL` behaves exactly as before.
 
 The config file holds no secrets, by construction: an `api_key` or `token` key — at the top level or in a
 profile — is a hard error pointing at `credentials.toml`, and any other unrecognized key (including a

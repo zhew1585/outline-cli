@@ -141,31 +141,60 @@ R1 指出：`--profile personal` 会把环境里的全局 `OUTLINE_API_KEY`（�
 `one_profiles_key_is_never_sent_to_another_profiles_instance` 断言退出 2 且
 `received_requests()` 为空——即「密钥根本没上路」，而不只是「响应失败」。
 
-### profile 同时作用于凭证与 origin（R2 finding 1 的处置：由警告改为拒绝）
+### profile 同时作用于凭证与 origin（R2-1 → R3 裁决后的最终形态）
 
-R1 修复里我对「profile 没有对应密钥变量」选了拒绝（理由：警告收不回已发出的凭证），却对「`OUTLINE_URL`
-指向别处」选了警告放行。R2 用我自己的论据打回来了，而且我新增的 e2e 测试**明确断言那次请求成功**，等于把
-被审查的行为固化成预期。审查者是对的，我原来的「不同严重度」论证不成立：
+演化过程记录在此，因为三轮下来这条是全 story 最难的取舍：
 
-- 「凭证仍是该 profile 自己的」不能让泄漏变得可接受。密钥被送到 profile 从未声明的 origin，这个 origin
-  可能根本不是用户的实例（旧 shell 里遗留的 `OUTLINE_URL`、CI 里从别处继承的变量、复制粘贴的 env 片段）。
-- 不可撤回性对两条路径完全一样。既然不可撤回性是拒绝全局密钥回退的理由，它对这里同样成立。
+1. **R1**：`--profile` 会把全局 `OUTLINE_API_KEY` 发给该 profile 的实例（跨 workspace 泄漏）。
+   修法：profile 只读 `OUTLINE_API_KEY_<PROFILE>`，不回退全局。理由是「警告收不回已发出的凭证」。
+2. **R2**：审查者指出我对「`OUTLINE_URL` 指向别处」只警告放行，与上一条自相矛盾。我照自己的论据改成
+   **在 `resolve_settings` 里拒绝**——即 profile 在场时 env 不再是 URL 的一层。
+3. **R3 裁决：采用替代方案，R2 的修法被判 REGRESSION。** 理由我接受：
+   - 它删掉了 URL 的 env 层，直接违反未修改的 Story 4.1 AC2（flag > env > file 逐项生效）；
+   - 「更早报错」没有实质优势：错误本来就发生在配置装载阶段、秘密与网络请求之前，替代方案给出的错误
+     一模一样清晰；
+   - 代价是真实的：把环境配置人为分成两类「ambient 程度」破坏了已发布的通用优先级模型，而且用原始
+     字符串比较制造了等价 URL 误报（`http://h:9` vs `http://h:9/` 被判成不同实例）。
 
-**改为**：profile 在场时，base URL 只来自 profile 自己的 `url` 或本次命令里的 `--url`；`OUTLINE_URL`
-不再是一个层，而是一个一致性检查——与解析结果不一致即 `ConflictingUrl` 报错（退出 2，不发请求）。
-profile 没有 `url` 且没有 `--url` 时也报错（不再由 `OUTLINE_URL` 顶上），因为那是同一条规则的另一面：
-ambient 变量不得决定 profile 凭证的去向。
+**最终形态**：解析与释放分离。
 
-**优先级契约的准确表述**：flag > env > file 逐项生效，唯一例外是「被选中 profile 的 base URL」——那一项
-env 不参与，只做一致性检查。AC、README、exit-codes、模块文档均已按此收敛，不留口径差。
+- `resolve_settings` 严格 flag > env > file，**每一个键都一样**，包括 base URL；并记录
+  `UrlSource`（Flag / Env / Profile）与该 profile 自己声明的 `profile_url`。
+- 新增唯一的「凭证释放边界」`release_token`，在把秘密交给请求通道之前问一个**不同的问题**：这个
+  origin 是这个凭证的归属地吗？
+  - `UrlSource::Flag` → 放行（`--url` 与 `--profile` 写在同一条命令里，是显式重定向）；
+  - `UrlSource::Profile` → 放行（origin 由 profile 自己声明）；
+  - `UrlSource::Env` 且与 profile 声明的**规范化 origin** 一致 → 放行；
+  - `UrlSource::Env` 且不一致 → `ConflictingUrl`，退出 2，密钥根本没被取出；
+  - `UrlSource::Env` 且 profile 未声明 url → `UnboundProfileCredential`（无从建立绑定）。
+- 比较用 `engine::base_url_origin` 的规范化 origin，因此尾斜杠、host 大小写、默认端口都不会误报
+  （R3 finding 4）；路径差异不改变「哪台服务器收到凭证」，因此按 origin 判定。
 
-**测试反转**：原先断言「成功且收到 from-elsewhere」的 e2e 改为
-`an_env_url_pointing_away_from_the_profile_sends_nothing`：退出 2、stdout 为空、stderr 不含密钥与 URL、
-且 `received_requests()` 为空。另加 `a_profile_without_a_url_is_not_rescued_by_the_env_var`（规则另一面）
-与 `the_url_flag_redirects_a_profile_deliberately`（逃生门仍然可用）。
+**检查在共享边界，不在 EnvApiKey 里**（裁决明确要求，Epic 2 合并时会复验这个接缝）：
 
-**逐项优先级仍有测试**：`precedence_is_applied_per_key_not_per_layer` 改为让三个层各贡献一个键
-（env 给 profile、flag 给 URL、file 给 auth），比原来的「env URL 覆盖 profile URL」更能证明「不是整层覆盖」。
+```rust
+pub struct BindingChecked(());              // 私有字段：模块外无法构造
+pub trait TokenSource {
+    fn fetch(&self, s: &Settings, checked: &BindingChecked) -> Result<String, ConfigError>;
+}
+pub fn release_token(source: &impl TokenSource, s: &Settings) -> Result<String, ConfigError> {
+    let checked = check_credential_binding(s)?;   // 唯一构造 BindingChecked 的地方
+    source.fetch(s, &checked)
+}
+```
+
+`BindingChecked` 只有一个私有字段，所以**模块外根本调不到 `fetch`**——不是靠约定，是靠类型系统。
+Epic 2 的凭证文件 TokenSource 接进来时自动继承这道检查，无需知道它存在。测试
+`the_binding_gate_applies_to_every_token_source` 用一个「对任何 settings 都吐出秘密」的假实现证明：
+即使 source 本身毫无防线，gate 仍然拒绝，且秘密不出现在错误里。
+
+**三项确认（裁决要求）**：
+- AC2 同项三层优先级：`the_url_key_itself_resolves_flag_over_env_over_file`——同一个 URL 键上依次断言
+  file → env 覆盖 → flag 覆盖，并断言 `url_source` 记录正确（R2 那个「三层各给一个键」的测试只证明了
+  层间不互删，已按 R3 意见换回同项阶梯，并作为独立测试保留）。
+- 跨 origin 零请求：`an_env_url_pointing_away_from_the_profile_sends_nothing` 与
+  `a_profile_without_a_url_cannot_bind_an_env_url` 都断言 `received_requests()` 为空。
+- 共享边界：见上；另有 `no_profile_means_no_binding_question` 证明无 profile 时不受影响。
 
 ### 故意留下的缺口
 
@@ -215,6 +244,21 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 | R2-3 | MAJOR | 已修：新增 `sanitize_path`，所有进诊断的路径都过它；端到端断言 OSC/BEL/换行不落 stderr |
 | R2-6 | MAJOR | 已修：`profile_api_key_suffix(name, case_insensitive)`，Windows 走大小写折叠、POSIX 保持敏感；平台规则做成参数，两种行为在任何平台都可测 |
 | R2-7 | MINOR | 已修：`MAX_PROFILE_VAR_CHARS = 64` 在**派生处**设界（截断后的变量名是错误建议），超长 profile 名走 `ProfileApiKeyVarUnnameable` |
+
+### R3 复核处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| 裁决 | REGRESSION | 已按替代方案重做：解析恢复严格 flag > env > file，绑定检查移到共享的 `release_token` 边界，用 `BindingChecked` 私有构造使其无法被绕过 |
+| R3-1 | BLOCKER | 同上；并恢复「同一 URL 键的三层优先级」测试 |
+| R3-2 | BLOCKER | 已修：`ConfigError` 的 Debug 改为**结构化**（只输出变体名 + 非文本标量），不再转发 Display；Display 侧所有自由文本字段（`reason`/`location`/`variable`）也过 `sanitize_text`，使其对任意公开构造都有界。原测试确实把 secret 放进 `available` 却没断言它不出现——已补上，并新增覆盖全部 12 个变体、每个字符串字段都埋 secret 的测试 |
+| R3-3 | MAJOR | 已修：`Overrides`/`EnvLayer`/`ConfigSource`/`LoadedConfig` 的 Debug 不再输出配置路径（只显示 set/unset），与 profile 名同一规则 |
+| R3-4 | MAJOR | 已修：绑定检查改用规范化 origin 比较（`engine::base_url_origin`），9 组等价/非等价用例 + 一个尾斜杠的 e2e |
+| R3-5 | MAJOR | 已修：`sanitize_*` 不再只看 `char::is_control()`，新增 bidi（U+202A–202E、U+2066–2069、U+200E/F、U+061C）与零宽/不可见（U+200B–200D、U+2060–2064、U+00AD、U+180E、U+FEFF）。注意 profile 名此前之所以安全是因为走 `{:?}` 的 Rust Debug 转义（Cf 类被转义），而路径走 Display，两条路径不同 |
+| R3-8 | MAJOR | 已修：`ConflictingUrl` 与 `UnboundProfileCredential` 登记进 `docs/exit-codes.md`；并新增 `every_config_error_is_registered_in_the_exit_code_document`——**穷尽 match** 把每个变体映射到文档关键词，新增变体不改文档就编译不过 |
+| R3-9 | MINOR | 已修：profile 无 URL 的错误不再建议 `set OUTLINE_URL`（那会撞上绑定检查），改为建议加 `url =` 或 `--url` |
+
+R3 已 VERIFIED：R2-6（Windows/POSIX 双规则参数化执行）、R2-7（64 字符上限在派生处生效）。
 
 R2 已 VERIFIED：R1-3（TOML 文本只用于分类）、R1-4（两层白名单）、R1-7（控制字符清理，并额外确认 bidi
 经 Rust Debug 转义后无法改变终端方向状态）。

@@ -95,9 +95,11 @@ so that 不背命令。
 
 | # | 级别 | 处置 |
 |---|------|------|
-| R2-5 | MINOR | 已修：R1 的口径收敛漏了公开 rustdoc（模块开头仍写 “operation names all complete”）。现在模块文档按 shell 写明，并新增 `the_public_module_documentation_matches_the_delivered_coverage`——直接读源文件的模块注释，与 `completes_operation_names` 判定表核对。文档也是一种声明，一并纳入测试。 |
+| R2-5 | MINOR | 部分修复（R3-7 补完）：R1 的口径收敛漏了公开 rustdoc（模块开头仍写 “operation names all complete”）。现在模块文档按 shell 写明，并新增 `the_public_module_documentation_matches_the_delivered_coverage`——直接读源文件的模块注释，与 `completes_operation_names` 判定表核对。文档也是一种声明，一并纳入测试。 |
 
-R2 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
+| R3-7 | MINOR | 已修：R2 那个 rustdoc 测试只校验「被支持的 shell 被提到」，追加一句 “powershell and elvish operation names complete” 仍会通过（循环里对谓词为 false 的分支没有 else 断言）。现在按**句子**双向校验：任何正面声称补全操作名的句子都不得点到未覆盖的 shell；另加一个「守卫的守卫」测试，用审查者给的那句原文验证检查本身会命中 |
+
+R2/R3 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
 进一步验证」——生成期过滤不依赖 build.rs 的编译期拒绝，是独立的第二道，specsync 合并后可直接复验该接缝。
 
 ### 故意留下的缺口

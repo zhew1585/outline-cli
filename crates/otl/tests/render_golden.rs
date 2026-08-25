@@ -737,32 +737,95 @@ fn blank_strings_do_not_earn_a_column_but_false_and_zero_do() {
     assert!(header.contains(&"revision".to_string()), "{header:?}");
 }
 
+/// Whether a payload has a visibly non-empty value for `key` in some row.
+///
+/// An INDEPENDENT reimplementation of the property under test, deliberately
+/// not reading the rendered table: a blank middle column shifts every later
+/// value left, so `split_whitespace().nth(i)` cannot tell which column a cell
+/// belongs to (R3 finding 6 called that out, correctly).
+fn visible_in_payload(payload: &Value, key: &str) -> bool {
+    payload
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get(key))
+        .any(|value| match value {
+            Value::Null => false,
+            Value::String(text) => text.chars().any(|c| {
+                !c.is_control()
+                    && !c.is_whitespace()
+                    && unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 0
+            }),
+            _ => true,
+        })
+}
+
 #[test]
 fn no_selected_column_is_ever_blank_in_every_row() {
-    // The invariant, checked over a spread of payload shapes.
+    // The invariant, over payload shapes that include the invisible cases:
+    // an ESC (which sanitizing turns into a space) and a zero-width space
+    // (which survives sanitizing but occupies no column).
     let schema = document_schema();
     for payload in [
         json!([{ "id": "d1" }]),
         json!([{ "id": "d1", "icon": null }]),
         json!([{ "id": "d1", "title": "", "icon": "x" }]),
         json!([{ "id": "d1", "title": null, "createdAt": "c", "updatedAt": null }]),
+        json!([{ "id": "d1", "title": "\u{1b}", "urlId": "visible" }]),
+        json!([{ "id": "d1", "title": "\u{200b}", "urlId": "visible" }]),
+        json!([{ "id": "d1", "title": " \u{200b}\u{1b} ", "text": "body", "urlId": "u" }]),
         documents_payload(),
     ] {
-        let rendered = render(&payload, OutputMode::Table, &schema).unwrap();
-        let lines: Vec<&str> = rendered.lines().collect();
-        let header = header_of(&payload, &schema);
-        for (index, name) in header.iter().enumerate() {
-            let has_data = lines[1..].iter().any(|line| {
-                line.split_whitespace()
-                    .nth(index)
-                    .is_some_and(|cell| !cell.trim().is_empty())
-            });
+        for column in header_of(&payload, &schema) {
             assert!(
-                has_data,
-                "column {name} is blank in every row for {payload}:\n{rendered}"
+                visible_in_payload(&payload, &column),
+                "column {column} is blank in every row of {payload}"
             );
         }
     }
+}
+
+#[test]
+fn invisible_values_do_not_crowd_out_visible_ones() {
+    // R3 finding 6: `has_content` judged the RAW string, so a high-priority
+    // field holding "\u{1b}" or "\u{200b}" counted as content, filled a
+    // column with nothing, and pushed a real value past the four-column cap.
+    let schema = document_schema();
+    let payload = json!([
+        {
+            "id": "d1",
+            "title": "\u{1b}",
+            "icon": "\u{200b}",
+            "color": "\u{200b}\u{200b}",
+            "text": "\u{1b}\u{1b}",
+            "urlId": "visible-1",
+            "createdAt": "2026-08-01"
+        },
+        {
+            "id": "d2",
+            "title": "\u{1b}",
+            "icon": "\u{200b}",
+            "color": "\u{200b}\u{200b}",
+            "text": "\u{1b}\u{1b}",
+            "urlId": "visible-2",
+            "createdAt": "2026-08-02"
+        }
+    ]);
+    let header = header_of(&payload, &schema);
+    assert!(
+        !header.contains(&"title".to_string()),
+        "an invisible cell took a column: {header:?}"
+    );
+    for invisible in ["icon", "color", "text"] {
+        assert!(
+            !header.contains(&invisible.to_string()),
+            "{invisible} took a column: {header:?}"
+        );
+    }
+    assert!(header.contains(&"urlId".to_string()), "{header:?}");
+    assert!(header.contains(&"createdAt".to_string()), "{header:?}");
+    let rendered = render(&payload, OutputMode::Table, &schema).unwrap();
+    assert!(rendered.contains("visible-1"), "{rendered}");
 }
 
 #[test]

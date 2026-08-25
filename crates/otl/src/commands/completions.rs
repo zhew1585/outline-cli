@@ -5,9 +5,9 @@
 //! nothing it offers can drift from what the binary can actually call.
 //!
 //! Subcommands and flag names complete in every supported shell. `otl api`
-//! OPERATION names complete in bash, zsh and fish only - see the per-shell
+//! OPERATION names complete in bash, zsh, fish only - see the per-shell
 //! coverage note below, and [`completes_operation_names`], which is the
-//! single source both the generated scripts and the tests read.
+//! single source the generated scripts, the CLI help and the tests all read.
 //!
 //! The augmentation is applied to a CLONE of the command used for generation
 //! only: the real parser keeps accepting any operation name so that an
