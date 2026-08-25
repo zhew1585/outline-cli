@@ -1,19 +1,22 @@
 //! The single request channel.
 //!
-//! Every HTTP call made on behalf of the engine flows through
-//! [`Client::execute`]. Local validation, backoff, error mapping and token
-//! renewal will all live here (and only here) as they are implemented.
+//! Every HTTP call made on behalf of the engine flows through the private
+//! [`Client::send`]: both the `key=value` path ([`Client::execute`]) and the
+//! raw-body passthrough ([`Client::execute_raw`]) funnel into it, so there
+//! is exactly one `.send()` in the crate. Local validation, backoff, error
+//! mapping and token renewal all live here (and only here).
 
 use std::fmt;
 use std::io::Read;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
+use crate::body::{build_request_body, ensure_dispatchable};
 use crate::error::{is_transport_failure, EngineError, TransportKind};
-use crate::ir::{OpSpec, ParamType};
+use crate::ir::{OpSpec, ValidationMode};
 use crate::sanitize::{clean_server_text, redact_secret, REDACTED};
 
 /// Default total request timeout.
@@ -22,7 +25,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ERROR_BODY_BYTES: u64 = 8 * 1024;
 /// Maximum number of characters kept from a server-provided error message.
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
-/// Maximum number of characters kept from a server-provided error code.
+/// Maximum number of characters kept from a server-provided error code, and
+/// the maximum length of a string still accepted as a structured code.
 const MAX_ERROR_CODE_CHARS: usize = 64;
 /// Fallback message when an error response carries no usable text.
 const NO_ERROR_DETAILS: &str = "no error details in response body";
@@ -31,6 +35,22 @@ const NO_ERROR_DETAILS: &str = "no error details in response body";
 const INVALID_HEADER_REASON: &str =
     "a header value contains characters that are not valid in HTTP \
      (for example a newline or a control character)";
+/// Explanation used in place of withheld server text.
+const SERVER_MESSAGE_WITHHELD: &str =
+    "server message withheld: it may quote the request body, which can contain secrets";
+
+/// How much of a server error response may be surfaced to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorDetail {
+    /// Report the server's free-form message (sanitized, token-redacted).
+    ///
+    /// Safe when every value in the request came from the caller's own
+    /// arguments, and available as an explicit opt-in otherwise.
+    #[default]
+    Full,
+    /// Report only the structured error code, never free-form text.
+    CodeOnly,
+}
 
 /// A blocking RPC client bound to one API base URL and one bearer token.
 pub struct Client {
@@ -88,25 +108,87 @@ impl Client {
 
     /// Execute one RPC operation with `key=value` arguments.
     ///
-    /// Sends `POST {base}{op.path}` with a JSON body assembled from `args`
-    /// and returns the parsed JSON response. The operation path comes from
-    /// the IR verbatim; the engine imposes no URL convention of its own.
-    pub fn execute(&self, op: &OpSpec, args: &[(String, String)]) -> Result<Value, EngineError> {
-        let url = format!("{}{}", self.base_url, op.path);
-        let body = build_body(op, args);
+    /// Arguments are validated against the operation's parameter specs and
+    /// coerced to their declared JSON types locally - any validation error
+    /// is returned before a single byte goes on the wire. Then sends
+    /// `POST {base}{op.path}` and returns the parsed JSON response. The
+    /// operation path comes from the IR verbatim; the engine imposes no
+    /// URL convention of its own.
+    pub fn execute(
+        &self,
+        op: &OpSpec,
+        args: &[(String, String)],
+        validation: ValidationMode,
+    ) -> Result<Value, EngineError> {
+        let body = build_request_body(op, args, validation)?;
+        let bytes = serde_json::to_vec(&body).map_err(|error| EngineError::InvalidRequestBody {
+            reason: error.to_string(),
+        })?;
+        // Every value came from the caller's own command line, so server
+        // error text may be surfaced in full (sanitized and token-free).
+        self.send(&op.path, bytes, ErrorDetail::Full)
+    }
 
+    /// Execute one RPC operation with a caller-supplied raw JSON body.
+    ///
+    /// The body must be valid JSON (checked locally, before any network
+    /// request) and is sent byte-for-byte verbatim, bypassing `key=value`
+    /// assembly and parameter validation entirely.
+    ///
+    /// A raw body may carry credentials this client knows nothing about,
+    /// and a server error response may quote the request it rejected.
+    /// There is no way to recognize such a quote after the fact - a secret
+    /// can be short, escaped differently, or overlap another value - so
+    /// the decision is categorical: with [`ErrorDetail::CodeOnly`] the
+    /// server's free-form text is withheld and only its structured error
+    /// code is reported. [`ErrorDetail::Full`] is the caller's explicit
+    /// opt-in to seeing text that may echo the body.
+    pub fn execute_raw(
+        &self,
+        op: &OpSpec,
+        body: &str,
+        detail: ErrorDetail,
+    ) -> Result<Value, EngineError> {
+        ensure_dispatchable(op)?;
+        // Well-formedness only: no value tree is built, so a large body
+        // costs one pass and no per-value work.
+        if let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(body) {
+            return Err(EngineError::InvalidRequestBody {
+                reason: error.to_string(),
+            });
+        }
+        self.send(&op.path, body.as_bytes().to_vec(), detail)
+    }
+
+    /// The single wire path: POST a JSON payload and parse the response.
+    ///
+    /// This is the only `.send()` in the engine. It carries both bodies
+    /// serialized from `key=value` arguments and raw caller-supplied bytes,
+    /// so every request shares one set of headers, one error
+    /// classification, and one credential-hygiene pipeline.
+    ///
+    /// `detail` decides how much of a server error response may be
+    /// surfaced (see [`Client::execute_raw`]).
+    fn send(
+        &self,
+        op_path: &str,
+        body: Vec<u8>,
+        detail: ErrorDetail,
+    ) -> Result<Value, EngineError> {
+        let url = format!("{}{}", self.base_url, op_path);
         let response = self
             .http
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(ACCEPT, "application/json")
-            .json(&body)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .map_err(|source| self.send_error(source))?;
 
         let status = response.status();
         if !status.is_success() {
-            let parts = extract_error_parts(response, &self.token);
+            let parts = extract_error_parts(response, &self.token, detail);
             return Err(EngineError::Api {
                 status: status.as_u16(),
                 code: parts.code,
@@ -223,30 +305,6 @@ fn validate_base_url(base_url: &str) -> Result<Url, EngineError> {
     Ok(parsed)
 }
 
-/// Assemble the JSON request body from `key=value` argument pairs.
-///
-/// Dispatch is structured by [`ParamType`]; in this milestone every type is
-/// passed through as a JSON string (typed conversion is a later story).
-/// Arguments without a matching parameter spec are passed through as strings.
-fn build_body(op: &OpSpec, args: &[(String, String)]) -> Value {
-    let entries = args.iter().map(|(key, raw)| {
-        let ty = op.param(key).map_or(ParamType::Json, |p| p.ty);
-        (key.clone(), encode_scalar(ty, raw))
-    });
-    Value::Object(entries.collect::<Map<String, Value>>())
-}
-
-/// Encode one raw CLI value according to its declared wire type.
-fn encode_scalar(ty: ParamType, raw: &str) -> Value {
-    match ty {
-        ParamType::String
-        | ParamType::Integer
-        | ParamType::Boolean
-        | ParamType::Number
-        | ParamType::Json => Value::String(raw.to_string()),
-    }
-}
-
 /// Typed error info extracted from an error response body.
 struct ApiErrorParts {
     /// Machine-readable error code (e.g. the envelope's `error` field).
@@ -259,13 +317,27 @@ struct ApiErrorParts {
 ///
 /// The body read is capped at [`MAX_ERROR_BODY_BYTES`]; one extra byte is
 /// requested so a cap hit is detectable, which makes the trailing fragment
-/// of a cut body droppable as a unit. Every extracted field goes through
+/// of a cut body droppable as a unit.
+///
+/// With [`ErrorDetail::Full`] every extracted field goes through
 /// [`clean_server_text`], which owns the whole credential-hygiene pipeline
 /// (redaction before AND after normalization, smuggling check, length cap).
-fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> ApiErrorParts {
-    let no_details = || ApiErrorParts {
-        code: None,
-        message: NO_ERROR_DETAILS.to_string(),
+///
+/// With [`ErrorDetail::CodeOnly`] the free-form text is dropped entirely
+/// and only a code-shaped [`is_error_code`] value is reported: server text
+/// may quote the request body, and no filter can reliably recognize a
+/// caller's own secret inside it after the fact.
+fn extract_error_parts(
+    response: reqwest::blocking::Response,
+    secret: &str,
+    detail: ErrorDetail,
+) -> ApiErrorParts {
+    let no_details = |detail: ErrorDetail| match detail {
+        ErrorDetail::CodeOnly => withheld_parts(None, secret),
+        ErrorDetail::Full => ApiErrorParts {
+            code: None,
+            message: NO_ERROR_DETAILS.to_string(),
+        },
     };
     let fallback = |mut parts: ApiErrorParts| {
         if parts.message.is_empty() {
@@ -280,11 +352,15 @@ fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> A
         .read_to_end(&mut raw)
         .is_err()
     {
-        return no_details();
+        return no_details(detail);
     }
     let capped = raw.len() as u64 > MAX_ERROR_BODY_BYTES;
     raw.truncate(MAX_ERROR_BODY_BYTES as usize);
     let body = String::from_utf8_lossy(&raw);
+    let parsed = serde_json::from_str::<Value>(&body).ok();
+    if detail == ErrorDetail::CodeOnly {
+        return withheld_parts(parsed.as_ref(), secret);
+    }
     // Whether a piece of text may itself be cut mid-way governs the
     // cap-tail treatment. A body that PARSED is complete no matter how it
     // was capped - JSON tolerates unlimited trailing whitespace, so a
@@ -292,8 +368,8 @@ fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> A
     // last word of a complete field would corrupt a legitimate diagnostic
     // for no security gain. The skeleton smuggling check still applies to
     // every field either way.
-    let parts = match serde_json::from_str::<Value>(&body) {
-        Ok(json) => {
+    let parts = match parsed {
+        Some(json) => {
             let clean = |text: &str, cap: usize| clean_server_text(text, secret, false, cap);
             ApiErrorParts {
                 code: json
@@ -311,10 +387,45 @@ fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> A
         }
         // Raw text straight out of the body: this is the only text that a
         // read cap can have cut mid-token.
-        Err(_) => ApiErrorParts {
+        None => ApiErrorParts {
             code: None,
             message: clean_server_text(&body, secret, capped, MAX_ERROR_MESSAGE_CHARS),
         },
     };
     fallback(parts)
+}
+
+/// Describe an error response without repeating any free-form text.
+///
+/// The structured error code is reported when the response carries one in
+/// a code-shaped field ([`is_error_code`]); a server that puts prose - or
+/// a quoted request body - there is treated as having sent no code. The
+/// surviving code still goes through [`clean_server_text`] (and is
+/// re-checked afterwards) so that a code that smuggles our own bearer token
+/// is discarded rather than printed.
+fn withheld_parts(parsed: Option<&Value>, secret: &str) -> ApiErrorParts {
+    let code = parsed
+        .and_then(|json| json.get("error").or_else(|| json.get("code")))
+        .and_then(Value::as_str)
+        .filter(|code| is_error_code(code))
+        .map(|code| clean_server_text(code, secret, false, MAX_ERROR_CODE_CHARS))
+        .filter(|code| is_error_code(code));
+    ApiErrorParts {
+        code,
+        message: SERVER_MESSAGE_WITHHELD.to_string(),
+    }
+}
+
+/// Whether `text` has the shape of a machine-readable error code: a short
+/// run of ASCII alphanumerics and `_`, `-`, `.` separators.
+///
+/// Deliberately strict: it is what separates a stable code from arbitrary
+/// server text that might embed the request body. Being ASCII-only, a
+/// string that passes can carry no invisible characters either.
+fn is_error_code(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_ERROR_CODE_CHARS
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }

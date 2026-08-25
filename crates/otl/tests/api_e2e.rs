@@ -473,9 +473,14 @@ fn cli_error_debug_and_chain_are_credential_free() {
     let op = engine::OpSpec {
         name: Cow::Borrowed("documents.info"),
         path: Cow::Borrowed("/api/documents.info"),
+        summary: Cow::Borrowed(""),
+        content_type: Cow::Borrowed("application/json"),
+        body_mode: engine::BodyMode::KeyValue,
         params: Cow::Borrowed(&[]),
     };
-    let engine_error = client.execute(&op, &[]).unwrap_err();
+    let engine_error = client
+        .execute(&op, &[], engine::ValidationMode::Strict)
+        .unwrap_err();
     let cli_error = otl::exit::CliError::failure(engine_error);
 
     let chain: String = cli_error

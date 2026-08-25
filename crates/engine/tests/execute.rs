@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use engine::{Client, EngineError, OpSpec, ParamSpec, ParamType, TransportKind};
+use engine::{Client, EngineError, OpSpec, ParamSpec, ParamType, TransportKind, ValidationMode};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -14,10 +14,18 @@ fn op_with_path(op_path: &'static str) -> OpSpec {
     OpSpec {
         name: Cow::Borrowed("things.info"),
         path: Cow::Borrowed(op_path),
+        summary: Cow::Borrowed("Retrieve a thing"),
+        content_type: Cow::Borrowed("application/json"),
+        body_mode: engine::BodyMode::KeyValue,
         params: Cow::Borrowed(&[ParamSpec {
             name: Cow::Borrowed("id"),
             ty: ParamType::String,
             required: false,
+            nullable: false,
+            enum_values: Cow::Borrowed(&[]),
+            format: Cow::Borrowed(""),
+            minimum: None,
+            maximum: None,
         }]),
     }
 }
@@ -44,6 +52,7 @@ async fn execute_posts_json_with_bearer_auth() {
         client.execute(
             &op_with_path("/api/things.info"),
             &[("id".to_string(), "doc-123".to_string())],
+            ValidationMode::Strict,
         )
     })
     .await
@@ -67,7 +76,7 @@ async fn execute_uses_ir_path_verbatim_not_name_convention() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/rpc/custom"), &[])
+        client.execute(&op_with_path("/rpc/custom"), &[], ValidationMode::Strict)
     })
     .await
     .unwrap();
@@ -91,7 +100,11 @@ async fn execute_maps_error_status_to_api_error() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -122,7 +135,11 @@ async fn non_json_error_body_has_no_code() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -160,7 +177,11 @@ async fn error_code_is_sanitized_and_capped() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "reflected-secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -195,7 +216,11 @@ async fn error_message_is_sanitized_and_capped() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -228,7 +253,11 @@ async fn reflected_bearer_token_is_redacted_from_error_message() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "reflected-secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -263,7 +292,11 @@ async fn token_prefix_cut_by_body_cap_is_redacted() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, token)?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -303,7 +336,11 @@ async fn token_smuggled_through_control_chars_is_discarded() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, token)?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -349,7 +386,11 @@ async fn token_smuggled_through_invisible_characters_is_discarded() {
         let base_url = server.uri();
         let result = tokio::task::spawn_blocking(move || {
             let client = Client::new(&base_url, token)?;
-            client.execute(&op_with_path("/api/things.info"), &[])
+            client.execute(
+                &op_with_path("/api/things.info"),
+                &[],
+                ValidationMode::Strict,
+            )
         })
         .await
         .unwrap();
@@ -394,7 +435,11 @@ async fn complete_json_envelope_in_a_capped_body_is_not_mangled() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, "secret-token")?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -424,7 +469,11 @@ async fn token_fragment_behind_capped_whitespace_is_discarded() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, token)?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -456,7 +505,11 @@ async fn short_token_prefix_left_by_body_cap_is_discarded() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::new(&base_url, token)?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -508,7 +561,11 @@ fn body_read_timeout_is_a_transport_error_not_invalid_json() {
     let client =
         Client::with_timeout(&base_url, "secret-token", Duration::from_millis(300)).unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
 
     match error {
@@ -528,7 +585,11 @@ fn truncated_body_is_a_transport_error_not_invalid_json() {
     );
     let client = Client::with_timeout(&base_url, "secret-token", Duration::from_secs(5)).unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
 
     match error {
@@ -558,7 +619,11 @@ async fn genuine_json_syntax_error_stays_invalid_response() {
     let base_url = server.uri();
     let result = tokio::task::spawn_blocking(move || {
         let client = Client::with_timeout(&base_url, "secret-token", Duration::from_secs(5))?;
-        client.execute(&op_with_path("/api/things.info"), &[])
+        client.execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
     })
     .await
     .unwrap();
@@ -576,7 +641,11 @@ fn invalid_header_credential_is_a_request_build_error() {
     // transport failure - and the token must not appear anywhere.
     let client = Client::new("http://127.0.0.1:9", "bad\nkey-SECRET-9c7a").unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
     assert!(
         matches!(error, EngineError::InvalidRequest { .. }),
@@ -654,7 +723,11 @@ fn transport_error_display_shows_origin_only() {
     // path (which may carry secrets), and never raw reqwest error text.
     let client = Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
     assert!(
         matches!(error, EngineError::Transport { .. }),
@@ -692,7 +765,11 @@ fn transport_error_debug_and_source_chain_are_credential_free() {
     // callers formatting {:?} or walking source() never see a path secret.
     let client = Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
     let error = client
-        .execute(&op_with_path("/api/things.info"), &[])
+        .execute(
+            &op_with_path("/api/things.info"),
+            &[],
+            ValidationMode::Strict,
+        )
         .unwrap_err();
     let rendered = render_full_error_chain(&error);
     assert_eq!(

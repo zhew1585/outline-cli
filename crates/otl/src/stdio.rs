@@ -21,9 +21,24 @@ use crate::exit::CliError;
 /// - broken pipe: `Ok(())` - the consumer stopped reading; exit quietly.
 /// - any other write failure: a generic failure (exit code 1).
 pub fn write_data_line(text: &str) -> Result<(), CliError> {
+    write_stdout(|handle| writeln!(handle, "{text}"))
+}
+
+/// Write DATA to stdout verbatim (no trailing newline added).
+///
+/// Same failure contract as [`write_data_line`]: for multi-line payloads
+/// that already carry their own line endings, such as `otl api list`.
+pub fn write_data(text: &str) -> Result<(), CliError> {
+    write_stdout(|handle| handle.write_all(text.as_bytes()))
+}
+
+/// Run one write against a locked stdout and classify its outcome.
+fn write_stdout(
+    write: impl FnOnce(&mut io::StdoutLock<'_>) -> io::Result<()>,
+) -> Result<(), CliError> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    match writeln!(handle, "{text}").and_then(|()| handle.flush()) {
+    match write(&mut handle).and_then(|()| handle.flush()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(CliError::failure(anyhow!(

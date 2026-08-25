@@ -33,6 +33,7 @@ unicode-segmentation = "1.12"
 wiremock = "0.6"
 assert_cmd = "2.0"
 predicates = "3.1"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # Release profile tuned for binary size and cold-start time (SPEC: <10ms

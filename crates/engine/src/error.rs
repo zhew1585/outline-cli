@@ -22,6 +22,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::ir::ParamType;
+
 /// Errors produced by the engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -91,6 +93,146 @@ pub enum EngineError {
         #[source]
         source: reqwest::Error,
     },
+
+    /// A `key=value` argument does not name any parameter of the operation.
+    ///
+    /// Detected locally, before any network request.
+    #[error("unknown parameter {name:?} for operation {operation:?}; {valid}")]
+    UnknownParam {
+        /// Operation name.
+        operation: String,
+        /// The unrecognized parameter name.
+        name: String,
+        /// Pre-formatted help text listing the valid parameter names (or
+        /// stating that the operation takes none).
+        valid: String,
+    },
+
+    /// A required parameter was not supplied.
+    ///
+    /// Detected locally, before any network request.
+    #[error("missing required parameter {name:?} (type {ty}) for operation {operation:?}")]
+    MissingParam {
+        /// Operation name.
+        operation: String,
+        /// The missing parameter name.
+        name: String,
+        /// Declared wire type of the missing parameter.
+        ty: ParamType,
+    },
+
+    /// A complex (object/array/union) parameter was given as `key=value`.
+    ///
+    /// Complex values cannot be expressed as a scalar CLI argument; the
+    /// caller must supply a raw JSON body instead. Detected locally,
+    /// before any network request.
+    #[error(
+        "parameter {name:?} of operation {operation:?} is a complex JSON type \
+         (object, array, or union) and cannot be passed as key=value"
+    )]
+    ComplexParam {
+        /// Operation name.
+        operation: String,
+        /// The complex parameter name.
+        name: String,
+    },
+
+    /// A `key=value` value does not conform to the parameter's scalar type.
+    ///
+    /// Detected locally, before any network request. Carries no raw value:
+    /// error text must stay credential-free by construction.
+    #[error("invalid value for parameter {name:?}: {reason}")]
+    InvalidParamValue {
+        /// The parameter name.
+        name: String,
+        /// Human-readable reason (e.g. `expected an integer`).
+        reason: String,
+    },
+
+    /// A `key=value` value cannot be sent exactly as a JSON number.
+    ///
+    /// Detected locally, before any network request. Raised instead of
+    /// silently rounding the value on the wire.
+    #[error("value for parameter {name:?} cannot be sent exactly as a JSON number: {reason}")]
+    InexactNumber {
+        /// The parameter name.
+        name: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// The operation's request body cannot be assembled from `key=value`
+    /// arguments because a root-level `oneOf`/`anyOf` union constrains it.
+    ///
+    /// Detected locally, before any network request.
+    #[error(
+        "operation {operation:?} constrains its request body with a JSON union \
+         (oneOf/anyOf), which key=value arguments cannot express"
+    )]
+    UnionBody {
+        /// Operation name.
+        operation: String,
+    },
+
+    /// The operation requires a request content type this client cannot
+    /// assemble (e.g. `multipart/form-data`).
+    ///
+    /// Detected locally, before any network request.
+    #[error(
+        "operation {operation:?} requires request content type {content_type}, \
+         which this client cannot assemble"
+    )]
+    UnsupportedBodyType {
+        /// Operation name.
+        operation: String,
+        /// The content type declared by the spec.
+        content_type: String,
+    },
+
+    /// A raw request body is not valid JSON.
+    ///
+    /// Detected locally, before any network request. The reason is a
+    /// serde_json position message (line/column), never body content.
+    #[error("request body is not valid JSON: {reason}")]
+    InvalidRequestBody {
+        /// Parse failure description (position only, no content).
+        reason: String,
+    },
+}
+
+impl EngineError {
+    /// Whether this error is a local validation/usage error, raised before
+    /// any network request (as opposed to a transport or server failure).
+    pub fn is_validation(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidBaseUrl { .. }
+                | Self::UnknownParam { .. }
+                | Self::MissingParam { .. }
+                | Self::ComplexParam { .. }
+                | Self::InvalidParamValue { .. }
+                | Self::InexactNumber { .. }
+                | Self::UnionBody { .. }
+                | Self::UnsupportedBodyType { .. }
+                | Self::InvalidRequestBody { .. }
+        )
+    }
+
+    /// Whether the caller should be pointed at supplying a raw JSON body
+    /// instead: the value or shape at fault cannot be expressed as
+    /// `key=value` arguments at all.
+    pub fn suggests_raw_body(&self) -> bool {
+        matches!(
+            self,
+            Self::ComplexParam { .. }
+                | Self::UnionBody { .. }
+                | Self::InexactNumber { .. }
+                | Self::MissingParam {
+                    ty: ParamType::Json,
+                    ..
+                }
+        )
+    }
 }
 
 /// Coarse classification of a transport failure, safe to display.

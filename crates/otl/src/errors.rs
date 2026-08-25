@@ -30,7 +30,21 @@ const NETWORK_RETRY_HINT: &str =
 /// Map an engine error to a `CliError` with a documented exit code
 /// (see `docs/exit-codes.md`) and a polished stderr message.
 pub fn map_engine_error(error: EngineError) -> CliError {
+    map_engine_error_with_hint(error, None)
+}
+
+/// Same as [`map_engine_error`], plus a caller-supplied actionable hint.
+///
+/// Exit-code classification stays here (one table, one place); the hint is
+/// the calling command's own contribution - which flag or file would get
+/// past this particular failure. It is authored text, never server- or
+/// user-supplied, so appending it cannot leak anything.
+pub fn map_engine_error_with_hint(error: EngineError, hint: Option<&str>) -> CliError {
     let (code, message) = classify(&error);
+    let message = match hint {
+        Some(hint) => format!("{message}; {hint}"),
+        None => message,
+    };
     CliError::new(code, anyhow::Error::new(error).context(message))
 }
 
@@ -52,6 +66,18 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
             code,
             message,
         } => classify_api(*status, code.as_deref(), message),
+        // Local validation: rejected before a single byte went on the wire,
+        // so these are usage errors (exit code 2) like a bad flag would be.
+        // Listed one by one on purpose: a new engine variant must fail to
+        // compile here rather than silently inherit a class.
+        EngineError::UnknownParam { .. }
+        | EngineError::MissingParam { .. }
+        | EngineError::ComplexParam { .. }
+        | EngineError::InvalidParamValue { .. }
+        | EngineError::InexactNumber { .. }
+        | EngineError::UnionBody { .. }
+        | EngineError::UnsupportedBodyType { .. }
+        | EngineError::InvalidRequestBody { .. } => (ExitCode::Usage, error.to_string()),
         EngineError::ClientBuild(_) | EngineError::InvalidResponse { .. } => {
             (ExitCode::Failure, error.to_string())
         }
