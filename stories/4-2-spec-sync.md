@@ -38,8 +38,9 @@ so that 新端点无需等 CLI 发版。
   - [x] 缓存 key 三要素：spec hash（provenance）+ CLI 版本 + IR schema 版本，任一不符整体废弃
   - [x] 位置经 `directories` 解析（Linux `~/.cache/outline-cli`、macOS `~/Library/Caches/outline-cli`、Windows `%LOCALAPPDATA%\outline-cli\cache`）；`OTL_CACHE_DIR` 覆盖
   - [x] 写入：同目录随机名 temp（`tempfile`，O_EXCL + Unix 0600）→ fsync → persist（Windows 亦替换）；失败即清理
-  - [x] 写入前校验：load 侧全部规则 + 编码长度上限（bincode limit 只约束解码）
-  - [x] 读取：文件尺寸 → magic → 布局版本 → 校验和 → 解码且无尾随字节 → 版本 → provenance → 逐 op 校验
+  - [x] 写入前校验：load 侧全部规则（含版本）+ 编码长度上限（bincode limit 只约束解码）
+  - [x] 读取：文件类型（不跟随 symlink）→ 尺寸 → fstat 复查 → 限长读取 → magic → 布局版本 → 校验和 →
+        有界解码（元素数 ≤ 8192 + 解码后 footprint ≤ 8 MiB）且无尾随字节 → 版本 → provenance → 逐 op 校验
 - [x] Task 4: 运行时表解析 (AC: 1, 2, 3)
   - [x] `ops::table()`：`OnceLock` 惰性解析，缓存优先、内置兜底
   - [x] 缓存不可用 → stderr 一行警告（区分 damaged / outdated）+ 修复命令，退出码不受影响
@@ -69,9 +70,14 @@ so that 新端点无需等 CLI 发版。
   语义（编译一次落缓存，之后所有命令生效），且解析仍只发生在 sync 这一条路径。`otl spec reset` 退出该状态。
 - **缓存 key 里的 spec hash**：加载时无法用 hash 做查找（运行时手里没有 spec 可以算 hash），所以 hash 是 provenance +
   「是否需要重写」的判据，CLI 版本与 IR schema 版本才是准入校验。三者都在 header 里。
-- **缓存是独立信任边界**：文件可能被截断、位翻转、被别的进程写、被上一版 CLI 留下。加载顺序为
-  文件尺寸 → magic → 布局版本 → 校验和 → bincode 解码且无尾随字节 → IR schema 版本 → CLI 版本 →
-  provenance → 每个 op 的 name/path/绑定/文本。任一失败即整体废弃，**不做迁移**。
+- **缓存是独立信任边界**：文件可能被截断、位翻转、换成管道或 symlink、被别的进程写、被上一版 CLI 留下。加载顺序为
+  文件类型（不跟随 symlink，必须是普通文件）→ 文件尺寸 → 打开后 fstat 复查 → 限长读取 → magic → 布局版本 →
+  校验和 → 有界解码（元素数 + 解码后 footprint，见下）且无尾随字节 → IR schema 版本 → CLI 版本 → provenance →
+  每个 op 的 name/path/绑定/文本。任一失败即整体废弃，**不做迁移**。
+- **字节上限不是内存上限**（R2 发现）：bincode 的 limit 计的是消耗字节，而最小 OpSpec 编码 6 字节、解码后上百字节，
+  serde 路径也不会为解码结构计费。所以真正的界是三个：文件 1 MiB、元素数 ≤ 8192、解码后 footprint ≤ 8 MiB
+  （逐元素累加）。残留：单个 op 内部的 params 要整个解完才计费，因此峰值 ≈ 预算 + 一个 op 的量，这也是文件上限
+  必须小的原因。
 - **路径校验是安全需求不是洁癖**：engine 以 `format!("{base}{path}")` 拼 URL。若 IR 里出现 `@evil.example/x`，
   `https://host` + 该 path = `https://host@evil.example/x`，host 变成 userinfo，Bearer token 直接送给攻击者。
   因此下载的 spec 与缓存文件两侧都强制「纯绝对路径」白名单（禁 `@ : ? # % //` 与 `..`）。
@@ -156,6 +162,25 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 | 14 allowlist 粒度太粗 | allowlist 改为「文件 + 模式 + 该行必须含的上下文」，另加「runtime 不得出现 `read_to_string`（除用户指定路径的两处）」。已用报告里的原样 bypass 实验验证会被抓住 |
 | 15 `--spec` 对 FIFO 阻塞 | 打开前先 `fs::metadata` 判类型，非普通文件即 usage error。测试：FIFO（带看门狗，回归时失败而非挂死）+ 目录 |
 | 16 函数 >50 行 | `fetch_document` 拆成 `DocumentFetch` 的方法、`collect_facets` 抽出 `merge_facets`；脚本核对本 story 新增/改动的函数全部 <50 行（仓库里仅剩 Epic 1 的 `client::send`、`extract_error_parts`、`paginate::fetch_all_pages` 超限，不在本 story 范围） |
+
+### Review R2 处置（8 VERIFIED / 8 PARTIAL + 2 MAJOR + 9 MINOR，全部修复）
+
+R2 判定 VERIFIED 的 8 项（FetchError 独立错误域并核对 blob hash、文本净化/拒绝两侧、tempfile 原子写与 Windows
+persist、HashSet 化无语义回归、consumed 检查、函数长度）未再改动。PARTIAL 与新发现的处置：
+
+| # | 处置 |
+|---|------|
+| [2] MAJOR 缓存读取不拒特殊文件、读取无上限 | `symlink_metadata`（不跟随 symlink）→ 必须是普通文件 → 打开后再 fstat 复查 → `take` 限长读取。FIFO/`/dev/zero` symlink/指向合法缓存的 symlink/目录/读中增长全部拒绝并回退内置表。FIFO 测试带看门狗线程，回归时失败而非挂死 |
+| [3] MAJOR 解码内存放大 | 新增 `BoundedOps`：自定义 seq visitor，先按 `size_hint` 拒绝不可能的元素数（不预分配），逐元素计数至 `MAX_CACHED_OPS`=8192，并逐元素累加**解码后 footprint** 与 8 MiB 预算比对。文件上限从 8 MiB 降到 1 MiB（约 7000 op，是 vendored 的 60 倍），因为它是所有放大界的乘数。同一 op 上限也进了 `validate_ops`，使「能编译」与「能缓存」不会打架。bincode 的 byte limit 改为 footprint 预算而非文件上限——它计的是「消耗字节 + 容器 claim」，绑到文件上限会拒绝本 build 刚写出的文件 |
+| [1] MINOR 超 u64 的 Retry-After | 全数字但溢出的值视为「非常久」返回 `Duration::MAX`，由 `max_wait` 钳制；非 delta-seconds 仍走退避 |
+| [4] MINOR 编译期缺 name/path 绑定 | 绑定断言移到编译器（对任意 prefix 成立）：无前导 `/` 的文档路径会被前缀吞掉成 `/apidocuments.delete`，现在直接拒绝文档 |
+| [5] MINOR store 不查版本 | `store_at` 增加 load 侧版本检查，不再写出下一条命令就会废弃的缓存 |
+| [6] MINOR RFC 6901 非法转义被接受 | 改为严格逐字符解码：非法 `~x`、尾随 `~`、空 token、裸 `/` 一律拒绝（`UnsupportedRef`） |
+| [7] MINOR 守卫按整文件放行 | 改为**计数**每条通道恰好一个 `.send()`；断言两条通道互不调用（fetch.rs 不得用带凭证的 client）；固定 fetch.rs 的公开符号清单——在放行文件里新增入口现在必须显式过审 |
+| [8] MINOR 第二 HTTP 栈只查根 manifest | 遍历全部 member manifest + `Cargo.lock`（覆盖传递依赖） |
+| [9] MINOR 拆分构造路径绕过 | 禁止 runtime 出现任何打开文件的 API（`File::open`/`OpenOptions`/`fs::read`/`read_to_string`/`read_dir`/`include_*!`），只放行读用户指定路径的两处与缓存一处。路径怎么拼都得经过其中之一 |
+| [10] MINOR 共享的「保证不存在」目录 | 目录名含 pid + 计数器 + 纳秒，返回前断言不存在 |
+| [11] MINOR `--spec` 打开竞态 | 打开动作放到看门狗线程 + `recv_timeout`，「打开阻塞」变成明确错误而非永久挂起（`O_NONBLOCK` 需要 libc 且平台常量不同，为一次调用不值得）。看门狗本身有单测 |
 
 审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
 
