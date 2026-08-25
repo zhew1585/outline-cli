@@ -24,10 +24,18 @@ pub struct Config {
 }
 
 impl fmt::Debug for Config {
-    /// Manual impl: the API key must never appear in Debug output.
+    /// Manual impl: the API key must never appear in Debug output, and the
+    /// base URL is redacted too whenever it might embed `user:password@`
+    /// userinfo. `Config` holds the raw env value before `Client::new`
+    /// validation, so it cannot be assumed credential-free here.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let base_url: &str = if self.base_url.contains('@') {
+            REDACTED
+        } else {
+            &self.base_url
+        };
         f.debug_struct("Config")
-            .field("base_url", &self.base_url)
+            .field("base_url", &base_url)
             .field("api_key", &REDACTED)
             .finish()
     }
@@ -93,5 +101,21 @@ mod tests {
         );
         assert!(rendered.contains("***"));
         assert!(rendered.contains("https://docs.example.com"));
+    }
+
+    #[test]
+    fn debug_output_redacts_base_url_with_userinfo() {
+        // Config holds the raw env value before Client::new validation, so
+        // a base URL may still embed credentials at this point.
+        let config = Config {
+            base_url: "http://alice:url-secret-pw@example.com".to_string(),
+            api_key: "k".to_string(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("url-secret-pw"),
+            "base_url credential leaked: {rendered}"
+        );
+        assert!(!rendered.contains("alice"), "username leaked: {rendered}");
     }
 }

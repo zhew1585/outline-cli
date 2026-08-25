@@ -198,3 +198,34 @@ async fn response_without_data_prints_whole_body() {
         .success()
         .stdout(predicate::eq(include_str!("golden/no_data_envelope.txt")));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reflected_api_key_never_reaches_stderr() {
+    // A server that echoes the Authorization value in its error body must
+    // not cause the API key to be printed to stderr.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "message": "invalid header: Bearer reflected-secret-key"
+        })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let assert = tokio::task::spawn_blocking(move || {
+        otl()
+            .env("OUTLINE_URL", uri)
+            .env("OUTLINE_API_KEY", "reflected-secret-key")
+            .args(["api", "documents.info", "id=x"])
+            .assert()
+    })
+    .await
+    .unwrap();
+
+    assert
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("reflected-secret-key").not())
+        .stderr(predicate::str::contains("Bearer ***"));
+}
