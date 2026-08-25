@@ -6,24 +6,31 @@
 
 use std::fmt;
 use std::io::Read;
+use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use reqwest::Url;
 use serde_json::{Map, Value};
 
-use crate::error::{EngineError, TransportKind};
+use crate::error::{is_transport_failure, EngineError, TransportKind};
 use crate::ir::{OpSpec, ParamType};
+use crate::sanitize::{clean_server_text, redact_secret, REDACTED};
 
-/// Placeholder shown instead of secrets in Debug output.
-const REDACTED: &str = "***";
-/// Minimum length (in chars) of a trailing secret fragment worth redacting.
-const MIN_SECRET_FRAGMENT_CHARS: usize = 4;
+/// Default total request timeout.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of bytes read from an error response body.
 const MAX_ERROR_BODY_BYTES: u64 = 8 * 1024;
 /// Maximum number of characters kept from a server-provided error message.
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+/// Maximum number of characters kept from a server-provided error code.
+const MAX_ERROR_CODE_CHARS: usize = 64;
 /// Fallback message when an error response carries no usable text.
 const NO_ERROR_DETAILS: &str = "no error details in response body";
+/// Reason reported when a request cannot be assembled locally because a
+/// header value is not valid HTTP. Deliberately generic and value-free.
+const INVALID_HEADER_REASON: &str =
+    "a header value contains characters that are not valid in HTTP \
+     (for example a newline or a control character)";
 
 /// A blocking RPC client bound to one API base URL and one bearer token.
 pub struct Client {
@@ -55,8 +62,20 @@ impl Client {
     /// and without userinfo (credentials), query, or fragment. A trailing
     /// slash is tolerated and normalized away.
     pub fn new(base_url: &str, token: &str) -> Result<Self, EngineError> {
+        Self::with_timeout(base_url, token, DEFAULT_TIMEOUT)
+    }
+
+    /// Create a client with an explicit total request timeout.
+    ///
+    /// Same contract as [`Client::new`], which uses [`DEFAULT_TIMEOUT`].
+    pub fn with_timeout(
+        base_url: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<Self, EngineError> {
         let parsed = validate_base_url(base_url)?;
         let http = reqwest::blocking::Client::builder()
+            .timeout(timeout)
             .build()
             .map_err(|error| EngineError::ClientBuild(error.without_url()))?;
         Ok(Self {
@@ -83,31 +102,63 @@ impl Client {
             .header(ACCEPT, "application/json")
             .json(&body)
             .send()
-            .map_err(|source| EngineError::Transport {
-                origin: self.display_origin(),
-                kind: TransportKind::classify(&source),
-                // reqwest errors embed the full request URL in their
-                // Display AND Debug output (reqwest docs warn about this
-                // explicitly); strip it before the error is retained so
-                // the stored source is credential-free by construction.
-                source: source.without_url(),
-            })?;
+            .map_err(|source| self.send_error(source))?;
 
         let status = response.status();
         if !status.is_success() {
+            let parts = extract_error_parts(response, &self.token);
             return Err(EngineError::Api {
                 status: status.as_u16(),
-                message: extract_error_message(response, &self.token),
+                code: parts.code,
+                message: parts.message,
             });
         }
 
-        response
-            .json()
-            .map_err(|source| EngineError::InvalidResponse {
+        response.json().map_err(|source| self.body_error(source))
+    }
+
+    /// Classify a failure of `send()`.
+    ///
+    /// A builder failure never reached the network: the request could not
+    /// be assembled locally (an invalid header value, e.g. a credential
+    /// containing a newline). It must not be reported as a network problem,
+    /// and the underlying error is NOT retained - a builder error may embed
+    /// the offending header value.
+    fn send_error(&self, source: reqwest::Error) -> EngineError {
+        if source.is_builder() {
+            return EngineError::InvalidRequest {
+                reason: INVALID_HEADER_REASON.to_string(),
+            };
+        }
+        EngineError::Transport {
+            origin: self.display_origin(),
+            kind: TransportKind::classify(&source),
+            // reqwest errors embed the full request URL in their Display
+            // AND Debug output (reqwest docs warn about this explicitly);
+            // strip it before the error is retained so the stored source is
+            // credential-free by construction.
+            source: source.without_url(),
+        }
+    }
+
+    /// Classify a failure of reading/decoding a success response body.
+    ///
+    /// A body that times out or is cut mid-transfer is a TRANSPORT failure,
+    /// not malformed JSON: callers must be able to tell "retry may help"
+    /// from "the server sent something unparseable".
+    fn body_error(&self, source: reqwest::Error) -> EngineError {
+        if is_transport_failure(&source) {
+            return EngineError::Transport {
                 origin: self.display_origin(),
-                // See the Transport arm: strip the URL before retention.
+                kind: TransportKind::classify(&source),
                 source: source.without_url(),
-            })
+            };
+        }
+        EngineError::InvalidResponse {
+            origin: self.display_origin(),
+            // See the Transport arm: strip the URL before retention.
+            source: source.without_url(),
+        }
     }
 
     /// The origin for error messages, passed through secret redaction as
@@ -196,99 +247,74 @@ fn encode_scalar(ty: ParamType, raw: &str) -> Value {
     }
 }
 
-/// Pull a best-effort human-readable message out of an error response.
+/// Typed error info extracted from an error response body.
+struct ApiErrorParts {
+    /// Machine-readable error code (e.g. the envelope's `error` field).
+    code: Option<String>,
+    /// Human-readable message.
+    message: String,
+}
+
+/// Pull best-effort typed error info out of an error response.
 ///
-/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. Any occurrence of
-/// `secret` (the client's own bearer token, which a server or proxy may
-/// reflect back) is redacted BEFORE sanitization and truncation, so not
-/// even a token prefix can survive the length cap. The result is then
-/// sanitized (control characters stripped, whitespace collapsed) and
-/// capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
-fn extract_error_message(response: reqwest::blocking::Response, secret: &str) -> String {
+/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]; one extra byte is
+/// requested so a cap hit is detectable, which makes the trailing fragment
+/// of a cut body droppable as a unit. Every extracted field goes through
+/// [`clean_server_text`], which owns the whole credential-hygiene pipeline
+/// (redaction before AND after normalization, smuggling check, length cap).
+fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> ApiErrorParts {
+    let no_details = || ApiErrorParts {
+        code: None,
+        message: NO_ERROR_DETAILS.to_string(),
+    };
+    let fallback = |mut parts: ApiErrorParts| {
+        if parts.message.is_empty() {
+            parts.message = NO_ERROR_DETAILS.to_string();
+        }
+        parts
+    };
+
     let mut raw = Vec::new();
     if response
-        .take(MAX_ERROR_BODY_BYTES)
+        .take(MAX_ERROR_BODY_BYTES + 1)
         .read_to_end(&mut raw)
         .is_err()
     {
-        return NO_ERROR_DETAILS.to_string();
+        return no_details();
     }
+    let capped = raw.len() as u64 > MAX_ERROR_BODY_BYTES;
+    raw.truncate(MAX_ERROR_BODY_BYTES as usize);
     let body = String::from_utf8_lossy(&raw);
-    let candidate = match serde_json::from_str::<Value>(&body) {
-        Ok(json) => json
-            .get("message")
-            .or_else(|| json.get("error"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_default(),
-        Err(_) => body.into_owned(),
-    };
-    let sanitized = sanitize_message(&redact_secret(&candidate, secret));
-    if sanitized.is_empty() {
-        NO_ERROR_DETAILS.to_string()
-    } else {
-        sanitized
-    }
-}
-
-/// Replace every occurrence of `secret` in `text` with [`REDACTED`].
-///
-/// An empty secret is left alone (a plain `str::replace("")` would insert
-/// the marker between every character). After the exact replacement, any
-/// trailing fragment that is a prefix of the secret is also redacted: the
-/// [`MAX_ERROR_BODY_BYTES`] read cap can cut a reflected secret mid-way,
-/// and such a cut fragment can only appear at the very end of the capped
-/// text, where an exact match cannot find it.
-fn redact_secret(text: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return text.to_string();
-    }
-    redact_cut_secret_tail(&text.replace(secret, REDACTED), secret)
-}
-
-/// Redact a trailing prefix of `secret` (at least
-/// [`MIN_SECRET_FRAGMENT_CHARS`] chars long) left behind by the body cap.
-///
-/// A cap cut mid-character leaves a U+FFFD from lossy decoding after the
-/// fragment, so trailing replacement characters are ignored when matching.
-fn redact_cut_secret_tail(text: &str, secret: &str) -> String {
-    let trimmed = text.trim_end_matches(char::REPLACEMENT_CHARACTER);
-    let fragment = secret
-        .char_indices()
-        .map(|(index, c)| &secret[..index + c.len_utf8()])
-        .rev()
-        .filter(|prefix| prefix.chars().count() >= MIN_SECRET_FRAGMENT_CHARS)
-        .find(|prefix| trimmed.ends_with(prefix));
-    match fragment {
-        Some(prefix) => {
-            let kept = &trimmed[..trimmed.len() - prefix.len()];
-            format!("{kept}{REDACTED}")
+    // Whether a piece of text may itself be cut mid-way governs the
+    // cap-tail treatment. A body that PARSED is complete no matter how it
+    // was capped - JSON tolerates unlimited trailing whitespace, so a
+    // complete envelope can sit inside a capped body - and dropping the
+    // last word of a complete field would corrupt a legitimate diagnostic
+    // for no security gain. The skeleton smuggling check still applies to
+    // every field either way.
+    let parts = match serde_json::from_str::<Value>(&body) {
+        Ok(json) => {
+            let clean = |text: &str, cap: usize| clean_server_text(text, secret, false, cap);
+            ApiErrorParts {
+                code: json
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|code| clean(code, MAX_ERROR_CODE_CHARS))
+                    .filter(|code| !code.is_empty()),
+                message: json
+                    .get("message")
+                    .or_else(|| json.get("error"))
+                    .and_then(Value::as_str)
+                    .map(|message| clean(message, MAX_ERROR_MESSAGE_CHARS))
+                    .unwrap_or_default(),
+            }
         }
-        None => text.to_string(),
-    }
-}
-
-/// Strip control characters (including ANSI/OSC escapes), collapse
-/// whitespace runs, trim, and cap length.
-fn sanitize_message(raw: &str) -> String {
-    let collapsed = raw
-        .chars()
-        .map(|c| {
-            if c.is_control() || c.is_whitespace() {
-                ' '
-            } else {
-                c
-            }
-        })
-        .fold(String::new(), |mut acc, c| {
-            if c != ' ' || !acc.ends_with(' ') {
-                acc.push(c);
-            }
-            acc
-        });
-    collapsed
-        .trim()
-        .chars()
-        .take(MAX_ERROR_MESSAGE_CHARS)
-        .collect()
+        // Raw text straight out of the body: this is the only text that a
+        // read cap can have cut mid-token.
+        Err(_) => ApiErrorParts {
+            code: None,
+            message: clean_server_text(&body, secret, capped, MAX_ERROR_MESSAGE_CHARS),
+        },
+    };
+    fallback(parts)
 }

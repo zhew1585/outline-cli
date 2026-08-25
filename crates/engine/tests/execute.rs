@@ -3,8 +3,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::borrow::Cow;
+use std::time::Duration;
 
-use engine::{Client, EngineError, OpSpec, ParamSpec, ParamType};
+use engine::{Client, EngineError, OpSpec, ParamSpec, ParamType, TransportKind};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -96,9 +97,83 @@ async fn execute_maps_error_status_to_api_error() {
     .unwrap();
 
     match result {
-        Err(EngineError::Api { status, message }) => {
+        Err(EngineError::Api {
+            status,
+            code,
+            message,
+        }) => {
             assert_eq!(status, 404);
+            assert_eq!(code.as_deref(), Some("not_found"));
             assert_eq!(message, "document not found");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_json_error_body_has_no_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(502).set_body_raw("Bad Gateway", "text/plain"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api {
+            status,
+            code,
+            message,
+        }) => {
+            assert_eq!(status, 502);
+            assert_eq!(code, None);
+            assert_eq!(message, "Bad Gateway");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn error_code_is_sanitized_and_capped() {
+    // The machine-readable code goes through the same hygiene pipeline as
+    // the message: control characters stripped, token redacted, length
+    // capped.
+    let forged_code = format!("evil\x1b[31m{}reflected-secret-token", "c".repeat(200));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": forged_code,
+            "message": "bad request"
+        })))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "reflected-secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { code, .. }) => {
+            let code = code.expect("code should be present");
+            assert!(!code.contains('\x1b'), "ESC not stripped: {code:?}");
+            assert!(
+                !code.contains("reflected-secret-token"),
+                "token leaked: {code:?}"
+            );
+            assert!(code.chars().count() <= 64, "code not capped: {code:?}");
         }
         other => panic!("expected Api error, got {other:?}"),
     }
@@ -207,6 +282,311 @@ async fn token_prefix_cut_by_body_cap_is_redacted() {
         }
         other => panic!("expected Api error, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_smuggled_through_control_chars_is_discarded() {
+    // Adversarial-review PoC: the server interleaves control characters
+    // inside the reflected token so the exact match misses; whitespace
+    // normalization would otherwise reassemble a token a human can read.
+    let token = "reflected-secret-token";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "reflected-\u{0}secret-token",
+            "message": "reflected-\u{0}secret-token\u{1b}[31m denied"
+        })))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, token)?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(error @ EngineError::Api { .. }) => {
+            // Squeeze out whitespace/control chars the way a reader would:
+            // the token must not be recoverable anywhere in the error, its
+            // Debug, or its source chain.
+            let rendered = render_full_error_chain(&error);
+            let squeezed: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !squeezed.contains(token),
+                "token recoverable after squeezing: {rendered}"
+            );
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_smuggled_through_invisible_characters_is_discarded() {
+    // Re-review PoC: U+200B ZERO WIDTH SPACE is neither is_control() nor
+    // is_whitespace(), so category-based stripping missed it while a reader
+    // sees the token unbroken. Also covers ZWJ and a variation selector.
+    let token = "reflected-secret-token";
+    for smuggled in [
+        "reflected-\u{200b}secret-token",
+        "reflected-\u{200d}secret-token",
+        "reflected-\u{fe0f}secret-token",
+        "reflected-\u{ad}secret\u{200b}-token",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/things.info"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": smuggled,
+                "message": smuggled
+            })))
+            .mount(&server)
+            .await;
+
+        let base_url = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = Client::new(&base_url, token)?;
+            client.execute(&op_with_path("/api/things.info"), &[])
+        })
+        .await
+        .unwrap();
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, EngineError::Api { .. }), "got {error:?}");
+        let rendered = render_full_error_chain(&error);
+        // Reduce the way a reader would: drop every non-alphanumeric.
+        let skeleton: String = rendered
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        let token_skeleton: String = token
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        assert!(
+            !skeleton.contains(&token_skeleton),
+            "token recoverable from {smuggled:?}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_json_envelope_in_a_capped_body_is_not_mangled() {
+    // Re-review PoC: JSON tolerates unlimited trailing whitespace, so a
+    // COMPLETE envelope can sit inside a body that hit the read cap. Its
+    // fields must not get the cut-fragment treatment.
+    let envelope = r#"{"error":"validation_error","message":"document not found"}"#;
+    let padded = format!("{envelope}{}", " ".repeat(8200 - envelope.len()));
+    assert!(padded.len() > 8192, "PoC must exceed the read cap");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(padded, "application/json"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { code, message, .. }) => {
+            assert_eq!(message, "document not found");
+            assert_eq!(code.as_deref(), Some("validation_error"));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_fragment_behind_capped_whitespace_is_discarded() {
+    // Re-review PoC: the cap lands on whitespace, so a single trailing-run
+    // drop leaves the 2-char token fragment sitting behind it.
+    let token = "reflected-secret-token";
+    let body = format!("{}re\n{}", "\n".repeat(8189), &token[2..]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(body, "text/plain"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, token)?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { message, .. }) => {
+            assert_eq!(message, "***", "fragment survived: {message:?}");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn short_token_prefix_left_by_body_cap_is_discarded() {
+    // Adversarial-review PoC: the 8 KiB cap leaves only "re", shorter than
+    // the fragment minimum, so prefix redaction alone cannot catch it. The
+    // whole trailing run of a capped body must be dropped.
+    let token = "reflected-secret-token";
+    // 8190 filler bytes + the full token: the 8 KiB cap cuts the token
+    // after its first two characters.
+    let body = format!("{}{token}", "\n".repeat(8190));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(body, "text/plain"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, token)?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { message, .. }) => {
+            assert_eq!(message, "***", "capped fragment survived: {message:?}");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+/// Serve one raw HTTP response on a throwaway localhost port.
+///
+/// wiremock cannot produce a header/body mismatch (its own hyper layer
+/// rejects it), so body-transport failures need a socket we control:
+/// `response_head` is written verbatim, then the connection is held open for
+/// `hold` before being closed.
+fn raw_http_once(response_head: &'static str, hold: Duration) -> String {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        // Drain what is available of the request; the client's body is
+        // small enough to arrive with the headers.
+        let mut buffer = [0_u8; 4096];
+        let _ = socket.read(&mut buffer);
+        let _ = socket.write_all(response_head.as_bytes());
+        let _ = socket.flush();
+        std::thread::sleep(hold);
+    });
+    base_url
+}
+
+#[test]
+fn body_read_timeout_is_a_transport_error_not_invalid_json() {
+    // 200 + Content-Length: 100 and no body at all: reading the body times
+    // out. That is a retryable transport failure, not malformed JSON. The
+    // short client timeout keeps the test fast.
+    let base_url = raw_http_once(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+        Duration::from_secs(2),
+    );
+    let client =
+        Client::with_timeout(&base_url, "secret-token", Duration::from_millis(300)).unwrap();
+    let error = client
+        .execute(&op_with_path("/api/things.info"), &[])
+        .unwrap_err();
+
+    match error {
+        EngineError::Transport { kind, .. } => assert_eq!(kind, TransportKind::Timeout),
+        other => panic!("expected Transport error, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncated_body_is_a_transport_error_not_invalid_json() {
+    // Headers promise 100 bytes, the server sends 8 and closes: the JSON is
+    // cut mid-structure. Retrying may help, so this must not be reported as
+    // an invalid-JSON error.
+    let base_url = raw_http_once(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"data\":",
+        Duration::from_millis(50),
+    );
+    let client = Client::with_timeout(&base_url, "secret-token", Duration::from_secs(5)).unwrap();
+    let error = client
+        .execute(&op_with_path("/api/things.info"), &[])
+        .unwrap_err();
+
+    match error {
+        EngineError::Transport { kind, .. } => {
+            assert!(
+                matches!(kind, TransportKind::Body | TransportKind::Timeout),
+                "unexpected kind {kind:?}"
+            );
+        }
+        other => panic!("expected Transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn genuine_json_syntax_error_stays_invalid_response() {
+    // A complete body that simply is not JSON must NOT be reclassified as a
+    // transport failure: retrying would not help.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("not json at all", "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::with_timeout(&base_url, "secret-token", Duration::from_secs(5))?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(result, Err(EngineError::InvalidResponse { .. })),
+        "expected InvalidResponse, got {result:?}"
+    );
+}
+
+#[test]
+fn invalid_header_credential_is_a_request_build_error() {
+    // A token containing a newline cannot go into an HTTP header; the
+    // request never reaches the network, so it must not be reported as a
+    // transport failure - and the token must not appear anywhere.
+    let client = Client::new("http://127.0.0.1:9", "bad\nkey-SECRET-9c7a").unwrap();
+    let error = client
+        .execute(&op_with_path("/api/things.info"), &[])
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::InvalidRequest { .. }),
+        "expected InvalidRequest, got {error:?}"
+    );
+    let rendered = render_full_error_chain(&error);
+    assert!(
+        !rendered.contains("SECRET-9c7a"),
+        "credential leaked: {rendered}"
+    );
 }
 
 #[test]

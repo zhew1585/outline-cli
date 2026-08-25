@@ -17,6 +17,7 @@
 //! Preserve this invariant when adding variants: sanitize at construction
 //! rather than at display time.
 
+use std::error::Error as _;
 use std::fmt;
 
 use thiserror::Error;
@@ -37,6 +38,17 @@ pub enum EngineError {
     /// The underlying HTTP client could not be constructed.
     #[error("failed to build HTTP client: {0}")]
     ClientBuild(#[source] reqwest::Error),
+
+    /// The request could not be assembled locally, so nothing was sent.
+    ///
+    /// Deliberately carries only an authored reason and no source: a
+    /// builder error can embed the offending header value, which may be a
+    /// credential.
+    #[error("request could not be built: {reason}")]
+    InvalidRequest {
+        /// Human-readable reason, free of any caller-supplied value.
+        reason: String,
+    },
 
     /// A transport-level failure (DNS, TLS, connection, timeout, ...).
     ///
@@ -62,6 +74,9 @@ pub enum EngineError {
     Api {
         /// HTTP status code.
         status: u16,
+        /// Sanitized, length-capped machine-readable error code extracted
+        /// from the response envelope (e.g. its `error` field), if any.
+        code: Option<String>,
         /// Sanitized, length-capped message extracted from the response.
         message: String,
     },
@@ -102,12 +117,41 @@ impl TransportKind {
             Self::Connect
         } else if error.is_redirect() {
             Self::Redirect
-        } else if error.is_body() || error.is_decode() {
+        } else if error.is_body() || error.is_decode() || has_io_source(error) {
             Self::Body
         } else {
             Self::Other
         }
     }
+}
+
+/// Whether a reqwest error that surfaced AFTER a response was received is a
+/// transport failure rather than a content problem.
+///
+/// A body that times out or is cut mid-transfer must be reported as a
+/// (retryable) transport failure, not as malformed JSON: only a genuine
+/// syntax error means retrying cannot help. A truncated or aborted body
+/// surfaces as a body/timeout error, or as a decode error carrying an I/O
+/// error in its source chain; a genuine JSON syntax error carries only a
+/// serde error.
+pub fn is_transport_failure(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || has_io_source(error)
+}
+
+/// Whether an I/O error appears anywhere in the error's source chain.
+fn has_io_source(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
+    while let Some(inner) = source {
+        if inner.is::<std::io::Error>() {
+            return true;
+        }
+        source = inner.source();
+    }
+    false
 }
 
 impl fmt::Display for TransportKind {

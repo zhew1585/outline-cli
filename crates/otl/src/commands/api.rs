@@ -5,12 +5,15 @@
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{Client, EngineError};
+use engine::Client;
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::errors::map_engine_error;
 use crate::exit::CliError;
 use crate::ops;
+use crate::render::{self, OutputMode};
+use crate::stdio;
 
 /// Arguments for `otl api`.
 #[derive(Debug, Args)]
@@ -25,7 +28,7 @@ pub struct ApiArgs {
 
 /// Run the `api` subcommand. Configuration and argument validation happen
 /// before any network request.
-pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
+pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
     let op = ops::find(&cmd.operation).ok_or_else(|| {
         CliError::usage(anyhow!(
             "unknown API operation {:?}; operation names follow the \
@@ -36,19 +39,10 @@ pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
     let args = parse_key_value_args(&cmd.args)?;
     let config = Config::from_env().map_err(CliError::usage)?;
 
-    let client = Client::new(&config.base_url, &config.api_key).map_err(client_error)?;
-    let response = client.execute(op, &args).map_err(CliError::failure)?;
+    let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
+    let response = client.execute(op, &args).map_err(map_engine_error)?;
 
-    print_response(&response)
-}
-
-/// A bad base URL is a configuration mistake (exit code 2); anything else
-/// while constructing the client is a generic failure (exit code 1).
-fn client_error(error: EngineError) -> CliError {
-    match error {
-        EngineError::InvalidBaseUrl { .. } => CliError::usage(error),
-        _ => CliError::failure(error),
-    }
+    print_response(&response, mode)
 }
 
 /// Parse raw `key=value` CLI arguments; reject malformed ones fail-fast.
@@ -65,11 +59,13 @@ fn parse_key_value_args(raw: &[String]) -> Result<Vec<(String, String)>, CliErro
         .collect()
 }
 
-/// Pretty-print the `data` field (or the whole envelope if absent) to stdout.
-fn print_response(response: &Value) -> Result<(), CliError> {
+/// Print the `data` field (or the whole envelope if absent) to stdout in
+/// the resolved output mode (raw JSON, or a table for list-shaped data).
+fn print_response(response: &Value, mode: OutputMode) -> Result<(), CliError> {
     let payload = response.get("data").unwrap_or(response);
-    let rendered = serde_json::to_string_pretty(payload)
+    let rendered = render::render(payload, mode)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
-    println!("{rendered}");
-    Ok(())
+    // Never `println!` on the data path: a consumer that closes the pipe
+    // early must not turn into a panic and exit code 101.
+    stdio::write_data_line(&rendered)
 }
