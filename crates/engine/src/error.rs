@@ -227,6 +227,29 @@ pub enum EngineError {
         content_type: String,
     },
 
+    /// A document URL could not be parsed or is not usable.
+    ///
+    /// Deliberately does not carry the offending URL: a document URL may
+    /// embed credentials in its userinfo or query components.
+    #[error("invalid document URL: {reason}")]
+    InvalidDocumentUrl {
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A fetched document cannot be used as text: it exceeded the size cap,
+    /// is not UTF-8, or its body could not be read.
+    ///
+    /// Carries only the origin and an authored reason - never any part of
+    /// the document, which is untrusted third-party content.
+    #[error("document from {origin} is unusable: {reason}")]
+    UnusableDocument {
+        /// Origin (`scheme://host[:port]`) the document came from.
+        origin: String,
+        /// Human-readable reason, free of document content.
+        reason: String,
+    },
+
     /// A raw request body is not valid JSON.
     ///
     /// Detected locally, before any network request. The reason is a
@@ -245,6 +268,7 @@ impl EngineError {
         matches!(
             self,
             Self::InvalidBaseUrl { .. }
+                | Self::InvalidDocumentUrl { .. }
                 | Self::UnknownParam { .. }
                 | Self::MissingParam { .. }
                 | Self::ComplexParam { .. }

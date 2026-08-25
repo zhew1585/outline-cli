@@ -10,6 +10,9 @@
 //! - [`client`]: the single request channel through which every HTTP call
 //!   must flow.
 //! - [`error`]: typed engine errors.
+//! - [`fetch`]: the plain-document channel (one unauthenticated GET), used
+//!   to retrieve a spec; separate from the credential-carrying request
+//!   channel on purpose (see the module docs).
 //! - [`sanitize`]: the credential-hygiene pipeline every piece of
 //!   server-provided text passes through at error construction time.
 //! - [`paginate`]: auto-pagination driven by a caller-supplied
@@ -22,6 +25,7 @@
 pub mod body;
 pub mod client;
 pub mod error;
+pub mod fetch;
 mod format;
 pub mod ir;
 pub mod paginate;

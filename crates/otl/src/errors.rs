@@ -55,6 +55,11 @@ pub fn map_engine_error_with_hint(error: EngineError, hint: Option<&str>) -> Cli
 fn classify(error: &EngineError) -> (ExitCode, String) {
     match error {
         EngineError::InvalidBaseUrl { .. } => (ExitCode::Usage, error.to_string()),
+        // A URL that never passed local checks is a usage error (nothing
+        // was sent); a document that arrived but cannot be used is a
+        // generic failure, like any other unusable response.
+        EngineError::InvalidDocumentUrl { .. } => (ExitCode::Usage, error.to_string()),
+        EngineError::UnusableDocument { .. } => (ExitCode::Failure, error.to_string()),
         // Nothing was sent, so this is a configuration problem, not a
         // network one: no retry hint, and exit code 2.
         EngineError::InvalidRequest { .. } => {
