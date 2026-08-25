@@ -226,6 +226,40 @@ fn base_url_path_secret_never_reaches_stderr() {
     );
 }
 
+#[test]
+fn cli_error_debug_and_chain_are_credential_free() {
+    // The otl-level error type must stay credential-free even under {:?}
+    // and when its anyhow chain is walked, with a realistic engine error
+    // from the PATH-SECRET PoC as payload.
+    use std::borrow::Cow;
+
+    let client =
+        engine::Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
+    let op = engine::OpSpec {
+        name: Cow::Borrowed("documents.info"),
+        path: Cow::Borrowed("/api/documents.info"),
+        params: Cow::Borrowed(&[]),
+    };
+    let engine_error = client.execute(&op, &[]).unwrap_err();
+    let cli_error = otl::exit::CliError::failure(engine_error);
+
+    let chain: String = cli_error
+        .source
+        .chain()
+        .map(|err| format!(" / {err} / {err:?}"))
+        .collect();
+    let rendered = format!("{cli_error} / {cli_error:?}{chain}");
+    assert_eq!(
+        rendered.matches("PATH-SECRET").count(),
+        0,
+        "secret leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/api/documents.info"),
+        "request path leaked: {rendered}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reflected_api_key_never_reaches_stderr() {
     // A server that echoes the Authorization value in its error body must

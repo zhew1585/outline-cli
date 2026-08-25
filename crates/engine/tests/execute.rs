@@ -295,6 +295,37 @@ fn transport_error_display_shows_origin_only() {
     );
 }
 
+/// Render an error's Display and Debug plus those of every error in its
+/// `source()` chain, recursively.
+fn render_full_error_chain(error: &dyn std::error::Error) -> String {
+    let own = format!("{error} / {error:?}");
+    match error.source() {
+        Some(inner) => format!("{own} / {}", render_full_error_chain(inner)),
+        None => own,
+    }
+}
+
+#[test]
+fn transport_error_debug_and_source_chain_are_credential_free() {
+    // reqwest errors embed the full request URL in Display AND Debug; the
+    // engine must store them URL-stripped (without_url) so that even
+    // callers formatting {:?} or walking source() never see a path secret.
+    let client = Client::new("http://127.0.0.1:9/PATH-SECRET-9c7a", "PATH-SECRET-9c7a").unwrap();
+    let error = client
+        .execute(&op_with_path("/api/things.info"), &[])
+        .unwrap_err();
+    let rendered = render_full_error_chain(&error);
+    assert_eq!(
+        rendered.matches("PATH-SECRET").count(),
+        0,
+        "secret leaked in Debug/source chain: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/api/things.info"),
+        "request path leaked in Debug/source chain: {rendered}"
+    );
+}
+
 #[test]
 fn new_normalizes_trailing_slash() {
     // A trailing slash must not produce `//api/...` URLs; constructing the

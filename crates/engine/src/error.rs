@@ -1,9 +1,21 @@
 //! Typed errors for the engine request channel.
 //!
-//! Error messages never echo credentials: base-URL problems report only a
-//! reason (the raw value may embed userinfo), and any URL-derived text in
-//! user-visible output is reduced to the origin (`scheme://host[:port]`) -
-//! never path, query, or userinfo, which may all carry secrets.
+//! Every field of [`EngineError`] is credential-free BY CONSTRUCTION, so
+//! the derived Debug, the Display, and the full `source()` chain are all
+//! safe to log:
+//!
+//! - base-URL problems report only a reason (the raw value may embed
+//!   userinfo);
+//! - any URL-derived text is reduced to the origin
+//!   (`scheme://host[:port]`) - never path, query, or userinfo, which may
+//!   all carry secrets;
+//! - server-provided text is sanitized, token-redacted, and length-capped;
+//! - retained `reqwest::Error` sources are stripped of their request URL
+//!   via `without_url()` before storage (reqwest prints the full URL in
+//!   both Display and Debug otherwise).
+//!
+//! Preserve this invariant when adding variants: sanitize at construction
+//! rather than at display time.
 
 use std::fmt;
 
@@ -38,7 +50,9 @@ pub enum EngineError {
         origin: String,
         /// Classified failure category.
         kind: TransportKind,
-        /// The underlying transport error (programmatic use; do not print).
+        /// The underlying transport error, stored URL-stripped
+        /// (`without_url()`), so even its Debug/Display are
+        /// credential-free.
         #[source]
         source: reqwest::Error,
     },
@@ -57,7 +71,8 @@ pub enum EngineError {
     InvalidResponse {
         /// Origin (`scheme://host[:port]`) of the request - no path/query.
         origin: String,
-        /// The underlying decode error (programmatic use).
+        /// The underlying decode error, stored URL-stripped
+        /// (`without_url()`).
         #[source]
         source: reqwest::Error,
     },

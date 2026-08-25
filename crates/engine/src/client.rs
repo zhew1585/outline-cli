@@ -58,7 +58,7 @@ impl Client {
         let parsed = validate_base_url(base_url)?;
         let http = reqwest::blocking::Client::builder()
             .build()
-            .map_err(EngineError::ClientBuild)?;
+            .map_err(|error| EngineError::ClientBuild(error.without_url()))?;
         Ok(Self {
             http,
             base_url: parsed.as_str().trim_end_matches('/').to_string(),
@@ -86,7 +86,11 @@ impl Client {
             .map_err(|source| EngineError::Transport {
                 origin: self.display_origin(),
                 kind: TransportKind::classify(&source),
-                source,
+                // reqwest errors embed the full request URL in their
+                // Display AND Debug output (reqwest docs warn about this
+                // explicitly); strip it before the error is retained so
+                // the stored source is credential-free by construction.
+                source: source.without_url(),
             })?;
 
         let status = response.status();
@@ -101,7 +105,8 @@ impl Client {
             .json()
             .map_err(|source| EngineError::InvalidResponse {
                 origin: self.display_origin(),
-                source,
+                // See the Transport arm: strip the URL before retention.
+                source: source.without_url(),
             })
     }
 

@@ -23,6 +23,10 @@ impl From<ExitCode> for std::process::ExitCode {
 }
 
 /// A CLI-level error: a human-readable message paired with an exit code.
+///
+/// The derived Debug is credential-free because every wrapped error is
+/// credential-free by construction (see `engine::error`); preserve that
+/// invariant when wrapping new error types.
 #[derive(Debug)]
 pub struct CliError {
     /// The exit code the process must terminate with.
