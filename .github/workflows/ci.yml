@@ -91,11 +91,18 @@ jobs:
     # OUTLINE_TEST_* secrets are configured (skipped otherwise, per project
     # rule). No credentials are stored in the repository.
     #
-    # Security boundary: never runs on pull_request (same-repo PR code must
-    # not see secrets), and secrets are exposed only to the two `run` steps
-    # below - never to third-party actions via job-level env.
+    # Security boundary: this job runs ONLY on a push to a trusted branch.
+    # `pull_request` is excluded because same-repo PR code must not see
+    # secrets, and `workflow_dispatch` is excluded because anyone with write
+    # access can dispatch an arbitrary same-repo branch (checkout would take
+    # that ref and run branch-controlled code with the real credentials).
+    # Trust comes from the ref, never from actor permissions. Secrets are
+    # also exposed only to the two `run` steps below - never to third-party
+    # actions via job-level env.
     name: contract tests (real workspace)
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     runs-on: ubuntu-latest
     steps:
       - name: check for contract-test credentials

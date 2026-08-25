@@ -1,12 +1,23 @@
-//! Startup guards (Story 1.8): the binary must work with no spec file
-//! reachable at runtime - the vendored OpenAPI spec is compiled to a static
-//! IR table by `build.rs`, so runtime never parses OpenAPI/YAML.
+//! Startup guards (Story 1.8): the vendored OpenAPI spec is compiled to a
+//! static IR table by `build.rs`, so the runtime never reads or parses it.
 //!
-//! To make "no spec reachable" real, each test copies the built binary into
-//! a fresh temp directory and runs that copy from there: neither the cwd nor
-//! any executable-relative path leads back to the repo checkout (and its
-//! `crates/otl/spec/`). The `api` cases go through operation dispatch, so
-//! they prove the IR lookup itself works without any spec file.
+//! What these tests guarantee, precisely:
+//!
+//! 1. `spec_path_and_content_absent_from_binary` - the shipped binary
+//!    contains neither the spec file name nor the vendored spec's content,
+//!    so it cannot open the spec through a compile-time absolute path
+//!    (`env!("CARGO_MANIFEST_DIR")` and friends) nor carry an embedded copy
+//!    (`include_str!`). This is the invariant that closes the "checkout's
+//!    `crates/otl/spec/` is still readable" gap; a regression that reads the
+//!    spec at runtime has to name it somewhere, and that string would show
+//!    up here.
+//! 2. The remaining tests copy the binary into a fresh temp directory and
+//!    run that copy from there, so no cwd-relative or executable-relative
+//!    lookup reaches the checkout. The `api` cases go through operation
+//!    dispatch, proving the IR lookup itself works in that environment.
+//!
+//! Together: no spec path in the binary, and no spec reachable from where it
+//! runs.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -34,6 +45,53 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
         .env_remove("OUTLINE_URL")
         .env_remove("OUTLINE_API_KEY");
     cmd
+}
+
+/// File name of the vendored spec; a runtime read has to name it.
+const SPEC_FILE_NAME: &str = "spec3.json";
+/// Distinctive text from the vendored spec's `info.description`: present if
+/// the spec were embedded in the binary, absent from the compiled IR table
+/// (which only carries operation names, paths and parameter names).
+const SPEC_CONTENT_MARKER: &str = "structured in an RPC style";
+
+/// Byte-level search, so this works on any platform without decoding the
+/// binary as UTF-8.
+fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+#[test]
+fn spec_path_and_content_absent_from_binary() {
+    let bin = assert_cmd::cargo::cargo_bin("otl");
+    let bytes = std::fs::read(&bin).unwrap();
+
+    // Sanity check: the markers really are in the vendored spec, so a
+    // negative result below means something.
+    let spec = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("spec")
+            .join(SPEC_FILE_NAME),
+    )
+    .unwrap();
+    assert!(
+        contains_bytes(&spec, SPEC_CONTENT_MARKER),
+        "test marker is stale: {SPEC_CONTENT_MARKER:?} no longer appears in {SPEC_FILE_NAME}"
+    );
+
+    assert!(
+        !contains_bytes(&bytes, SPEC_FILE_NAME),
+        "{} references {SPEC_FILE_NAME}: the runtime must not open the spec \
+         (build.rs compiles it to a static IR table)",
+        bin.display()
+    );
+    assert!(
+        !contains_bytes(&bytes, SPEC_CONTENT_MARKER),
+        "{} embeds the vendored spec's content: the runtime must not carry \
+         or parse the OpenAPI document",
+        bin.display()
+    );
 }
 
 #[test]
