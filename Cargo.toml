@@ -24,6 +24,16 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 clap = { version = "4.6", features = ["derive"] }
 httpdate = "1.0"
+# Credential file + OAuth (otl only; the engine stays service-agnostic).
+toml = "1"
+directories = "6"
+base64 = "0.22"
+sha2 = "0.11"
+getrandom = "0.4"
+# Advisory file locks (refresh single-flight). Pure Rust, no libc, so it
+# needs no `unsafe` on our side; `std::fs::File::lock` would raise the
+# workspace MSRV from 1.85 to 1.89, which is not this epic's call to make.
+fs4 = "1.1"
 # Terminal column width of a string is not its char count (CJK is 2
 # columns wide, combining marks 0); table alignment depends on this.
 unicode-width = "0.2"

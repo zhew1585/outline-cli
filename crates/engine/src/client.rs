@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::io::Read;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use reqwest::{StatusCode, Url};
 use serde_json::Value;
 
 use crate::body::{build_request_body, ensure_dispatchable};
+use crate::credential::{CredentialSource, StaticCredential};
 use crate::error::{is_transport_failure, EngineError, TransportKind};
 use crate::ir::{OpSpec, ValidationMode};
 use crate::paginate::{self, Fetched, PaginationSpec};
@@ -58,7 +60,8 @@ pub enum ErrorDetail {
     CodeOnly,
 }
 
-/// A blocking RPC client bound to one API base URL and one bearer token.
+/// A blocking RPC client bound to one API base URL and one credential
+/// source.
 pub struct Client {
     http: reqwest::blocking::Client,
     base_url: String,
@@ -66,7 +69,9 @@ pub struct Client {
     /// this client ever puts into user-visible output (base URL paths can
     /// carry secrets, e.g. token-in-path auth schemes).
     origin: String,
-    token: String,
+    /// Where the bearer credential comes from, and how it is renewed when
+    /// the server rejects it.
+    credential: Arc<dyn CredentialSource>,
     /// How the channel reacts to HTTP 429 responses.
     retry: RetryPolicy,
     /// Shared request-rate budget; clients given the same handle pace
@@ -75,13 +80,13 @@ pub struct Client {
 }
 
 impl fmt::Debug for Client {
-    /// Manual impl: the bearer token must never appear in Debug output,
-    /// and the base URL is reduced to its origin (a path can carry
+    /// Manual impl: the bearer credential must never appear in Debug
+    /// output, and the base URL is reduced to its origin (a path can carry
     /// secrets).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("origin", &self.origin)
-            .field("token", &REDACTED)
+            .field("credential", &REDACTED)
             .finish_non_exhaustive()
     }
 }
@@ -104,6 +109,32 @@ impl Client {
         token: &str,
         timeout: Duration,
     ) -> Result<Self, EngineError> {
+        Self::with_credentials_and_timeout(
+            base_url,
+            Arc::new(StaticCredential::new(token)),
+            timeout,
+        )
+    }
+
+    /// Create a client whose credential comes from - and is renewed by - a
+    /// [`CredentialSource`].
+    ///
+    /// This is how token renewal reaches the channel: the source is
+    /// consulted before each request and once more, for a fresh value,
+    /// whenever the server answers HTTP 401.
+    pub fn with_credentials(
+        base_url: &str,
+        credential: Arc<dyn CredentialSource>,
+    ) -> Result<Self, EngineError> {
+        Self::with_credentials_and_timeout(base_url, credential, DEFAULT_TIMEOUT)
+    }
+
+    /// [`Client::with_credentials`] with an explicit total request timeout.
+    pub fn with_credentials_and_timeout(
+        base_url: &str,
+        credential: Arc<dyn CredentialSource>,
+        timeout: Duration,
+    ) -> Result<Self, EngineError> {
         let parsed = validate_base_url(base_url)?;
         let http = reqwest::blocking::Client::builder()
             .timeout(timeout)
@@ -113,7 +144,7 @@ impl Client {
             http,
             base_url: parsed.as_str().trim_end_matches('/').to_string(),
             origin: parsed.origin().ascii_serialization(),
-            token: token.to_string(),
+            credential,
             retry: RetryPolicy::default(),
             throttle: Throttle::process_wide(),
         })
@@ -247,7 +278,14 @@ impl Client {
     /// This is the only `.send()` in the engine. It carries both bodies
     /// serialized from `key=value` arguments and raw caller-supplied bytes,
     /// so every request shares one set of headers, one error
-    /// classification, and one credential-hygiene pipeline.
+    /// classification, one credential-hygiene pipeline, and one renewal
+    /// hook.
+    ///
+    /// Renewal: the credential source is consulted once per request, and -
+    /// if the server answers HTTP 401 - asked exactly once for a renewed
+    /// value, after which the request is replayed verbatim. At most one
+    /// replay happens per request, so a source that hands back a
+    /// still-rejected credential cannot spin the channel.
     ///
     /// `detail` decides how much of a server error response may be
     /// surfaced (see [`Client::execute_raw`]).
@@ -258,53 +296,98 @@ impl Client {
         detail: ErrorDetail,
     ) -> Result<Value, EngineError> {
         let url = format!("{}{}", self.base_url, op_path);
+        let mut token = self.credential.bearer()?;
+        let mut renewed = false;
+        loop {
+            let rejected = match self.send_once(&url, &body, &token, detail)? {
+                Outcome::Value(value) => return Ok(value),
+                Outcome::Unauthorized(response) => response,
+            };
+            if !renewed {
+                if let Some(fresh) = self.credential.renew(&token)? {
+                    token = fresh;
+                    renewed = true;
+                    continue;
+                }
+            }
+            // Either the source cannot renew, or the renewed credential
+            // was rejected too: report the server's own 401.
+            return Err(api_error(rejected, &token, detail));
+        }
+    }
+
+    /// One trip to the server with one credential, absorbing HTTP 429 per
+    /// the retry policy.
+    ///
+    /// A 401 is handed back intact rather than turned into an error: only
+    /// [`Client::send`] knows whether a renewal is still available, and the
+    /// response body is needed either way to report the server's message.
+    fn send_once(
+        &self,
+        url: &str,
+        body: &[u8],
+        token: &str,
+        detail: ErrorDetail,
+    ) -> Result<Outcome, EngineError> {
         let mut attempt: u32 = 0;
         loop {
             self.pace();
             let response = self
                 .http
-                .post(&url)
-                .header(AUTHORIZATION, format!("Bearer {}", self.token))
+                .post(url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
                 .header(ACCEPT, "application/json")
                 .header(CONTENT_TYPE, "application/json")
-                .body(body.clone())
+                .body(body.to_vec())
                 .send()
-                .map_err(|source| self.send_error(source))?;
+                .map_err(|source| self.send_error(source, token))?;
 
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS {
-                if attempt >= self.retry.max_retries {
-                    return Err(EngineError::RateLimited {
-                        origin: self.display_origin(),
-                        retries: attempt,
-                    });
-                }
-                let wait = self
-                    .retry
-                    .retry_wait(retry_after_header(&response).as_deref(), attempt);
-                attempt += 1;
-                // Diagnostics only ever go to stderr; stdout is data.
-                eprintln!(
-                    "rate limited by {} (HTTP 429); waiting {:.1}s before retry {}/{}",
-                    self.display_origin(),
-                    wait.as_secs_f64(),
-                    attempt,
-                    self.retry.max_retries
-                );
-                thread::sleep(wait);
+                attempt = self.absorb_rate_limit(&response, attempt, token)?;
                 continue;
             }
-            if !status.is_success() {
-                let parts = extract_error_parts(response, &self.token, detail);
-                return Err(EngineError::Api {
-                    status: status.as_u16(),
-                    code: parts.code,
-                    message: parts.message,
-                });
+            if status == StatusCode::UNAUTHORIZED {
+                return Ok(Outcome::Unauthorized(response));
             }
-
-            return response.json().map_err(|source| self.body_error(source));
+            if !status.is_success() {
+                return Err(api_error(response, token, detail));
+            }
+            return response
+                .json()
+                .map(Outcome::Value)
+                .map_err(|source| self.body_error(source, token));
         }
+    }
+
+    /// Absorb one HTTP 429: sleep out the advised delay and report the next
+    /// attempt number, or fail because the retry budget is spent.
+    fn absorb_rate_limit(
+        &self,
+        response: &reqwest::blocking::Response,
+        attempt: u32,
+        token: &str,
+    ) -> Result<u32, EngineError> {
+        if attempt >= self.retry.max_retries {
+            return Err(EngineError::RateLimited {
+                origin: self.display_origin(token),
+                retries: attempt,
+            });
+        }
+        let wait = self
+            .retry
+            .retry_wait(retry_after_header(response).as_deref(), attempt);
+        let next = attempt + 1;
+        // Diagnostics only ever go to stderr; stdout is data.
+        eprintln!(
+            "rate limited by {} (HTTP 429); waiting {:.1}s before retry {}/{}",
+            self.display_origin(token),
+            wait.as_secs_f64(),
+            next,
+            self.retry.max_retries
+        );
+        thread::sleep(wait);
+        Ok(next)
     }
 
     /// Draw one token from the shared throttle, sleeping out any required
@@ -330,14 +413,14 @@ impl Client {
     /// containing a newline). It must not be reported as a network problem,
     /// and the underlying error is NOT retained - a builder error may embed
     /// the offending header value.
-    fn send_error(&self, source: reqwest::Error) -> EngineError {
+    fn send_error(&self, source: reqwest::Error, secret: &str) -> EngineError {
         if source.is_builder() {
             return EngineError::InvalidRequest {
                 reason: INVALID_HEADER_REASON.to_string(),
             };
         }
         EngineError::Transport {
-            origin: self.display_origin(),
+            origin: self.display_origin(secret),
             kind: TransportKind::classify(&source),
             // reqwest errors embed the full request URL in their Display
             // AND Debug output (reqwest docs warn about this explicitly);
@@ -352,26 +435,51 @@ impl Client {
     /// A body that times out or is cut mid-transfer is a TRANSPORT failure,
     /// not malformed JSON: callers must be able to tell "retry may help"
     /// from "the server sent something unparseable".
-    fn body_error(&self, source: reqwest::Error) -> EngineError {
+    fn body_error(&self, source: reqwest::Error, secret: &str) -> EngineError {
         if is_transport_failure(&source) {
             return EngineError::Transport {
-                origin: self.display_origin(),
+                origin: self.display_origin(secret),
                 kind: TransportKind::classify(&source),
                 source: source.without_url(),
             };
         }
         EngineError::InvalidResponse {
-            origin: self.display_origin(),
+            origin: self.display_origin(secret),
             // See the Transport arm: strip the URL before retention.
             source: source.without_url(),
         }
     }
 
     /// The origin for error messages, passed through secret redaction as
-    /// defense in depth (an origin should never contain the token, but no
-    /// URL-derived text reaches output without going through the pipeline).
-    fn display_origin(&self) -> String {
-        redact_secret(&self.origin, &self.token)
+    /// defense in depth (an origin should never contain the credential, but
+    /// no URL-derived text reaches output without going through the
+    /// pipeline).
+    fn display_origin(&self, secret: &str) -> String {
+        redact_secret(&self.origin, secret)
+    }
+}
+
+/// What one trip to the server produced.
+enum Outcome {
+    /// A success response, parsed.
+    Value(Value),
+    /// HTTP 401, response intact so the caller can either renew the
+    /// credential and replay, or report the server's own message.
+    Unauthorized(reqwest::blocking::Response),
+}
+
+/// Turn a non-success response into an [`EngineError::Api`].
+fn api_error(
+    response: reqwest::blocking::Response,
+    secret: &str,
+    detail: ErrorDetail,
+) -> EngineError {
+    let status = response.status().as_u16();
+    let parts = extract_error_parts(response, secret, detail);
+    EngineError::Api {
+        status,
+        code: parts.code,
+        message: parts.message,
     }
 }
 
