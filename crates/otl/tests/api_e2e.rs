@@ -55,6 +55,48 @@ fn unknown_operation_exits_2() {
 }
 
 #[test]
+fn base_url_with_credentials_exits_2_and_never_leaks_password() {
+    let output = otl()
+        .env("OUTLINE_URL", "http://alice:url-password@127.0.0.1:9")
+        .env("OUTLINE_API_KEY", "test-key")
+        .args(["api", "documents.info", "id=doc-123"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("url-password") && !stdout.contains("url-password"),
+        "credential leaked: {stderr}"
+    );
+    assert!(stderr.contains("credentials"), "stderr: {stderr}");
+}
+
+#[test]
+fn unparseable_base_url_exits_2_not_1() {
+    otl()
+        .env("OUTLINE_URL", "http://[::1")
+        .env("OUTLINE_API_KEY", "test-key")
+        .args(["api", "documents.info", "id=doc-123"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("invalid base URL"));
+}
+
+#[test]
+fn base_url_with_query_exits_2() {
+    otl()
+        .env("OUTLINE_URL", "http://127.0.0.1:9?tenant=x")
+        .env("OUTLINE_API_KEY", "test-key")
+        .args(["api", "documents.info", "id=doc-123"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("query"));
+}
+
+#[test]
 fn malformed_argument_exits_2() {
     otl()
         .env("OUTLINE_URL", "http://127.0.0.1:9")
@@ -95,8 +137,10 @@ async fn success_prints_data_field_pretty() {
     .await
     .unwrap();
 
-    let expected = "{\n  \"id\": \"doc-123\",\n  \"title\": \"Hello World\"\n}\n";
-    assert.success().stdout(predicate::eq(expected));
+    // Golden file: full stdout must match byte-for-byte.
+    assert.success().stdout(predicate::eq(include_str!(
+        "golden/documents_info_data.txt"
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -149,7 +193,8 @@ async fn response_without_data_prints_whole_body() {
     .await
     .unwrap();
 
+    // Golden file: full stdout must match byte-for-byte.
     assert
         .success()
-        .stdout(predicate::str::contains("\"success\": true"));
+        .stdout(predicate::eq(include_str!("golden/no_data_envelope.txt")));
 }

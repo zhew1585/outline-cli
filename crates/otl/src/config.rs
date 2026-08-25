@@ -11,13 +11,26 @@ pub const ENV_URL: &str = "OUTLINE_URL";
 /// Environment variable holding the API key.
 pub const ENV_API_KEY: &str = "OUTLINE_API_KEY";
 
+/// Placeholder shown instead of the API key in Debug output.
+const REDACTED: &str = "***";
+
 /// Resolved runtime configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Base URL of the Outline instance (e.g. `https://docs.example.com`).
     pub base_url: String,
     /// API key used as a bearer token.
     pub api_key: String,
+}
+
+impl fmt::Debug for Config {
+    /// Manual impl: the API key must never appear in Debug output.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("base_url", &self.base_url)
+            .field("api_key", &REDACTED)
+            .finish()
+    }
 }
 
 /// Configuration errors. Always reported before any network request.
@@ -61,4 +74,24 @@ impl Config {
 
 fn non_empty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn debug_output_redacts_api_key() {
+        let config = Config {
+            base_url: "https://docs.example.com".to_string(),
+            api_key: "super-secret-key".to_string(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("super-secret-key"),
+            "api key leaked: {rendered}"
+        );
+        assert!(rendered.contains("***"));
+        assert!(rendered.contains("https://docs.example.com"));
+    }
 }
