@@ -54,6 +54,7 @@ development_status:
   1-3-param-validation-and-coercion: in-progress
   1-4-error-mapping-exit-codes: in-progress
   1-5-dual-mode-output: in-progress
+  1-5b-schema-driven-columns: backlog  # follow-up: thread OpSpec/response schema into table renderer after 1-2 IR merges
   1-6-auto-pagination: in-progress
   1-7-rate-limit-backoff: in-progress
   1-8-performance-ci-baseline: in-progress
