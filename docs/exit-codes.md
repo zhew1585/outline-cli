@@ -36,8 +36,11 @@ Notes:
   schema - never any text produced by the TOML parser. The parser's messages interpolate the offending
   VALUE (an unknown `auth` value, a type mismatch, an unknown bare key), so a credential wrongly placed
   in the config file would otherwise be echoed back into a message, a log, or a Debug rendering. Names
-  that are shown (a `--profile` argument, the list of defined profiles) have their control characters
-  replaced and their length capped, because a TOML quoted key can carry ESC or newline bytes.
+  and paths that are shown (a `--profile` argument, the list of defined profiles, a `--config` path) have
+  their control characters replaced and their length capped, because a TOML quoted key and a path
+  argument can both carry ESC, BEL or newline bytes - enough to forge a terminal hyperlink or an extra
+  `error:` line. `Debug` renderings go further and omit profile names entirely: `Display` is the only
+  place a name is needed, and `Debug` is the surface that ends up in logs and panic messages.
 - Configuration errors (code 2) are always reported before any network request is made. A request that cannot even be assembled locally (invalid header value) is a configuration error, never a network error. The same holds for local schema validation: an argument the vendored spec rejects never reaches the network.
 - A closed stdout pipe is normal completion, not a failure: when the reader stops early (`otl ... | head -1`), `otl` stops writing and exits **0** with no diagnostics, the way well-behaved Unix filters do. It never dies of a panic (which would produce the undocumented code 101).
 - A response body that times out or is truncated mid-transfer is a network error (code 7), not an invalid-response error (code 1): only a genuine JSON syntax error means retrying cannot help.

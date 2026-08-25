@@ -17,11 +17,27 @@
 //! # Credentials are scoped to their instance
 //!
 //! A profile names an INSTANCE, so the credential sent to it must belong to
-//! that instance. The global `OUTLINE_API_KEY` is therefore used only when
-//! no profile is in effect; a profile reads
-//! `OUTLINE_API_KEY_<PROFILE>` and refuses to fall back, because falling
-//! back would send one workspace's key to another workspace's server. See
-//! [`EnvApiKey`].
+//! that instance. Two rules enforce that, in both directions:
+//!
+//! - the CREDENTIAL comes from the profile's own scope. The global
+//!   `OUTLINE_API_KEY` is used only when no profile is in effect; a profile
+//!   reads `OUTLINE_API_KEY_<PROFILE>` and refuses to fall back, because
+//!   falling back would send one workspace's key to another workspace's
+//!   server. See [`EnvApiKey`].
+//! - the ORIGIN comes from the profile's own scope too. With a profile in
+//!   effect the base URL is the profile's `url`, or `--url` when the caller
+//!   overrides it deliberately in this invocation; `OUTLINE_URL` is not a
+//!   source, and one that disagrees with the resolved origin is a hard
+//!   error rather than a silent redirect.
+//!
+//! The second rule is the same argument as the first. An environment
+//! variable exported in some earlier shell session must not be able to
+//! point a profile's credential at a server the profile never named: a
+//! warning cannot recall a credential that has already been sent, so the
+//! request has to fail before it is made. This is the one place where
+//! precedence is not simply flag > env > file: for the base URL of a
+//! SELECTED PROFILE the environment is not a layer at all, it is a
+//! consistency check.
 //!
 //! # Nothing from the config file is echoed back
 //!
@@ -39,7 +55,7 @@
 mod error;
 mod file;
 
-pub use error::{sanitize_name, ConfigError};
+pub use error::{sanitize_name, sanitize_path, ConfigError};
 pub use file::{config_dir, default_config_path, load_file, load_from, locate, CONFIG_FILE_NAME};
 
 use std::collections::BTreeMap;
@@ -70,6 +86,11 @@ pub const CREDENTIALS_FILE_NAME: &str = "credentials.toml";
 
 /// Placeholder shown instead of secrets in Debug output.
 const REDACTED: &str = "***";
+/// Maximum profile-name length that still maps to an API key variable.
+///
+/// Bounds the derived variable name, which appears in diagnostics as advice
+/// to act on; see [`api_key_var_suffix`].
+const MAX_PROFILE_VAR_CHARS: usize = 64;
 
 /// How a profile authenticates.
 ///
@@ -159,12 +180,18 @@ pub struct ConfigFile {
 }
 
 impl fmt::Debug for ConfigFile {
-    /// Manual impl: delegates to [`Profile`]'s redacting Debug and shows
-    /// profile names as escaped strings, never raw.
+    /// Manual impl: delegates to [`Profile`]'s redacting Debug, and shows no
+    /// profile NAME at all - see `redacted_name`. `default_profile` is a
+    /// config-file value like any other, and a table key is one too.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A Vec, not the map: rendering the map would print its keys.
+        let profiles: Vec<&Profile> = self.profiles.values().collect();
         f.debug_struct("ConfigFile")
-            .field("default_profile", &self.default_profile)
-            .field("profiles", &self.profiles)
+            .field(
+                "default_profile",
+                &redacted_name(self.default_profile.as_deref()),
+            )
+            .field("profiles", &profiles)
             .finish()
     }
 }
@@ -185,7 +212,7 @@ impl fmt::Debug for Overrides {
     /// as the environment variable, so it is reduced to its origin.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Overrides")
-            .field("profile", &self.profile)
+            .field("profile", &redacted_name(self.profile.as_deref()))
             .field("url_origin", &redacted_origin(self.url.as_deref()))
             .field("config_path", &self.config_path)
             .finish()
@@ -215,7 +242,7 @@ impl fmt::Debug for EnvLayer {
     /// carry credentials).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EnvLayer")
-            .field("profile", &self.profile)
+            .field("profile", &redacted_name(self.profile.as_deref()))
             .field("url_origin", &redacted_origin(self.url.as_deref()))
             .field("api_key", &REDACTED)
             .field("config_path", &self.config_path)
@@ -275,26 +302,68 @@ impl EnvLayer {
     }
 }
 
+/// Whether environment variable NAMES are case-insensitive on this platform.
+///
+/// They are on Windows, where the environment block nevertheless preserves
+/// whatever case was used to set a variable: `set outline_api_key_work=K`
+/// stores that spelling, and `GetEnvironmentVariable` still finds it under
+/// any case. `std::env::var` therefore works for the fixed names, but a scan
+/// over `std::env::vars` sees the original spelling and must compare
+/// case-insensitively or it would miss the variable and report it unset.
+/// POSIX names are case-sensitive, where `outline_api_key_work` is a
+/// genuinely different variable that must NOT be accepted.
+const ENV_NAMES_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
+
 /// Collect every `OUTLINE_API_KEY_*` variable from the process environment.
 ///
 /// Blank values count as unset, matching every other variable.
 fn profile_api_keys_from_process() -> BTreeMap<String, String> {
     env::vars()
         .filter_map(|(name, value)| {
-            let suffix = name.strip_prefix(ENV_API_KEY_PREFIX)?;
+            let suffix = profile_api_key_suffix(&name, ENV_NAMES_ARE_CASE_INSENSITIVE)?;
             let value = non_blank(Some(&value))?;
-            (!suffix.is_empty()).then(|| (suffix.to_string(), value))
+            Some((suffix, value))
         })
         .collect()
+}
+
+/// The profile-key suffix of an environment variable name, or `None` when the
+/// name is not a per-profile API key variable.
+///
+/// `case_insensitive` selects the platform rule (see
+/// `ENV_NAMES_ARE_CASE_INSENSITIVE`); it is a parameter rather than a
+/// `cfg!` inside the body so that both platform behaviours are testable
+/// everywhere. The suffix is upper-cased on the case-insensitive path so it
+/// matches what [`api_key_var_suffix`] derives from a profile name.
+pub fn profile_api_key_suffix(env_name: &str, case_insensitive: bool) -> Option<String> {
+    let suffix = if case_insensitive {
+        let upper = env_name.to_ascii_uppercase();
+        upper.strip_prefix(ENV_API_KEY_PREFIX)?.to_string()
+    } else {
+        env_name.strip_prefix(ENV_API_KEY_PREFIX)?.to_string()
+    };
+    (!suffix.is_empty()).then_some(suffix)
 }
 
 /// The `OUTLINE_API_KEY_*` variable suffix for a profile name.
 ///
 /// ASCII alphanumerics are upper-cased and every other character becomes
-/// `_`, so `work` -> `WORK` and `self-hosted` -> `SELF_HOSTED`. `None` when
-/// the name has no ASCII alphanumeric at all and therefore cannot be
-/// expressed as an environment variable name.
+/// `_`, so `work` -> `WORK` and `self-hosted` -> `SELF_HOSTED`.
+///
+/// `None` when the name cannot be expressed as an environment variable name,
+/// which is either of:
+///
+/// - no ASCII alphanumeric at all, so the suffix would be meaningless;
+/// - longer than the 64-character cap (`MAX_PROFILE_VAR_CHARS`). The
+///   variable name is advice the
+///   user has to act on, and it is bounded at the SOURCE rather than
+///   truncated when printed: a truncated name would be advice to set a
+///   variable that is not the one being read, and some platforms cap
+///   variable-name length anyway.
 pub fn api_key_var_suffix(profile: &str) -> Option<String> {
+    if profile.chars().count() > MAX_PROFILE_VAR_CHARS {
+        return None;
+    }
     let suffix: String = profile
         .chars()
         .map(|c| {
@@ -361,7 +430,7 @@ impl fmt::Debug for Settings {
     /// Manual impl: same base-URL redaction rule as [`Config`].
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Settings")
-            .field("profile", &self.profile)
+            .field("profile", &redacted_name(self.profile.as_deref()))
             .field("base_url_origin", &redacted_origin(Some(&self.base_url)))
             .field("auth", &self.auth)
             .finish()
@@ -389,6 +458,21 @@ impl fmt::Debug for Config {
             .field("base_url_origin", &redacted_origin(Some(&self.base_url)))
             .field("api_key", &REDACTED)
             .finish()
+    }
+}
+
+/// Whether a profile name is set, without disclosing it.
+///
+/// Debug output is an unbounded machine surface: it lands in logs, panic
+/// messages and error chains. A profile name is config-file (or flag)
+/// content, so a user who put a secret there - `default_profile =
+/// "<token>"`, `[profiles.<token>]` - must not have it copied into all of
+/// those. Names appear only in `Display`, where the user needs them to fix
+/// their own file and where they are sanitized and length-capped.
+fn redacted_name(name: Option<&str>) -> &'static str {
+    match name {
+        Some(_) => REDACTED,
+        None => "<unset>",
     }
 }
 
@@ -473,19 +557,53 @@ pub fn resolve_settings(
     if let Some((name, _)) = profile {
         check_api_key_var_is_unambiguous(name, loaded)?;
     }
-    let base_url = overrides
-        .url
-        .clone()
-        .or_else(|| env.url.clone())
-        .or_else(|| profile.and_then(|(_, p)| non_blank(p.url.as_deref())))
-        .ok_or_else(|| ConfigError::MissingUrl {
-            profile: profile.map(|(name, _)| name.to_string()),
-        })?;
+    let base_url = match profile {
+        Some((name, declared)) => profile_base_url(name, declared, overrides, env)?,
+        None => overrides
+            .url
+            .clone()
+            .or_else(|| env.url.clone())
+            .ok_or(ConfigError::MissingUrl { profile: None })?,
+    };
     Ok(Settings {
         profile: profile.map(|(name, _)| name.to_string()),
         base_url,
         auth: profile.and_then(|(_, p)| p.auth).unwrap_or_default(),
     })
+}
+
+/// The base URL for a SELECTED PROFILE: the profile's own `url`, or `--url`
+/// when the caller overrides it in this invocation.
+///
+/// `OUTLINE_URL` is deliberately not a source here, and one that disagrees
+/// with the result is an error rather than a redirect. The profile decides
+/// which credential is sent, so it must also decide where it is sent;
+/// otherwise a variable exported in some earlier shell session silently
+/// points this profile's key at a server the profile never named. A warning
+/// would not do, because it cannot recall a credential that has already
+/// been sent - the same reason a profile does not fall back to the global
+/// API key.
+///
+/// `--url` is exempt: it is stated in the same command as `--profile`, so
+/// the redirect is deliberate rather than ambient.
+fn profile_base_url(
+    name: &str,
+    profile: &Profile,
+    overrides: &Overrides,
+    env: &EnvLayer,
+) -> Result<String, ConfigError> {
+    if let Some(url) = non_blank(overrides.url.as_deref()) {
+        return Ok(url);
+    }
+    let declared = non_blank(profile.url.as_deref()).ok_or_else(|| ConfigError::MissingUrl {
+        profile: Some(name.to_string()),
+    })?;
+    match env.url.as_deref() {
+        Some(from_env) if from_env != declared => Err(ConfigError::ConflictingUrl {
+            profile: name.to_string(),
+        }),
+        _ => Ok(declared),
+    }
 }
 
 /// Refuse a selected profile whose API key variable another profile shares.
@@ -518,28 +636,6 @@ fn check_api_key_var_is_unambiguous(
     }
 }
 
-/// Whether an environment base URL points somewhere other than the selected
-/// profile does.
-///
-/// Not an error - precedence is flag > env > file for every key - but it
-/// means the profile's credential is about to be sent to an instance the
-/// profile did not name, so it is worth saying out loud. `--url` is the
-/// deliberate way to redirect a profile and is therefore not reported.
-pub fn env_url_shadows_profile<'a>(
-    overrides: &Overrides,
-    env: &'a EnvLayer,
-    loaded: &LoadedConfig,
-    settings: &Settings,
-) -> Option<&'a str> {
-    if overrides.url.is_some() {
-        return None;
-    }
-    let env_url = env.url.as_deref()?;
-    let profile = loaded.file.profiles.get(settings.profile.as_deref()?)?;
-    let declared = non_blank(profile.url.as_deref())?;
-    (declared != env_url).then_some(env_url)
-}
-
 /// Look up a selected profile, or explain what does exist.
 fn lookup_profile<'a>(
     name: &'a str,
@@ -570,20 +666,6 @@ impl Config {
         let env = EnvLayer::from_process();
         let loaded = load_file(overrides, &env)?;
         let settings = resolve_settings(overrides, &env, &loaded)?;
-        if env_url_shadows_profile(overrides, &env, &loaded, &settings).is_some() {
-            // Diagnostics go to stderr; the origin is not printed, since a
-            // base URL can carry credentials in its own path or query.
-            crate::stdio::write_diagnostic_line(&format!(
-                "warning: {ENV_URL} points at a different instance than profile {:?} \
-                 declares, so that profile's credential is being sent there; \
-                 unset {ENV_URL}, or pass --url to redirect it deliberately",
-                settings
-                    .profile
-                    .as_deref()
-                    .map(sanitize_name)
-                    .unwrap_or_default()
-            ));
-        }
         let api_key = EnvApiKey(&env).token(&settings)?;
         Ok(Self::from_parts(&settings, api_key))
     }

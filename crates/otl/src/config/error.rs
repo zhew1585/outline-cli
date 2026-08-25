@@ -5,15 +5,21 @@
 //! - no value from the config file is echoed, because a user who wrongly put
 //!   a credential there must not see it again in a diagnostic, a log or a
 //!   Debug rendering;
-//! - every NAME that is echoed goes through [`sanitize_name`] first, because
-//!   a TOML quoted key can carry ESC and newline bytes straight into a
-//!   terminal.
+//! - every NAME or PATH that is echoed goes through [`sanitize_name`] or
+//!   [`sanitize_path`] first, because a TOML quoted key and a `--config`
+//!   argument can both carry ESC, BEL and newline bytes straight into a
+//!   terminal, where they forge hyperlinks, retitle the window or fake an
+//!   additional `error:` line.
+//!
+//! `Debug` deliberately does not render these fields at all: it forwards to
+//! `Display`, which is the only rendering that has passed both rules.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::{
     AuthMethod, CONFIG_FILE_NAME, CREDENTIALS_FILE_NAME, ENV_API_KEY, ENV_API_KEY_PREFIX, ENV_URL,
+    MAX_PROFILE_VAR_CHARS,
 };
 
 /// Maximum number of characters kept from any name echoed in a diagnostic.
@@ -25,6 +31,11 @@ const CONTROL_PLACEHOLDER: char = '\u{fffd}';
 const CREDENTIAL_KEYS: &str = "`api_key` / `token`";
 /// Maximum number of profile names listed in one diagnostic.
 const MAX_LISTED_PROFILES: usize = 20;
+/// Maximum number of characters kept from a path echoed in a diagnostic.
+///
+/// Larger than [`MAX_NAME_CHARS`]: a legitimate path is much longer than a
+/// legitimate profile name, and the point here is a bound, not brevity.
+const MAX_PATH_CHARS: usize = 200;
 
 /// or forge additional diagnostic lines on stderr. Applied even when stderr
 /// is not a terminal, because the consumer may be one.
@@ -47,8 +58,35 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// Make a filesystem path safe to print in a diagnostic.
+///
+/// `Path::display()` is lossy for non-UTF-8 but passes control bytes through
+/// unchanged, and a path is caller-controlled (`--config`,
+/// `OUTLINE_CONFIG`). Without this, `--config` carrying an OSC 8 sequence
+/// plants a clickable hyperlink in the user's terminal, and an embedded
+/// newline lets it forge a second `error:` line.
+pub fn sanitize_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    let cleaned: String = shown
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                CONTROL_PLACEHOLDER
+            } else {
+                c
+            }
+        })
+        .take(MAX_PATH_CHARS)
+        .collect();
+    if shown.chars().count() > MAX_PATH_CHARS {
+        format!("{cleaned}...")
+    } else {
+        cleaned
+    }
+}
+
 /// Configuration errors. Always reported before any network request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// No base URL from any layer.
     MissingUrl {
@@ -69,6 +107,17 @@ pub enum ConfigError {
     },
     /// A profile name cannot be expressed as an environment variable name.
     ProfileApiKeyVarUnnameable {
+        /// The profile in effect.
+        profile: String,
+    },
+    /// `OUTLINE_URL` disagrees with the selected profile's own base URL.
+    ///
+    /// Refused rather than resolved: the profile decides which credential is
+    /// sent, so it must also decide where. Neither answer is safe to pick
+    /// silently - honouring the variable sends the profile's key to a server
+    /// the profile never named, and ignoring it discards configuration
+    /// without saying so.
+    ConflictingUrl {
         /// The profile in effect.
         profile: String,
     },
@@ -139,6 +188,7 @@ impl fmt::Display for ConfigError {
                 global_set,
             } => write_missing_profile_key(f, profile, variable, *global_set),
             Self::ProfileApiKeyVarUnnameable { profile } => write_unnameable_var(f, profile),
+            Self::ConflictingUrl { profile } => write_conflicting_url(f, profile),
             Self::AmbiguousProfileApiKeyVar {
                 profile,
                 other,
@@ -152,12 +202,12 @@ impl fmt::Display for ConfigError {
             Self::ConfigFileUnreadable { path, reason } => write!(
                 f,
                 "cannot read the user config file {}: {reason}",
-                path.display()
+                sanitize_path(path)
             ),
             Self::MalformedConfigFile { path, reason } => write!(
                 f,
                 "the user config file {} is not valid: {reason}",
-                path.display()
+                sanitize_path(path)
             ),
             Self::CredentialInConfigFile { path, location } => write!(
                 f,
@@ -165,7 +215,7 @@ impl fmt::Display for ConfigError {
                  Credentials never live in the config file (which is meant to be \
                  shareable); they belong in {CREDENTIALS_FILE_NAME} beside it, or in \
                  {ENV_API_KEY}. Remove the key and re-run.",
-                path.display()
+                sanitize_path(path)
             ),
             Self::UnsupportedAuthMethod { profile, method } => {
                 write_unsupported_auth(f, profile.as_deref(), *method)
@@ -177,10 +227,25 @@ impl fmt::Display for ConfigError {
 fn write_unnameable_var(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Result {
     write!(
         f,
-        "profile {:?} has no ASCII letters or digits in its name, so it has no \
-         {ENV_API_KEY_PREFIX}* variable to read its API key from.\n\
-         Rename the profile, or pass the instance directly with --url and \
+        "profile {:?} has no {ENV_API_KEY_PREFIX}* variable to read its API \
+         key from: a profile name must contain at least one ASCII letter or \
+         digit and be at most {MAX_PROFILE_VAR_CHARS} characters.\n\
+         Rename the profile, or drop --profile and use --url with \
          {ENV_API_KEY}.",
+        sanitize_name(profile)
+    )
+}
+
+fn write_conflicting_url(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Result {
+    // Neither URL is printed: a base URL can carry credentials in its
+    // userinfo, path or query.
+    write!(
+        f,
+        "{ENV_URL} points at a different instance than profile {:?} declares, \
+         so it is unclear where that profile's API key should be sent - and \
+         sending it to the wrong instance cannot be undone.\n\
+         Unset {ENV_URL}, drop --profile to use {ENV_URL} on its own, or pass \
+         --url to redirect this profile deliberately.",
         sanitize_name(profile)
     )
 }
@@ -243,12 +308,12 @@ fn write_unknown_profile(
         Some(path) if available.is_empty() => write!(
             f,
             "the user config file {} defines no profiles",
-            path.display()
+            sanitize_path(path)
         ),
         Some(path) => write!(
             f,
             "the user config file {} defines {}",
-            path.display(),
+            sanitize_path(path),
             profile_list(available)
         ),
         None => write!(
@@ -318,6 +383,20 @@ fn write_unsupported_auth(
          via {ENV_API_KEY}.",
         AuthMethod::ApiKey
     )
+}
+
+impl fmt::Debug for ConfigError {
+    /// Manual impl: forwards to `Display`.
+    ///
+    /// The derived Debug would print the raw fields, which is exactly what
+    /// the two rules in the module docs forbid: profile names and paths
+    /// unsanitized, and (via `available`) a whole list of them. `Display` is
+    /// the only rendering that has passed both, so Debug reuses it rather
+    /// than opening a second, unchecked surface - Debug is the one that ends
+    /// up in logs, panic messages and error chains.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ConfigError({self})")
+    }
 }
 
 impl std::error::Error for ConfigError {}

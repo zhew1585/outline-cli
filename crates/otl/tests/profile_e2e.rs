@@ -374,10 +374,12 @@ fn an_oauth_profile_reports_that_only_api_keys_are_wired_up() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_env_url_pointing_away_from_the_profile_warns_on_stderr() {
-    // Precedence keeps the env URL, but the profile's credential is now
-    // going somewhere the profile did not name, so say so. The warning is a
-    // diagnostic: stdout stays pure data.
+async fn an_env_url_pointing_away_from_the_profile_sends_nothing() {
+    // R2 finding 1. The previous version of this test asserted the command
+    // SUCCEEDED and reached the other instance, which enshrined the very
+    // behaviour under review: a warning cannot recall a credential already on
+    // the wire. The conflict now fails before the request channel, and the
+    // mock proves nothing arrived.
     let elsewhere = instance("from-elsewhere", "key-for-work").await;
     let (_dir, config) = config_file("[profiles.work]\nurl = \"http://127.0.0.1:9\"\n");
     let config_arg = config.to_str().unwrap().to_string();
@@ -404,16 +406,55 @@ async fn an_env_url_pointing_away_from_the_profile_warns_on_stderr() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
-    assert!(stderr.contains("warning:"), "no warning: {stderr}");
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("OUTLINE_URL"), "{stderr}");
-    assert!(stdout.contains("from-elsewhere"), "{stdout}");
-    // The URL itself is not printed: a base URL can carry credentials.
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(!stderr.contains("key-for-work"), "key echoed: {stderr}");
+    // Neither URL is printed: a base URL can carry credentials.
     assert!(!stderr.contains("127.0.0.1:9"), "{stderr}");
+    let received = elsewhere.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "{} request(s) reached the instance the profile never named",
+        received.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_matching_env_url_produces_no_warning() {
+async fn the_url_flag_redirects_a_profile_deliberately() {
+    // The escape hatch: stated in the same command as --profile, so it is a
+    // deliberate redirect rather than an ambient one, and it is allowed even
+    // when OUTLINE_URL is also set.
+    let target = instance("from-flag", "key-for-work").await;
+    let (_dir, config) = config_file("[profiles.work]\nurl = \"http://127.0.0.1:9\"\n");
+    let config_arg = config.to_str().unwrap().to_string();
+    let uri = target.uri();
+
+    tokio::task::spawn_blocking(move || {
+        otl()
+            .env("OUTLINE_API_KEY_WORK", "key-for-work")
+            .env("OUTLINE_URL", "http://127.0.0.1:9")
+            .args([
+                "--config",
+                &config_arg,
+                "--profile",
+                "work",
+                "--url",
+                &uri,
+                "api",
+                "documents.info",
+                "id=doc-1",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("from-flag"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_matching_env_url_is_not_a_conflict() {
     let work = instance("from-work", "key-for-work").await;
     let (_dir, config) = config_file(&format!("[profiles.work]\nurl = \"{}\"\n", work.uri()));
     let config_arg = config.to_str().unwrap().to_string();
@@ -441,4 +482,51 @@ async fn a_matching_env_url_produces_no_warning() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn a_profile_without_a_url_is_not_rescued_by_the_env_var() {
+    // The same rule from the other side: an ambient OUTLINE_URL must not
+    // decide where a profile-scoped credential goes.
+    let (_dir, config) = config_file("[profiles.work]\nauth = \"api-key\"\n");
+    otl()
+        .env("OUTLINE_API_KEY_WORK", "key-for-work")
+        .env("OUTLINE_URL", "http://127.0.0.1:9")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--profile",
+            "work",
+            "api",
+            "documents.info",
+            "id=doc-1",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("no base URL"));
+}
+
+#[test]
+fn a_hostile_config_path_cannot_inject_into_stderr() {
+    // R2 finding 3, end to end: the path reaches stderr through the error
+    // message, so it must arrive inert.
+    let hostile =
+        "/missing/\u{1b}]8;;https://evil.example.com\u{7}FORGED\u{1b}]8;;\u{7}\nerror: forged";
+    let output = otl()
+        .env("OUTLINE_URL", "http://127.0.0.1:9")
+        .env("OUTLINE_API_KEY", "test-key")
+        .args(["--config", hostile, "api", "documents.info", "id=doc-1"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(!stderr.contains('\u{1b}'), "ESC on stderr: {stderr:?}");
+    assert!(!stderr.contains('\u{7}'), "BEL on stderr: {stderr:?}");
+    assert!(
+        stderr
+            .lines()
+            .all(|line| !line.trim_start().starts_with("error: forged")),
+        "forged line on stderr: {stderr:?}"
+    );
 }
