@@ -9,6 +9,15 @@
 
 use serde_json::Value;
 
+/// Pointer for a column whose value the COMMAND fills in rather than the
+/// response row: a resolved collection name, a derived document count.
+///
+/// The empty string is the RFC 6901 pointer to the whole document, which
+/// is a container and therefore renders as an empty cell - so a command
+/// that forgets to fill such a column produces a blank, never a wrong
+/// value picked up from somewhere else.
+pub const COMPUTED: &str = "";
+
 /// One column of a curated table.
 #[derive(Debug, Clone, Copy)]
 pub struct Column {

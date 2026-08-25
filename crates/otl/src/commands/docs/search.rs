@@ -11,7 +11,7 @@ use clap::Args;
 use serde_json::Value;
 
 use crate::exit::CliError;
-use crate::fields::{self, Column};
+use crate::fields::{self, Column, COMPUTED};
 use crate::render::{self, OutputMode};
 use crate::session::Session;
 use crate::stdio;
@@ -26,12 +26,11 @@ const COLLECTION_ID_POINTER: &str = "/document/collectionId";
 
 /// The curated columns, in display order.
 ///
-/// The collection column is filled from the id at
-/// [`COLLECTION_ID_POINTER`], resolved to a name where possible - hence a
-/// pointer that resolves to nothing on its own.
+/// The collection column is [`COMPUTED`]: it is filled from the id at
+/// [`COLLECTION_ID_POINTER`], resolved to a name where possible.
 const COLUMNS: &[Column] = &[
     Column::plain("TITLE", "/document/title"),
-    Column::plain("COLLECTION", "/-collection-name"),
+    Column::plain("COLLECTION", COMPUTED),
     Column::timestamp("UPDATED", "/document/updatedAt"),
     Column::snippet("MATCH", "/context"),
 ];

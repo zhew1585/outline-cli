@@ -286,6 +286,85 @@ async fn one_failing_document_exits_9_and_the_rest_are_written() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_subtree_whose_directory_cannot_be_created_is_reported_whole() {
+    // A file already sits where `Alpha/` has to go. Every document under it
+    // is unreachable, so all three must appear in the summary - none may
+    // vanish from both stdout and stderr.
+    let server = server_with(vec![
+        row("a", "Alpha", None),
+        row("b", "Beta", Some("a")),
+        row("c", "Gamma", Some("b")),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("Alpha"), "in the way").unwrap();
+
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--overwrite",
+                "--out",
+            ])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for id in ["a", "b", "c"] {
+        assert!(
+            stderr.contains(&format!("  {id}: ")),
+            "{id} missing: {stderr}"
+        );
+    }
+    assert!(stderr.contains("3 of 3 document(s)"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_directory_and_its_own_file_share_a_name() {
+    // Two documents named "Deploy"; the second also has a child, so it gets
+    // the de-duplicated stem AND the directory named after it.
+    let server = server_with(vec![
+        row("a", "Deploy", None),
+        row("b", "Deploy", None),
+        row("c", "Child", Some("b")),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+
+    assert_eq!(
+        tree(&out),
+        BTreeSet::from([
+            "Deploy.md".to_string(),
+            "Deploy-2/Deploy-2.md".to_string(),
+            "Deploy-2/Child.md".to_string(),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failing_enumeration_reports_its_own_exit_code_and_writes_nothing() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

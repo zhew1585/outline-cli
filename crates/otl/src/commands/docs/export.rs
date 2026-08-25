@@ -150,13 +150,20 @@ impl Export<'_> {
     ) {
         let child_dir = dir.join(stem);
         if let Err(reason) = create_child_dir(&child_dir) {
-            self.fail(plan.id(node), reason);
+            // The whole subtree lives in that directory, so every document
+            // under it failed too. Reporting only the parent would let the
+            // descendants vanish from both stdout and the summary - exactly
+            // the silent loss this command exists to avoid.
+            self.fail(plan.id(node), reason.clone());
+            for descendant in plan.descendants(node) {
+                self.fail(plan.id(descendant), reason.clone());
+            }
             return;
         }
         let mut child_names = Names::new();
-        // The parent's own file lives inside its directory, so its name is
-        // claimed there before any child can take it.
-        let own = child_names.claim(plan.title(node));
+        // The parent's own file lives inside its directory and shares its
+        // name, claimed there before any child can take it.
+        let own = child_names.claim_exact(stem);
         self.write_document(&child_dir, plan, node, &own);
         self.write_level(&child_dir, plan, children, depth + 1, &mut child_names);
     }
@@ -194,7 +201,7 @@ impl Export<'_> {
         Ok(with_trailing_newline(&format!("# {title}\n\n{text}")))
     }
 
-    /// Record a written file and stream its path to stdout.
+    /// Record a written file, by its path relative to the output directory.
     fn record(&mut self, path: &Path) {
         let shown = path
             .strip_prefix(self.root)
@@ -308,6 +315,13 @@ fn prepare_out_dir(out: &Path, overwrite: bool) -> Result<(), CliError> {
             }
             Ok(())
         }
+        // `symlink_metadata` does not follow links, so a symlink lands here
+        // rather than in the branch above: an export must not be redirected
+        // somewhere else by a link the user may not have noticed.
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(usage(format!(
+            "{} is a symlink; point --out at a real directory",
+            out.display()
+        ))),
         Ok(_) => Err(usage(format!("{} is not a directory", out.display()))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(out)
             .map_err(|error| usage(format!("cannot create {}: {}", out.display(), error.kind()))),

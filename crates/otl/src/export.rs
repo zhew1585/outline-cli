@@ -207,6 +207,18 @@ impl Names {
         unique
     }
 
+    /// Claim an already-sanitized stem verbatim, de-duplicating if taken.
+    ///
+    /// Used for a document's own file inside the directory named after it,
+    /// so that `Deploy-2/` holds `Deploy-2.md` and not `Deploy.md`: the
+    /// directory and the document it belongs to carry the same name.
+    pub fn claim_exact(&mut self, stem: &str) -> String {
+        if self.insert(stem) {
+            return stem.to_string();
+        }
+        self.claim(stem)
+    }
+
     /// Record a name, reporting whether it was still free.
     fn insert(&mut self, name: &str) -> bool {
         self.used.insert(name.to_lowercase())
@@ -389,6 +401,15 @@ mod tests {
                 stem.len()
             );
         }
+    }
+
+    #[test]
+    fn claim_exact_keeps_an_already_safe_stem() {
+        // A document's own file inside its own directory must carry the
+        // directory's name, suffix included.
+        let mut names = Names::new();
+        assert_eq!(names.claim_exact("Deploy-2"), "Deploy-2");
+        assert_eq!(names.claim_exact("Deploy-2"), "Deploy-2-2");
     }
 
     #[test]

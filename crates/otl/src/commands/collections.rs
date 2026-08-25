@@ -18,7 +18,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 
 use crate::exit::CliError;
-use crate::fields::{self, Column};
+use crate::fields::{self, Column, COMPUTED};
 use crate::render::{self, OutputMode};
 use crate::session::Session;
 use crate::stdio;
@@ -42,7 +42,7 @@ const MAX_COUNTED_NODES: usize = 100_000;
 const COLUMNS: &[Column] = &[
     Column::plain("NAME", "/name"),
     Column::plain("ID", "/id"),
-    Column::plain("DOCUMENTS", "/-document-count"),
+    Column::plain("DOCUMENTS", COMPUTED),
 ];
 
 /// Index of the document-count column in [`COLUMNS`].

@@ -66,6 +66,26 @@ impl<'a> Plan<'a> {
         self.children.get(node).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Every node below `node`, at any depth.
+    ///
+    /// Walked with an explicit stack and a seen-set: the forest is built
+    /// from server data, so neither its depth nor (before
+    /// [`break_cycles`]) its acyclicity may be assumed here.
+    pub fn descendants(&self, node: usize) -> Vec<usize> {
+        let mut seen = vec![false; self.entries.len()];
+        let mut stack: Vec<usize> = self.children(node).to_vec();
+        let mut found = Vec::new();
+        while let Some(next) = stack.pop() {
+            match seen.get_mut(next) {
+                Some(flag) if !*flag => *flag = true,
+                _ => continue,
+            }
+            found.push(next);
+            stack.extend(self.children(next).iter().copied());
+        }
+        found
+    }
+
     /// Total number of documents in the plan.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -371,6 +391,33 @@ mod tests {
         let plan = plan(&documents);
         let ids: Vec<&str> = plan.roots.iter().map(|node| plan.id(*node)).collect();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn descendants_covers_the_whole_subtree() {
+        let documents = vec![
+            doc("a", "Alpha", None),
+            doc("b", "Beta", Some("a")),
+            doc("c", "Gamma", Some("b")),
+            doc("d", "Delta", Some("a")),
+            doc("e", "Epsilon", None),
+        ];
+        let plan = plan(&documents);
+        let mut found: Vec<&str> = plan
+            .descendants(0)
+            .iter()
+            .map(|node| plan.title(*node))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, vec!["Beta", "Delta", "Gamma"]);
+        assert!(plan.descendants(4).is_empty(), "a leaf has no descendants");
+    }
+
+    #[test]
+    fn descendants_of_an_unknown_node_is_empty() {
+        let documents = vec![doc("a", "Alpha", None)];
+        let plan = plan(&documents);
+        assert!(plan.descendants(99).is_empty());
     }
 
     #[test]
