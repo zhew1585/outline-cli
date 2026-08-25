@@ -143,34 +143,123 @@ async fn success_prints_data_field_pretty() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn server_error_exits_1_with_message() {
+/// Run `otl api documents.info id=x` against a mock returning `template`,
+/// and hand back the finished assertion.
+async fn assert_for_response(template: ResponseTemplate) -> assert_cmd::assert::Assert {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/documents.info"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "ok": false,
-            "error": "not_found",
-            "message": "document not found"
-        })))
+        .respond_with(template)
         .mount(&server)
         .await;
 
     let uri = server.uri();
-    let assert = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         otl()
             .env("OUTLINE_URL", uri)
             .env("OUTLINE_API_KEY", "test-key")
-            .args(["api", "documents.info", "id=missing"])
+            .args(["api", "documents.info", "id=x"])
             .assert()
     })
     .await
-    .unwrap();
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn not_found_exits_5_with_server_message() {
+    let assert = assert_for_response(ResponseTemplate::new(404).set_body_json(json!({
+        "ok": false,
+        "error": "not_found",
+        "message": "document not found"
+    })))
+    .await;
 
     assert
         .failure()
-        .code(1)
-        .stderr(predicate::str::contains("document not found"));
+        .code(5)
+        .stderr(predicate::str::contains("not found (HTTP 404)"))
+        .stderr(predicate::str::contains("document not found"))
+        .stdout(predicate::str::is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_error_exits_4_with_key_hint() {
+    let assert = assert_for_response(ResponseTemplate::new(401).set_body_json(json!({
+        "ok": false,
+        "error": "authentication_required",
+        "message": "Authentication error"
+    })))
+    .await;
+
+    assert
+        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("authentication failed (HTTP 401)"))
+        .stderr(predicate::str::contains("Authentication error"))
+        .stderr(predicate::str::contains("OUTLINE_API_KEY"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forbidden_exits_4() {
+    let assert = assert_for_response(ResponseTemplate::new(403).set_body_json(json!({
+        "ok": false,
+        "error": "authorization_required",
+        "message": "Authorization error"
+    })))
+    .await;
+
+    assert
+        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("permission denied (HTTP 403)"))
+        .stderr(predicate::str::contains("Authorization error"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_request_exits_3_with_error_code() {
+    let assert = assert_for_response(ResponseTemplate::new(400).set_body_json(json!({
+        "ok": false,
+        "error": "validation_error",
+        "message": "id: Invalid uuid"
+    })))
+    .await;
+
+    assert
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("request rejected (HTTP 400)"))
+        .stderr(predicate::str::contains("id: Invalid uuid"))
+        .stderr(predicate::str::contains("validation_error"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_5xx_exits_6_with_retry_hint() {
+    let assert = assert_for_response(
+        ResponseTemplate::new(503).set_body_json(json!({ "message": "Service unavailable" })),
+    )
+    .await;
+
+    assert
+        .failure()
+        .code(6)
+        .stderr(predicate::str::contains("server error (HTTP 503)"))
+        .stderr(predicate::str::contains("Service unavailable"))
+        .stderr(predicate::str::contains("retry"));
+}
+
+#[test]
+fn network_unreachable_exits_7_with_retry_suggestion() {
+    // Nothing listens on port 9: connection refused at the transport level.
+    otl()
+        .env("OUTLINE_URL", "http://127.0.0.1:9")
+        .env("OUTLINE_API_KEY", "test-key")
+        .args(["api", "documents.info", "id=x"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(predicate::str::contains("network error"))
+        .stderr(predicate::str::contains("retry"))
+        .stdout(predicate::str::is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -213,7 +302,7 @@ fn base_url_path_secret_never_reaches_stderr() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(output.status.code(), Some(7), "stderr: {stderr}");
     assert_eq!(
         stderr.matches("PATH-SECRET").count(),
         0,
@@ -286,7 +375,7 @@ async fn reflected_api_key_never_reaches_stderr() {
 
     assert
         .failure()
-        .code(1)
+        .code(3)
         .stderr(predicate::str::contains("reflected-secret-key").not())
         .stderr(predicate::str::contains("Bearer ***"));
 }

@@ -62,6 +62,9 @@ pub enum EngineError {
     Api {
         /// HTTP status code.
         status: u16,
+        /// Sanitized, length-capped machine-readable error code extracted
+        /// from the response envelope (e.g. its `error` field), if any.
+        code: Option<String>,
         /// Sanitized, length-capped message extracted from the response.
         message: String,
     },

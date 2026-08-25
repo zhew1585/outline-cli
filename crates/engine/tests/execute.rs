@@ -96,9 +96,83 @@ async fn execute_maps_error_status_to_api_error() {
     .unwrap();
 
     match result {
-        Err(EngineError::Api { status, message }) => {
+        Err(EngineError::Api {
+            status,
+            code,
+            message,
+        }) => {
             assert_eq!(status, 404);
+            assert_eq!(code.as_deref(), Some("not_found"));
             assert_eq!(message, "document not found");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_json_error_body_has_no_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(502).set_body_raw("Bad Gateway", "text/plain"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api {
+            status,
+            code,
+            message,
+        }) => {
+            assert_eq!(status, 502);
+            assert_eq!(code, None);
+            assert_eq!(message, "Bad Gateway");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn error_code_is_sanitized_and_capped() {
+    // The machine-readable code goes through the same hygiene pipeline as
+    // the message: control characters stripped, token redacted, length
+    // capped.
+    let forged_code = format!("evil\x1b[31m{}reflected-secret-token", "c".repeat(200));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": forged_code,
+            "message": "bad request"
+        })))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "reflected-secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { code, .. }) => {
+            let code = code.expect("code should be present");
+            assert!(!code.contains('\x1b'), "ESC not stripped: {code:?}");
+            assert!(
+                !code.contains("reflected-secret-token"),
+                "token leaked: {code:?}"
+            );
+            assert!(code.chars().count() <= 64, "code not capped: {code:?}");
         }
         other => panic!("expected Api error, got {other:?}"),
     }

@@ -22,6 +22,8 @@ const MIN_SECRET_FRAGMENT_CHARS: usize = 4;
 const MAX_ERROR_BODY_BYTES: u64 = 8 * 1024;
 /// Maximum number of characters kept from a server-provided error message.
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+/// Maximum number of characters kept from a server-provided error code.
+const MAX_ERROR_CODE_CHARS: usize = 64;
 /// Fallback message when an error response carries no usable text.
 const NO_ERROR_DETAILS: &str = "no error details in response body";
 
@@ -95,9 +97,11 @@ impl Client {
 
         let status = response.status();
         if !status.is_success() {
+            let parts = extract_error_parts(response, &self.token);
             return Err(EngineError::Api {
                 status: status.as_u16(),
-                message: extract_error_message(response, &self.token),
+                code: parts.code,
+                message: parts.message,
             });
         }
 
@@ -196,39 +200,64 @@ fn encode_scalar(ty: ParamType, raw: &str) -> Value {
     }
 }
 
-/// Pull a best-effort human-readable message out of an error response.
+/// Typed error info extracted from an error response body.
+struct ApiErrorParts {
+    /// Machine-readable error code (e.g. the envelope's `error` field).
+    code: Option<String>,
+    /// Human-readable message.
+    message: String,
+}
+
+/// Pull best-effort typed error info out of an error response.
 ///
 /// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. Any occurrence of
 /// `secret` (the client's own bearer token, which a server or proxy may
 /// reflect back) is redacted BEFORE sanitization and truncation, so not
-/// even a token prefix can survive the length cap. The result is then
+/// even a token prefix can survive the length cap. Both fields are then
 /// sanitized (control characters stripped, whitespace collapsed) and
-/// capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
-fn extract_error_message(response: reqwest::blocking::Response, secret: &str) -> String {
+/// length-capped before they can reach stderr.
+fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> ApiErrorParts {
+    const NO_DETAILS: ApiErrorParts = ApiErrorParts {
+        code: None,
+        message: String::new(),
+    };
+    let fallback = |mut parts: ApiErrorParts| {
+        if parts.message.is_empty() {
+            parts.message = NO_ERROR_DETAILS.to_string();
+        }
+        parts
+    };
+
     let mut raw = Vec::new();
     if response
         .take(MAX_ERROR_BODY_BYTES)
         .read_to_end(&mut raw)
         .is_err()
     {
-        return NO_ERROR_DETAILS.to_string();
+        return fallback(NO_DETAILS);
     }
     let body = String::from_utf8_lossy(&raw);
-    let candidate = match serde_json::from_str::<Value>(&body) {
-        Ok(json) => json
-            .get("message")
-            .or_else(|| json.get("error"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_default(),
-        Err(_) => body.into_owned(),
+    let clean = |text: &str, cap: usize| sanitize_message(&redact_secret(text, secret), cap);
+    let parts = match serde_json::from_str::<Value>(&body) {
+        Ok(json) => ApiErrorParts {
+            code: json
+                .get("error")
+                .and_then(Value::as_str)
+                .map(|code| clean(code, MAX_ERROR_CODE_CHARS))
+                .filter(|code| !code.is_empty()),
+            message: json
+                .get("message")
+                .or_else(|| json.get("error"))
+                .and_then(Value::as_str)
+                .map(|message| clean(message, MAX_ERROR_MESSAGE_CHARS))
+                .unwrap_or_default(),
+        },
+        Err(_) => ApiErrorParts {
+            code: None,
+            message: clean(&body, MAX_ERROR_MESSAGE_CHARS),
+        },
     };
-    let sanitized = sanitize_message(&redact_secret(&candidate, secret));
-    if sanitized.is_empty() {
-        NO_ERROR_DETAILS.to_string()
-    } else {
-        sanitized
-    }
+    fallback(parts)
 }
 
 /// Replace every occurrence of `secret` in `text` with [`REDACTED`].
@@ -269,8 +298,8 @@ fn redact_cut_secret_tail(text: &str, secret: &str) -> String {
 }
 
 /// Strip control characters (including ANSI/OSC escapes), collapse
-/// whitespace runs, trim, and cap length.
-fn sanitize_message(raw: &str) -> String {
+/// whitespace runs, trim, and cap length at `cap` characters.
+fn sanitize_message(raw: &str, cap: usize) -> String {
     let collapsed = raw
         .chars()
         .map(|c| {
@@ -286,9 +315,5 @@ fn sanitize_message(raw: &str) -> String {
             }
             acc
         });
-    collapsed
-        .trim()
-        .chars()
-        .take(MAX_ERROR_MESSAGE_CHARS)
-        .collect()
+    collapsed.trim().chars().take(cap).collect()
 }

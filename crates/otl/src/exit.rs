@@ -10,10 +10,20 @@ use std::fmt;
 pub enum ExitCode {
     /// Success.
     Success = 0,
-    /// Generic failure, including network and server errors.
+    /// Generic failure (unexpected internal error, malformed response).
     Failure = 1,
     /// Usage or configuration error (bad arguments, missing config).
     Usage = 2,
+    /// The API rejected the request (4xx other than auth/not-found).
+    ApiRequest = 3,
+    /// Authentication or permission error (HTTP 401/403).
+    Auth = 4,
+    /// The requested resource does not exist (HTTP 404).
+    NotFound = 5,
+    /// The server failed to process the request (HTTP 5xx).
+    Server = 6,
+    /// Network/transport failure (DNS, connect, TLS, timeout).
+    Network = 7,
 }
 
 impl From<ExitCode> for std::process::ExitCode {
@@ -36,20 +46,22 @@ pub struct CliError {
 }
 
 impl CliError {
-    /// A usage/configuration error (exit code 2).
-    pub fn usage(source: impl Into<anyhow::Error>) -> Self {
+    /// An error with an explicit exit code.
+    pub fn new(code: ExitCode, source: impl Into<anyhow::Error>) -> Self {
         Self {
-            code: ExitCode::Usage,
+            code,
             source: source.into(),
         }
     }
 
-    /// A generic/network failure (exit code 1).
+    /// A usage/configuration error (exit code 2).
+    pub fn usage(source: impl Into<anyhow::Error>) -> Self {
+        Self::new(ExitCode::Usage, source)
+    }
+
+    /// A generic failure (exit code 1).
     pub fn failure(source: impl Into<anyhow::Error>) -> Self {
-        Self {
-            code: ExitCode::Failure,
-            source: source.into(),
-        }
+        Self::new(ExitCode::Failure, source)
     }
 }
 
