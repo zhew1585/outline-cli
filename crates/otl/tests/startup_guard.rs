@@ -144,10 +144,23 @@ const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Reviewed exceptions as (path suffix, pattern) pairs. Empty on purpose:
-/// add an entry with a comment only when a runtime source legitimately needs
-/// one of the patterns above.
-const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[];
+/// Reviewed exceptions as (path suffix, pattern) pairs. Add an entry with a
+/// comment only when a runtime source legitimately needs one of the patterns
+/// above; the release-binary assertions above remain the hard proof that no
+/// spec is embedded or opened at runtime.
+const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[
+    // `otl docs export` refuses to write into a directory that already has
+    // contents unless `--overwrite` is given, which means enumerating the
+    // user-supplied output directory. Nothing about the vendored spec.
+    ("commands/docs/export.rs", "read_dir"),
+    // Golden-file assertions inside `#[cfg(test)]` modules: the curated
+    // commands' human-readable output is compared byte-for-byte against
+    // `tests/golden/*.txt`. The embedded files are test fixtures, compiled
+    // only into the test harness, never into the shipped binary.
+    ("commands/collections.rs", "include_str!"),
+    ("commands/docs/detail.rs", "include_str!"),
+    ("commands/docs/search.rs", "include_str!"),
+];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
 /// are therefore excluded by construction.

@@ -105,6 +105,47 @@ pub fn render_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
     layout_table(&header, &body)
 }
 
+/// Render label/value pairs as an aligned two-column block.
+///
+/// Used by the curated commands that report ONE object (`otl docs create`,
+/// `otl docs update`) rather than a list. Values are scrubbed of control
+/// characters, like every other piece of server text that reaches a
+/// terminal, but deliberately NOT truncated: a document URL is the point of
+/// the output, and a 40-column cell would cut it in half.
+pub fn render_pairs(pairs: &[(&str, String)]) -> String {
+    let labels: Vec<String> = pairs
+        .iter()
+        .map(|(label, _)| scrub_control_chars(label))
+        .collect();
+    let Some(width) = labels.iter().map(|label| display_width(label)).max() else {
+        return String::new();
+    };
+    pairs
+        .iter()
+        .zip(labels.iter())
+        .map(|((_, value), label)| {
+            format!(
+                "{}{COLUMN_GAP}{}",
+                pad_to_width(label, width),
+                scrub_control_chars(value)
+            )
+            .trim_end()
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace control characters (ANSI escapes, newlines, tabs) with spaces.
+///
+/// The length-bounding half of [`sanitize_cell`] is deliberately absent:
+/// this is for values that must stay whole (see [`render_pairs`]).
+fn scrub_control_chars(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// Render a list of objects as a table, or `None` when the payload does
 /// not have that shape.
 ///

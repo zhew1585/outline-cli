@@ -7,6 +7,8 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
+use otl::commands::collections::{self, CollectionsArgs};
+use otl::commands::docs::{self, DocsArgs};
 use otl::exit::ExitCode;
 use otl::render;
 use otl::stdio;
@@ -27,6 +29,10 @@ struct Cli {
 enum Command {
     /// Call any API operation by name (output format unstable).
     Api(ApiArgs),
+    /// Work with documents: search, view, create, update, export.
+    Docs(DocsArgs),
+    /// Work with collections.
+    Collections(CollectionsArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -35,6 +41,8 @@ fn main() -> std::process::ExitCode {
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
         Command::Api(args) => api::run(args, mode),
+        Command::Docs(args) => docs::run(args, mode, cli.json),
+        Command::Collections(args) => collections::run(args, mode),
     };
     match result {
         Ok(()) => ExitCode::Success.into(),

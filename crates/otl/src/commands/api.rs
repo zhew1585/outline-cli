@@ -14,10 +14,7 @@ use std::io::Read;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{
-    BodyMode, Client, EngineError, ErrorDetail, Fetched, Truncation, TruncationCause,
-    ValidationMode,
-};
+use engine::{BodyMode, Client, EngineError, ErrorDetail, Fetched, ValidationMode};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -26,6 +23,7 @@ use crate::exit::CliError;
 use crate::ops;
 use crate::paging;
 use crate::render::{self, OutputMode};
+use crate::session::{self, UNCONFIRMED_OFFSET_NOTICE};
 use crate::stdio;
 
 /// Hint appended to validation errors that only a raw body can express.
@@ -38,13 +36,6 @@ const SHOW_MESSAGE_HINT: &str =
 /// Hint appended when an operation cannot be called generically at all.
 const DEDICATED_COMMAND_HINT: &str =
     "it is not callable via `otl api`; a dedicated command is planned";
-
-/// Notice for a list response that carried no pagination echo, so page
-/// boundaries rest on the CLI's own offset counter.
-const UNCONFIRMED_OFFSET_NOTICE: &str =
-    "notice: the server did not echo the pagination offset, so page \
-     boundaries could not be confirmed; results were paged by offset and \
-     may repeat or omit rows if the server ignored it";
 
 /// Marker appended in `otl api list` to operations that cannot be called.
 const NOT_CALLABLE_MARKER: &str = "[not callable via api";
@@ -146,7 +137,7 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         stdio::write_diagnostic_line(UNCONFIRMED_OFFSET_NOTICE);
     }
     if let Some(truncation) = &fetched.truncation {
-        warn_truncated(truncation);
+        session::warn_truncated(truncation);
     }
     print_response(&fetched.value, mode)
 }
@@ -179,38 +170,6 @@ fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Resul
         )));
     }
     Ok(())
-}
-
-/// Explicit stderr warning whenever results may be incomplete (hard rule:
-/// pagination never truncates silently), including how to get more.
-///
-/// Only [`TruncationCause::is_definite`] causes are stated as fact; the
-/// others say results *may* be truncated, because the data could have
-/// ended exactly at the boundary.
-fn warn_truncated(truncation: &Truncation) {
-    let remedy = match truncation.cause {
-        TruncationCause::MaxItems => "raise or drop --limit to fetch more",
-        TruncationCause::PageLimit => {
-            "narrow the query, or continue from this point with an \
-             `offset=` argument"
-        }
-        TruncationCause::ManualPage => {
-            "a `limit=` argument fetches one page only; drop it to fetch \
-             every page, or page manually with `offset=`"
-        }
-        TruncationCause::OffsetSpaceExhausted => {
-            "the pagination offset space is exhausted; narrow the query"
-        }
-    };
-    let certainty = if truncation.cause.is_definite() {
-        "results truncated"
-    } else {
-        "results may be truncated"
-    };
-    stdio::write_diagnostic_line(&format!(
-        "warning: {certainty} after {} items; {remedy}",
-        truncation.fetched
-    ));
 }
 
 /// How strictly to validate locally: `--no-validate` keeps the structural
