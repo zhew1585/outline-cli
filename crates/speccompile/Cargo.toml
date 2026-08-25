@@ -1,0 +1,22 @@
+# Shared OpenAPI -> IR compiler, used from two places:
+#   - `crates/otl/build.rs` at build time (renders the static IR table)
+#   - `otl spec sync` at run time (compiles a freshly fetched spec)
+# It is deliberately a separate crate rather than a module of `engine`: a
+# build script may only use build-dependencies, and pulling `engine` (and
+# with it reqwest/rustls) into the host build would cost far more than it
+# saves. Kept service-agnostic like `engine`: no vendor-specific content.
+[package]
+name = "spec-compile"
+version = "0.1.0"
+description = "Compile an OpenAPI document into the versioned RPC IR"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

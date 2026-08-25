@@ -18,15 +18,19 @@ path = "src/main.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+spec-compile = { workspace = true }
 anyhow = { workspace = true }
+bincode = { workspace = true }
 clap = { workspace = true }
+directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [build-dependencies]
-serde_json = { workspace = true }
+spec-compile = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
