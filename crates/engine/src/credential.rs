@@ -4,8 +4,9 @@
 //! stored, or which grant produced it. It asks a [`CredentialSource`] for
 //! the bearer value to put on the next request and - when the server
 //! answers HTTP 401 - asks the same source once for a renewed value before
-//! replaying that request. Everything service-specific (OAuth grants, key
-//! files, environment variables) stays outside this crate.
+//! replaying that request. How a credential is obtained, stored, protected
+//! or renewed is entirely the caller's business and stays outside this
+//! crate, along with every protocol name involved.
 //!
 //! Renewal lives here, in the channel, and nowhere else: a command that
 //! refreshed credentials on its own would be a second, unaudited request

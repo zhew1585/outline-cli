@@ -43,6 +43,31 @@ otl api documents.info id=not-a-uuid             # exits 2, no request sent
 otl api shares.create --body @share.json         # oneOf/anyOf bodies go through --body verbatim
 ```
 
+## Signing in
+
+An API key in the environment works everywhere and needs no setup, which is why the quick start uses it.
+For interactive use there is a browser flow, and for keys there is a place to put them that is not your
+shell history:
+
+```sh
+otl auth login                        # browser consent, OAuth 2.0 authorization code + PKCE
+otl auth login --client-id <id>       # when an admin pre-registered the application
+otl auth set-key < key.txt            # store an API key in the credential file (0600)
+otl auth info                         # which credential is in use, and where it lives
+otl auth logout                       # revoke and forget this profile's credentials
+otl auth logout --purge               # also delete the application otl registered for itself
+```
+
+`otl auth login` discovers the instance's OAuth endpoints, registers `otl` as a public client if the
+instance allows it (otherwise it tells you exactly what an admin has to create), and catches the redirect
+on a loopback port. Access tokens are then renewed inside the request channel, so no command ever fails
+because a token aged out. Outline rotates the refresh token on every use, so renewal takes an advisory
+file lock: concurrent `otl` processes refresh once between them rather than invalidating each other.
+
+When several credentials exist for a profile, the order is OAuth session, then the credential file's API
+key, then `OUTLINE_API_KEY`. Using the environment variable prints a one-time note about where plaintext
+in the environment tends to end up; `OUTLINE_NO_KEY_WARNING=1` silences it.
+
 ## Design
 
 **Two crates.** `engine` is a generic OpenAPI RPC client with no knowledge of Outline whatsoever — the
