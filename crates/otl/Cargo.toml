@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 terminal_size = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

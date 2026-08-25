@@ -149,3 +149,79 @@ fn listing_without_configuration_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("OUTLINE_URL"));
 }
+
+/// Pages the CLI is willing to fetch before its own safety cap stops it
+/// (`paging::MAX_PAGES`).
+const MAX_PAGES: usize = 100;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_stopped_by_the_page_cap_does_not_exit_0() {
+    // "Auto-paginated to the end" is the promise of this command. When the
+    // CLI's own cap stops the fetch instead, the rows still go to stdout -
+    // they are real - but exit 0 would tell a script it had seen every
+    // collection.
+    let server = MockServer::start().await;
+    for page in 0..MAX_PAGES + 1 {
+        Mock::given(method("POST"))
+            .and(path("/api/collections.list"))
+            .and(body_partial_json(json!({ "offset": page })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [collection(&format!("c{page}"), "Endless")],
+                "pagination": { "offset": page, "limit": 1 },
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["collections", "list", "--json"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The rows fetched are still valid output, and still on stdout.
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed.as_array().map(Vec::len), Some(MAX_PAGES));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("incomplete"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_requested_limit_is_not_treated_as_a_failure() {
+    // The counterpart: `--limit` truncation is what the caller asked for,
+    // so it stays exit 0 with a warning. Only the CLI giving up on its own
+    // becomes exit 9.
+    let server = MockServer::start().await;
+    let full: Vec<Value> = (0..100)
+        .map(|index| collection(&format!("c{index}"), "Name"))
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/api/collections.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": full,
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["collections", "list", "--json", "--limit", "2"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated"));
+}

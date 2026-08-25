@@ -11,7 +11,7 @@
 //! `--json` prints the server's own rows untouched instead of inventing a
 //! field the API does not have.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
 use clap::{Args, Subcommand};
@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::exit::CliError;
 use crate::fields::{self, Column, COMPUTED};
 use crate::render::{self, OutputMode};
-use crate::session::Session;
+use crate::session::{self, Session};
 use crate::stdio;
 
 /// Operation that lists collections (auto-paginated).
@@ -30,6 +30,8 @@ const DOCUMENTS_OPERATION: &str = "collections.documents";
 
 /// Placeholder for a count that could not be determined.
 const UNKNOWN_COUNT: &str = "?";
+/// Suffix marking a count that stopped at [`MAX_COUNTED_NODES`].
+const CAPPED_MARKER: &str = "+";
 
 /// Upper bound on the nodes counted for one collection.
 ///
@@ -89,21 +91,43 @@ fn list(cmd: &ListArgs, mode: OutputMode) -> Result<(), CliError> {
     if mode == OutputMode::Json {
         // Raw server rows: no synthetic count field, so a script never sees
         // a value the API cannot confirm.
-        let payload = Value::Array(collections);
+        let payload = Value::Array(collections.items.clone());
         let rendered = render::render(&payload, OutputMode::Json)
             .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
-        return stdio::write_data_line(&rendered);
-    }
-    let counts = if cmd.no_counts {
-        HashMap::new()
+        stdio::write_data_line(&rendered)?;
     } else {
-        document_counts(&session, &collections)
-    };
-    stdio::write_data_line(&table(&collections, &counts, cmd.no_counts))
+        let counts = if cmd.no_counts {
+            Counts::default()
+        } else {
+            document_counts(&session, &collections.items)
+        };
+        stdio::write_data_line(&table(&collections.items, &counts, cmd.no_counts))?;
+    }
+    // "Auto-paginated to the end" is this command's whole promise (story
+    // 3.5). When the CLI's own page cap cut the listing instead, the rows
+    // still go to stdout but the exit code must not read as "here is every
+    // collection".
+    match collections.incomplete() {
+        Some(truncation) => Err(session::incomplete_error(
+            "the collection listing",
+            truncation,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Document counts per collection id, plus which ones hit the node cap.
+#[derive(Debug, Default)]
+struct Counts {
+    /// Counted nodes per collection id.
+    counted: HashMap<String, usize>,
+    /// Collection ids whose walk stopped at [`MAX_COUNTED_NODES`], so the
+    /// number is a floor and not the count.
+    capped: HashSet<String>,
 }
 
 /// Build the human-readable table.
-fn table(collections: &[Value], counts: &HashMap<String, usize>, no_counts: bool) -> String {
+fn table(collections: &[Value], counts: &Counts, no_counts: bool) -> String {
     let mut rows = fields::rows(collections, COLUMNS);
     for (row, collection) in rows.iter_mut().zip(collections.iter()) {
         if let Some(cell) = row.get_mut(COUNT_COLUMN) {
@@ -114,14 +138,20 @@ fn table(collections: &[Value], counts: &HashMap<String, usize>, no_counts: bool
 }
 
 /// The document-count cell for one collection.
-fn count_label(collection: &Value, counts: &HashMap<String, usize>, no_counts: bool) -> String {
+///
+/// Three distinguishable states, because presenting any of them as the
+/// others would be a lie: a number, `<n>+` when the walk stopped at the
+/// node cap (the count is a floor), and `?` when the structure could not be
+/// read at all.
+fn count_label(collection: &Value, counts: &Counts, no_counts: bool) -> String {
     if no_counts {
         return String::new();
     }
     let Some(id) = fields::string_at(collection, "/id") else {
         return UNKNOWN_COUNT.to_string();
     };
-    match counts.get(id) {
+    match counts.counted.get(id) {
+        Some(count) if counts.capped.contains(id) => format!("{count}{CAPPED_MARKER}"),
         Some(count) => count.to_string(),
         None => UNKNOWN_COUNT.to_string(),
     }
@@ -133,8 +163,8 @@ fn count_label(collection: &Value, counts: &HashMap<String, usize>, no_counts: b
 /// cell shows `?`); one unreadable collection must not fail the listing.
 /// Failures are summarized once rather than per collection, so a workspace
 /// with many private collections does not bury its own output.
-fn document_counts(session: &Session, collections: &[Value]) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
+fn document_counts(session: &Session, collections: &[Value]) -> Counts {
+    let mut counts = Counts::default();
     let mut failed = 0_usize;
     for id in collections
         .iter()
@@ -143,7 +173,11 @@ fn document_counts(session: &Session, collections: &[Value]) -> HashMap<String, 
         let args = [("id".to_string(), id.to_string())];
         match session.call_data(DOCUMENTS_OPERATION, &args) {
             Ok(structure) => {
-                counts.insert(id.to_string(), count_nodes(&structure));
+                let count = count_nodes(&structure);
+                counts.counted.insert(id.to_string(), count.nodes);
+                if count.capped {
+                    counts.capped.insert(id.to_string());
+                }
             }
             Err(_) => failed += 1,
         }
@@ -155,7 +189,25 @@ fn document_counts(session: &Session, collections: &[Value]) -> HashMap<String, 
              (--no-counts skips this lookup entirely)"
         ));
     }
+    if !counts.capped.is_empty() {
+        stdio::write_diagnostic_line(&format!(
+            "warning: {} collection(s) have more than {MAX_COUNTED_NODES} \
+             documents in their structure; their counts are shown as \
+             `{MAX_COUNTED_NODES}{CAPPED_MARKER}` rather than counted to the end",
+            counts.capped.len()
+        ));
+    }
     counts
+}
+
+/// The outcome of counting one navigation tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeCount {
+    /// Nodes counted.
+    nodes: usize,
+    /// True when the walk stopped at [`MAX_COUNTED_NODES`], so `nodes` is a
+    /// lower bound rather than the answer.
+    capped: bool,
 }
 
 /// Count the nodes of a navigation tree.
@@ -163,22 +215,35 @@ fn document_counts(session: &Session, collections: &[Value]) -> HashMap<String, 
 /// Walked with an explicit stack, not recursion: the depth of the tree is
 /// server-controlled and a recursive walk would be a stack-overflow away
 /// from an abort.
-fn count_nodes(structure: &Value) -> usize {
+///
+/// Hitting the cap is REPORTED rather than folded into the number: showing
+/// a capped walk as the exact count `100000` would be a wrong fact, not a
+/// rounded one.
+fn count_nodes(structure: &Value) -> NodeCount {
     let Some(roots) = structure.as_array() else {
-        return 0;
+        return NodeCount {
+            nodes: 0,
+            capped: false,
+        };
     };
     let mut stack: Vec<&Value> = roots.iter().collect();
-    let mut count = 0;
+    let mut nodes = 0;
     while let Some(node) = stack.pop() {
-        if count >= MAX_COUNTED_NODES {
-            break;
+        if nodes >= MAX_COUNTED_NODES {
+            return NodeCount {
+                nodes,
+                capped: true,
+            };
         }
-        count += 1;
+        nodes += 1;
         if let Some(children) = node.get("children").and_then(Value::as_array) {
             stack.extend(children.iter());
         }
     }
-    count
+    NodeCount {
+        nodes,
+        capped: false,
+    }
 }
 
 #[cfg(test)]
@@ -192,7 +257,8 @@ mod tests {
     #[test]
     fn counts_a_flat_structure() {
         let structure = json!([{ "id": "a" }, { "id": "b" }]);
-        assert_eq!(count_nodes(&structure), 2);
+        assert_eq!(count_nodes(&structure).nodes, 2);
+        assert!(!count_nodes(&structure).capped);
     }
 
     #[test]
@@ -201,14 +267,15 @@ mod tests {
             { "id": "a", "children": [{ "id": "b", "children": [{ "id": "c" }] }] },
             { "id": "d" }
         ]);
-        assert_eq!(count_nodes(&structure), 4);
+        assert_eq!(count_nodes(&structure).nodes, 4);
     }
 
     #[test]
     fn counts_nothing_for_a_non_array_payload() {
-        assert_eq!(count_nodes(&json!({})), 0);
-        assert_eq!(count_nodes(&json!(null)), 0);
-        assert_eq!(count_nodes(&json!([])), 0);
+        for payload in [json!({}), json!(null), json!([])] {
+            assert_eq!(count_nodes(&payload).nodes, 0);
+            assert!(!count_nodes(&payload).capped);
+        }
     }
 
     #[test]
@@ -240,13 +307,16 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("join");
-        assert_eq!(counted, MAX_COUNTED_NODES);
+        assert_eq!(counted.nodes, MAX_COUNTED_NODES);
+        // The cap must be VISIBLE: a capped walk reported as the exact
+        // number 100000 would be a wrong fact rather than a rounded one.
+        assert!(counted.capped, "the node cap was not reported");
     }
 
     #[test]
     fn missing_counts_render_as_unknown() {
         let collection = json!({ "id": "c1", "name": "Eng" });
-        let counts = HashMap::new();
+        let counts = Counts::default();
         assert_eq!(count_label(&collection, &counts, false), UNKNOWN_COUNT);
         assert_eq!(count_label(&collection, &counts, true), "");
     }
@@ -254,8 +324,25 @@ mod tests {
     #[test]
     fn known_counts_render_as_numbers() {
         let collection = json!({ "id": "c1", "name": "Eng" });
-        let counts = HashMap::from([("c1".to_string(), 7)]);
+        let counts = Counts {
+            counted: HashMap::from([("c1".to_string(), 7)]),
+            capped: HashSet::new(),
+        };
         assert_eq!(count_label(&collection, &counts, false), "7");
+    }
+
+    #[test]
+    fn a_capped_count_is_marked_as_a_floor() {
+        let collection = json!({ "id": "c1", "name": "Eng" });
+        let counts = Counts {
+            counted: HashMap::from([("c1".to_string(), MAX_COUNTED_NODES)]),
+            capped: HashSet::from(["c1".to_string()]),
+        };
+        assert_eq!(
+            count_label(&collection, &counts, false),
+            format!("{MAX_COUNTED_NODES}+"),
+            "a capped walk must not be shown as an exact count"
+        );
     }
 
     #[test]
@@ -265,7 +352,10 @@ mod tests {
             json!({ "id": "8a2d-hr", "name": "Human Resources" }),
             json!({ "id": "9b3e-x", "name": "\u{4e2d}\u{6587}\u{96c6}\u{5408}" }),
         ];
-        let counts = HashMap::from([("6f1c-eng".to_string(), 12), ("8a2d-hr".to_string(), 0)]);
+        let counts = Counts {
+            counted: HashMap::from([("6f1c-eng".to_string(), 12), ("8a2d-hr".to_string(), 0)]),
+            capped: HashSet::new(),
+        };
         // Golden file: byte-for-byte, including alignment past a CJK name
         // (whose display width is twice its character count).
         assert_eq!(
@@ -276,6 +366,6 @@ mod tests {
 
     #[test]
     fn an_empty_list_renders_a_placeholder_not_a_bare_header() {
-        assert_eq!(table(&[], &HashMap::new(), false), "(no items)");
+        assert_eq!(table(&[], &Counts::default(), false), "(no items)");
     }
 }

@@ -25,7 +25,7 @@ so that 内容可进 git 或离线阅读。
   - [x] Windows 保留名：CON/PRN/AUX/NUL/COM0-9/LPT0-9/CLOCK$/CONIN$/CONOUT$，忽略大小写与扩展名，加 `_` 前缀
   - [x] 非法字符 `< > : " / \ | ? *` + 控制符 → `-`；不可见重排字符（RLO/ZWJ/BOM 等）直接丢弃
   - [x] 长度上限按**字节**（96 B），按 char 边界截断，截断后再裁一次尾部点
-  - [x] 大小写不敏感文件系统重名：`Names` 以小写键去重，冲突加 `-2`/`-3`…（后缀也守字节上限）
+  - [x] 大小写不敏感文件系统重名：`Names` 以「全 Unicode 小写 + NFC」为键去重，冲突加 `-2`/`-3`…（后缀也守字节上限）
 - [x] Task 2: 层级重建 (AC: 1)
   - [x] `commands/docs/tree.rs`（纯函数）：由 `parentDocumentId` 建森林
   - [x] 父不在清单内 / 自己是自己的父 / 父链成环 → 一律提升为 root（环用三色状态机在一点切断）
@@ -36,19 +36,28 @@ so that 内容可进 git 或离线阅读。
   - [x] 有子文档的节点 → 目录 `Stem/`，自身写成 `Stem/Stem.md`，子文档写在其中（子目录有独立 `Names`）
   - [x] 每篇正文前置 `# <title>`（文件名已被安全化，标题靠这行保真），已以 `# ` 开头则不重复加
   - [x] 目录深度上限 8 层，更深的**用队列**（不是递归）平铺到该层并警告一次
-  - [x] 不跟随符号链接：子目录 `create_dir` + `symlink_metadata` 校验；文件遇 symlink 直接拒写
+  - [x] 写盘原子化：同目录 temp（`create_new`）→ `write_all` → `fsync` → `rename`；失败清理 temp
+  - [x] 不跟随符号链接：子目录 `create_dir` + `symlink_metadata` 校验 + canonicalize 后必须仍在 root 内；
+        文件只经 `create_new` + `rename` 落地（`rename` 替换链接而非跟随），无 check-then-open 竞态
+  - [x] `documents.info` 无 `text` 字段（或为 null）→ 记为失败，不写只有标题的文件；空字符串照常导出
   - [x] `--out` 非空目录在**任何请求之前**拒绝（退出码 2），`--overwrite` 才允许覆盖
 - [x] Task 4: 部分失败 (AC: 2)
   - [x] 失败逐条收集（id + 原因），结尾汇总到 stderr（最多列 20 条 + "and N more"）
   - [x] 有失败 → 退出码 9（新增），已登记 `docs/exit-codes.md`
+  - [x] **枚举被 CLI 页上限截断 → 同样退出码 9**，`--json` 里 `complete:false` + `enumeration_truncated:true`
   - [x] 枚举本身失败 → 沿用其自身退出码（3-7），不写任何文件，不报 9
   - [x] stdout：Table 模式逐行输出相对路径；JSON 模式输出 `{out, exported[], failed[]}`
 - [x] Task 5: 测试 (AC: 1, 2)
-  - [x] `export.rs` 单测 17 项：穿越/非法字符/控制符/不可见字符/保留名/尾点/空标题/字节上限/去重/大小写冲突/500 次冲突全唯一
+  - [x] `export.rs` 单测 22 项：穿越/非法字符/控制符/不可见字符/保留名/尾点/空标题/字节上限/去重/
+        大小写冲突/NFC-NFD 冲突/兼容字符不折叠/不同标题不误合/`claim_exact`/500 次冲突全唯一
   - [x] `tree.rs` 单测 11 项：扁平/嵌套/父缺失/自环/双环/长环/无 id/重复 id/确定性排序/空清单
   - [x] `tests/docs_export.rs`（tempfile）：层级落盘、跨页 101 篇全导出、恶意标题不越界（含 out 目录外哨兵文件）、
         同名三文档三文件、单篇失败→9 且其余落盘、枚举失败→5 且零写入、非空目录→2 且零请求、
-        `--overwrite`、JSON 摘要、空 collection
+        `--overwrite`、JSON 摘要、空 collection、子目录建不出来时整棵子树进汇总、分支目录与自身文件同名
+  - [x] R1 回归测试：100 页耗尽页上限 → 退出 9 + `complete:false`（且断言真的打了 100 次 list，
+        否则测试不成立）、`text:null` → 失败而非空文件、`text:""` → 正常导出、NFC/NFD 两篇各得一文件、
+        run 后无残留 temp 文件、rename 失败时旧内容完好、`--overwrite` 下目标 symlink 被替换而非穿透、
+        `--out` 是 symlink → 退出 2
 
 ## Dev Notes
 
@@ -63,9 +72,25 @@ so that 内容可进 git 或离线阅读。
   1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
   2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
      递归深度因此被 `MAX_DEPTH` 硬性封顶。
-- **符号链接**：`--overwrite` 下 `File::create` 会跟随符号链接写到目录树之外。
-  因此写前用 `symlink_metadata` 判定，是链接就报该篇失败；子目录同理。
+- **写盘为什么必须原子**（R1 finding 3）：旧实现 `--overwrite` 先 `truncate(true)` 再写，
+  一旦 `write_all`/`flush` 中途失败（磁盘满、配额），**上一次有效备份已经被清空了**，
+  而命令只报一个 exit 9。改为「同目录 temp → fsync → rename」后：目标文件只被 `rename` 整体替换，
+  写失败时目标一个字节都没动，temp 被删掉，不留残缺文件。
+- **符号链接不再靠 check-then-open**（R1 finding 7）：`symlink_metadata` 后再 `open` 是 TOCTOU。
+  现在 temp 文件用 `create_new`（`O_CREAT|O_EXCL`，对已存在项直接失败，不可能跟随链接），
+  再用 `rename` 落地——`rename` **替换**目标处的符号链接而不是跟随它。这条竞态窗口被结构性消除，
+  不是被缩小。子目录只用 `create_dir`（不用 `create_dir_all`），已存在项必须是真目录，
+  并在 canonicalize 后要求仍在 root 内——目录被换成链接会在使用它的那一刻被抓到。
   另外所有路径都是 `root.join(<安全组件>)`，安全组件里不可能出现分隔符或 `..`。
+- **`--out` 祖先是符号链接是合法的**：macOS 的 `/tmp`、`/var` 本身就是链接，很多 home 目录也是。
+  所以祖先链接照常跟随，但只跟随一次（`--out` 在动手前 canonicalize），
+  结尾的 "exported N documents to <path>" 报告解析后的真实位置——重定向可见而非静默。
+  `--out` 的**末级**不得是符号链接（退出 2）。
+- **Unicode 规范化去重**（R1 finding 4）：NFC 的 `é`（U+00E9）与 NFD 的 `e`+U+0301 是不同字节串，
+  但在 macOS 卷上是**同一个目录项**。去重键因此是「全 Unicode 小写 + NFC」。
+  不用 NFKC：它会把 `ﬁ`→`fi`、全角→ASCII 也折掉，而真实文件系统不这么做，会误合本可共存的名字。
+  更宽的等价关系（某些文件系统可能有）由下游兜底：每写完一个文件就记下它的 (dev, ino)，
+  撞上本次已写过的文件就报冲突，而不是把两次覆盖计成两次成功导出。
 - **退出码 9 是新增的公共 API**：已写入 `docs/exit-codes.md`，并明确"批量还没开始就失败的用原错误码"。
 - **Windows 路径长度**：8 层 × 96 B 的 stem 可能越过传统 `MAX_PATH`(260)。
   这类失败会变成该篇文档的 I/O 失败并进结尾汇总（而不是静默丢失），深度上限也是为此存在。
@@ -79,6 +104,9 @@ so that 内容可进 git 或离线阅读。
   不在本 story 范围。
 - **不写 manifest**：没有 id → 路径的映射文件，因此二次导出后无法按 id 定位旧文件。
   v2 的 pull/push 才需要这个。
+- **(dev, ino) 冲突兜底只在 Unix**：Windows 需要另一套 API（`file_index`）。
+  NTFS 大小写不敏感但不做 normalization folding，所以「小写 + NFC」键在那里已经覆盖了实际等价关系；
+  这条兜底是给等价关系更宽的文件系统（主要是 macOS）用的。
 - **`index` 排序信息未使用**：兄弟按标题排序（确定性、git 友好），不复刻 Outline 侧边栏顺序。
 
 ### References

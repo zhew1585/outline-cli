@@ -232,3 +232,68 @@ fn a_search_without_configuration_exits_2_before_any_request() {
         .code(2)
         .stderr(predicate::str::contains("OUTLINE_URL"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_search_stopped_by_the_page_cap_does_not_exit_0() {
+    // Same rule as the other list commands: the hits are real and go to
+    // stdout, but a caller reading only stdout must not take exit 0 as
+    // "these are all of them".
+    const MAX_PAGES: usize = 100;
+    let server = MockServer::start().await;
+    for page in 0..MAX_PAGES + 1 {
+        Mock::given(method("POST"))
+            .and(path("/api/documents.search"))
+            .and(body_partial_json(json!({ "offset": page })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [hit(&format!("doc-{page}"), "Endless", COLLECTION)],
+                "pagination": { "offset": page, "limit": 1 },
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "search", "deploy", "--json"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed.as_array().map(Vec::len), Some(MAX_PAGES));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_search_limited_by_the_user_still_exits_0() {
+    let server = MockServer::start().await;
+    let full: Vec<Value> = (0..100)
+        .map(|index| hit(&format!("doc-{index}"), "Hit", COLLECTION))
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/api/documents.search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": full,
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "search", "deploy", "--json", "--limit", "3"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(0), "--limit is not a failure");
+}

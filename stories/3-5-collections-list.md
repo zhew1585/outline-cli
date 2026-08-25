@@ -25,6 +25,8 @@ so that 拿到 id 供其他命令使用。
   - [x] 每个 collection 调一次 `collections.documents`，用显式栈（非递归）数导航树节点
   - [x] 读不到的 collection 显示 `?`，只在结尾汇总一条 stderr 警告，不让列表失败
   - [x] `--no-counts` 完全跳过这轮请求；`--json` 输出服务端原始行（不注入合成字段）
+  - [x] R1 修复：数到 `MAX_COUNTED_NODES` 上限时显示 `100000+` 并 stderr 警告，不再冒充精确值
+  - [x] R1 修复：列表被 CLI 页上限截断时退出码 9（`--limit` 截断仍为 0）
 - [x] Task 4: 测试 (AC: 1)
   - [x] golden file `tests/golden/collections_list_table.txt`（含 CJK 名称的对齐、`?` 与 0 两种计数）
   - [x] 单测：扁平/嵌套计数、非数组载荷、10 万层深树不爆栈、未知计数渲染
@@ -45,6 +47,8 @@ so that 拿到 id 供其他命令使用。
   `to_value` 深拷贝，测试里必须用 move 构造，否则测试自身变成 O(n²)）。
 - **`collections.documents` 的 `id` 是 `format: uuid`**：真实实例的 collection id 就是 UUID，
   但若某实例返回非 UUID，engine 会本地拒绝，该行计数落到 `?`——降级而非崩溃。
+- **计数有三种可区分状态**（R1 finding 9）：精确数字、`<n>+`（走到节点上限，只能算下界）、
+  `?`（结构读不到）。把上限截断显示成精确的 `100000` 是错误事实，不是四舍五入。
 - **列宽按终端显示宽度算**：复用既有 `render` 的 grapheme + `unicode-width` 布局，
   所以 CJK 名称后面的列不会错位（golden file 锁住了这一点）。
 

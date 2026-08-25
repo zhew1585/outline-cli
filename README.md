@@ -77,11 +77,21 @@ Notes worth knowing:
   `/dev/null`) can never be read as "replace the body with nothing". Clearing a body is possible, but
   only by spelling it out: `otl api documents.update id=<id> text=`.
 - **`docs export`** rebuilds the document hierarchy as directories, sanitizes every file name (path
-  traversal, Windows device names, case-insensitive collisions, length limits), refuses a non-empty
-  output directory unless `--overwrite` is given, and keeps going when one document fails — the
-  failures are summarized at the end and the exit code is 9 (partial failure).
-- **Pagination never truncates silently.** `--limit N` on a list command caps the total rows and prints
-  a warning on stderr saying so.
+  traversal, Windows device names, case- and normalization-insensitive collisions, length limits),
+  refuses a non-empty output directory unless `--overwrite` is given, and keeps going when one
+  document fails — the failures are summarized at the end and the exit code is 9 (partial failure).
+  Each file is written through a temporary file and renamed into place, so an interrupted export never
+  leaves a half-written document and a failed `--overwrite` never destroys the previous backup.
+- **Pagination never truncates silently, and never lies about it either.** `--limit N` caps the total
+  rows, warns on stderr and exits 0 — you asked for it. But when the CLI's own page cap stops a fetch
+  before the server ran out of rows, the result is incomplete through no choice of yours, so
+  `docs search`, `collections list` and `docs export` all exit **9**. `docs export --json` also reports
+  `"complete": false`, because an output directory cannot show what was never fetched.
+- **`docs view` on a terminal is a display, in a pipe it is data.** Piped or `--raw` output is the
+  document byte-for-byte — not even a trailing newline is added. On a terminal the text is prepared for
+  display: control sequences are replaced (a document body must not be able to set your clipboard or
+  forge a hyperlink), and `$PAGER` takes over when the content does not fit on one screen, counting
+  wrapped rows rather than lines.
 
 ## Design
 

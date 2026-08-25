@@ -24,13 +24,18 @@ so that 终端内完成阅读。
 
 - [x] Task 1: pager 模块 (AC: 1, 2)
   - [x] `crates/otl/src/pager.rs`：`Pager::parse($PAGER)`（空白分词，无 shell），缺省 `less -R -F -X`
-  - [x] `exceeds_screen(text, height)`：留一行给 shell 提示符；终端高度用 `terminal_size`，未知回落 24
+  - [x] `exceeds_screen(text, height, width)`：按**屏幕行**（含自动换行）而非逻辑行计数，
+        宽度经 `render::display_columns`（grapheme + unicode-width），留一行给 shell 提示符；
+        终端尺寸用 `terminal_size`，未知回落 80x24
   - [x] 内容经 stdin 喂给 pager；spawn 失败 → stderr 警告 + 直出 stdout，退出码仍 0
   - [x] pager 提前退出（broken pipe）视为正常完成
+  - [x] R1 修复：TTY 显示路径把控制字符换成 U+FFFD（`\r` 丢弃、`\t` 展开），并去掉默认 `less -R`；
+        管道/`--raw` 路径逐字节原样输出，连结尾换行都不补
 - [x] Task 2: browser 模块 (AC: 3)
   - [x] `crates/otl/src/browser.rs`：`$BROWSER` 优先，否则 macOS `open` / Windows `rundll32 url.dll,FileProtocolHandler` / 其余 `xdg-open`
   - [x] URL 始终作为独立 argv 末位参数传入，不经 shell
   - [x] `Session::absolute_url`：只接受"纯 root-relative 路径"（无 scheme/authority/`..`/空白/控制符/`\`/`:`），否则拒绝
+  - [x] R1 修复：额外拒绝百分号编码的分隔符/点段（`%2e` `%2f` `%5c`）与不可见/双向格式字符
 - [x] Task 3: 命令实现 (AC: 1, 2, 3)
   - [x] `commands/docs/view.rs`：`documents.info id=<id>`
   - [x] 默认输出 markdown（管道也是 markdown，不是 JSON）；`--json` 才是对象
@@ -49,6 +54,15 @@ so that 终端内完成阅读。
   传给 `docs::run`，因为 `OutputMode::Json` 无法区分"用户要 JSON"与"stdout 不是终端"。
   其余五个命令仍是标准双态。
 - **分页判定**：`mode == Table` 已经等价于「stdout 是 TTY 且没有 --json」，再叠加 `!--raw` 与「超一屏」。
+- **交互路径是"显示"，管道路径是"数据"**（R1 findings 6/11）：文档正文由任何有编辑权的人写入，
+  而终端会把其中一部分字节当**命令**执行（OSC 52 改剪贴板、OSC 8 伪造超链接、光标移动重绘）。
+  这些都不是 markdown，所以 TTY 路径一律替换为 U+FFFD 并在 stderr 说明可用 `--raw` 拿原始字节；
+  管道与 `--raw` 则一个字节都不动——脚本做 hash/diff 必须拿到 API 的原文。
+  默认 pager 参数因此去掉了 `-R`：既然显示路径已经过滤，`-R` 只会在"漏掉一个转义序列"时起作用，
+  而那正是应该按字面显示的场景。
+- **"超一屏"要按屏幕行算**（R1 finding 5）：终端会自动换行，一行 10,000 列在 80 列窗口里占 125 行。
+  只数 `lines()` 会把它判成 1 行直接灌进终端。宽度计算复用 render 的 grapheme + unicode-width，
+  CJK 宽 2、组合符宽 0 都算对；tab 先展开再量。
 - **绝不把内容交给 shell**：pager 通过 stdin 拿正文，opener 通过独立 argv 拿 URL。
   Windows 特意不用 `cmd /c start`——`cmd` 会重新解析参数，URL 里的 `&` 会变成命令分隔符。
 - **`--web` 的 URL 从 origin 拼**：`Session` 只保存 `scheme://host[:port]`（base URL 的 path 可能带凭证，

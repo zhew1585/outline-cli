@@ -85,16 +85,19 @@ impl Session {
     }
 
     /// Call one list operation, auto-paginating to the end (or to `limit`
-    /// rows), and return the merged rows.
+    /// rows), and return the merged rows together with WHY the fetch
+    /// stopped.
     ///
     /// Truncation and unconfirmed page boundaries are reported on stderr
-    /// here, once per call: results are never silently short.
+    /// here, once per call, but the truncation is also RETURNED: a warning
+    /// alone is not enough for a caller whose output is an artifact rather
+    /// than a stream (see [`Rows::incomplete`] and `otl docs export`).
     pub fn call_rows(
         &self,
         operation: &str,
         args: &[(String, String)],
         limit: Option<u64>,
-    ) -> Result<Vec<Value>, CliError> {
+    ) -> Result<Rows, CliError> {
         let op = self.operation(operation)?;
         let spec = paging::spec_for(op).ok_or_else(|| {
             CliError::failure(anyhow!(
@@ -137,21 +140,50 @@ impl Session {
     }
 }
 
+/// Characters that are invisible or re-order what follows them.
+///
+/// Not `char::is_control`, but a right-to-left override inside a URL makes
+/// the link printed on stdout read as a different address than the one the
+/// browser will open, which is the whole point of showing it.
+const INVISIBLE: &[char] = &[
+    '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}',
+    '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
+];
+
+/// Percent-encodings that a URL parser turns back into a path separator or
+/// a dot segment. Compared case-insensitively.
+const ENCODED_SEPARATORS: &[&str] = &["%2e", "%2f", "%5c"];
+
 /// Whether a server-provided path is a plain root-relative URL path.
 ///
 /// Rejects protocol-relative (`//host/...`) and scheme-bearing values, any
 /// whitespace or control character (which could smuggle a second argument
 /// or a terminal escape), backslashes (a Windows path separator and a URL
 /// escape hatch), and `..` segments.
+///
+/// Two subtler classes are rejected as well, because this string is both
+/// printed to the user AND handed to a browser, and the two must agree:
+///
+/// - **percent-encoded separators and dots** (`%2e%2e%2f`, `%5c`): the
+///   literal check above sees an ordinary segment, while the browser
+///   decodes and then normalizes, so the address opened would not be the
+///   one validated. Outline's own `url` values are plain slugs, so there is
+///   nothing legitimate to lose here.
+/// - **invisible and bidirectional formatting characters**: they survive
+///   into stdout and make the printed link read as a different path.
 fn is_safe_relative_path(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
     path.starts_with('/')
         && !path.starts_with("//")
         && !path.contains('\\')
         && !path.contains(':')
         && !path.split('/').any(|segment| segment == "..")
+        && !ENCODED_SEPARATORS
+            .iter()
+            .any(|encoded| lowered.contains(encoded))
         && !path
             .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || c == '\u{7f}')
+            .any(|c| c.is_control() || c.is_whitespace() || c == '\u{7f}' || INVISIBLE.contains(&c))
 }
 
 /// Take the `data` payload out of a response envelope.
@@ -166,8 +198,44 @@ pub fn take_data(envelope: &mut Value) -> Value {
     }
 }
 
+/// The result of an auto-paginated fetch: the rows, plus why it stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rows {
+    /// The merged rows.
+    pub items: Vec<Value>,
+    /// Present exactly when the row set may be short of the full result.
+    pub truncation: Option<Truncation>,
+}
+
+impl Rows {
+    /// Whether the row set is short of what the caller ASKED for.
+    ///
+    /// [`TruncationCause::MaxItems`] is excluded: it is only reachable when
+    /// the caller passed `--limit`, so stopping there is the requested
+    /// outcome, not a shortfall. Every other cause means the CLI gave up
+    /// before the data ran out - the page-count safety cap, an exhausted
+    /// offset space, a pinned page size - and a command whose result must
+    /// be trustworthy has to treat that as an incomplete result rather
+    /// than as a warning it hopes someone reads.
+    pub fn incomplete(&self) -> Option<&Truncation> {
+        self.truncation
+            .as_ref()
+            .filter(|truncation| truncation.cause != TruncationCause::MaxItems)
+    }
+
+    /// How many rows came back.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether no rows came back.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 /// Surface everything a paged fetch has to say, then hand back its rows.
-fn report(fetched: Fetched) -> Vec<Value> {
+fn report(fetched: Fetched) -> Rows {
     let Fetched {
         mut value,
         truncation,
@@ -179,13 +247,28 @@ fn report(fetched: Fetched) -> Vec<Value> {
     if let Some(truncation) = &truncation {
         warn_truncated(truncation);
     }
-    match take_data(&mut value) {
+    let items = match take_data(&mut value) {
         Value::Array(rows) => rows,
         // Unreachable: the engine only accepts a page when the descriptor's
         // items pointer holds an array. Treated as "no rows" rather than a
         // panic.
         _ => Vec::new(),
-    }
+    };
+    Rows { items, truncation }
+}
+
+/// The stderr-and-exit-code message for an incomplete result set.
+///
+/// Shared by every curated list command so the wording (and the exit code
+/// it carries) cannot drift between them.
+pub fn incomplete_error(what: &str, truncation: &Truncation) -> CliError {
+    CliError::partial(anyhow!(
+        "{what} is incomplete: only {} item(s) could be fetched before the \
+         CLI's own pagination limit stopped the fetch. The rows that were \
+         fetched are valid; narrow the query (for example by collection) and \
+         run again to cover the rest.",
+        truncation.fetched
+    ))
 }
 
 /// Explicit stderr warning whenever results may be incomplete (hard rule:
@@ -241,6 +324,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_percent_encoded_separators_and_dot_segments() {
+        // A browser decodes and then normalizes these, so the address it
+        // opens is not the one the literal check saw.
+        for path in [
+            "/%2e%2e/admin",
+            "/%2E%2E/admin",
+            "/doc/..%2fadmin",
+            "/doc/%5cadmin",
+            "/doc/a%2Fb",
+        ] {
+            assert!(!is_safe_relative_path(path), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_invisible_and_bidirectional_formatting_characters() {
+        // `report-<RLO>fdp` prints as `report-pdf`: the link shown to the
+        // user would not be the link the browser opens.
+        for path in [
+            "/doc/report-\u{202e}fdp",
+            "/doc/a\u{200b}b",
+            "/doc/\u{feff}x",
+            "/doc/\u{2066}x\u{2069}",
+        ] {
+            assert!(!is_safe_relative_path(path), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn still_accepts_ordinary_percent_free_unicode_slugs() {
+        // Guard against over-rejecting: a non-ASCII slug is fine.
+        assert!(is_safe_relative_path("/doc/\u{4e2d}\u{6587}-abc123"));
+        assert!(is_safe_relative_path("/doc/caf\u{e9}-9f2"));
+    }
+
+    #[test]
     fn rejects_paths_with_control_characters_or_spaces() {
         // Whitespace could split into a second argv entry for an opener,
         // and an escape sequence could rewrite the terminal.
@@ -251,6 +370,54 @@ mod tests {
         assert!(!is_safe_relative_path("/doc/../../etc/passwd"));
         assert!(!is_safe_relative_path("doc/relative"));
         assert!(!is_safe_relative_path(""));
+    }
+
+    fn rows_with(cause: Option<TruncationCause>) -> Rows {
+        Rows {
+            items: Vec::new(),
+            truncation: cause.map(|cause| Truncation { fetched: 10, cause }),
+        }
+    }
+
+    #[test]
+    fn a_complete_fetch_is_not_incomplete() {
+        assert!(rows_with(None).incomplete().is_none());
+    }
+
+    #[test]
+    fn a_user_requested_limit_is_not_an_incomplete_result() {
+        // `--limit N` asked for exactly this; it must not become exit 9.
+        assert!(rows_with(Some(TruncationCause::MaxItems))
+            .incomplete()
+            .is_none());
+    }
+
+    #[test]
+    fn every_other_truncation_cause_is_an_incomplete_result() {
+        // The CLI gave up before the data ran out. A stderr warning alone
+        // would let automation read exit 0 as "complete".
+        for cause in [
+            TruncationCause::PageLimit,
+            TruncationCause::ManualPage,
+            TruncationCause::OffsetSpaceExhausted,
+        ] {
+            assert!(
+                rows_with(Some(cause)).incomplete().is_some(),
+                "{cause:?} was treated as complete"
+            );
+        }
+    }
+
+    #[test]
+    fn the_incomplete_error_carries_exit_code_9() {
+        let truncation = Truncation {
+            fetched: 10_000,
+            cause: TruncationCause::PageLimit,
+        };
+        let error = incomplete_error("the collection listing", &truncation);
+        assert_eq!(error.code, crate::exit::ExitCode::Partial);
+        assert!(error.to_string().contains("10000"), "{error}");
+        assert!(error.to_string().contains("incomplete"), "{error}");
     }
 
     #[test]

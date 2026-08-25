@@ -5,9 +5,10 @@
 //! rule still holds, it is just spelled with a different default:
 //!
 //! - `--json` (explicit): the raw document object, for scripts;
-//! - `--raw`, or a non-terminal stdout: the markdown, verbatim, no pager;
-//! - a terminal stdout: the markdown, through `$PAGER` when it does not fit
-//!   on one screen;
+//! - `--raw`, or a non-terminal stdout: the markdown, byte-for-byte - no
+//!   pager, no filtering, not even an added trailing newline;
+//! - a terminal stdout: the markdown prepared for display (see
+//!   [`crate::pager`]), through `$PAGER` when it does not fit on one screen;
 //! - `--web`: the document's URL on stdout, and the browser opened at it.
 
 use anyhow::anyhow;
@@ -57,9 +58,11 @@ pub fn run(cmd: &ViewArgs, mode: OutputMode, json_requested: bool) -> Result<(),
         return print_json(&document);
     }
     let text = markdown(&document);
-    // Paging is for humans only: a terminal, no --raw, no --json.
-    let paginate = mode == OutputMode::Table && !cmd.raw;
-    pager::write(&text, paginate)
+    // Interactive display (control-character filtering, a trailing newline,
+    // and a pager past one screen) is for humans only: a terminal, no
+    // --raw, no --json. Everything else gets the bytes verbatim.
+    let interactive = mode == OutputMode::Table && !cmd.raw;
+    pager::write(&text, interactive)
 }
 
 /// The document's markdown body.

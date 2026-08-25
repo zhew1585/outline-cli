@@ -499,3 +499,376 @@ async fn an_empty_collection_exports_nothing_and_says_so() {
     assert!(tree(&out).is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no documents"));
 }
+
+/// Pages the CLI is willing to fetch before its own safety cap stops it
+/// (`paging::MAX_PAGES`). Kept in sync by the assertion in the test below:
+/// if the cap changes, the test stops proving anything and says so.
+const MAX_PAGES: usize = 100;
+
+/// Mount a `documents.list` that never runs out of pages.
+///
+/// Each page reports an applied page size of 1 and returns exactly one row,
+/// so the engine always sees a full page and keeps asking - until its own
+/// page cap stops it. That is the shape of a collection larger than the CLI
+/// can enumerate, without needing 10,001 fixtures.
+async fn server_that_never_runs_out(row_id: &str) -> MockServer {
+    let server = MockServer::start().await;
+    for page in 0..MAX_PAGES + 1 {
+        Mock::given(method("POST"))
+            .and(request_path("/api/documents.list"))
+            .and(body_partial_json(json!({ "offset": page })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [row(row_id, "Endless", None)],
+                "pagination": { "offset": page, "limit": 1 },
+            })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "id": row_id, "title": "Endless", "text": "body\n" },
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_enumeration_stopped_by_the_page_cap_is_not_a_successful_backup() {
+    // The regression this exists for: the pagination cap used to produce a
+    // stderr warning and exit 0, so an automated backup of a collection
+    // larger than the cap was recorded as complete. The files that WERE
+    // written are kept - they are real - but the exit code and the JSON
+    // summary both have to say the copy is partial.
+    let server = server_that_never_runs_out("d1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "an incomplete export must not exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("NOT a complete copy"),
+        "the summary must say the export is partial: {stderr}"
+    );
+
+    // The machine-readable summary must carry the same verdict, because a
+    // backup script reads stdout and not stderr.
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["complete"], json!(false));
+    assert_eq!(parsed["enumeration_truncated"], json!(true));
+
+    // The page cap really was reached (and not, say, a mock mismatch that
+    // ended the fetch early), so this test is measuring what it claims to.
+    let calls = server.received_requests().await.unwrap();
+    let list_calls = calls
+        .iter()
+        .filter(|call| call.url.path() == "/api/documents.list")
+        .count();
+    assert_eq!(
+        list_calls, MAX_PAGES,
+        "the fetch did not reach the page cap; MAX_PAGES may have changed"
+    );
+
+    // Every page returned the same document id: it is exported once, not a
+    // hundred times.
+    assert_eq!(tree(&out), BTreeSet::from(["Endless.md".to_string()]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_with_no_markdown_body_is_a_failure_not_an_empty_file() {
+    // `documents.info` answering without `text` used to produce a file
+    // holding only the title heading, counted as exported, exit 0.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [row("ok", "Good", None), row("nobody", "Bodyless", None)],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.info"))
+        .and(body_partial_json(json!({ "id": "ok" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "id": "ok", "title": "Good", "text": "kept\n" },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.info"))
+        .and(body_partial_json(json!({ "id": "nobody" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            // Null body, and a second variant (an absent field) is covered
+            // by the same code path.
+            "data": { "id": "nobody", "title": "Bodyless", "text": null },
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nobody"), "not reported: {stderr}");
+    assert!(stderr.contains("no markdown body"), "{stderr}");
+    // No file for the bodyless document: an empty-looking .md would read as
+    // a successfully backed-up empty document.
+    assert_eq!(tree(&out), BTreeSet::from(["Good.md".to_string()]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_document_body_is_still_exported() {
+    // The counterpart to the test above: an empty STRING is a real document
+    // body, and must not be mistaken for a missing one.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [row("blank", "Blank", None)],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "id": "blank", "title": "Blank", "text": "" },
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+    assert_eq!(tree(&out), BTreeSet::from(["Blank.md".to_string()]));
+    assert_eq!(
+        std::fs::read_to_string(out.join("Blank.md")).unwrap(),
+        "# Blank\n\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn titles_that_differ_only_by_unicode_normalization_get_separate_files() {
+    // NFC `é` and NFD `e`+U+0301 are ONE directory entry on macOS. Without
+    // a normalization-insensitive de-duplication key the second document
+    // silently replaced the first while both were reported as exported.
+    let server = server_with(vec![
+        row("a", "Caf\u{e9}", None),
+        row("b", "Cafe\u{301}", None),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reported = parsed["exported"].as_array().map(Vec::len);
+    assert_eq!(reported, Some(2), "summary: {parsed}");
+    // Two documents claimed, two files on disk: the claim in the summary
+    // matches reality even on a normalization-insensitive filesystem.
+    assert_eq!(tree(&out).len(), 2, "one document overwrote the other");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_temporary_files_are_left_behind() {
+    // Every document is written through a temp file in the destination
+    // directory; none may survive the run.
+    let server = server_with(vec![row("a", "Alpha", None), row("b", "Beta", Some("a"))]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+
+    for path in tree(&out) {
+        assert!(
+            !path.contains("otl-export-"),
+            "temporary file survived: {path}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_that_cannot_be_placed_leaves_the_old_content_alone() {
+    // A directory sits where a document's file has to go, so the final
+    // rename cannot succeed. The point is what does NOT happen: the
+    // existing entry is not emptied first (the old `truncate(true)` would
+    // have destroyed a previous backup before discovering the failure), and
+    // no partial file is left behind.
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let blocker = out.join("Alpha.md");
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("precious.txt"), "keep me").unwrap();
+
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--overwrite",
+                "--out",
+            ])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    // The pre-existing content survived untouched.
+    assert_eq!(
+        std::fs::read_to_string(blocker.join("precious.txt")).unwrap(),
+        "keep me"
+    );
+    // And no temp file was left in the destination directory.
+    assert_eq!(
+        tree(&out),
+        BTreeSet::from(["Alpha.md/precious.txt".to_string()])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlink_at_the_destination_is_replaced_not_written_through() {
+    // With `--overwrite`, a symlink where a document's file goes used to be
+    // a check-then-open race. Writing a fresh temp file and renaming it over
+    // the destination closes it structurally: `rename` replaces the link
+    // itself, so the file it pointed at is never touched.
+    use std::os::unix::fs::symlink;
+
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    std::fs::create_dir_all(&out).unwrap();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "do not touch").unwrap();
+    symlink(&outside, out.join("Alpha.md")).unwrap();
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--overwrite",
+                "--out",
+            ])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "do not touch",
+        "the export wrote through the symlink"
+    );
+    let written = out.join("Alpha.md");
+    assert!(
+        std::fs::symlink_metadata(&written).unwrap().is_file(),
+        "the symlink was not replaced by a real file"
+    );
+    assert!(std::fs::read_to_string(&written)
+        .unwrap()
+        .contains("body of a"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_output_directory_that_is_a_symlink_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("link");
+    symlink(&real, &link).unwrap();
+
+    let uri = server.uri();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&link)
+            .assert()
+    })
+    .await;
+
+    assert
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("symlink"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

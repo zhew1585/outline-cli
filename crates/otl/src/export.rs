@@ -221,8 +221,33 @@ impl Names {
 
     /// Record a name, reporting whether it was still free.
     fn insert(&mut self, name: &str) -> bool {
-        self.used.insert(name.to_lowercase())
+        self.used.insert(collision_key(name))
     }
+}
+
+/// The key two names collide under.
+///
+/// Two things have to be folded away, because two filesystems in wide use
+/// fold them and would otherwise turn two documents into one file:
+///
+/// - **case**, via full Unicode lowercasing (not just ASCII): macOS and
+///   Windows are case-insensitive by default;
+/// - **normalization**, via NFC: `é` written as one codepoint (U+00E9) and
+///   as `e` + a combining acute (U+0065 U+0301) are DIFFERENT byte strings
+///   but the same directory entry on a macOS volume.
+///
+/// NFC rather than NFKC on purpose: NFKC would also fold compatibility
+/// characters (`ﬁ` to `fi`, full-width to ASCII), which real filesystems do
+/// not, so it would merge names that can coexist.
+///
+/// The fold is deliberately conservative, so a filesystem with even broader
+/// equivalence could still fuse two names. That is caught downstream rather
+/// than assumed away: `otl docs export` re-checks the identity of each file
+/// it writes and reports a collision instead of counting two exports.
+fn collision_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    name.to_lowercase().nfc().collect()
 }
 
 /// `base` with a `-N` de-duplication suffix, keeping the byte cap.
@@ -399,6 +424,49 @@ mod tests {
                 stem.len() <= MAX_STEM_BYTES,
                 "{stem:?} is {} bytes",
                 stem.len()
+            );
+        }
+    }
+
+    #[test]
+    fn collisions_are_detected_across_unicode_normalization_forms() {
+        // NFC `é` and NFD `e`+U+0301 are one directory entry on macOS. Two
+        // documents must not both claim it.
+        let mut names = Names::new();
+        assert_eq!(names.claim("Caf\u{e9}"), "Caf\u{e9}");
+        assert_eq!(
+            names.claim("Cafe\u{301}"),
+            "Cafe\u{301}-2",
+            "NFD spelling of the same title reused the name"
+        );
+    }
+
+    #[test]
+    fn normalization_and_case_folding_combine() {
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{c9}clair"), "\u{c9}clair"); // NFC É
+        assert_eq!(names.claim("e\u{301}clair"), "e\u{301}clair-2"); // NFD é
+    }
+
+    #[test]
+    fn compatibility_characters_are_not_folded_away() {
+        // NFKC would merge these; no mainstream filesystem does, so folding
+        // them would refuse names that can legitimately coexist.
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{fb01}le"), "\u{fb01}le"); // U+FB01 LATIN SMALL LIGATURE FI
+        assert_eq!(names.claim("file"), "file");
+    }
+
+    #[test]
+    fn distinct_titles_still_get_distinct_names() {
+        // Guard against an over-eager fold: normalization must not collapse
+        // genuinely different names.
+        let mut names = Names::new();
+        for title in ["alpha", "beta", "\u{4e2d}\u{6587}", "\u{e9}", "\u{ea}"] {
+            let claimed = names.claim(title);
+            assert!(
+                !claimed.ends_with("-2"),
+                "{title:?} collided with an earlier name as {claimed:?}"
             );
         }
     }

@@ -18,6 +18,8 @@
 //!
 //! Everything here is pure, so all of it is unit-testable without a server.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::fields;
@@ -121,15 +123,28 @@ pub fn plan<'a>(documents: &'a [Value]) -> Plan<'a> {
 }
 
 /// Extract the usable rows and their raw parent ids.
+///
+/// A row is dropped when it has no id (it could not be fetched) and when
+/// its id was already seen. The second case is not hypothetical: a server
+/// whose ordering shifts between page requests can return the same document
+/// on two pages, and keeping both would fetch it twice, write it twice
+/// under two de-duplicated names, and inflate every count in the summary.
+/// One document, one file.
 fn collect<'a>(documents: &'a [Value]) -> (Vec<Entry<'a>>, Vec<Option<&'a str>>) {
     let mut entries = Vec::with_capacity(documents.len());
     let mut parents = Vec::with_capacity(documents.len());
-    let mut skipped = 0_usize;
+    let mut seen: HashSet<&str> = HashSet::with_capacity(documents.len());
+    let mut without_id = 0_usize;
+    let mut duplicates = 0_usize;
     for document in documents {
         let Some(id) = fields::string_at(document, "/id").filter(|id| !id.is_empty()) else {
-            skipped += 1;
+            without_id += 1;
             continue;
         };
+        if !seen.insert(id) {
+            duplicates += 1;
+            continue;
+        }
         entries.push(Entry {
             id,
             title: fields::string_at(document, "/title").unwrap_or_default(),
@@ -137,16 +152,26 @@ fn collect<'a>(documents: &'a [Value]) -> (Vec<Entry<'a>>, Vec<Option<&'a str>>)
         });
         parents.push(fields::string_at(document, "/parentDocumentId"));
     }
-    if skipped > 0 {
+    if without_id > 0 {
         stdio::write_diagnostic_line(&format!(
-            "warning: skipped {skipped} row(s) from the collection listing \
+            "warning: skipped {without_id} row(s) from the collection listing \
              that carried no document id"
+        ));
+    }
+    if duplicates > 0 {
+        stdio::write_diagnostic_line(&format!(
+            "warning: the collection listing returned {duplicates} document(s) \
+             more than once; each was exported a single time"
         ));
     }
     (entries, parents)
 }
 
-/// Map document id to its position, first occurrence winning.
+/// Map document id to its position.
+///
+/// [`collect`] has already dropped repeats, so every id appears once; the
+/// `or_insert` is kept so that a future change to `collect` degrades to
+/// "first occurrence wins" instead of silently re-pointing parents.
 fn index_of<'a>(entries: &[Entry<'a>]) -> std::collections::HashMap<&'a str, usize> {
     let mut index = std::collections::HashMap::with_capacity(entries.len());
     for (position, entry) in entries.iter().enumerate() {
@@ -360,15 +385,33 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_id_keeps_its_first_occurrence_as_the_parent() {
+    fn a_duplicate_id_is_dropped_rather_than_exported_twice() {
+        // Page overlap or a shifting sort order can return one document
+        // twice. Keeping both would fetch it twice and write two files.
         let documents = vec![
             doc("a", "First", None),
             doc("a", "Second", None),
             doc("b", "Child", Some("a")),
         ];
         let plan = plan(&documents);
-        assert_eq!(plan.children(0), &[2]);
-        assert!(plan.children(1).is_empty());
+        assert_eq!(plan.len(), 2, "the repeat was kept: {:?}", shape(&plan));
+        assert_eq!(plan.title(0), "First", "the first occurrence must win");
+        assert_eq!(plan.children(0), &[1]);
+    }
+
+    #[test]
+    fn every_id_appears_exactly_once_in_the_plan() {
+        let documents = vec![
+            doc("a", "Alpha", None),
+            doc("b", "Beta", Some("a")),
+            doc("a", "Alpha again", None),
+            doc("b", "Beta again", Some("a")),
+        ];
+        let plan = plan(&documents);
+        let ids: Vec<&str> = (0..plan.len()).map(|node| plan.id(node)).collect();
+        let unique: std::collections::HashSet<&&str> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len(), "duplicate ids in plan: {ids:?}");
+        assert_eq!(reachable(&plan), plan.len());
     }
 
     #[test]

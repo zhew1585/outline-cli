@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::exit::CliError;
 use crate::fields::{self, Column, COMPUTED};
 use crate::render::{self, OutputMode};
-use crate::session::Session;
+use crate::session::{self, Session};
 use crate::stdio;
 
 /// The compiled operation this command drives.
@@ -67,11 +67,20 @@ pub fn run(cmd: &SearchArgs, mode: OutputMode) -> Result<(), CliError> {
     }
     let hits = session.call_rows(OPERATION, &args, cmd.limit)?;
     match mode {
-        OutputMode::Json => print_json(&hits),
+        OutputMode::Json => print_json(&hits.items)?,
         OutputMode::Table => {
-            let names = collection_names(&session, &hits);
-            stdio::write_data_line(&table(&hits, &names))
+            let names = collection_names(&session, &hits.items);
+            stdio::write_data_line(&table(&hits.items, &names))?;
         }
+    }
+    // The hits are already on stdout: they are real results and worth
+    // having. But the CLI stopped before the server ran out of them for a
+    // reason the caller never asked for, so the exit code has to say the
+    // result set is short - a stderr warning alone is invisible to
+    // `otl docs search ... --json | jq`.
+    match hits.incomplete() {
+        Some(truncation) => Err(session::incomplete_error("the search result", truncation)),
+        None => Ok(()),
     }
 }
 
@@ -118,7 +127,12 @@ fn collection_names(session: &Session, hits: &[Value]) -> HashMap<String, String
         return HashMap::new();
     }
     match session.call_rows(COLLECTIONS_OPERATION, &[], None) {
+        // A truncated collection index only costs readability here (some
+        // cells fall back to raw ids), so it is not escalated: the names are
+        // decoration on top of the real result, and `call_rows` has already
+        // warned on stderr.
         Ok(collections) => collections
+            .items
             .iter()
             .filter_map(|collection| {
                 let id = fields::string_at(collection, "/id")?;

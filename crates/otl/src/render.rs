@@ -146,6 +146,17 @@ fn scrub_control_chars(raw: &str) -> String {
         .collect()
 }
 
+/// The terminal column width of `text`, summed over grapheme clusters.
+///
+/// Public because layout decisions outside this module need the same
+/// measure - notably [`crate::pager`], which has to know how many terminal
+/// rows a line will wrap onto. Character counts are wrong for CJK (two
+/// columns each), combining marks (zero) and emoji ligatures (one cluster
+/// of width two whose codepoints sum to more).
+pub fn display_columns(text: &str) -> usize {
+    display_width(text)
+}
+
 /// Render a list of objects as a table, or `None` when the payload does
 /// not have that shape.
 ///

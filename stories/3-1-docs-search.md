@@ -32,6 +32,7 @@ so that 不用切浏览器。
   - [x] Table 模式四列 TITLE / COLLECTION / UPDATED / MATCH
   - [x] collection id → name 用一次 `collections.list`（自动分页），失败降级为显示 id + stderr 警告
   - [x] `--json` 输出合并后的原始 hit 数组（含 `document.id`）
+  - [x] R1 修复：分页被 CLI 自身页上限截断时退出码 9（`--limit` 截断仍为 0，是用户要求的）
 - [x] Task 4: 测试 (AC: 1, 2)
   - [x] golden file `tests/golden/docs_search_table.txt`（含 CJK/多行片段/未解析 id 分支）
   - [x] `tests/docs_search.rs`：`--json` 含 id、非 TTY 无 ANSI、请求体含 query/collectionId、跨页合并、`--limit` 截断警告、401→4、缺配置→2
@@ -46,6 +47,9 @@ so that 不用切浏览器。
 - **collection 名称解析的取舍**：搜索结果只带 `collectionId`，终端里不可读。多花一次 list 请求换可读性，
   仅在 Table 模式（交互场景）执行；`--json` 是原始数据，不做解析也不注入合成字段。
   该请求失败只警告不失败——搜索本身已经成功了。
+- **截断必须能被调用方消费，不只是警告**（R1 finding 1 同源）：`call_rows` 返回 `Rows { items, truncation }`，
+  `Rows::incomplete()` 把「用户要求的 `--limit`」与「CLI 自己放弃」分开。后者退出码 9——
+  `otl docs search --json | jq` 的调用方只读 stdout，stderr 警告对它不存在。
 - **表格只在 TTY 出现**，因此 golden file 测试放在模块内单测（直接调 `table()`），
   端到端测试覆盖 JSON 契约与网络行为。
 

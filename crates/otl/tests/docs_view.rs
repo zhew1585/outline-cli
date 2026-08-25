@@ -269,3 +269,108 @@ async fn a_browser_that_cannot_be_launched_still_leaves_the_url_on_stdout() {
         "the URL was not printed"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipe_gets_the_body_byte_for_byte() {
+    // No trailing newline in the API response means no trailing newline on
+    // stdout. A script that hashes or diffs the output has to see exactly
+    // what the API returned; the display path is where presentation
+    // adjustments belong.
+    let mut document = document();
+    document["text"] = json!("no trailing newline");
+    let server = server_with(document).await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "view", "doc-1"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.stdout, b"no trailing newline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_output_is_byte_for_byte_too() {
+    let mut document = document();
+    document["text"] = json!("no trailing newline");
+    let server = server_with(document).await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "view", "doc-1", "--raw"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.stdout, b"no trailing newline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipe_preserves_control_bytes_that_the_display_path_filters() {
+    // The two paths differ on purpose. A pipe is data: an escape sequence in
+    // the document body belongs to the consumer, byte for byte. The
+    // interactive path replaces the same bytes (unit-tested in `pager`)
+    // because there the consumer is a terminal that would EXECUTE them.
+    let mut document = document();
+    document["text"] = json!("before\u{1b}]52;c;cGF5bG9hZA==\u{7}after");
+    let server = server_with(document).await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "view", "doc-1", "--raw"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "before\u{1b}]52;c;cGF5bG9hZA==\u{7}after",
+        "the data path must not alter the body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_url_with_a_percent_encoded_traversal_is_refused() {
+    // A browser decodes and normalizes before it navigates, so the address
+    // opened would not be the one that was validated.
+    let mut document = document();
+    document["url"] = json!("/%2e%2e/admin");
+    let server = server_with(document).await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .env("BROWSER", "otl-no-such-browser-9c7a")
+            .args(["docs", "view", "doc-1", "--web"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "printed a rejected URL");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_url_with_a_bidi_override_is_refused() {
+    // `report-<RLO>fdp` prints as `report-pdf`: the link shown would not be
+    // the link opened.
+    let mut document = document();
+    document["url"] = json!("/doc/report-\u{202e}fdp");
+    let server = server_with(document).await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .env("BROWSER", "otl-no-such-browser-9c7a")
+            .args(["docs", "view", "doc-1", "--web"])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "printed a rejected URL");
+}
