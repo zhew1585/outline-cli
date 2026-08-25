@@ -85,6 +85,11 @@ jobs:
           # CI enforces the same threshold as the local default.
           STARTUP_THRESHOLD_MS: "10"
         run: ./scripts/bench-startup.sh
+      - name: startup guards against the release artifact
+        # The bench step above built the release binary, so the release-only
+        # guard (no manifest-directory path embedded) actually runs here
+        # instead of skipping.
+        run: cargo test --release -p outline-cli --test startup_guard
 
   contract:
     # Contract tests hit a real Outline workspace and only run when the

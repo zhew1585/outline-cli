@@ -1,23 +1,33 @@
 //! Startup guards (Story 1.8): the vendored OpenAPI spec is compiled to a
 //! static IR table by `build.rs`, so the runtime never reads or parses it.
 //!
-//! What these tests guarantee, precisely:
+//! The invariant is enforced in three layers, each closing what the others
+//! cannot see:
 //!
-//! 1. `spec_path_and_content_absent_from_binary` - the shipped binary
-//!    contains neither the spec file name nor the vendored spec's content,
-//!    so it cannot open the spec through a compile-time absolute path
-//!    (`env!("CARGO_MANIFEST_DIR")` and friends) nor carry an embedded copy
-//!    (`include_str!`). This is the invariant that closes the "checkout's
-//!    `crates/otl/spec/` is still readable" gap; a regression that reads the
-//!    spec at runtime has to name it somewhere, and that string would show
-//!    up here.
-//! 2. The remaining tests copy the binary into a fresh temp directory and
-//!    run that copy from there, so no cwd-relative or executable-relative
-//!    lookup reaches the checkout. The `api` cases go through operation
-//!    dispatch, proving the IR lookup itself works in that environment.
+//! 1. **Source scan** (`runtime_sources_never_reach_for_the_spec`) - no
+//!    runtime source file (`crates/*/src/**/*.rs`) names the constructs a
+//!    runtime spec read needs: `CARGO_MANIFEST_DIR` (a compile-time path to
+//!    the crate, hence to `spec/`), `include_str!`/`include_bytes!`, a
+//!    directory walk, or the spec's name. This catches regressions that
+//!    embed only the *directory* and discover the file at runtime - which no
+//!    binary-content check can see. `build.rs` is deliberately out of scope:
+//!    reading the spec at build time is exactly its job.
+//! 2. **Binary content** (`spec_path_and_content_absent_from_binary`,
+//!    `manifest_dir_absent_from_release_binary`) - the built binary contains
+//!    neither the spec file name nor a marker of the spec's content, and the
+//!    release artifact does not contain the crate's manifest-directory path
+//!    (any compile-time absolute-path regression embeds it). Debug builds
+//!    legitimately embed paths, so the manifest-dir check is release-only and
+//!    skips with a message when no release artifact is present.
+//! 3. **Runtime isolation** (the `*_with_no_spec_file_reachable` cases) - the
+//!    binary is copied into a fresh temp directory and run from there, so no
+//!    cwd-relative or executable-relative lookup reaches the checkout. The
+//!    `api` cases go through operation dispatch, proving the IR lookup itself
+//!    works in that environment.
 //!
-//! Together: no spec path in the binary, and no spec reachable from where it
-//! runs.
+//! Together: the runtime sources cannot ask for the spec, the shipped binary
+//! carries no path or copy of it, and the process still works with no spec
+//! reachable from where it runs.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -25,6 +35,15 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+
+/// Repository root: `crates/otl` -> `crates` -> workspace root.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_path_buf()
+}
 
 /// Copy the built `otl` binary into a fresh empty temp dir outside the repo;
 /// returns (dir, copied binary path).
@@ -92,6 +111,137 @@ fn spec_path_and_content_absent_from_binary() {
          or parse the OpenAPI document",
         bin.display()
     );
+}
+
+/// Constructs a runtime spec read would need, with why each is forbidden in
+/// runtime sources. Plain substring matches, comments included: a mention is
+/// as good as a use for review purposes, and genuine exceptions go through
+/// `SOURCE_SCAN_ALLOWLIST` so they stay visible.
+const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
+    (
+        "CARGO_MANIFEST_DIR",
+        "compile-time crate path; it locates the vendored `spec/` directory at runtime",
+    ),
+    (
+        "include_str!",
+        "compile-time file embedding; the IR table is the only compiled-in spec artifact",
+    ),
+    (
+        "include_bytes!",
+        "compile-time file embedding; the IR table is the only compiled-in spec artifact",
+    ),
+    (
+        "read_dir",
+        "directory enumeration; the runtime has no data files to discover",
+    ),
+    (
+        SPEC_FILE_NAME,
+        "the vendored spec file name; only build.rs may name it",
+    ),
+    (
+        "\"spec\"",
+        "the vendored spec directory name; only build.rs may name it",
+    ),
+];
+
+/// Reviewed exceptions as (path suffix, pattern) pairs. Empty on purpose:
+/// add an entry with a comment only when a runtime source legitimately needs
+/// one of the patterns above.
+const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[];
+
+/// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
+/// are therefore excluded by construction.
+fn runtime_source_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let crates_dir = workspace_root().join("crates");
+    for entry in std::fs::read_dir(&crates_dir).unwrap() {
+        let src = entry.unwrap().path().join("src");
+        if src.is_dir() {
+            collect_rs_files(&src, &mut files);
+        }
+    }
+    assert!(
+        !files.is_empty(),
+        "found no runtime sources under {}: the guard would pass vacuously",
+        crates_dir.display()
+    );
+    files
+}
+
+/// Recursively push every `.rs` file under `dir` into `out`.
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Is this (file, pattern) combination a reviewed exception?
+fn is_allowlisted(file: &Path, pattern: &str) -> bool {
+    let path = file.to_string_lossy().replace('\\', "/");
+    SOURCE_SCAN_ALLOWLIST
+        .iter()
+        .any(|(suffix, allowed)| *allowed == pattern && path.ends_with(suffix))
+}
+
+#[test]
+fn runtime_sources_never_reach_for_the_spec() {
+    let mut violations = Vec::new();
+    for file in runtime_source_files() {
+        let source = std::fs::read_to_string(&file).unwrap();
+        for (pattern, reason) in FORBIDDEN_SOURCE_PATTERNS {
+            if source.contains(pattern) && !is_allowlisted(&file, pattern) {
+                violations.push(format!("  {}: {pattern} - {reason}", file.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "runtime sources must never read the OpenAPI spec: build.rs compiles \
+         it into the static IR table at build time, and the runtime does zero \
+         spec/OpenAPI/YAML parsing (SPEC.md Constraints).\n{}\n\
+         If one of these is genuinely needed, add it to SOURCE_SCAN_ALLOWLIST \
+         with a justifying comment.",
+        violations.join("\n")
+    );
+}
+
+/// The release artifact must not embed this crate's manifest directory: any
+/// compile-time absolute path (`env!("CARGO_MANIFEST_DIR")`, `file!()` based
+/// tricks) would leave that string behind. Debug builds embed paths for
+/// legitimate reasons, so this is checked against the release binary only.
+#[test]
+fn manifest_dir_absent_from_release_binary() {
+    let release_bin = target_dir()
+        .join("release")
+        .join(format!("otl{}", std::env::consts::EXE_SUFFIX));
+    let Ok(bytes) = std::fs::read(&release_bin) else {
+        eprintln!(
+            "skipping: no release binary at {} (run `cargo build --release -p outline-cli`; \
+             CI's startup-bench job builds it and runs this test)",
+            release_bin.display()
+        );
+        return;
+    };
+
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    assert!(
+        !contains_bytes(&bytes, manifest_dir),
+        "{} embeds the crate manifest directory {manifest_dir:?}: a \
+         compile-time absolute path can reach the vendored spec at runtime",
+        release_bin.display()
+    );
+}
+
+/// Cargo target directory, honouring `CARGO_TARGET_DIR`.
+fn target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
 }
 
 #[test]
