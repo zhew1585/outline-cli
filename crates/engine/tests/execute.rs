@@ -325,6 +325,119 @@ async fn token_smuggled_through_control_chars_is_discarded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn token_smuggled_through_invisible_characters_is_discarded() {
+    // Re-review PoC: U+200B ZERO WIDTH SPACE is neither is_control() nor
+    // is_whitespace(), so category-based stripping missed it while a reader
+    // sees the token unbroken. Also covers ZWJ and a variation selector.
+    let token = "reflected-secret-token";
+    for smuggled in [
+        "reflected-\u{200b}secret-token",
+        "reflected-\u{200d}secret-token",
+        "reflected-\u{fe0f}secret-token",
+        "reflected-\u{ad}secret\u{200b}-token",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/things.info"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": smuggled,
+                "message": smuggled
+            })))
+            .mount(&server)
+            .await;
+
+        let base_url = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = Client::new(&base_url, token)?;
+            client.execute(&op_with_path("/api/things.info"), &[])
+        })
+        .await
+        .unwrap();
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, EngineError::Api { .. }), "got {error:?}");
+        let rendered = render_full_error_chain(&error);
+        // Reduce the way a reader would: drop every non-alphanumeric.
+        let skeleton: String = rendered
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        let token_skeleton: String = token
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        assert!(
+            !skeleton.contains(&token_skeleton),
+            "token recoverable from {smuggled:?}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_json_envelope_in_a_capped_body_is_not_mangled() {
+    // Re-review PoC: JSON tolerates unlimited trailing whitespace, so a
+    // COMPLETE envelope can sit inside a body that hit the read cap. Its
+    // fields must not get the cut-fragment treatment.
+    let envelope = r#"{"error":"validation_error","message":"document not found"}"#;
+    let padded = format!("{envelope}{}", " ".repeat(8200 - envelope.len()));
+    assert!(padded.len() > 8192, "PoC must exceed the read cap");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(padded, "application/json"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { code, message, .. }) => {
+            assert_eq!(message, "document not found");
+            assert_eq!(code.as_deref(), Some("validation_error"));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_fragment_behind_capped_whitespace_is_discarded() {
+    // Re-review PoC: the cap lands on whitespace, so a single trailing-run
+    // drop leaves the 2-char token fragment sitting behind it.
+    let token = "reflected-secret-token";
+    let body = format!("{}re\n{}", "\n".repeat(8189), &token[2..]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(body, "text/plain"))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, token)?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { message, .. }) => {
+            assert_eq!(message, "***", "fragment survived: {message:?}");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn short_token_prefix_left_by_body_cap_is_discarded() {
     // Adversarial-review PoC: the 8 KiB cap leaves only "re", shorter than
     // the fragment minimum, so prefix redaction alone cannot catch it. The

@@ -285,26 +285,35 @@ fn extract_error_parts(response: reqwest::blocking::Response, secret: &str) -> A
     let capped = raw.len() as u64 > MAX_ERROR_BODY_BYTES;
     raw.truncate(MAX_ERROR_BODY_BYTES as usize);
     let body = String::from_utf8_lossy(&raw);
-    let clean = |text: &str, cap: usize| clean_server_text(text, secret, capped, cap);
-    // A body that hit the read cap cannot be valid JSON, so the JSON arm
-    // never has to worry about a cut fragment mid-structure.
+    // Whether a piece of text may itself be cut mid-way governs the
+    // cap-tail treatment. A body that PARSED is complete no matter how it
+    // was capped - JSON tolerates unlimited trailing whitespace, so a
+    // complete envelope can sit inside a capped body - and dropping the
+    // last word of a complete field would corrupt a legitimate diagnostic
+    // for no security gain. The skeleton smuggling check still applies to
+    // every field either way.
     let parts = match serde_json::from_str::<Value>(&body) {
-        Ok(json) => ApiErrorParts {
-            code: json
-                .get("error")
-                .and_then(Value::as_str)
-                .map(|code| clean(code, MAX_ERROR_CODE_CHARS))
-                .filter(|code| !code.is_empty()),
-            message: json
-                .get("message")
-                .or_else(|| json.get("error"))
-                .and_then(Value::as_str)
-                .map(|message| clean(message, MAX_ERROR_MESSAGE_CHARS))
-                .unwrap_or_default(),
-        },
+        Ok(json) => {
+            let clean = |text: &str, cap: usize| clean_server_text(text, secret, false, cap);
+            ApiErrorParts {
+                code: json
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|code| clean(code, MAX_ERROR_CODE_CHARS))
+                    .filter(|code| !code.is_empty()),
+                message: json
+                    .get("message")
+                    .or_else(|| json.get("error"))
+                    .and_then(Value::as_str)
+                    .map(|message| clean(message, MAX_ERROR_MESSAGE_CHARS))
+                    .unwrap_or_default(),
+            }
+        }
+        // Raw text straight out of the body: this is the only text that a
+        // read cap can have cut mid-token.
         Err(_) => ApiErrorParts {
             code: None,
-            message: clean(&body, MAX_ERROR_MESSAGE_CHARS),
+            message: clean_server_text(&body, secret, capped, MAX_ERROR_MESSAGE_CHARS),
         },
     };
     fallback(parts)
