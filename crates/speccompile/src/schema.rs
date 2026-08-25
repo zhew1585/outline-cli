@@ -6,12 +6,17 @@
 //! `components.schemas` are expanded, depth-bounded so that a reference
 //! cycle in an untrusted document is a typed error rather than a hang.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::{CompileError, CompiledParam, ScalarKind};
 
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
+/// JSON pointer to the component-schema map itself (no name appended, so
+/// no escaping question arises for this part).
+const COMPONENT_SCHEMAS_POINTER: &str = "/components/schemas";
 /// Maximum `$ref`/`allOf` expansion depth (guards reference cycles).
 pub const MAX_SCHEMA_DEPTH: usize = 8;
 
@@ -26,7 +31,8 @@ pub(crate) fn extract_params(
     let mut walk = Walk {
         document,
         params: Vec::new(),
-        required: Vec::new(),
+        seen: HashSet::new(),
+        required: HashSet::new(),
         root_union: false,
     };
     walk.collect(schema, 0)?;
@@ -47,10 +53,17 @@ pub(crate) fn extract_params(
 }
 
 /// Accumulator for one body-schema walk.
+///
+/// `seen` and `required` are hash sets, not lists, on purpose: an
+/// untrusted document may declare tens of thousands of properties in one
+/// schema, and the linear scans this replaces made compilation quadratic
+/// in that count - a small download could pin a core for minutes.
+/// `params` stays a `Vec` so the output keeps the parser's key order.
 struct Walk<'a> {
     document: &'a Value,
     params: Vec<CompiledParam>,
-    required: Vec<String>,
+    seen: HashSet<String>,
+    required: HashSet<String>,
     root_union: bool,
 }
 
@@ -79,7 +92,7 @@ impl Walk<'_> {
         }
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
             for (name, prop) in properties {
-                if self.params.iter().any(|existing| existing.name == *name) {
+                if !self.seen.insert(name.clone()) {
                     continue;
                 }
                 let param = self.compile_param(name, prop, depth)?;
@@ -163,25 +176,7 @@ impl Walk<'_> {
         facets: &mut Facets,
     ) -> Result<(), CompileError> {
         check_depth(depth)?;
-        if schema.get("nullable").and_then(Value::as_bool) == Some(true) {
-            facets.nullable = true;
-        }
-        if facets.enum_values.is_empty() {
-            if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-                facets.enum_values = values.iter().map(enum_literal).collect();
-            }
-        }
-        if facets.format.is_empty() {
-            if let Some(format) = schema.get("format").and_then(Value::as_str) {
-                facets.format = format.to_string();
-            }
-        }
-        facets.minimum = facets
-            .minimum
-            .or_else(|| schema.get("minimum").and_then(Value::as_f64));
-        facets.maximum = facets
-            .maximum
-            .or_else(|| schema.get("maximum").and_then(Value::as_f64));
+        merge_facets(schema, facets);
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
             let resolved = resolve_ref(reference, self.document)?;
             self.collect_facets(resolved, depth + 1, facets)?;
@@ -193,6 +188,30 @@ impl Walk<'_> {
         }
         Ok(())
     }
+}
+
+/// Merge the facets declared directly on one schema node. First
+/// declaration wins for enum and format; bounds and nullable accumulate.
+fn merge_facets(schema: &Value, facets: &mut Facets) {
+    if schema.get("nullable").and_then(Value::as_bool) == Some(true) {
+        facets.nullable = true;
+    }
+    if facets.enum_values.is_empty() {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            facets.enum_values = values.iter().map(enum_literal).collect();
+        }
+    }
+    if facets.format.is_empty() {
+        if let Some(format) = schema.get("format").and_then(Value::as_str) {
+            facets.format = format.to_string();
+        }
+    }
+    facets.minimum = facets
+        .minimum
+        .or_else(|| schema.get("minimum").and_then(Value::as_f64));
+    facets.maximum = facets
+        .maximum
+        .or_else(|| schema.get("maximum").and_then(Value::as_f64));
 }
 
 /// Schema constraint facets carried into the IR for local validation.
@@ -217,17 +236,26 @@ fn check_depth(depth: usize) -> Result<(), CompileError> {
 }
 
 /// Resolve a local `#/components/schemas/...` reference.
+///
+/// The text after the prefix is one JSON Pointer *token*, so it arrives
+/// already escaped per RFC 6901: `~1` stands for `/` and `~0` for `~`. It
+/// therefore has to be UNescaped to recover the schema name - escaping it
+/// again (or indexing with it raw) fails to find any schema whose name
+/// contains either character. Unescaping is done by hand and the map is
+/// indexed directly, which also keeps `/` inside a name from being read as
+/// pointer structure.
 fn resolve_ref<'a>(reference: &str, document: &'a Value) -> Result<&'a Value, CompileError> {
-    let name = reference
+    let token = reference
         .strip_prefix(COMPONENTS_SCHEMAS_REF)
         .ok_or_else(|| CompileError::UnsupportedRef {
             reference: reference.to_string(),
         })?;
-    // Escape the pointer token: `/` and `~` inside a schema name would
-    // otherwise be read as pointer syntax.
-    let escaped = name.replace('~', "~0").replace('/', "~1");
+    // Order matters (RFC 6901): `~1` first, then `~0`, so that the literal
+    // sequence `~01` decodes to `~1` rather than to `/`.
+    let name = token.replace("~1", "/").replace("~0", "~");
     document
-        .pointer(&format!("/components/schemas/{escaped}"))
+        .pointer(COMPONENT_SCHEMAS_POINTER)
+        .and_then(|schemas| schemas.get(&name))
         .ok_or_else(|| CompileError::UnresolvedRef {
             reference: reference.to_string(),
         })
@@ -324,6 +352,64 @@ mod tests {
         let note = params.iter().find(|p| p.name == "note").expect("note");
         assert!(note.nullable);
         assert_eq!(note.format, "uuid");
+    }
+
+    /// A schema name containing `/` or `~` is referenced with the RFC 6901
+    /// escapes `~1` / `~0`; the compiler has to decode them, not re-encode
+    /// them.
+    #[test]
+    fn resolves_refs_whose_schema_name_needs_pointer_escaping() {
+        for (name, escaped) in [
+            ("A/B", "A~1B"),
+            ("A~B", "A~0B"),
+            ("A~1B", "A~01B"),
+            ("a/b/c", "a~1b~1c"),
+        ] {
+            let compiled = compile(
+                &body(&format!(r##"{{"$ref":"#/components/schemas/{escaped}"}}"##)),
+                &format!(
+                    r#"{{"{name}":{{"type":"object","required":["id"],
+                        "properties":{{"id":{{"type":"string"}}}}}}}}"#
+                ),
+            )
+            .unwrap_or_else(|error| panic!("{escaped} must resolve to {name:?}: {error}"));
+            let params = &compiled.ops[0].params;
+            assert_eq!(params.len(), 1, "{escaped}");
+            assert!(params[0].required, "{escaped}");
+        }
+    }
+
+    /// A wide schema must compile in linear time. Before the sets below
+    /// were sets, this was two quadratic scans: 64k properties took seconds
+    /// of pure CPU on a release build, and the input for that is a few
+    /// megabytes of JSON - well inside the download limit.
+    #[test]
+    fn a_very_wide_schema_compiles_in_linear_time() {
+        const WIDTH: usize = 20_000;
+        let properties: String = (0..WIDTH)
+            .map(|index| format!(r#""p{index}":{{"type":"string"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let required: String = (0..WIDTH)
+            .map(|index| format!(r#""p{index}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema =
+            format!(r#"{{"type":"object","required":[{required}],"properties":{{{properties}}}}}"#);
+
+        let started = std::time::Instant::now();
+        let compiled = compile(&body(&schema), "{}").expect("compiles");
+        let elapsed = started.elapsed();
+
+        assert_eq!(compiled.ops[0].params.len(), WIDTH);
+        assert!(compiled.ops[0].params.iter().all(|param| param.required));
+        // Linear work is milliseconds even in a debug build; the quadratic
+        // version needed seconds at this width. A wide margin keeps this
+        // from being load-flaky while still catching a regression.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "compiling {WIDTH} properties took {elapsed:?}: quadratic again?"
+        );
     }
 
     #[test]

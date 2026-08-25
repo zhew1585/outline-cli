@@ -44,6 +44,9 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+mod common;
+use common::{no_cache_dir, CACHE_DIR_ENV};
+
 /// Repository root: `crates/otl` -> `crates` -> workspace root.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,7 +73,10 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.current_dir(dir)
         .env_remove("OUTLINE_URL")
-        .env_remove("OUTLINE_API_KEY");
+        .env_remove("OUTLINE_API_KEY")
+        // The guard is about the spec inside the binary; a synced cache on
+        // the developer's machine must not stand in for it.
+        .env(CACHE_DIR_ENV, no_cache_dir());
     cmd
 }
 
@@ -157,21 +163,59 @@ const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Reviewed exceptions as (path suffix, pattern) pairs. Add an entry with a
-/// comment only when a runtime source legitimately needs one of the patterns
-/// above.
-const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[
+/// A reviewed exception: `pattern` is tolerated in `file`, but ONLY on
+/// lines that also contain `context`.
+///
+/// The context is what keeps an exception from becoming a hole. A
+/// file-wide exemption would let a later `fs::read_to_string("spec3.json")`
+/// into the same file unnoticed - the very thing this guard exists to
+/// prevent - so each entry pins the one construct that was reviewed, and
+/// every OTHER occurrence in that file is still a violation.
+struct Exception {
+    file: &'static str,
+    pattern: &'static str,
+    context: &'static str,
+}
+
+/// Reviewed exceptions. Add one only with a comment saying why, and keep
+/// the context as specific as the reviewed line allows.
+const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
     // Story 4.2: the upstream spec URL ends in the same file name. It is a
     // URL constant for `otl spec sync` (a network fetch on one explicit
     // command), not a path to the vendored file - nothing here reads a spec
-    // from disk. `spec_path_and_content_absent_from_binary` still forbids
-    // the file PATH in the shipped binary, which is what a disk read needs.
-    ("crates/otl/src/spec/mod.rs", SPEC_FILE_NAME),
+    // from disk. The context pins it to the URL line: any other mention of
+    // the file name in this file is still a violation.
+    Exception {
+        file: "crates/otl/src/spec/mod.rs",
+        pattern: SPEC_FILE_NAME,
+        context: "https://raw.githubusercontent.com/outline/openapi",
+    },
     // Story 4.2: the name of the `--spec <PATH>` flag of `otl spec sync`,
     // which compiles a document the USER points at (the documented
     // development override). It is a clap flag name, not a directory this
     // process goes looking in.
-    ("crates/otl/src/commands/spec.rs", "\"spec\""),
+    Exception {
+        file: "crates/otl/src/commands/spec.rs",
+        pattern: "\"spec\"",
+        context: "#[arg(long = ",
+    },
+];
+
+/// Patterns that must not appear in a runtime source at all, because the
+/// runtime has no data file of its own to read. Kept separate from the
+/// spec-specific list above so an exception for one cannot widen another.
+const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[(
+    "read_to_string",
+    "reading a file by name; only the `--spec` path the user typed and the \
+     IR cache are read at runtime",
+)];
+
+/// Files allowed to read a file at runtime, with the reason.
+const FILE_READ_ALLOWLIST: &[&str] = &[
+    // The `--spec <PATH>` document, named by the user on the command line.
+    "crates/otl/src/commands/spec.rs",
+    // The `--body @file.json` request body, likewise user-named (Story 1.3).
+    "crates/otl/src/commands/api.rs",
 ];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
@@ -205,12 +249,24 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Is this (file, pattern) combination a reviewed exception?
-fn is_allowlisted(file: &Path, pattern: &str) -> bool {
-    let path = file.to_string_lossy().replace('\\', "/");
-    SOURCE_SCAN_ALLOWLIST
+/// Normalized, workspace-relative form of a source path.
+fn relative(file: &Path) -> String {
+    file.to_string_lossy().replace('\\', "/")
+}
+
+/// Every line of `source` that contains `pattern` and is NOT covered by a
+/// reviewed exception for this file.
+fn unexcused_lines<'a>(file: &Path, source: &'a str, pattern: &str) -> Vec<&'a str> {
+    let path = relative(file);
+    let exceptions: Vec<&Exception> = SOURCE_SCAN_ALLOWLIST
         .iter()
-        .any(|(suffix, allowed)| *allowed == pattern && path.ends_with(suffix))
+        .filter(|entry| entry.pattern == pattern && path.ends_with(entry.file))
+        .collect();
+    source
+        .lines()
+        .filter(|line| line.contains(pattern))
+        .filter(|line| !exceptions.iter().any(|entry| line.contains(entry.context)))
+        .collect()
 }
 
 #[test]
@@ -219,7 +275,21 @@ fn runtime_sources_never_reach_for_the_spec() {
     for file in runtime_source_files() {
         let source = std::fs::read_to_string(&file).unwrap();
         for (pattern, reason) in FORBIDDEN_SOURCE_PATTERNS {
-            if source.contains(pattern) && !is_allowlisted(&file, pattern) {
+            for line in unexcused_lines(&file, &source, pattern) {
+                violations.push(format!(
+                    "  {}: {pattern} - {reason}\n    at: {}",
+                    file.display(),
+                    line.trim()
+                ));
+            }
+        }
+        let path = relative(&file);
+        for (pattern, reason) in FORBIDDEN_FILE_READS {
+            if source.contains(pattern)
+                && !FILE_READ_ALLOWLIST
+                    .iter()
+                    .any(|allowed| path.ends_with(allowed))
+            {
                 violations.push(format!("  {}: {pattern} - {reason}", file.display()));
             }
         }

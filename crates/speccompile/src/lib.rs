@@ -33,11 +33,16 @@
 #![forbid(unsafe_code)]
 
 mod schema;
+mod text;
 
 use serde_json::Value;
 use thiserror::Error;
 
 pub use schema::MAX_SCHEMA_DEPTH;
+pub use text::{
+    is_display_safe, MAX_CONTENT_TYPE_BYTES, MAX_ENUM_VALUES, MAX_ENUM_VALUE_BYTES,
+    MAX_FORMAT_BYTES, MAX_PARAM_NAME_BYTES, MAX_SUMMARY_BYTES, MAX_SUMMARY_CHARS,
+};
 
 /// The only request content type a generic JSON RPC client can assemble.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
@@ -199,7 +204,33 @@ pub enum CompileError {
         /// Why it was rejected.
         reason: &'static str,
     },
+    /// A string with meaning (a parameter name, content type, format or
+    /// enum value) carries characters a terminal would execute, or is
+    /// implausibly long.
+    ///
+    /// Such text cannot be silently rewritten the way a summary can: it is
+    /// matched against user input or sent on the wire, so the document is
+    /// rejected instead. The offending value is deliberately NOT echoed -
+    /// printing it is exactly the attack.
+    #[error(
+        "operation {operation:?} has an unusable {field}: {reason} \
+         (the value is not shown: printing it is the attack)"
+    )]
+    UnsafeText {
+        /// The offending operation.
+        operation: String,
+        /// Which kind of string is at fault.
+        field: &'static str,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
+
+/// Reason text for a rejected string with meaning.
+const UNSAFE_TEXT_REASON: &str =
+    "it contains control or direction-changing characters, or exceeds its length limit";
+/// Reason text for an over-long enum.
+const TOO_MANY_ENUM_VALUES: &str = "it declares more enumerated values than the limit";
 
 /// Compile a JSON OpenAPI document.
 ///
@@ -262,7 +293,44 @@ fn compile_op(
         name,
     };
     check_identifiers(&op)?;
+    check_text(&op)?;
     Ok(op)
+}
+
+/// Reject an operation carrying text a terminal would execute.
+///
+/// The summary is not checked here: [`extract_summary`] sanitizes it
+/// instead, because display-only text can be rewritten without changing
+/// what any command does. Everything checked below is compared against
+/// user input or sent on the wire, where rewriting WOULD change behaviour.
+fn check_text(op: &CompiledOp) -> Result<(), CompileError> {
+    let unsafe_text = |field, reason| CompileError::UnsafeText {
+        operation: op.name.clone(),
+        field,
+        reason,
+    };
+    if !is_display_safe(&op.content_type, MAX_CONTENT_TYPE_BYTES) {
+        return Err(unsafe_text("content type", UNSAFE_TEXT_REASON));
+    }
+    for param in &op.params {
+        if param.name.is_empty() || !is_display_safe(&param.name, MAX_PARAM_NAME_BYTES) {
+            return Err(unsafe_text("parameter name", UNSAFE_TEXT_REASON));
+        }
+        if !is_display_safe(&param.format, MAX_FORMAT_BYTES) {
+            return Err(unsafe_text("parameter format", UNSAFE_TEXT_REASON));
+        }
+        if param.enum_values.len() > MAX_ENUM_VALUES {
+            return Err(unsafe_text("parameter enum", TOO_MANY_ENUM_VALUES));
+        }
+        if !param
+            .enum_values
+            .iter()
+            .all(|value| is_display_safe(value, MAX_ENUM_VALUE_BYTES))
+        {
+            return Err(unsafe_text("parameter enum value", UNSAFE_TEXT_REASON));
+        }
+    }
+    Ok(())
 }
 
 /// Classify how the request body of an operation may be supplied.
@@ -320,7 +388,13 @@ fn request_body<'a>(
 }
 
 /// One-line summary: the document `summary`, falling back to the first
-/// line of `description`, whitespace-collapsed. Empty if neither exists.
+/// line of `description`. Empty if neither exists.
+///
+/// The result is SANITIZED, not validated: control characters (terminal
+/// escapes, row-forging tabs and newlines, bidi overrides) are dropped and
+/// the length is capped. Nothing dispatches on a summary, so dropping
+/// characters cannot change behaviour - whereas rejecting the whole
+/// document because one description contains a stray byte would.
 fn extract_summary(post: &Value) -> String {
     let raw = post
         .get("summary")
@@ -329,7 +403,7 @@ fn extract_summary(post: &Value) -> String {
         .or_else(|| post.get("description").and_then(Value::as_str))
         .unwrap_or_default();
     let first_line = raw.lines().next().unwrap_or_default();
-    first_line.split_whitespace().collect::<Vec<_>>().join(" ")
+    text::sanitize_display(first_line)
 }
 
 /// Why an operation name is rejected, as one sentence.
@@ -527,6 +601,88 @@ mod tests {
         }
         assert!(is_safe_path("/api/things.info"));
         assert!(is_safe_path("/a/b-c_d.e"));
+    }
+
+    /// A summary is display-only, so hostile characters are dropped rather
+    /// than making the whole document unusable - but they must be gone
+    /// before the string reaches the IR, because `api list` prints it
+    /// verbatim in a line-oriented format.
+    #[test]
+    fn a_hostile_summary_is_sanitized_not_propagated() {
+        let raw = doc(r#"{"/things.info":{"post":{"summary":
+                "safe \u001b]52;c;cGF3bmVk\u0007 \u001b[31mred\u001b[0m\ttab"}}}"#);
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let summary = &compiled.ops[0].summary;
+        for forbidden in ['\u{1b}', '\u{7}', '\t', '\n', '\r'] {
+            assert!(
+                !summary.contains(forbidden),
+                "{forbidden:?} survived: {summary:?}"
+            );
+        }
+        assert!(summary.contains("red"), "{summary:?}");
+        assert!(is_display_safe(summary, MAX_SUMMARY_CHARS), "{summary:?}");
+    }
+
+    #[test]
+    fn an_enormous_summary_is_capped() {
+        let raw = doc(&format!(
+            r#"{{"/things.info":{{"post":{{"summary":"{}"}}}}}}"#,
+            "x".repeat(200_000)
+        ));
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        assert_eq!(compiled.ops[0].summary.chars().count(), MAX_SUMMARY_CHARS);
+    }
+
+    /// Text with meaning cannot be silently rewritten (it is matched
+    /// against user input or sent on the wire), so a document that puts
+    /// terminal control sequences there is rejected whole.
+    #[test]
+    fn hostile_text_with_meaning_is_rejected() {
+        let cases = [
+            // parameter name
+            r#"{"/things.info":{"post":{"requestBody":{"content":{"application/json":
+                {"schema":{"type":"object","properties":{"id\u001b[31m":{"type":"string"}}}}}}}}}"#,
+            // content type
+            r#"{"/things.info":{"post":{"requestBody":{"content":{"text/x\u001b[31m":
+                {"schema":{"type":"object"}}}}}}}"#,
+            // enum value
+            r#"{"/things.info":{"post":{"requestBody":{"content":{"application/json":
+                {"schema":{"type":"object","properties":{"mode":{"type":"string",
+                "enum":["ok","bad\u0007"]}}}}}}}}}"#,
+            // format
+            r#"{"/things.info":{"post":{"requestBody":{"content":{"application/json":
+                {"schema":{"type":"object","properties":{"id":{"type":"string",
+                "format":"uu\nid"}}}}}}}}}"#,
+        ];
+        for case in cases {
+            let error = compile_json(&doc(case), &opts()).expect_err("must be rejected");
+            assert!(
+                matches!(error, CompileError::UnsafeText { .. }),
+                "unexpected error: {error}"
+            );
+            // The error must not print the value it just rejected.
+            let text = format!("{error}");
+            assert!(!text.contains('\u{1b}'), "escape echoed: {text:?}");
+            assert!(!text.contains('\u{7}'), "control echoed: {text:?}");
+        }
+    }
+
+    #[test]
+    fn an_unbounded_enum_is_rejected() {
+        let values: String = (0..MAX_ENUM_VALUES + 1)
+            .map(|index| format!(r#""v{index}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = doc(&format!(
+            r#"{{"/things.info":{{"post":{{"requestBody":{{"content":{{"application/json":
+                {{"schema":{{"type":"object","properties":{{"mode":{{"type":"string",
+                "enum":[{values}]}}}}}}}}}}}}}}}}}}"#
+        ));
+        let error = compile_json(&raw, &opts()).expect_err("must be rejected");
+        assert!(
+            matches!(error, CompileError::UnsafeText { .. }),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

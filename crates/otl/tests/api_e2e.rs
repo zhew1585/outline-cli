@@ -9,10 +9,16 @@ use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{no_cache_dir, CACHE_DIR_ENV};
+
 /// `otl` command with Outline env scrubbed for deterministic tests.
 fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env_remove("OUTLINE_URL").env_remove("OUTLINE_API_KEY");
+    cmd.env_remove("OUTLINE_URL")
+        .env_remove("OUTLINE_API_KEY")
+        // Dispatch must come from the built-in spec, not a synced one.
+        .env(CACHE_DIR_ENV, no_cache_dir());
     cmd
 }
 
@@ -387,6 +393,7 @@ async fn closed_stdout_pipe_exits_quietly_without_panicking() {
         let mut child = Command::new(assert_cmd::cargo::cargo_bin("otl"))
             .env_remove("OUTLINE_URL")
             .env_remove("OUTLINE_API_KEY")
+            .env(CACHE_DIR_ENV, no_cache_dir())
             .env("OUTLINE_URL", uri)
             .env("OUTLINE_API_KEY", "test-key")
             .args(["api", "--json", "documents.list"])

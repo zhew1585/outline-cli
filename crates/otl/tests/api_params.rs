@@ -10,6 +10,9 @@ use serde_json::json;
 use wiremock::matchers::{body_json, body_string, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{no_cache_dir, CACHE_DIR_ENV};
+
 /// Nothing listens here; validation must fail before any network attempt.
 const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 
@@ -17,7 +20,9 @@ const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 fn otl_offline() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
     cmd.env("OUTLINE_URL", CLOSED_PORT_URL)
-        .env("OUTLINE_API_KEY", "test-key");
+        .env("OUTLINE_API_KEY", "test-key")
+        // Validation is asserted against the built-in spec's facets.
+        .env(CACHE_DIR_ENV, no_cache_dir());
     cmd
 }
 
@@ -25,7 +30,8 @@ fn otl_offline() -> Command {
 fn otl_online(uri: &str) -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
     cmd.env("OUTLINE_URL", uri)
-        .env("OUTLINE_API_KEY", "test-key");
+        .env("OUTLINE_API_KEY", "test-key")
+        .env(CACHE_DIR_ENV, no_cache_dir());
     cmd
 }
 

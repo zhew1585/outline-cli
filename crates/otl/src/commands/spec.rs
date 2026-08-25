@@ -10,6 +10,7 @@
 //! no background fetch (NFR4, no phone home). A sync happens when, and
 //! only when, the user types it.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use engine::fetch::{self, MAX_DOCUMENT_BYTES};
 use engine::ir::OpSpec;
 use serde_json::{json, Value};
 
-use crate::errors::map_engine_error;
+use crate::errors::map_fetch_error;
 use crate::exit::CliError;
 use crate::ops;
 use crate::render::OutputMode;
@@ -152,7 +153,7 @@ fn load_document(args: &SyncArgs) -> Result<(String, Source, String), CliError> 
     // Announced on stderr, not stdout: stdout is data.
     stdio::write_diagnostic_line("fetching the OpenAPI document...");
     let document =
-        fetch::fetch_document(url, MAX_DOCUMENT_BYTES, FETCH_TIMEOUT).map_err(map_engine_error)?;
+        fetch::fetch_document(url, MAX_DOCUMENT_BYTES, FETCH_TIMEOUT).map_err(map_fetch_error)?;
     let label = origin_of(url);
     Ok((document, Source::Remote, label))
 }
@@ -165,11 +166,14 @@ fn origin_of(url: &str) -> String {
     fetch::document_origin(url).unwrap_or_else(|| UNKNOWN_SOURCE.to_string())
 }
 
-/// Read a local document, refusing anything over the document size cap.
+/// Read a local document, refusing anything that is not a plain file of
+/// plausible size.
 ///
-/// The metadata size is checked first (cheap rejection) and the read is
-/// bounded too, so a file that grows in between - or one whose reported
-/// size is unreliable, such as a pipe - cannot exhaust memory.
+/// The file type is checked BEFORE opening: opening a FIFO blocks until a
+/// writer appears, which no read cap can interrupt, and a directory or
+/// device node has no useful content either. Then the size is checked
+/// (cheap rejection) and the read itself is bounded too, so a file that
+/// grows in between cannot exhaust memory.
 fn read_local(path: &Path) -> Result<String, CliError> {
     let display = path.display();
     let io_error = |error: std::io::Error| {
@@ -183,11 +187,20 @@ fn read_local(path: &Path) -> Result<String, CliError> {
             "the spec file {display} is too large: the limit is {MAX_DOCUMENT_BYTES} bytes"
         ))
     };
-    let file = fs::File::open(path).map_err(io_error)?;
-    let metadata = file.metadata().map_err(io_error)?;
-    if metadata.is_file() && metadata.len() > MAX_DOCUMENT_BYTES {
+    // Follows symlinks (a symlink to a regular file is fine) but reports
+    // the TYPE of the target, which is what matters here.
+    let metadata = fs::metadata(path).map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(CliError::usage(anyhow!(
+            "the spec path {display} is not a regular file; pass a saved \
+             OpenAPI document (a pipe, socket, device or directory cannot be \
+             read safely: opening one can block forever)"
+        )));
+    }
+    if metadata.len() > MAX_DOCUMENT_BYTES {
         return Err(too_large());
     }
+    let file = fs::File::open(path).map_err(io_error)?;
     let mut raw = String::new();
     let read = file
         .take(MAX_DOCUMENT_BYTES + 1)
@@ -302,9 +315,15 @@ fn sync_report(ops: &[OpSpec], before: &[String], meta: &cache::CacheMeta, path:
 }
 
 /// Names in `left` that are not in `right`.
+///
+/// Set-based, not a nested scan: both sides come from documents that may
+/// declare very many operations, and comparing two tables of a hundred
+/// thousand names each with `contains` is ten billion string comparisons
+/// before the cache is even written.
 fn difference(left: &[String], right: &[String]) -> Vec<String> {
+    let right: HashSet<&str> = right.iter().map(String::as_str).collect();
     left.iter()
-        .filter(|name| !right.contains(name))
+        .filter(|name| !right.contains(name.as_str()))
         .cloned()
         .collect()
 }

@@ -30,7 +30,7 @@
 //! therefore only ever sees a complete file.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,7 +57,15 @@ const APPLICATION: &str = "outline-cli";
 /// File name of the cache inside the cache directory.
 const CACHE_FILE_NAME: &str = "ir-cache.bin";
 /// Prefix of the same-directory temporary file used for atomic writes.
-const TEMP_FILE_PREFIX: &str = "ir-cache.bin.tmp";
+///
+/// The rest of the name is random and the file is created exclusively; see
+/// [`store_at`] for why a predictable name would be a vulnerability.
+const TEMP_FILE_PREFIX: &str = "ir-cache.bin.tmp.";
+
+/// Length of a hex SHA-256 digest.
+const SPEC_HASH_HEX_LEN: usize = 64;
+/// Longest accepted provenance string (an origin or a fixed placeholder).
+const MAX_SOURCE_BYTES: usize = 256;
 
 /// Magic marker: identifies the file and its purpose.
 const MAGIC: [u8; 8] = *b"OTL-IRC\x00";
@@ -69,17 +77,29 @@ const FORMAT_VERSION: u32 = 1;
 /// Size of the raw prefix: magic + format version + checksum.
 const PREFIX_LEN: usize = 8 + 4 + 32;
 
-/// Maximum accepted cache file size.
+/// Maximum accepted cache FILE size, header included.
 ///
 /// The file is read into memory and decoded, so both the read and the
 /// bincode decoder are bounded: a corrupt length prefix must not turn into
 /// a huge allocation.
-const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CACHE_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum size of the encoded body, i.e. the file limit minus the header.
+///
+/// This is the number every check uses, and it is derived rather than
+/// written twice on purpose: when the two were independent, a table could
+/// encode to something that fit the *body* limit, get written, and then be
+/// rejected on load for exceeding the *file* limit - a cache that reported
+/// success and never worked.
+pub const MAX_CACHE_BODY_BYTES: usize = MAX_CACHE_FILE_BYTES - PREFIX_LEN;
 
 /// Bincode configuration. Fixed and bounded: a cache written by one build
 /// must decode identically in the next, and never allocate past the cap.
+///
+/// The limit binds the DECODER only (bincode's encoder does not consult
+/// it), so [`store_at`] checks the encoded length itself.
 fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard().with_limit::<MAX_CACHE_BYTES>()
+    bincode::config::standard().with_limit::<MAX_CACHE_BODY_BYTES>()
 }
 
 /// Provenance of a cached table, kept for diagnostics and for deciding
@@ -175,6 +195,18 @@ pub enum CacheError {
         /// Which version differs.
         reason: String,
     },
+    /// The compiled table does not fit the cache format.
+    ///
+    /// Raised BEFORE writing anything: a file that could not be loaded
+    /// back must never be reported as a successful sync.
+    #[error(
+        "the compiled spec is too large to cache: {encoded} bytes of operations, \
+         limit {MAX_CACHE_BODY_BYTES}"
+    )]
+    TooLarge {
+        /// Size the table encoded to.
+        encoded: usize,
+    },
 }
 
 impl CacheError {
@@ -188,6 +220,10 @@ impl CacheError {
         match self {
             Self::NoCacheDir | Self::Io { .. } => {
                 "run `otl spec sync` again, or `otl spec reset` to drop the cache"
+            }
+            Self::TooLarge { .. } => {
+                "the document declares far more operations than a real API has; \
+                 check that --url or --spec points at the right document"
             }
             Self::Damaged { .. } | Self::Stale { .. } => {
                 "run `otl spec sync` to rebuild it, or `otl spec reset` to drop it"
@@ -232,14 +268,35 @@ pub fn load_at(file: &Path) -> Result<Option<CachedIr>, CacheError> {
     };
     let body = decode_body(file, &raw)?;
     check_versions(file, &body.meta)?;
-    super::validate_ops(&body.ops).map_err(|reason| CacheError::Damaged {
+    let damaged = |reason: String| CacheError::Damaged {
         path: file.to_path_buf(),
         reason,
-    })?;
+    };
+    check_meta(&body.meta).map_err(damaged)?;
+    super::validate_ops(&body.ops).map_err(damaged)?;
     Ok(Some(CachedIr {
         meta: body.meta,
         ops: body.ops,
     }))
+}
+
+/// Check the provenance record itself.
+///
+/// It is displayed (`spec sync` prints the source, `doctor` will print the
+/// rest), so the same reasoning as for operation text applies: a hostile
+/// writer must not be able to put terminal escapes there. The hash is
+/// compared against a freshly computed one, so anything that is not a
+/// plain hex digest is meaningless as well.
+fn check_meta(meta: &CacheMeta) -> Result<(), String> {
+    if meta.spec_hash.len() != SPEC_HASH_HEX_LEN
+        || !meta.spec_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("its recorded spec hash is not a hex digest".to_string());
+    }
+    if !spec_compile::is_display_safe(&meta.source, MAX_SOURCE_BYTES) {
+        return Err("its recorded source is too long or contains control characters".to_string());
+    }
+    Ok(())
 }
 
 /// Read the file, refusing anything implausibly large before allocating.
@@ -249,10 +306,10 @@ fn read_capped(file: &Path) -> Result<Option<Vec<u8>>, CacheError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error("read", file, error)),
     };
-    if metadata.len() > MAX_CACHE_BYTES as u64 {
+    if metadata.len() > MAX_CACHE_FILE_BYTES as u64 {
         return Err(CacheError::Damaged {
             path: file.to_path_buf(),
-            reason: format!("it is larger than the {MAX_CACHE_BYTES} byte limit"),
+            reason: format!("it is larger than the {MAX_CACHE_FILE_BYTES} byte limit"),
         });
     }
     fs::read(file)
@@ -287,9 +344,19 @@ fn decode_body(file: &Path, raw: &[u8]) -> Result<Body, CacheError> {
             "its checksum does not match its contents".to_string(),
         ));
     }
-    bincode::serde::decode_from_slice::<Body, _>(body, bincode_config())
-        .map(|(body, _)| body)
-        .map_err(|error| damaged(format!("it could not be decoded ({error})")))
+    let (decoded, consumed) = bincode::serde::decode_from_slice::<Body, _>(body, bincode_config())
+        .map_err(|error| damaged(format!("it could not be decoded ({error})")))?;
+    // A cache file is exactly one encoded body and nothing else. Trailing
+    // bytes mean the file is not what this build writes - whoever produced
+    // it was not this code path - so it is not trusted, even though the
+    // decoder stopped happily and the checksum covers the suffix too.
+    if consumed != body.len() {
+        return Err(damaged(format!(
+            "it carries {} unexpected trailing bytes",
+            body.len() - consumed
+        )));
+    }
+    Ok(decoded)
 }
 
 /// Reject a cache this build cannot interpret.
@@ -350,7 +417,56 @@ pub fn store(ops: &[OpSpec], meta: &CacheMeta) -> Result<PathBuf, CacheError> {
 }
 
 /// [`store`] against an explicit file, for tests.
+///
+/// The temporary file is created in the target directory with a RANDOM
+/// name and `O_EXCL` semantics (via `tempfile`), which is what makes the
+/// write safe rather than merely atomic:
+///
+/// - a predictable name (a PID, say) can be pre-created by anyone who can
+///   write the cache directory. As a symlink it would redirect this write
+///   onto any file the user can write; as an existing mode-0666 file it
+///   would keep its permissions, because an open that does not CREATE the
+///   file cannot set its mode. Exclusive creation fails instead.
+/// - `tempfile` also creates it 0600 on Unix, and its `persist` uses
+///   `MOVEFILE_REPLACE_EXISTING` on Windows, where `fs::rename` refuses to
+///   replace an existing target - so a second sync works there.
+/// - if anything fails, the `NamedTempFile` guard removes the file on
+///   drop; nothing is left behind and the previous cache is untouched.
 pub fn store_at(file: &Path, ops: &[OpSpec], meta: &CacheMeta) -> Result<(), CacheError> {
+    // Whatever this function writes, [`load_at`] must accept: a cache that
+    // reports success and is then rejected on every command is worse than
+    // a failed sync. So the load-side rules are applied here too, on the
+    // table and on the size of its encoding.
+    super::validate_ops(ops).map_err(|reason| CacheError::Damaged {
+        path: file.to_path_buf(),
+        reason,
+    })?;
+    check_meta(meta).map_err(|reason| CacheError::Damaged {
+        path: file.to_path_buf(),
+        reason,
+    })?;
+    let encoded = encode(file, ops, meta)?;
+    let dir = file.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(|error| io_error("create", dir, error))?;
+    // Same directory as the target: a rename across filesystems is not
+    // atomic (and usually fails outright).
+    let mut temp = tempfile::Builder::new()
+        .prefix(TEMP_FILE_PREFIX)
+        .tempfile_in(dir)
+        .map_err(|error| io_error("create", dir, error))?;
+    write_all(temp.as_file_mut(), &encoded)
+        .map_err(|error| io_error("write", temp.path(), error))?;
+    temp.persist(file)
+        .map_err(|error| io_error("replace", file, error.error))?;
+    Ok(())
+}
+
+/// Encode the body, refusing a table that would not load back.
+///
+/// bincode's byte limit binds the decoder only, so the encoded length is
+/// checked here: writing a file that the loader would reject as oversized
+/// would report a successful sync that silently never takes effect.
+fn encode(file: &Path, ops: &[OpSpec], meta: &CacheMeta) -> Result<Vec<u8>, CacheError> {
     let body = Body {
         meta: meta.clone(),
         ops: ops.to_vec(),
@@ -361,18 +477,12 @@ pub fn store_at(file: &Path, ops: &[OpSpec], meta: &CacheMeta) -> Result<(), Cac
             reason: format!("the table could not be encoded ({error})"),
         }
     })?;
-
-    let dir = file.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir).map_err(|error| io_error("create", dir, error))?;
-    // Same directory as the target: a rename across filesystems is not
-    // atomic (and usually fails outright).
-    let temp = dir.join(format!("{TEMP_FILE_PREFIX}-{}", std::process::id()));
-    if let Err(error) = write_all(&temp, &encoded) {
-        // Never leave a partial file behind.
-        let _ = fs::remove_file(&temp);
-        return Err(error);
+    if encoded.len() > MAX_CACHE_BODY_BYTES {
+        return Err(CacheError::TooLarge {
+            encoded: encoded.len(),
+        });
     }
-    fs::rename(&temp, file).map_err(|error| io_error("replace", file, error))
+    Ok(encoded)
 }
 
 /// One filesystem failure, reduced to (action, path, error kind).
@@ -387,46 +497,18 @@ fn io_error(action: &'static str, path: &Path, error: std::io::Error) -> CacheEr
     }
 }
 
-/// Write prefix + body to `temp`, flush and fsync it.
+/// Write prefix + body to the open temporary file, flush and fsync it.
 ///
 /// fsync before the rename is what makes the cache crash-safe: a rename
 /// that reaches the disk before the data would otherwise leave a
 /// zero-length "valid" file behind.
-fn write_all(temp: &Path, encoded: &[u8]) -> Result<(), CacheError> {
-    let io = |action: &'static str| {
-        move |error: std::io::Error| CacheError::Io {
-            action,
-            path: temp.to_path_buf(),
-            kind: error.kind(),
-        }
-    };
-    let mut handle = create_private(temp).map_err(io("create"))?;
-    handle.write_all(&MAGIC).map_err(io("write"))?;
-    handle
-        .write_all(&FORMAT_VERSION.to_le_bytes())
-        .map_err(io("write"))?;
-    handle.write_all(&checksum(encoded)).map_err(io("write"))?;
-    handle.write_all(encoded).map_err(io("write"))?;
-    handle.flush().map_err(io("write"))?;
-    handle.sync_all().map_err(io("write"))
-}
-
-/// Create a file for writing, owner-only where the platform has file
-/// modes.
-///
-/// The cache holds no secrets (a public spec), but a file only the owner
-/// can write is one fewer way for another local account to feed this
-/// process a table of request paths. Windows has no POSIX mode bits; the
-/// per-user ACL of the local app-data directory is what protects it there.
-fn create_private(path: &Path) -> std::io::Result<File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+fn write_all(handle: &mut std::fs::File, encoded: &[u8]) -> std::io::Result<()> {
+    handle.write_all(&MAGIC)?;
+    handle.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    handle.write_all(&checksum(encoded))?;
+    handle.write_all(encoded)?;
+    handle.flush()?;
+    handle.sync_all()
 }
 
 /// Delete the cache, returning the path if one was removed.

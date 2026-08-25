@@ -26,6 +26,11 @@ directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Atomic cache writes: exclusive creation with a random name in the target
+# directory (a predictable temp name is a symlink/permission attack), 0600
+# on Unix, and a persist() that replaces the target on Windows too - which
+# std's rename does not.
+tempfile = { workspace = true }
 # Typed errors for the spec cache. anyhow stays the boundary type (main and
 # the command layer); a cache failure needs to be inspectable - "stale" and
 # "damaged" get different diagnostics - so it is a real enum.

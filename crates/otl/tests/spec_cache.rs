@@ -94,6 +94,10 @@ fn a_store_leaves_no_temporary_file_behind() {
     assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
 }
 
+/// Replacing an existing cache must work on every platform. This is a
+/// Windows regression test in particular: `std::fs::rename` there refuses
+/// to replace an existing target, so a plain rename made every sync after
+/// the first one fail. The CI matrix runs this on windows-latest.
 #[test]
 fn a_store_replaces_an_existing_cache() {
     let (_dir, file) = temp_cache();
@@ -102,6 +106,135 @@ fn a_store_replaces_an_existing_cache() {
     let loaded = cache::load_at(&file).expect("loads").expect("is present");
     assert_eq!(loaded.ops.len(), 1);
     assert_eq!(loaded.ops[0].name, "new.op");
+
+    // ...repeatedly, and the temporary files do not accumulate either.
+    for index in 0..3 {
+        let name = format!("op{index}.x");
+        cache::store_at(&file, &[op(&name, &format!("/api/{name}"))], &meta())
+            .expect("replaces again");
+    }
+    let entries: Vec<String> = fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, ["ir-cache.bin"], "leftovers: {entries:?}");
+}
+
+/// A cache file left behind by something else must not lend its
+/// permissions to the new one: the store creates a fresh file and moves it
+/// over the old path, so the result is 0600 no matter what was there.
+#[cfg(unix)]
+#[test]
+fn a_store_does_not_inherit_a_loose_permission_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, file) = temp_cache();
+    fs::write(&file, b"pre-existing").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
+
+    cache::store_at(&file, &[op("things.info", "/api/things.info")], &meta()).expect("stores");
+    let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "inherited mode {mode:o} from the old file");
+}
+
+/// A symlink where the cache should be is replaced, not followed: the
+/// store must never write through it into a file elsewhere.
+#[cfg(unix)]
+#[test]
+fn a_store_never_writes_through_a_symlink() {
+    let dir = TempDir::new().unwrap();
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, b"do not touch").unwrap();
+    let file = dir.path().join("ir-cache.bin");
+    std::os::unix::fs::symlink(&victim, &file).unwrap();
+
+    cache::store_at(&file, &[op("things.info", "/api/things.info")], &meta()).expect("stores");
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"do not touch",
+        "the store wrote through the symlink"
+    );
+    assert!(!fs::symlink_metadata(&file).unwrap().is_symlink());
+    assert!(cache::load_at(&file).expect("loads").is_some());
+}
+
+/// A temporary file someone else pre-created cannot capture the write:
+/// names are random and creation is exclusive, so an existing one is
+/// simply irrelevant.
+#[test]
+fn a_pre_existing_temporary_file_does_not_affect_the_store() {
+    let (dir, file) = temp_cache();
+    let squatted = dir
+        .path()
+        .join(format!("ir-cache.bin.tmp.{}", std::process::id()));
+    fs::write(&squatted, b"squatted").unwrap();
+
+    cache::store_at(&file, &[op("things.info", "/api/things.info")], &meta()).expect("stores");
+    assert!(cache::load_at(&file).expect("loads").is_some());
+    assert_eq!(
+        fs::read(&squatted).unwrap(),
+        b"squatted",
+        "the store reused a predictable temp name"
+    );
+}
+
+/// A table too large for the cache format must fail BEFORE any file is
+/// written: a "successful" sync whose cache the loader then rejects as
+/// oversized would silently never take effect.
+#[test]
+fn an_oversized_table_is_refused_without_writing_anything() {
+    let (_dir, file) = temp_cache();
+    // 128-byte names (the operation-name limit) reach the body limit in
+    // ~20k operations, which is quick to build and encode.
+    let name = format!("things.{}", "n".repeat(120));
+    let ops: Vec<OpSpec> = (0..30_000)
+        .map(|index| {
+            let name = format!("{}{index}", &name[..name.len() - 6]);
+            op(&name, &format!("/api/{name}"))
+        })
+        .collect();
+    let error = cache::store_at(&file, &ops, &meta()).expect_err("must be refused");
+    assert!(
+        error.to_string().contains("too large"),
+        "unexpected error: {error}"
+    );
+    assert!(!file.exists(), "a rejected table was still written");
+    let leftovers = fs::read_dir(file.parent().unwrap()).unwrap().count();
+    assert_eq!(leftovers, 0, "temporary file left behind");
+}
+
+/// The size limits are one limit: whatever store accepts, load accepts -
+/// header included. A table of several megabytes exercises the boundary
+/// the two used to disagree about.
+#[test]
+fn the_store_and_load_size_limits_agree() {
+    let (_dir, file) = temp_cache();
+    // Names stay within the operation-name limit (128 bytes); ~20k of them
+    // encode to several MiB, close under the cache limit.
+    let ops: Vec<OpSpec> = (0..20_000)
+        .map(|index| {
+            let name = format!("things.{:0>110}{index}", "n");
+            op(&name, &format!("/api/{name}"))
+        })
+        .collect();
+    cache::store_at(&file, &ops, &meta()).expect("a table under the limit stores");
+
+    let size = fs::metadata(&file).unwrap().len() as usize;
+    assert!(
+        size > 4 * 1024 * 1024,
+        "the test table is too small to exercise the boundary: {size} bytes"
+    );
+    assert!(
+        size <= cache::MAX_CACHE_FILE_BYTES,
+        "stored {size} bytes, over the load limit"
+    );
+    assert_eq!(
+        cache::load_at(&file)
+            .expect("loads back")
+            .expect("is present")
+            .ops
+            .len(),
+        ops.len()
+    );
 }
 
 #[test]
@@ -284,6 +417,115 @@ fn a_cache_with_a_hostile_operation_path_is_rejected() {
         );
         let error = cache::load_at(&file).expect_err("must be rejected");
         assert!(!error.is_stale(), "{path:?}: unexpected error: {error}");
+    }
+}
+
+/// A valid body followed by extra bytes, with the checksum recomputed over
+/// the whole thing, is not a file this build writes - so it is not trusted,
+/// even though the decoder stops happily at the end of the object.
+#[test]
+fn trailing_bytes_after_the_body_are_rejected() {
+    let (_dir, file) = temp_cache();
+    cache::store_at(&file, &[op("things.info", "/api/things.info")], &meta()).expect("stores");
+    let raw = fs::read(&file).unwrap();
+    let (_, body) = raw.split_at(44);
+
+    let mut extended = body.to_vec();
+    extended.extend_from_slice(b"appended payload");
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&MAGIC);
+    forged.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    forged.extend_from_slice(&Sha256::digest(&extended));
+    forged.extend_from_slice(&extended);
+    fs::write(&file, &forged).unwrap();
+
+    let error = cache::load_at(&file).expect_err("must be rejected");
+    assert!(!error.is_stale(), "unexpected error: {error}");
+    assert!(error.to_string().contains("trailing"), "{error}");
+}
+
+/// The same-origin remap from the review: both fields are individually
+/// well formed, but the path belongs to another operation, so calling the
+/// harmless one would send the bearer token to the destructive one.
+#[test]
+fn a_cache_that_remaps_an_operation_to_another_endpoint_is_rejected() {
+    let (_dir, file) = temp_cache();
+    write_raw(
+        &file,
+        MAGIC,
+        FORMAT_VERSION,
+        &Body {
+            meta: meta(),
+            ops: vec![op("documents.search", "/api/documents.delete")],
+        },
+    );
+    let error = cache::load_at(&file).expect_err("must be rejected");
+    assert!(!error.is_stale(), "unexpected error: {error}");
+    assert!(
+        error
+            .to_string()
+            .contains("does not dispatch to its own endpoint"),
+        "{error}"
+    );
+}
+
+/// Hostile text in a cached operation is not printed: `api list` writes
+/// summaries verbatim, and a terminal executes some byte sequences.
+#[test]
+fn a_cache_with_terminal_escapes_in_its_text_is_rejected() {
+    for summary in [
+        "\u{1b}]52;c;cGF3bmVk\u{7}",
+        "forged\nthings.other\trow",
+        "flip\u{202e}txet",
+    ] {
+        let (_dir, file) = temp_cache();
+        let mut hostile = op("things.info", "/api/things.info");
+        hostile.summary = summary.to_string().into();
+        write_raw(
+            &file,
+            MAGIC,
+            FORMAT_VERSION,
+            &Body {
+                meta: meta(),
+                ops: vec![hostile],
+            },
+        );
+        assert!(
+            cache::load_at(&file).is_err(),
+            "{summary:?} must be rejected"
+        );
+    }
+}
+
+/// The provenance record is displayed too, so it gets the same treatment.
+#[test]
+fn a_cache_with_a_hostile_provenance_record_is_rejected() {
+    let cases = [
+        CacheMeta {
+            source: "https://x\u{1b}[31m".to_string(),
+            ..meta()
+        },
+        CacheMeta {
+            spec_hash: "not-a-hash".to_string(),
+            ..meta()
+        },
+        CacheMeta {
+            spec_hash: "z".repeat(64),
+            ..meta()
+        },
+    ];
+    for hostile in cases {
+        let (_dir, file) = temp_cache();
+        write_raw(
+            &file,
+            MAGIC,
+            FORMAT_VERSION,
+            &Body {
+                meta: hostile,
+                ops: vec![op("things.info", "/api/things.info")],
+            },
+        );
+        assert!(cache::load_at(&file).is_err(), "must be rejected");
     }
 }
 

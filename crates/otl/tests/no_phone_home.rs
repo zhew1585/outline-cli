@@ -77,6 +77,15 @@ const CONFINED: &[Confined] = &[
               caller would be a network request the user did not ask for",
     },
     Confined {
+        needle: "get_text",
+        allowed: &[
+            "crates/engine/src/fetch.rs",
+            "crates/otl/src/commands/spec.rs",
+        ],
+        why: "the same rule for the fetcher's method form, which a caller \
+              could otherwise use to bypass the free function",
+    },
+    Confined {
         needle: "UPSTREAM_SPEC_URL",
         allowed: &[
             "crates/otl/src/spec/mod.rs",
@@ -84,13 +93,51 @@ const CONFINED: &[Confined] = &[
         ],
         why: "the upstream spec source may only be read by the sync command",
     },
+    // The HTTP stack itself is confined, not just the shapes of a call.
+    // `.send()` alone was too weak a guard: `reqwest::blocking::get(url)`,
+    // `Client::execute(request)`, or a `.send()` split across lines all
+    // pass it. Naming the CRATE catches every form of every API it has,
+    // and reaching for a different HTTP client or a raw socket means
+    // adding a dependency, which the rules below also catch.
+    Confined {
+        needle: "reqwest",
+        allowed: &[
+            "crates/engine/src/client.rs",
+            "crates/engine/src/error.rs",
+            "crates/engine/src/fetch.rs",
+            // One doc comment explaining why transport errors are not
+            // printed; no code.
+            "crates/otl/src/exit.rs",
+        ],
+        why: "HTTP belongs to the engine's two channels; no other module may \
+              speak to the network, in any shape",
+    },
     Confined {
         needle: ".send()",
         allowed: &["crates/engine/src/client.rs", "crates/engine/src/fetch.rs"],
         why: "all HTTP goes through the engine's two channels: the \
               authenticated request channel and the plain-document fetch",
     },
+    Confined {
+        needle: "std::net",
+        allowed: &[],
+        why: "a raw socket would bypass the request channels entirely",
+    },
+    Confined {
+        needle: "TcpStream",
+        allowed: &[],
+        why: "a raw socket would bypass the request channels entirely",
+    },
+    Confined {
+        needle: "UdpSocket",
+        allowed: &[],
+        why: "a raw socket would bypass the request channels entirely",
+    },
 ];
+
+/// Rules whose needle is expected to be absent everywhere, so the
+/// "not vacuous" check below must not demand a hit for them.
+const EXPECTED_ABSENT: &[&str] = &["std::net", "TcpStream", "UdpSocket"];
 
 #[test]
 fn network_entry_points_stay_confined() {
@@ -113,9 +160,13 @@ fn network_entry_points_stay_confined() {
 
 #[test]
 fn the_confinement_rules_are_not_vacuous() {
-    // A renamed symbol would make every rule above pass trivially.
+    // A renamed symbol would make a rule pass trivially. The socket rules
+    // are exempt: their whole point is that nothing matches them.
     let sources = runtime_sources();
     for rule in CONFINED {
+        if EXPECTED_ABSENT.contains(&rule.needle) {
+            continue;
+        }
         let hits = sources
             .iter()
             .filter(|(_, source)| source.contains(rule.needle))
@@ -124,6 +175,45 @@ fn the_confinement_rules_are_not_vacuous() {
             hits > 0,
             "{:?} no longer appears in any runtime source: the rule is stale",
             rule.needle
+        );
+    }
+}
+
+/// Every allowlisted file must exist. A rename would otherwise turn an
+/// entry into a permanent hole in whichever rule it belongs to.
+#[test]
+fn allowlisted_files_all_exist() {
+    let root = workspace_root();
+    for rule in CONFINED {
+        for allowed in rule.allowed {
+            assert!(
+                root.join(allowed).is_file(),
+                "{allowed} is allowlisted for {:?} but does not exist",
+                rule.needle
+            );
+        }
+    }
+}
+
+/// No new dependency may bring a second HTTP stack or TLS client in
+/// through the back door, which would make the source rules above moot.
+#[test]
+fn no_second_http_stack_is_declared() {
+    let manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml")).unwrap();
+    for forbidden in [
+        "ureq",
+        "curl",
+        "hyper =",
+        "isahc",
+        "attohttpc",
+        "surf",
+        "native-tls",
+        "openssl",
+    ] {
+        assert!(
+            !manifest.contains(forbidden),
+            "{forbidden:?} appears in the workspace manifest: a second HTTP/TLS \
+             stack would sidestep the single-channel rule"
         );
     }
 }
