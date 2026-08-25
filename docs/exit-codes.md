@@ -9,7 +9,7 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 |------|---------|----------|
 | 0 | Success | Command completed normally |
 | 1 | Generic failure | Invalid JSON in a response, unexpected internal error, HTTP status outside 4xx/5xx, failure writing to stdout other than a closed pipe |
-| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, invalid base URL, API key that cannot be sent as an HTTP header (e.g. it contains a newline), local parameter-validation failure (unknown/missing/complex parameter, value violating its schema facets, inexact number, oversized or invalid `--body` file, operation requiring a non-JSON body or a `oneOf`/`anyOf` request body) |
+| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, unsupported shell for `completions`, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, invalid base URL, API key that cannot be sent as an HTTP header (e.g. it contains a newline), local parameter-validation failure (unknown/missing/complex parameter, value violating its schema facets, inexact number, oversized or invalid `--body` file, operation requiring a non-JSON body or a `oneOf`/`anyOf` request body), user-config-file problem (see below) |
 | 3 | API request rejected | 4xx other than auth, not-found, and exhausted rate limits: validation error (400), a 429 that was not retried to exhaustion |
 | 4 | Authentication or permission error | Invalid or expired API key (401), operation forbidden for this key (403) |
 | 5 | Resource not found | Unknown document, collection, or other resource (404) |
@@ -19,6 +19,17 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 
 Notes:
 
+- Every user-config-file failure is a configuration error (code 2), never a new code: a file named
+  explicitly with `--config` / `OUTLINE_CONFIG` that does not exist, one that cannot be read or is
+  larger than the size cap, TOML that does not parse, an unknown key, an empty profile name, a
+  `--profile` / `OUTLINE_PROFILE` / `default_profile` naming a profile the file does not define, a
+  selected profile with no base URL and no `--url` / `OUTLINE_URL`, an `auth` method the build cannot
+  use yet, or an `api_key` / `token` key in the config file (credentials belong in `credentials.toml`).
+  A config file missing at the DEFAULT location is not an error at all: the environment-only path must
+  keep working on a fresh machine.
+- Config-file parse errors report a location and the parser's own wording, never a quoted line from the
+  file: a credential wrongly placed there must not be echoed back into a message, a log, or a Debug
+  rendering.
 - Configuration errors (code 2) are always reported before any network request is made. A request that cannot even be assembled locally (invalid header value) is a configuration error, never a network error. The same holds for local schema validation: an argument the vendored spec rejects never reaches the network.
 - A closed stdout pipe is normal completion, not a failure: when the reader stops early (`otl ... | head -1`), `otl` stops writing and exits **0** with no diagnostics, the way well-behaved Unix filters do. It never dies of a panic (which would produce the undocumented code 101).
 - A response body that times out or is truncated mid-transfer is a network error (code 7), not an invalid-response error (code 1): only a genuine JSON syntax error means retrying cannot help.
