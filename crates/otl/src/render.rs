@@ -14,12 +14,13 @@
 //! [`OutputMode::Table`] so that non-TTY output stays decoration-free.
 
 use serde_json::Value;
+use unicode_width::UnicodeWidthChar;
 
 /// Maximum number of columns shown in a table.
 const MAX_TABLE_COLUMNS: usize = 4;
-/// Maximum number of characters kept in one table cell (including the
-/// truncation marker).
-const MAX_CELL_CHARS: usize = 40;
+/// Maximum terminal width (in columns, not characters) of one table cell,
+/// including the truncation marker.
+const MAX_CELL_WIDTH: usize = 40;
 /// Marker appended to truncated cells.
 const TRUNCATION_MARK: char = '\u{2026}'; // …
 /// Gap between table columns.
@@ -64,6 +65,15 @@ pub fn render(payload: &Value, mode: OutputMode) -> Result<String, serde_json::E
 
 /// Render a list of objects as a table, or `None` when the payload does
 /// not have that shape.
+///
+// TODO(story-1.5b): thread the operation's response schema in here (an
+// `&OpSpec` carrying response field descriptors from the IR) and select
+// columns from the SCHEMA instead of the observed rows. Until the IR gains
+// response schemas, the column set is derived from the response itself; it
+// is made deterministic within a response by unioning keys across all rows
+// and ordering them by a fixed priority, so it cannot drift between rows or
+// with map iteration order - but two responses of the same operation that
+// omit different optional fields can still differ.
 fn try_render_table(payload: &Value) -> Option<String> {
     let rows = payload.as_array()?;
     if rows.is_empty() {
@@ -84,7 +94,17 @@ fn try_render_table(payload: &Value) -> Option<String> {
 }
 
 /// Pick up to [`MAX_TABLE_COLUMNS`] keys, preferring identity and
-/// timestamp-like keys, purely from the data (schema-driven, generic).
+/// timestamp-like keys.
+///
+/// Determinism rules, so the same response always yields the same header:
+///
+/// - the candidate set is the UNION of the keys of every row, never a
+///   sample, so an optional field missing from the first row (or from any
+///   other) cannot change the column set;
+/// - ordering is by fixed priority and then by key name, so it depends on
+///   neither row order nor JSON object iteration order;
+/// - a key whose value is a container in any row is dropped entirely, so a
+///   column is never half-rendered.
 fn select_columns<'a>(rows: &[&'a serde_json::Map<String, Value>]) -> Vec<&'a String> {
     let mut candidates: Vec<&String> = Vec::new();
     for row in rows {
@@ -94,7 +114,6 @@ fn select_columns<'a>(rows: &[&'a serde_json::Map<String, Value>]) -> Vec<&'a St
             }
         }
     }
-    // A key qualifies only if it is scalar in every row where it appears.
     let mut columns: Vec<&String> = candidates
         .into_iter()
         .filter(|key| {
@@ -103,13 +122,17 @@ fn select_columns<'a>(rows: &[&'a serde_json::Map<String, Value>]) -> Vec<&'a St
                 .all(|value| !value.is_object() && !value.is_array())
         })
         .collect();
-    columns.sort_by_key(|key| key_priority(key));
+    columns.sort_by(|left, right| {
+        key_priority(left)
+            .cmp(&key_priority(right))
+            .then_with(|| left.cmp(right))
+    });
     columns.truncate(MAX_TABLE_COLUMNS);
     columns
 }
 
-/// Ranking used to auto-pick key columns; lower is better. The sort is
-/// stable, so equal-priority keys keep their first-seen order.
+/// Ranking used to auto-pick key columns; lower is better. Ties are broken
+/// by key name in [`select_columns`], never by input order.
 fn key_priority(key: &str) -> u8 {
     match key {
         "id" => 0,
@@ -133,30 +156,60 @@ fn cell_text(value: Option<&Value>) -> String {
 }
 
 /// Replace control characters (ANSI escapes, newlines, tabs) with spaces
-/// and truncate to [`MAX_CELL_CHARS`] characters.
+/// and truncate to [`MAX_CELL_WIDTH`] terminal columns.
+///
+/// Truncation counts display width, not characters, so a cell of CJK text
+/// occupies the same number of columns as an ASCII one; it always cuts on a
+/// character boundary.
 fn sanitize_cell(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    if cleaned.chars().count() <= MAX_CELL_CHARS {
-        cleaned
-    } else {
-        let mut truncated: String = cleaned.chars().take(MAX_CELL_CHARS - 1).collect();
-        truncated.push(TRUNCATION_MARK);
-        truncated
+    if display_width(&cleaned) <= MAX_CELL_WIDTH {
+        return cleaned;
     }
+    let budget = MAX_CELL_WIDTH.saturating_sub(char_display_width(TRUNCATION_MARK));
+    let mut truncated = String::new();
+    let mut width = 0;
+    for c in cleaned.chars() {
+        let next = width + char_display_width(c);
+        if next > budget {
+            break;
+        }
+        truncated.push(c);
+        width = next;
+    }
+    truncated.push(TRUNCATION_MARK);
+    truncated
+}
+
+/// Terminal column width of a string.
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+/// Terminal column width of one character.
+///
+/// Unassigned/unknown characters are counted as one column, which keeps
+/// alignment sane for text the width tables do not cover.
+fn char_display_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(1)
 }
 
 /// Lay out header and body cells with padded, gap-separated columns.
+///
+/// Padding is computed from terminal display width, not character count:
+/// `format!("{:<width$}")` pads to a character count, which misaligns every
+/// column after a CJK or emoji cell.
 fn layout_table(header: &[String], body: &[Vec<String>]) -> String {
     let widths: Vec<usize> = header
         .iter()
         .enumerate()
         .map(|(index, name)| {
             body.iter()
-                .map(|row| char_width(&row[index]))
-                .chain([char_width(name)])
+                .map(|row| display_width(&row[index]))
+                .chain([display_width(name)])
                 .max()
                 .unwrap_or(0)
         })
@@ -166,7 +219,7 @@ fn layout_table(header: &[String], body: &[Vec<String>]) -> String {
         let padded: Vec<String> = cells
             .iter()
             .zip(widths.iter().copied())
-            .map(|(cell, width)| format!("{cell:<width$}"))
+            .map(|(cell, width)| pad_to_width(cell, width))
             .collect();
         padded.join(COLUMN_GAP).trim_end().to_string()
     };
@@ -176,7 +229,8 @@ fn layout_table(header: &[String], body: &[Vec<String>]) -> String {
     lines.join("\n")
 }
 
-/// Column width of a cell, counted in characters.
-fn char_width(text: &str) -> usize {
-    text.chars().count()
+/// Right-pad `text` with spaces until it occupies `width` terminal columns.
+fn pad_to_width(text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(display_width(text));
+    format!("{text}{}", " ".repeat(padding))
 }

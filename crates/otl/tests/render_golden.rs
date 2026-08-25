@@ -11,14 +11,33 @@ use std::path::Path;
 use otl::render::{render, resolve_mode, OutputMode};
 use serde_json::{json, Value};
 
+/// Whether golden files may be rewritten instead of asserted.
+///
+/// Requires the exact value `1` (so `OTL_UPDATE_GOLDEN=0`, `false`, or an
+/// empty value do NOT rewrite anything), and never applies when `CI` is
+/// set: on CI a rendering regression must fail, not overwrite the evidence.
+fn golden_update_requested() -> bool {
+    may_update_golden(
+        std::env::var("OTL_UPDATE_GOLDEN").ok().as_deref(),
+        std::env::var("CI").ok().as_deref(),
+    )
+}
+
+/// Pure decision behind [`golden_update_requested`], so the gate itself is
+/// testable without mutating the process environment (which would need
+/// `unsafe`, forbidden workspace-wide).
+fn may_update_golden(update: Option<&str>, ci: Option<&str>) -> bool {
+    update == Some("1") && ci.is_none()
+}
+
 /// Compare rendered output against a golden file (or rewrite it when
-/// `OTL_UPDATE_GOLDEN` is set).
+/// `OTL_UPDATE_GOLDEN=1` outside CI).
 fn assert_golden(payload: &Value, mode: OutputMode, golden_name: &str) {
     let rendered = format!("{}\n", render(payload, mode).unwrap());
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(golden_name);
-    if std::env::var_os("OTL_UPDATE_GOLDEN").is_some() {
+    if golden_update_requested() {
         std::fs::write(&path, &rendered).unwrap();
         return;
     }
@@ -134,6 +153,108 @@ fn json_mode_is_pretty_json_without_decoration() {
     let reparsed: Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(reparsed, documents_payload());
     assert!(!rendered.contains('\u{1b}'), "ANSI in JSON output");
+}
+
+#[test]
+fn golden_update_gate_accepts_only_exact_one_outside_ci() {
+    // A stray OTL_UPDATE_GOLDEN must not let a rendering regression
+    // overwrite its own expected output.
+    for (value, ci, expected) in [
+        (Some("1"), None, true),
+        (Some("1"), Some("true"), false),
+        (Some("1"), Some(""), false),
+        (Some("0"), None, false),
+        (Some("false"), None, false),
+        (Some(""), None, false),
+        (Some("yes"), None, false),
+        (None, None, false),
+    ] {
+        assert_eq!(
+            may_update_golden(value, ci),
+            expected,
+            "OTL_UPDATE_GOLDEN={value:?} CI={ci:?}"
+        );
+    }
+}
+
+#[test]
+fn table_column_set_is_stable_across_heterogeneous_rows() {
+    // Optional fields present in only some rows must not change the column
+    // set, and neither must row order: the header is the union of all keys
+    // in fixed priority order.
+    let full = json!({
+        "id": "a", "title": "First", "updatedAt": "2026-08-01T00:00:00Z", "pinned": true
+    });
+    let sparse = json!({ "id": "b" });
+    let other = json!({ "id": "c", "title": "Third" });
+
+    let header_of = |payload: &Value| -> String {
+        render(payload, OutputMode::Table)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    let expected = header_of(&json!([full, sparse, other]));
+    assert_eq!(header_of(&json!([sparse, full, other])), expected);
+    assert_eq!(header_of(&json!([other, sparse, full])), expected);
+    assert_eq!(header_of(&json!([sparse, other, full])), expected);
+    // The sparse row alone cannot suppress columns contributed by others.
+    assert!(expected.contains("title"), "header: {expected}");
+    assert!(expected.contains("updatedAt"), "header: {expected}");
+}
+
+#[test]
+fn table_aligns_cjk_emoji_and_combining_characters() {
+    // Terminal alignment is display width, not char count: CJK is 2
+    // columns, combining marks 0. Every row must place the last column at
+    // the same display column.
+    let payload = json!([
+        { "id": "1", "title": "中文标题", "updatedAt": "A" },
+        { "id": "2", "title": "ascii", "updatedAt": "B" },
+        { "id": "3", "title": "e\u{301}mile", "updatedAt": "C" },
+        { "id": "4", "title": "ok \u{1f600}", "updatedAt": "D" }
+    ]);
+    let rendered = render(&payload, OutputMode::Table).unwrap();
+    assert_golden(&payload, OutputMode::Table, "table_unicode.txt");
+
+    // Compute the display column at which the final cell starts on each
+    // line; they must all agree.
+    let width = |text: &str| -> usize {
+        text.chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum()
+    };
+    let starts: Vec<usize> = rendered
+        .lines()
+        .map(|line| {
+            let last = line.rsplit("  ").next().unwrap_or("");
+            width(&line[..line.len() - last.len()])
+        })
+        .collect();
+    assert!(
+        starts.windows(2).all(|pair| pair[0] == pair[1]),
+        "columns misaligned: {starts:?} in\n{rendered}"
+    );
+}
+
+#[test]
+fn table_truncates_wide_characters_by_display_width() {
+    // 40 CJK characters are 80 columns wide; truncation must cut to the
+    // width budget on a character boundary and never panic.
+    let wide = "中".repeat(40);
+    let payload = json!([{ "id": "1", "title": wide }]);
+    let rendered = render(&payload, OutputMode::Table).unwrap();
+    let title_cell = rendered.lines().nth(1).unwrap();
+    let width: usize = title_cell
+        .chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+        .sum();
+    assert!(rendered.contains('\u{2026}'), "not truncated: {rendered}");
+    // id column (1) + gap (2) + at most 40 columns of title.
+    assert!(width <= 1 + 2 + 40, "cell too wide ({width}): {title_cell}");
 }
 
 #[test]
