@@ -113,6 +113,17 @@ fn read_error(origin: &str, error: std::io::Error) -> EngineError {
     }
 }
 
+/// The origin (`scheme://host[:port]`) of a document URL, or `None` when
+/// the URL is not one [`fetch_document`] would accept.
+///
+/// The only URL-derived form safe to display or persist: a path or query
+/// can carry a token, an origin cannot.
+pub fn document_origin(url: &str) -> Option<String> {
+    validate_document_url(url)
+        .ok()
+        .map(|parsed| parsed.origin().ascii_serialization())
+}
+
 /// Validate a document URL.
 ///
 /// Never place the raw input in the returned error: it may embed

@@ -167,6 +167,11 @@ const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[
     // from disk. `spec_path_and_content_absent_from_binary` still forbids
     // the file PATH in the shipped binary, which is what a disk read needs.
     ("crates/otl/src/spec/mod.rs", SPEC_FILE_NAME),
+    // Story 4.2: the name of the `--spec <PATH>` flag of `otl spec sync`,
+    // which compiles a document the USER points at (the documented
+    // development override). It is a clap flag name, not a directory this
+    // process goes looking in.
+    ("crates/otl/src/commands/spec.rs", "\"spec\""),
 ];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and

@@ -1,0 +1,396 @@
+//! `otl spec sync` and `otl spec reset` - the spec lifecycle commands.
+//!
+//! `sync` is the ONLY code path in the CLI that fetches or parses an
+//! OpenAPI document at run time. It compiles the document once and stores
+//! the resulting IR as a bincode cache; every later command deserializes
+//! that cache instead of parsing anything, so new endpoints are usable
+//! immediately without a CLI release and without a startup cost.
+//!
+//! Nothing here ever runs on its own: the CLI performs no update check and
+//! no background fetch (NFR4, no phone home). A sync happens when, and
+//! only when, the user types it.
+
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::anyhow;
+use clap::{Args, Subcommand};
+use engine::fetch::{self, MAX_DOCUMENT_BYTES};
+use engine::ir::OpSpec;
+use serde_json::{json, Value};
+
+use crate::errors::map_engine_error;
+use crate::exit::CliError;
+use crate::ops;
+use crate::render::OutputMode;
+use crate::spec::{self, cache};
+use crate::stdio;
+
+/// Total timeout for fetching a spec document.
+///
+/// Longer than an API call: this is a several-megabyte document from a
+/// CDN, on a command the user is watching.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest list of changed operation names printed in human output.
+const MAX_LISTED_CHANGES: usize = 8;
+
+/// Source label recorded in the cache for a local document.
+///
+/// A filesystem path is deliberately NOT stored: it can name a home
+/// directory or a private checkout, and the cache is a plain file.
+const LOCAL_SOURCE: &str = "local file";
+
+/// Source label for a URL whose origin could not be determined. Cannot
+/// happen for a URL the fetch accepted, but the record must say something.
+const UNKNOWN_SOURCE: &str = "unknown origin";
+
+/// Arguments for `otl spec`.
+#[derive(Debug, Args)]
+pub struct SpecArgs {
+    #[command(subcommand)]
+    command: SpecCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SpecCommand {
+    /// Fetch the upstream spec, compile it, and make it effective now.
+    Sync(SyncArgs),
+    /// Delete the synced spec and go back to the built-in one.
+    Reset,
+}
+
+/// Arguments for `otl spec sync`.
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Fetch the document from this URL instead of the upstream one.
+    #[arg(long, value_name = "URL", conflicts_with = "spec_file")]
+    url: Option<String>,
+
+    /// Compile a local OpenAPI document instead of fetching one.
+    ///
+    /// The development override: point the CLI at a document you are
+    /// editing, then every command uses it until `otl spec reset`.
+    ///
+    /// (The field is `spec_file` so the clap id stays distinct from the
+    /// `spec` subcommand's own.)
+    #[arg(long = "spec", value_name = "PATH")]
+    spec_file: Option<PathBuf>,
+
+    /// Rewrite the cache even when the document has not changed.
+    #[arg(long)]
+    force: bool,
+}
+
+/// Where a document came from, which decides how a bad document is
+/// classified: a file the user named is a usage error, a fetched document
+/// is a failure of the remote source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Local,
+    Remote,
+}
+
+/// Run the `spec` subcommand.
+pub fn run(args: &SpecArgs, mode: OutputMode) -> Result<(), CliError> {
+    match &args.command {
+        SpecCommand::Sync(sync) => run_sync(sync, mode),
+        SpecCommand::Reset => run_reset(mode),
+    }
+}
+
+/// Fetch (or read), compile, and cache a spec.
+fn run_sync(args: &SyncArgs, mode: OutputMode) -> Result<(), CliError> {
+    let before: Vec<String> = ops::table().iter().map(|op| op.name.to_string()).collect();
+    let (document, source, label) = load_document(args)?;
+    let hash = cache::spec_hash(&document);
+
+    if !args.force {
+        if let Some(unchanged) = unchanged_report(&hash, before.len()) {
+            return emit(&unchanged, mode);
+        }
+    }
+
+    let ops = compile(&document, source)?;
+    let meta = cache::CacheMeta::new(hash.clone(), label);
+    let path = cache::store(&ops, &meta).map_err(cache_write_error)?;
+    emit(&sync_report(&ops, &before, &meta, &path), mode)
+}
+
+/// Delete the cache, if there is one.
+fn run_reset(mode: OutputMode) -> Result<(), CliError> {
+    let removed = cache::reset().map_err(cache_write_error)?;
+    let report = match &removed {
+        Some(path) => Report {
+            json: json!({"removed": true, "cache_path": path.display().to_string()}),
+            human: format!(
+                "removed the synced spec at {}; the built-in spec is in effect again",
+                path.display()
+            ),
+        },
+        None => Report {
+            json: json!({"removed": false}),
+            human: "no synced spec to remove; the built-in spec is already in effect".to_string(),
+        },
+    };
+    emit(&report, mode)
+}
+
+/// Read the document to compile, and say where it came from.
+///
+/// The returned label is what goes into the cache: an origin for a URL
+/// (never the full URL, which may carry a token in its query) and a fixed
+/// placeholder for a file (never its path).
+fn load_document(args: &SyncArgs) -> Result<(String, Source, String), CliError> {
+    if let Some(path) = &args.spec_file {
+        let document = read_local(path)?;
+        return Ok((document, Source::Local, LOCAL_SOURCE.to_string()));
+    }
+    let url = args.url.as_deref().unwrap_or(spec::UPSTREAM_SPEC_URL);
+    // Announced on stderr, not stdout: stdout is data.
+    stdio::write_diagnostic_line("fetching the OpenAPI document...");
+    let document =
+        fetch::fetch_document(url, MAX_DOCUMENT_BYTES, FETCH_TIMEOUT).map_err(map_engine_error)?;
+    let label = origin_of(url);
+    Ok((document, Source::Remote, label))
+}
+
+/// Origin of a URL, for the provenance record.
+///
+/// Falls back to a placeholder rather than storing the full URL: a query
+/// string can carry a credential and the cache file is not a secret store.
+fn origin_of(url: &str) -> String {
+    fetch::document_origin(url).unwrap_or_else(|| UNKNOWN_SOURCE.to_string())
+}
+
+/// Read a local document, refusing anything over the document size cap.
+///
+/// The metadata size is checked first (cheap rejection) and the read is
+/// bounded too, so a file that grows in between - or one whose reported
+/// size is unreliable, such as a pipe - cannot exhaust memory.
+fn read_local(path: &Path) -> Result<String, CliError> {
+    let display = path.display();
+    let io_error = |error: std::io::Error| {
+        CliError::usage(anyhow!(
+            "cannot read the spec file {display}: {}",
+            error.kind()
+        ))
+    };
+    let too_large = || {
+        CliError::usage(anyhow!(
+            "the spec file {display} is too large: the limit is {MAX_DOCUMENT_BYTES} bytes"
+        ))
+    };
+    let file = fs::File::open(path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if metadata.is_file() && metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(too_large());
+    }
+    let mut raw = String::new();
+    let read = file
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(io_error)?;
+    if read as u64 > MAX_DOCUMENT_BYTES {
+        return Err(too_large());
+    }
+    Ok(raw)
+}
+
+/// Compile a document into IR, treating it as untrusted input.
+fn compile(document: &str, source: Source) -> Result<Vec<OpSpec>, CliError> {
+    let compiled = spec_compile::compile_json(document, &spec::compile_options())
+        .map_err(|error| compile_error(&error.to_string(), source))?;
+    let ops = spec::to_ir(&compiled);
+    // Belt and braces: the compiler already enforces these rules, and the
+    // cache loader enforces them again on the way back in.
+    spec::validate_ops(&ops).map_err(|reason| compile_error(&reason, source))?;
+    Ok(ops)
+}
+
+/// Classify an unusable document.
+///
+/// A file the user named is a usage error (exit 2), like an invalid
+/// `--body` file. A fetched document is the remote source's fault, not the
+/// invocation's, so it is a generic failure (exit 1).
+fn compile_error(reason: &str, source: Source) -> CliError {
+    let message = anyhow!("the OpenAPI document cannot be used: {reason}");
+    match source {
+        Source::Local => CliError::usage(message),
+        Source::Remote => CliError::failure(message),
+    }
+}
+
+/// A cache that cannot be written or deleted is a generic failure: the
+/// command did not do what it said, and no fallback applies.
+fn cache_write_error(error: cache::CacheError) -> CliError {
+    let remedy = error.remedy();
+    CliError::failure(anyhow!("{error}; {remedy}"))
+}
+
+/// One command result, in both output states.
+struct Report {
+    json: Value,
+    human: String,
+}
+
+/// Print a report in the resolved output mode.
+fn emit(report: &Report, mode: OutputMode) -> Result<(), CliError> {
+    match mode {
+        OutputMode::Json => {
+            let text = serde_json::to_string_pretty(&report.json).map_err(|error| {
+                CliError::failure(anyhow!("failed to render the report: {error}"))
+            })?;
+            stdio::write_data_line(&text)
+        }
+        OutputMode::Table => stdio::write_data_line(&report.human),
+    }
+}
+
+/// Report for a document whose hash already matches the cache.
+///
+/// Returns `None` when there is no usable cache to compare against - a
+/// damaged or outdated one must be rewritten, not treated as up to date.
+fn unchanged_report(hash: &str, op_count: usize) -> Option<Report> {
+    let cached = cache::load().ok().flatten()?;
+    if cached.meta.spec_hash != hash {
+        return None;
+    }
+    Some(Report {
+        json: json!({
+            "changed": false,
+            "operations": op_count,
+            "spec_hash": hash,
+            "source": cached.meta.source,
+        }),
+        human: format!(
+            "already up to date: {op_count} operations, spec {}; \
+             pass --force to rewrite the cache",
+            short_hash(hash)
+        ),
+    })
+}
+
+/// Report for a completed sync, including what changed.
+fn sync_report(ops: &[OpSpec], before: &[String], meta: &cache::CacheMeta, path: &Path) -> Report {
+    let after: Vec<String> = ops.iter().map(|op| op.name.to_string()).collect();
+    let added = difference(&after, before);
+    let removed = difference(before, &after);
+    let human = format!(
+        "synced {} operations from {}\n  new: {}\n  gone: {}\n  spec {}\n  cache: {}",
+        after.len(),
+        meta.source,
+        summarize(&added),
+        summarize(&removed),
+        short_hash(&meta.spec_hash),
+        path.display()
+    );
+    Report {
+        json: json!({
+            "changed": true,
+            "operations": after.len(),
+            "added": added,
+            "removed": removed,
+            "spec_hash": meta.spec_hash,
+            "source": meta.source,
+            "cache_path": path.display().to_string(),
+        }),
+        human,
+    }
+}
+
+/// Names in `left` that are not in `right`.
+fn difference(left: &[String], right: &[String]) -> Vec<String> {
+    left.iter()
+        .filter(|name| !right.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// Render a change list for humans, capped in length.
+fn summarize(names: &[String]) -> String {
+    if names.is_empty() {
+        return "(none)".to_string();
+    }
+    let listed = names
+        .iter()
+        .take(MAX_LISTED_CHANGES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().checked_sub(MAX_LISTED_CHANGES) {
+        Some(rest) if rest > 0 => format!("{listed}, and {rest} more"),
+        _ => listed,
+    }
+}
+
+/// First 12 hex characters of a spec hash, enough to compare by eye.
+fn short_hash(hash: &str) -> String {
+    let short: String = hash.chars().take(12).collect();
+    format!("sha256:{short}")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn difference_reports_only_missing_names() {
+        let before = names(&["a", "b"]);
+        let after = names(&["b", "c"]);
+        assert_eq!(difference(&after, &before), names(&["c"]));
+        assert_eq!(difference(&before, &after), names(&["a"]));
+    }
+
+    #[test]
+    fn summarize_caps_long_lists() {
+        assert_eq!(summarize(&[]), "(none)");
+        let many: Vec<String> = (0..12).map(|index| format!("op{index}")).collect();
+        let text = summarize(&many);
+        assert!(text.ends_with("and 4 more"), "{text}");
+        assert!(text.starts_with("op0, op1"), "{text}");
+    }
+
+    #[test]
+    fn a_local_source_label_never_carries_a_path() {
+        // The cache is a plain file; a path can name a private checkout.
+        assert_eq!(LOCAL_SOURCE, "local file");
+        assert!(!LOCAL_SOURCE.contains('/'));
+    }
+
+    #[test]
+    fn a_url_is_reduced_to_its_origin() {
+        assert_eq!(
+            origin_of("https://raw.example.com/openapi/main/spec.json?token=secret"),
+            "https://raw.example.com"
+        );
+        assert!(!origin_of("https://u:p@example.com/x").contains('p'));
+    }
+
+    #[test]
+    fn a_bad_document_is_a_usage_error_only_for_a_local_file() {
+        use crate::exit::ExitCode;
+        assert_eq!(
+            compile_error("not JSON", Source::Local).code,
+            ExitCode::Usage
+        );
+        assert_eq!(
+            compile_error("not JSON", Source::Remote).code,
+            ExitCode::Failure
+        );
+    }
+
+    #[test]
+    fn short_hash_is_a_prefix_of_the_full_hash() {
+        let hash = "0123456789abcdef".repeat(4);
+        assert_eq!(short_hash(&hash), "sha256:0123456789ab");
+    }
+}

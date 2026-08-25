@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
+use otl::commands::spec::{self, SpecArgs};
 use otl::exit::ExitCode;
 use otl::render;
 use otl::stdio;
@@ -27,6 +28,8 @@ struct Cli {
 enum Command {
     /// Call any API operation by name (output format unstable).
     Api(ApiArgs),
+    /// Manage the OpenAPI spec this CLI dispatches from.
+    Spec(SpecArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -35,6 +38,7 @@ fn main() -> std::process::ExitCode {
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
         Command::Api(args) => api::run(args, mode),
+        Command::Spec(args) => spec::run(args, mode),
     };
     match result {
         Ok(()) => ExitCode::Success.into(),
