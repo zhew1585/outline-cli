@@ -238,6 +238,7 @@ fn cli_error_debug_and_chain_are_credential_free() {
     let op = engine::OpSpec {
         name: Cow::Borrowed("documents.info"),
         path: Cow::Borrowed("/api/documents.info"),
+        summary: Cow::Borrowed(""),
         params: Cow::Borrowed(&[]),
     };
     let engine_error = client.execute(&op, &[]).unwrap_err();

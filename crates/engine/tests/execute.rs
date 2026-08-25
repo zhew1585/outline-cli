@@ -13,6 +13,7 @@ fn op_with_path(op_path: &'static str) -> OpSpec {
     OpSpec {
         name: Cow::Borrowed("things.info"),
         path: Cow::Borrowed(op_path),
+        summary: Cow::Borrowed("Retrieve a thing"),
         params: Cow::Borrowed(&[ParamSpec {
             name: Cow::Borrowed("id"),
             ty: ParamType::String,

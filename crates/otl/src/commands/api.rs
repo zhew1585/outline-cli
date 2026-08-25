@@ -12,10 +12,15 @@ use crate::config::Config;
 use crate::exit::CliError;
 use crate::ops;
 
+/// Reserved word: `otl api list` enumerates operations instead of calling
+/// one. Safe because real operation names always contain a `.`.
+const LIST_OPERATION: &str = "list";
+
 /// Arguments for `otl api`.
 #[derive(Debug, Args)]
 pub struct ApiArgs {
-    /// API operation name, e.g. `documents.info`.
+    /// API operation name, e.g. `documents.info` (or `list` to enumerate
+    /// all operations).
     pub operation: String,
 
     /// Request parameters as `key=value` pairs.
@@ -26,10 +31,14 @@ pub struct ApiArgs {
 /// Run the `api` subcommand. Configuration and argument validation happen
 /// before any network request.
 pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
+    if cmd.operation == LIST_OPERATION {
+        return run_list(cmd);
+    }
     let op = ops::find(&cmd.operation).ok_or_else(|| {
         CliError::usage(anyhow!(
             "unknown API operation {:?}; operation names follow the \
-             `resource.method` form, e.g. `documents.info`",
+             `resource.method` form, e.g. `documents.info` \
+             (run `otl api list` to see all operations)",
             cmd.operation
         ))
     })?;
@@ -40,6 +49,25 @@ pub fn run(cmd: &ApiArgs) -> Result<(), CliError> {
     let response = client.execute(op, &args).map_err(CliError::failure)?;
 
     print_response(&response)
+}
+
+/// Print every compiled operation as `name<TAB>summary`, one per line.
+/// Purely local: needs no configuration and touches no network.
+fn run_list(cmd: &ApiArgs) -> Result<(), CliError> {
+    if !cmd.args.is_empty() {
+        return Err(CliError::usage(anyhow!(
+            "`otl api list` takes no further arguments"
+        )));
+    }
+    let mut out = String::new();
+    for op in ops::OPS {
+        out.push_str(&op.name);
+        out.push('\t');
+        out.push_str(&op.summary);
+        out.push('\n');
+    }
+    print!("{out}");
+    Ok(())
 }
 
 /// A bad base URL is a configuration mistake (exit code 2); anything else

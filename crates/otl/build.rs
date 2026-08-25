@@ -1,9 +1,9 @@
 //! Compile the vendored OpenAPI spec into a static IR data table.
 //!
-//! This build script parses `spec/spec3.json`, keeps only the `documents.*`
-//! operations (Story 1.1 scope), and code-generates a `static OPS` table of
-//! `engine::ir::OpSpec` values into `$OUT_DIR/ir_table.rs`. It produces a
-//! data table only - never per-endpoint functions.
+//! This build script parses `spec/spec3.json`, compiles every operation in
+//! it, and code-generates a `static OPS` table of `engine::ir::OpSpec`
+//! values into `$OUT_DIR/ir_table.rs`. It produces a data table only -
+//! never per-endpoint functions.
 
 use std::env;
 use std::fmt::Write as _;
@@ -12,20 +12,19 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-/// Prefix selecting the operation subset compiled in this milestone.
-const OP_PATH_PREFIX: &str = "/documents.";
 /// Outline URL convention: every RPC path lives under this prefix. This is
 /// an Outline-specific rule, so it is applied here (the otl layer), never
 /// in the engine - the engine joins `base_url + op.path` verbatim.
 const API_PATH_PREFIX: &str = "/api";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 1;
+const IR_SCHEMA_VERSION: u32 = 2;
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
 
 struct Op {
     name: String,
     path: String,
+    summary: String,
     params: Vec<Param>,
 }
 
@@ -43,10 +42,7 @@ fn main() {
     let spec = load_spec(&spec_path);
     let ops = extract_ops(&spec);
     if ops.is_empty() {
-        panic!(
-            "no {OP_PATH_PREFIX}* operations found in {}",
-            spec_path.display()
-        );
+        panic!("no operations found in {}", spec_path.display());
     }
 
     let out_path = PathBuf::from(env_var("OUT_DIR")).join("ir_table.rs");
@@ -76,24 +72,40 @@ fn load_spec(path: &Path) -> Value {
     }
 }
 
-/// Collect every POST operation under the configured path prefix.
+/// Collect every POST operation in the spec.
 fn extract_ops(spec: &Value) -> Vec<Op> {
     let Some(paths) = spec.get("paths").and_then(Value::as_object) else {
         panic!("spec has no object at `paths`");
     };
     let mut ops: Vec<Op> = paths
         .iter()
-        .filter(|(path, _)| path.starts_with(OP_PATH_PREFIX))
         .filter_map(|(path, item)| {
             item.get("post").map(|post| Op {
                 name: path.trim_start_matches('/').to_string(),
                 path: format!("{API_PATH_PREFIX}{path}"),
+                summary: extract_summary(post),
                 params: extract_params(post, spec),
             })
         })
         .collect();
     ops.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(pair) = ops.windows(2).find(|pair| pair[0].name == pair[1].name) {
+        panic!("duplicate operation name in spec: {}", pair[0].name);
+    }
     ops
+}
+
+/// One-line summary: the spec `summary`, falling back to the first line of
+/// `description`, whitespace-collapsed. Empty if the spec provides neither.
+fn extract_summary(post: &Value) -> String {
+    let raw = post
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| post.get("description").and_then(Value::as_str))
+        .unwrap_or_default();
+    let first_line = raw.lines().next().unwrap_or_default();
+    first_line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Extract scalar request-body parameters from one POST operation.
@@ -157,7 +169,7 @@ fn collect_schema(
             if params.iter().all(|existing| existing.name != *name) {
                 params.push(Param {
                     name: name.clone(),
-                    ty: param_type(prop),
+                    ty: param_type(prop, spec, depth),
                     required: false,
                 });
             }
@@ -176,7 +188,30 @@ fn resolve_ref<'a>(reference: &str, spec: &'a Value) -> &'a Value {
     }
 }
 
-fn param_type(prop: &Value) -> &'static str {
+/// Map one property schema to a `ParamType` variant name.
+///
+/// `oneOf`/`anyOf` unions are always `Json` (complex; k=v is rejected at
+/// runtime). `$ref`s and `allOf` wrappers around a scalar (a common enum
+/// idiom, e.g. `allOf: [$ref: SomeStringEnum]`) resolve to that scalar.
+fn param_type(prop: &Value, spec: &Value, depth: usize) -> &'static str {
+    if depth > MAX_SCHEMA_DEPTH {
+        panic!("schema $ref/allOf nesting exceeds {MAX_SCHEMA_DEPTH} levels (cycle?)");
+    }
+    if prop.get("oneOf").is_some() || prop.get("anyOf").is_some() {
+        return "Json";
+    }
+    if let Some(reference) = prop.get("$ref").and_then(Value::as_str) {
+        return param_type(resolve_ref(reference, spec), spec, depth + 1);
+    }
+    if let Some(branches) = prop.get("allOf").and_then(Value::as_array) {
+        // A scalar wrapped in allOf stays a scalar; mixed/objecty
+        // compositions fall through to Json.
+        return branches
+            .iter()
+            .map(|branch| param_type(branch, spec, depth + 1))
+            .find(|ty| *ty != "Json")
+            .unwrap_or("Json");
+    }
     match prop.get("type").and_then(Value::as_str) {
         Some("string") => "String",
         Some("integer") => "Integer",
@@ -210,6 +245,11 @@ fn render_table(ops: &[Op]) -> String {
             out,
             "        path: ::std::borrow::Cow::Borrowed({:?}),",
             op.path
+        );
+        let _ = writeln!(
+            out,
+            "        summary: ::std::borrow::Cow::Borrowed({:?}),",
+            op.summary
         );
         let _ = writeln!(out, "        params: ::std::borrow::Cow::Borrowed(&[");
         for param in &op.params {

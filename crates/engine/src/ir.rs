@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Any serialized IR (e.g. a future on-disk cache) must embed this version;
 /// a mismatch invalidates the whole artifact and forces a rebuild.
-pub const IR_SCHEMA_VERSION: u32 = 1;
+///
+/// Version history: 2 added `OpSpec::summary`.
+pub const IR_SCHEMA_VERSION: u32 = 2;
 
 /// The wire type of a single request parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,8 @@ pub struct OpSpec {
     /// `/rpc/things.info`). Any service-specific prefix convention is
     /// applied by the spec compiler that emits the IR, never by the engine.
     pub path: Cow<'static, str>,
+    /// One-line human-readable summary from the source spec (may be empty).
+    pub summary: Cow<'static, str>,
     /// Request-body parameters.
     pub params: Cow<'static, [ParamSpec]>,
 }

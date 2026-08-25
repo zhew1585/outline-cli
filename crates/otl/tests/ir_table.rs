@@ -5,33 +5,82 @@
 
 use engine::ParamType;
 use otl::ops;
+use serde_json::Value;
+
+/// The vendored spec, parsed fresh so tests compare against the source of
+/// truth rather than a hardcoded operation count.
+fn vendored_spec() -> Value {
+    serde_json::from_str(include_str!("../spec/spec3.json")).unwrap()
+}
+
+/// Operation names (path minus leading `/`) of every POST path in the spec.
+fn spec_operation_names(spec: &Value) -> Vec<String> {
+    spec["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, item)| item.get("post").is_some())
+        .map(|(path, _)| path.trim_start_matches('/').to_string())
+        .collect()
+}
 
 #[test]
-fn table_contains_more_than_ten_documents_ops() {
+fn table_compiles_every_spec_operation() {
+    let spec = vendored_spec();
+    let expected = spec_operation_names(&spec);
+    // Sanity: the vendored spec is the full API, not the Story 1.1 subset.
     assert!(
-        ops::OPS.len() > 10,
-        "expected > 10 documents.* operations, got {}",
-        ops::OPS.len()
+        expected.len() > 100,
+        "vendored spec unexpectedly small: {} ops",
+        expected.len()
     );
+    assert_eq!(
+        ops::OPS.len(),
+        expected.len(),
+        "IR table op count != spec op count"
+    );
+    for name in &expected {
+        assert!(ops::find(name).is_some(), "{name} missing from IR table");
+    }
 }
 
 #[test]
-fn table_contains_key_operations() {
-    assert!(ops::find("documents.info").is_some());
-    assert!(ops::find("documents.search").is_some());
+fn table_spans_multiple_resources() {
+    for name in [
+        "documents.info",
+        "documents.search",
+        "collections.list",
+        "users.invite",
+        "shares.create",
+        "auth.info",
+        "attachments.create",
+    ] {
+        assert!(ops::find(name).is_some(), "{name} missing");
+    }
 }
 
 #[test]
-fn every_op_is_a_documents_op_with_api_prefixed_path() {
+fn every_op_has_api_prefixed_path() {
     for op in ops::OPS {
-        assert!(
-            op.name.starts_with("documents."),
-            "unexpected op {:?}",
-            op.name
-        );
         // The Outline URL convention (`/api/...`) is applied by the otl
         // build pipeline; the engine joins base + path verbatim.
         assert_eq!(op.path.as_ref(), format!("/api/{}", op.name));
+    }
+}
+
+#[test]
+fn every_op_has_a_single_line_summary() {
+    for op in ops::OPS {
+        assert!(
+            !op.summary.trim().is_empty(),
+            "{} has an empty summary",
+            op.name
+        );
+        assert!(
+            !op.summary.contains('\n'),
+            "{} summary spans lines",
+            op.name
+        );
     }
 }
 
@@ -83,10 +132,46 @@ fn no_all_of_op_has_an_empty_param_table() {
         "documents.deleted",
         "documents.answerQuestion",
         "documents.group_memberships",
+        "users.list",
+        "events.list",
     ] {
         let op = ops::find(name).unwrap();
         assert!(!op.params.is_empty(), "{name} has an empty param table");
     }
+}
+
+#[test]
+fn scalar_integer_and_boolean_params_are_typed() {
+    let op = ops::find("documents.update").unwrap();
+    assert_eq!(op.param("lastRevision").unwrap().ty, ParamType::Integer);
+    assert_eq!(op.param("publish").unwrap().ty, ParamType::Boolean);
+    // Objects and arrays stay Json (complex; k=v must be rejected).
+    assert_eq!(op.param("preferences").unwrap().ty, ParamType::Json);
+    assert_eq!(op.param("dataAttributes").unwrap().ty, ParamType::Json);
+}
+
+#[test]
+fn ref_and_all_of_wrapped_scalars_resolve_to_scalar_types() {
+    // documents.update `editMode` is `$ref -> TextEditMode` (string enum).
+    let edit_mode = ops::find("documents.update").unwrap().param("editMode");
+    assert_eq!(edit_mode.unwrap().ty, ParamType::String);
+    // users.list `role` is `allOf -> $ref UserRole` (string enum).
+    let role = ops::find("users.list").unwrap().param("role");
+    assert_eq!(role.unwrap().ty, ParamType::String);
+}
+
+#[test]
+fn one_of_required_branches_do_not_leak_into_required() {
+    // shares.create constrains via top-level oneOf(required: documentId |
+    // required: collectionId); neither may be marked unconditionally
+    // required, but both properties must exist as string params.
+    let op = ops::find("shares.create").unwrap();
+    let document_id = op.param("documentId").unwrap();
+    assert_eq!(document_id.ty, ParamType::String);
+    assert!(!document_id.required);
+    let collection_id = op.param("collectionId").unwrap();
+    assert_eq!(collection_id.ty, ParamType::String);
+    assert!(!collection_id.required);
 }
 
 #[test]
@@ -95,6 +180,18 @@ fn required_params_are_marked() {
     let op = ops::find("documents.update").unwrap();
     let param = op.param("id").unwrap();
     assert!(param.required);
+    // users.invite requires the complex `invites` parameter.
+    let invites = ops::find("users.invite").unwrap().param("invites").unwrap();
+    assert!(invites.required);
+    assert_eq!(invites.ty, ParamType::Json);
+}
+
+#[test]
+fn ops_without_request_body_have_empty_param_tables() {
+    for name in ["auth.info", "auth.config"] {
+        let op = ops::find(name).unwrap();
+        assert!(op.params.is_empty(), "{name} should have no params");
+    }
 }
 
 #[test]
