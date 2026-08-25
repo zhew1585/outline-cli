@@ -65,6 +65,7 @@ development_status:
   2-3-auto-refresh-rotation: backlog
   2-4-logout-and-purge: backlog
   2-5-api-key-management: backlog
+  2-6-credential-file-hygiene: backlog
   epic-2-retrospective: optional
   epic-3: backlog
   3-1-docs-search: backlog

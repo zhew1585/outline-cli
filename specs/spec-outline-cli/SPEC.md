@@ -19,7 +19,7 @@ Outline API 是纯 RPC 风格（全部 POST /api/resource.method），spec 即�
 
 ### CAP-1 双模式认证
 intent: 用户可用 API key（脚本/CI/无浏览器环境，env 兜底）或浏览器 OAuth 2.0（`otl auth login`，授权码 + PKCE + 本地回环回调）向任意 Outline 实例（云或自托管）认证。
-success: 两种模式下 `auth info` 返回正确身份；OAuth access token 过期后请求自动用 refresh token 续期，用户无感知；凭证存于系统钥匙串。
+success: 两种模式下 `auth info` 返回正确身份；OAuth access token 过期后请求自动用 refresh token 续期，用户无感知；凭证存于用户配置目录下的独立凭证文件（明文 + 仅属主可读写）。
 
 ### CAP-2 精选高频命令
 intent: 六个抛光命令覆盖日用场景：文档搜索、查看、创建（支持 stdin 管道输入内容）、更新、集合列表、批量导出。

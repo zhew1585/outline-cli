@@ -19,7 +19,7 @@ This document provides the complete epic and story breakdown for outline-cli (ot
 FR1: 用户可用 API key（Bearer token）认证，`OUTLINE_API_KEY` 环境变量兜底，`otl auth info` 返回正确身份。
 FR2: `otl auth login` 完成 OAuth 2.0 授权码 + PKCE S256 + 本地回环回调流程，服务器元数据自 `/.well-known/oauth-authorization-server` 发现，默认申请 scope `read write`。
 FR3: OAuth access token 过期后请求自动用 refresh token 续期，用户无感知；refresh token 轮换后新凭证原子持久化，并发刷新有防护。
-FR4: 所有凭证（API key、OAuth tokens、registration_access_token）存于系统钥匙串（keyring）。
+FR4: 所有凭证（API key、OAuth tokens、registration_access_token）存于用户配置目录下的独立凭证文件（`credentials.toml`，明文 + Unix 0600），与 `config.toml` 分离；不使用系统钥匙串。
 FR5: 未配置 client_id 时自动尝试 DCR（RFC 7591）注册公共客户端并缓存注册结果；DCR 不可用时回退提示管理员在 Settings → Applications 预注册。
 FR6: `otl auth logout --purge` 凭 registration_access_token 走 RFC 7592 删除 DCR 注册，避免服务器孤儿客户端。
 FR7: `otl docs search` 搜索文档，输出人类可读结果。
@@ -49,7 +49,7 @@ NFR2: 单静态二进制，目标体积约 5MB。
 NFR3: 三平台（macOS/Linux/Windows）一等公民，CI 矩阵覆盖。
 NFR4: 不 phone home：无自动更新检查、无自动 spec 检查、无遥测。
 NFR5: 精选命令接口走 semver 稳定契约；`otl api` 裸调模式明示不保证稳定。
-NFR6: 凭证安全：钥匙串存储、原子写入、env 明文使用时提示风险。
+NFR6: 凭证安全：独立凭证文件、创建即 0600、读取前权限校验（过宽拒用）、原子写入、env 明文使用时提示风险。
 NFR7: 测试体系：wiremock + spec 生成 fixture 的单测、输出渲染 golden file 测试、CI 对真实 workspace 的契约测试。
 
 ### Additional Requirements
@@ -59,7 +59,7 @@ NFR7: 测试体系：wiremock + spec 生成 fixture 的单测、输出渲染 gol
 - 运行时单一通用 `execute(op, args)` 分发器；clap 命令树运行时由 IR 构建。
 - vendor 上游 github.com/outline/openapi，`include_str!` 打包；`--spec` 开发时覆盖；定制走 overlay（x-cli 扩展），不 fork。
 - bincode 缓存于 `~/.cache/outline-cli`，key 为 spec hash + CLI 版本；原子 rename 写入，损坏自愈重解析。
-- 依赖基线：clap + serde + anyhow + reqwest（rustls）+ directories + keyring + clap_complete。
+- 依赖基线：clap + serde + anyhow + reqwest（rustls）+ directories + toml + clap_complete（不含 keyring）。
 - 两步协议（附件上传等）手写特例命令，预算约 5 个（v1 至少覆盖附件上传路径的设计口子，不强制实现）。
 - 分发：cargo-dist（brew tap + shell 安装器 + MSI）；命名 crate `outline-cli`、二进制 `otl`。
 - MVP 顺序约束：① documents.* 子集跑通 build.rs IR 管线 + 分发器 → ② 全端点 + api 逃生舱 → ③ 六精选命令抛光 + OAuth。
@@ -75,7 +75,7 @@ NFR7: 测试体系：wiremock + spec 生成 fixture 的单测、输出渲染 gol
 FR1: Epic 1 - API key 认证与 auth info
 FR2: Epic 2 - OAuth 授权码 + PKCE 登录
 FR3: Epic 2 - token 自动续期与轮换持久化
-FR4: Epic 2 - 凭证入系统钥匙串
+FR4: Epic 2 - 凭证入本地凭证文件（0600）
 FR5: Epic 2 - DCR 自注册优先与回退
 FR6: Epic 2 - logout --purge 自删注册
 FR7: Epic 3 - docs search
@@ -107,10 +107,42 @@ build.rs IR 管线、通用分发器、可靠请求通道、双态输出在此�
 （内含 NFR1 启动预算、NFR3 CI 矩阵、NFR7 测试骨架的落地）
 
 ### Epic 2: OAuth 登录与凭证安全
-用户 `otl auth login` 浏览器授权即用，token 自动续期无感知，凭证进钥匙串；DCR 自注册优先、可回退、可自删。
+用户 `otl auth login` 浏览器授权即用，token 自动续期无感知，凭证进本地凭证文件（0600）；DCR 自注册优先、可回退、可自删。
 **FRs covered:** FR2, FR3, FR4, FR5, FR6
 
-### Epic 3: 六个日用精选命令
+#### Story 2.6: 凭证文件卫生
+
+As a 把凭证明文放在磁盘上的用户,
+I want CLI 严格管好这个文件的权限与写入,
+So that 明文存储的风险被压到只剩"磁盘被物理读取"这一层。
+
+**Acceptance Criteria:**
+
+**Given** 全新环境首次写入凭证（login 或 set-key）
+**When** 凭证文件被创建
+**Then** Unix 上文件权限为 0600 且是创建时即设定（禁止先创建再 chmod 的竞态窗口），父目录不存在时一并创建且权限为 0700
+
+**Given** 凭证文件权限被改宽（如 0644 或组可读）
+**When** 执行任意需要凭证的命令
+**Then** 拒绝使用该文件并报可读错误，含具体修复命令（如 `chmod 600 <path>`），退出码符合退出码表；不静默降级也不自动改权限
+
+**Given** 写入过程中进程被杀或磁盘写失败
+**When** 检查凭证文件
+**Then** 文件内容或为旧值或为新值，绝不为截断/半写状态（同目录 temp → fsync → rename，temp 同为 0600）
+
+**Given** 多个 otl 进程并发触发 token 刷新
+**When** 刷新完成
+**Then** 锁文件建议锁保证只有一个进程执行刷新，其余进程读到刷新后的有效凭证，refresh_token 不因竞争而失效
+
+**Given** Windows 平台（无 POSIX 权限位）
+**When** 执行 `otl auth info` 或 `otl doctor`
+**Then** 明示该平台的凭证保护依赖用户 profile 目录 ACL，不谎报已设权限
+
+**Given** 执行 `otl doctor`
+**When** 报告凭证健康
+**Then** 输出凭证文件路径、存在性、权限是否合规、各 profile 有哪些凭证类型，但绝不打印任何凭证值或其片段
+
+## Epic 3: 六个日用精选命令
 终端日常工作流成立：搜索、查看（pager）、创建（stdin）、更新、集合列表、批量导出。
 **FRs covered:** FR7, FR8, FR9, FR10, FR11, FR12
 
@@ -268,7 +300,7 @@ So that 工具值得信赖。
 
 ## Epic 2: OAuth 登录与凭证安全
 
-用户 `otl auth login` 浏览器授权即用，token 自动续期无感知，凭证进钥匙串；DCR 自注册优先、可回退、可自删。
+用户 `otl auth login` 浏览器授权即用，token 自动续期无感知，凭证进本地凭证文件（0600）；DCR 自注册优先、可回退、可自删。
 
 ### Story 2.1: OAuth 浏览器登录（预注册路径）
 
@@ -284,7 +316,7 @@ So that 用工作区身份安全登录。
 
 **Given** 用户在浏览器完成授权
 **When** 回调命中本地服务器
-**Then** state 严格校验，授权码换取 tokens，access/refresh token 存入系统钥匙串，终端提示登录成功身份
+**Then** state 严格校验，授权码换取 tokens，access/refresh token 原子写入凭证文件（创建即 0600），终端提示登录成功身份
 
 **Given** 已登录
 **When** 执行 `otl auth info`
@@ -320,7 +352,7 @@ So that 永远不需要手动重新登录。
 
 **Given** access token 已过期
 **When** 任意命令发起请求
-**Then** 请求通道自动用 refresh token 换新（单飞：并发请求只触发一次刷新），新 access/refresh token 原子写入钥匙串后重放原请求
+**Then** 请求通道自动用 refresh token 换新（单飞：锁文件建议锁保证并发进程只刷新一次），新 access/refresh token 原子写入凭证文件后重放原请求
 
 **Given** refresh token 已失效或被撤销
 **When** 刷新失败
@@ -336,7 +368,7 @@ So that 服务器与本地都不残留。
 
 **Given** 已 OAuth 登录
 **When** 执行 `otl auth logout`
-**Then** 调用 revocation_endpoint 撤销 tokens，删除钥匙串中的本地凭证
+**Then** 调用 revocation_endpoint 撤销 tokens，从凭证文件移除该 profile 的凭证条目（文件无剩余凭证时删除文件本身）
 
 **Given** 客户端来自 DCR 注册
 **When** 执行 `otl auth logout --purge`
@@ -352,15 +384,15 @@ So that 两种认证方式都有一等体验。
 
 **Given** 执行 `otl auth set-key`
 **When** 输入 API key
-**Then** 存入系统钥匙串，`otl auth info` 显示 API key 认证身份
+**Then** 原子写入凭证文件（创建即 0600），`otl auth info` 显示 API key 认证身份与凭证文件路径
 
 **Given** 仅设置了 `OUTLINE_API_KEY` env
 **When** 首次使用
-**Then** 正常工作并提示一次钥匙串更安全
+**Then** 正常工作并提示一次：env 明文会经进程环境与 shell 历史泄漏，建议改用 `otl auth set-key` 存入凭证文件
 
-**Given** 同时存在 OAuth 登录、钥匙串 API key、env API key
+**Given** 同时存在 OAuth 登录、凭证文件 API key、env API key
 **When** 发起请求
-**Then** 按 OAuth > 钥匙串 API key > env 优先级选用
+**Then** 按 OAuth > 凭证文件 API key > env 优先级选用
 
 ## Epic 3: 六个日用精选命令
 

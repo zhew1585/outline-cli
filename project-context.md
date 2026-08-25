@@ -21,7 +21,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 ## Technology Stack & Versions
 
 - Rust stable（edition 2021+），Cargo workspace：`crates/engine`（通用 OpenAPI RPC 引擎）+ `crates/otl`（Outline UX 层，产出二进制 `otl`）。
-- 核心依赖：clap（derive + 运行时动态构建）、serde/serde_json、anyhow（应用层）+ thiserror（engine 库层）、reqwest（rustls-tls，禁用默认 native-tls）、keyring、directories、clap_complete、bincode。
+- 核心依赖：clap（derive + 运行时动态构建）、serde/serde_json、anyhow（应用层）+ thiserror（engine 库层）、reqwest（rustls-tls，禁用默认 native-tls）、toml、directories、clap_complete、bincode。**不用 keyring**（凭证走本地文件）。
 - 测试：wiremock、assert_cmd、golden file 快照；发布：cargo-dist。
 
 ## Critical Implementation Rules
@@ -49,7 +49,8 @@ _This file contains critical rules and patterns that AI agents must follow when 
 
 ### 安全与凭证规则
 
-- 凭证只存系统钥匙串（keyring）；任何凭证禁止落普通文件/日志/错误消息（含 debug 输出、doctor 报告）。
+- 凭证只存唯一的凭证文件（配置目录下 `credentials.toml`，与 `config.toml` 分离）；除该文件外，任何凭证禁止落其他文件/日志/错误消息（含 debug 输出、doctor 报告）。凭证文件之外的位置一律视为泄漏。
+- 凭证文件规则（不可妥协）：创建即以 0600 打开（禁止"先创建再 chmod"）；读取前校验权限，过宽即拒用并给修复命令；写入走同目录 temp → fsync → rename 原子路径，temp 同为 0600；Windows 无权限位，依赖 profile 目录 ACL 且必须在 `auth info`/`doctor` 明示。
 - 凭证写入必须原子；token 刷新必须单飞（并发请求只触发一次刷新）。
 - refresh_token 每次轮换：刷新成功后旧 token 立即作废，持久化失败必须显式报错而非静默。
 - 禁止任何 phone home：无遥测、无自动更新检查、无未经用户命令的网络请求。
@@ -72,7 +73,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 
 - 不要给精选命令手写响应结构体以外的每端点渲染代码。通用渲染必须 schema 驱动。
 - 不要在 oneOf/anyOf 参数上硬造 flag 映射。直接引导 `--body`。
-- 不要在 Windows 上假设 Unix 路径/钥匙串行为。一律经 directories/keyring 抽象。
+- 不要在 Windows 上假设 Unix 路径与权限行为。路径一律经 directories；权限位是 Unix-only，Windows 分支必须显式处理而非假装成功。
 - 不要实现非目标清单里的东西（pull/push 同步、TUI、watch、MCP、device flow、离线队列）。
 - DCR 注册后必须持久化 registration_access_token。丢了服务器上就删不掉了。
 
