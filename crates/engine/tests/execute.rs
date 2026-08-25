@@ -136,6 +136,40 @@ async fn error_message_is_sanitized_and_capped() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn reflected_bearer_token_is_redacted_from_error_message() {
+    // A server or proxy may echo the Authorization value back in its error
+    // body; the client must scrub its own token before the message can
+    // reach any error type.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/things.info"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "message": "invalid header: Bearer reflected-secret-token"
+        })))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = Client::new(&base_url, "reflected-secret-token")?;
+        client.execute(&op_with_path("/api/things.info"), &[])
+    })
+    .await
+    .unwrap();
+
+    match result {
+        Err(EngineError::Api { message, .. }) => {
+            assert!(
+                !message.contains("reflected-secret-token"),
+                "token leaked: {message:?}"
+            );
+            assert_eq!(message, "invalid header: Bearer ***");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
 #[test]
 fn new_rejects_non_http_base_url() {
     let error = Client::new("ftp://example.com", "token").unwrap_err();

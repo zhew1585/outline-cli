@@ -83,7 +83,7 @@ impl Client {
         if !status.is_success() {
             return Err(EngineError::Api {
                 status: status.as_u16(),
-                message: extract_error_message(response),
+                message: extract_error_message(response, &self.token),
             });
         }
 
@@ -150,10 +150,13 @@ fn encode_scalar(ty: ParamType, raw: &str) -> Value {
 
 /// Pull a best-effort human-readable message out of an error response.
 ///
-/// The body read is capped at [`MAX_ERROR_BODY_BYTES`], and the resulting
-/// message is sanitized (control characters stripped, whitespace collapsed)
-/// and capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
-fn extract_error_message(response: reqwest::blocking::Response) -> String {
+/// The body read is capped at [`MAX_ERROR_BODY_BYTES`]. Any occurrence of
+/// `secret` (the client's own bearer token, which a server or proxy may
+/// reflect back) is redacted BEFORE sanitization and truncation, so not
+/// even a token prefix can survive the length cap. The result is then
+/// sanitized (control characters stripped, whitespace collapsed) and
+/// capped at [`MAX_ERROR_MESSAGE_CHARS`] before it can reach stderr.
+fn extract_error_message(response: reqwest::blocking::Response, secret: &str) -> String {
     let mut raw = Vec::new();
     if response
         .take(MAX_ERROR_BODY_BYTES)
@@ -172,11 +175,23 @@ fn extract_error_message(response: reqwest::blocking::Response) -> String {
             .unwrap_or_default(),
         Err(_) => body.into_owned(),
     };
-    let sanitized = sanitize_message(&candidate);
+    let sanitized = sanitize_message(&redact_secret(&candidate, secret));
     if sanitized.is_empty() {
         NO_ERROR_DETAILS.to_string()
     } else {
         sanitized
+    }
+}
+
+/// Replace every occurrence of `secret` in `text` with [`REDACTED`].
+///
+/// An empty secret is left alone (a plain `str::replace("")` would insert
+/// the marker between every character).
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, REDACTED)
     }
 }
 
