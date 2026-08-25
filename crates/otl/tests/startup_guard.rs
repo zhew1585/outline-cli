@@ -58,9 +58,23 @@ fn isolated_otl(tag: &str) -> (PathBuf, PathBuf) {
 
 /// Command for the isolated binary, running from its temp dir with Outline
 /// env scrubbed.
+/// A configuration directory that deliberately does not exist, so these
+/// tests never read - or write - the developer's real credential file, and
+/// so credential resolution depends on the environment alone.
+const NO_CREDENTIALS_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/no-credentials");
+
+/// Point a command at an empty credential store and silence the one-time
+/// plaintext-key notice, which is not what these tests are about.
+fn isolate(cmd: &mut Command) -> &mut Command {
+    cmd.env("OUTLINE_CONFIG_DIR", NO_CREDENTIALS_DIR)
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .env_remove("OUTLINE_PROFILE")
+}
+
 fn otl_cmd(dir: &Path, bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
-    cmd.current_dir(dir)
+    isolate(&mut cmd)
+        .current_dir(dir)
         .env_remove("OUTLINE_URL")
         .env_remove("OUTLINE_API_KEY");
     cmd

@@ -15,13 +15,12 @@ use std::io::Read;
 use anyhow::anyhow;
 use clap::Args;
 use engine::{
-    BodyMode, Client, EngineError, ErrorDetail, Fetched, Truncation, TruncationCause,
-    ValidationMode,
+    BodyMode, EngineError, ErrorDetail, Fetched, Truncation, TruncationCause, ValidationMode,
 };
 use serde_json::Value;
 
-use crate::config::Config;
-use crate::errors::{map_engine_error, map_engine_error_with_hint};
+use crate::auth;
+use crate::errors::map_engine_error_with_hint;
 use crate::exit::CliError;
 use crate::ops;
 use crate::paging;
@@ -125,9 +124,9 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         Payload::Raw(_) => None,
     };
     check_limit_usage(cmd, &payload, pagination.is_some())?;
-    let config = Config::from_env().map_err(CliError::usage)?;
-
-    let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
+    // One place resolves the credential for every command, and it hands the
+    // request channel a source that renews itself (see `crate::auth`).
+    let client = auth::client()?;
     let detail = error_detail(cmd);
     let fetched = match (&payload, &pagination) {
         (Payload::KeyValue(args), Some(spec)) => {

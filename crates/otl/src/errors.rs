@@ -10,7 +10,7 @@
 //! construction (see `engine::error`). Never interpolate raw URLs,
 //! tokens, or unsanitized server text here.
 
-use engine::EngineError;
+use engine::{CredentialFault, EngineError};
 
 use crate::config::ENV_API_KEY;
 use crate::exit::{CliError, ExitCode};
@@ -54,6 +54,16 @@ pub fn map_engine_error_with_hint(error: EngineError, hint: Option<&str>) -> Cli
 /// Pick the exit code and compose the top-level message for an engine error.
 fn classify(error: &EngineError) -> (ExitCode, String) {
     match error {
+        // The credential source composed its own actionable message (it
+        // knows whether the fix is `chmod`, `otl auth login`, or an
+        // environment variable); only the exit class is decided here.
+        EngineError::Credential(inner) => (
+            match inner.fault {
+                CredentialFault::Unavailable => ExitCode::Usage,
+                CredentialFault::ReauthRequired => ExitCode::Auth,
+            },
+            inner.message.clone(),
+        ),
         EngineError::InvalidBaseUrl { .. } => (ExitCode::Usage, error.to_string()),
         // Nothing was sent, so this is a configuration problem, not a
         // network one: no retry hint, and exit code 2.

@@ -14,9 +14,23 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 
 /// `otl` with valid-looking config pointing at a closed port.
+/// A configuration directory that deliberately does not exist, so these
+/// tests never read - or write - the developer's real credential file, and
+/// so credential resolution depends on the environment alone.
+const NO_CREDENTIALS_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/no-credentials");
+
+/// Point a command at an empty credential store and silence the one-time
+/// plaintext-key notice, which is not what these tests are about.
+fn isolate(cmd: &mut Command) -> &mut Command {
+    cmd.env("OUTLINE_CONFIG_DIR", NO_CREDENTIALS_DIR)
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .env_remove("OUTLINE_PROFILE")
+}
+
 fn otl_offline() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env("OUTLINE_URL", CLOSED_PORT_URL)
+    isolate(&mut cmd)
+        .env("OUTLINE_URL", CLOSED_PORT_URL)
         .env("OUTLINE_API_KEY", "test-key");
     cmd
 }
@@ -24,7 +38,8 @@ fn otl_offline() -> Command {
 /// `otl` pointed at a wiremock server.
 fn otl_online(uri: &str) -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env("OUTLINE_URL", uri)
+    isolate(&mut cmd)
+        .env("OUTLINE_URL", uri)
         .env("OUTLINE_API_KEY", "test-key");
     cmd
 }

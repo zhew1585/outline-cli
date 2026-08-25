@@ -15,9 +15,24 @@ use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// `otl` command with Outline env scrubbed for deterministic tests.
+/// A configuration directory that deliberately does not exist, so these
+/// tests never read - or write - the developer's real credential file, and
+/// so credential resolution depends on the environment alone.
+const NO_CREDENTIALS_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/no-credentials");
+
+/// Point a command at an empty credential store and silence the one-time
+/// plaintext-key notice, which is not what these tests are about.
+fn isolate(cmd: &mut Command) -> &mut Command {
+    cmd.env("OUTLINE_CONFIG_DIR", NO_CREDENTIALS_DIR)
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .env_remove("OUTLINE_PROFILE")
+}
+
 fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env_remove("OUTLINE_URL").env_remove("OUTLINE_API_KEY");
+    isolate(&mut cmd)
+        .env_remove("OUTLINE_URL")
+        .env_remove("OUTLINE_API_KEY");
     cmd
 }
 

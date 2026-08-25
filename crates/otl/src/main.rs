@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
+use otl::commands::auth::{self, AuthArgs};
 use otl::exit::ExitCode;
 use otl::render;
 use otl::stdio;
@@ -27,6 +28,8 @@ struct Cli {
 enum Command {
     /// Call any API operation by name (output format unstable).
     Api(ApiArgs),
+    /// Sign in, sign out, and inspect stored credentials.
+    Auth(AuthArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -35,6 +38,7 @@ fn main() -> std::process::ExitCode {
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
         Command::Api(args) => api::run(args, mode),
+        Command::Auth(args) => auth::run(args, mode),
     };
     match result {
         Ok(()) => ExitCode::Success.into(),
