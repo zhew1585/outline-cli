@@ -3,13 +3,12 @@
 # exceeds the threshold. Also reports the release binary size.
 #
 # Performance target (specs/spec-outline-cli/SPEC.md, Constraints):
-#   mean cold start < 10 ms on a local release build.
-# CI runs on shared, noisy runners, so .github/workflows/ci.yml overrides the
-# gate to 25 ms via STARTUP_THRESHOLD_MS; 10 ms stays the local default here.
+#   mean cold start < 10 ms on a release build. This is a hard acceptance
+#   line; CI (.github/workflows/ci.yml) enforces the same 10 ms threshold.
 #
 # Usage:
-#   ./scripts/bench-startup.sh                       # gate at 10 ms
-#   STARTUP_THRESHOLD_MS=25 ./scripts/bench-startup.sh
+#   ./scripts/bench-startup.sh                      # gate at 10 ms
+#   STARTUP_THRESHOLD_MS=5 ./scripts/bench-startup.sh
 set -euo pipefail
 
 # Gate threshold in milliseconds (override via STARTUP_THRESHOLD_MS).

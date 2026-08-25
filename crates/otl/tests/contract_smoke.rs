@@ -20,9 +20,13 @@ fn contract_credentials() -> Option<(String, String)> {
     Some((url, key))
 }
 
+// The smoke uses `documents.search` because the current IR table only
+// compiles the documents.* subset (Story 1.1 MVP slice). Once the
+// full-endpoint IR lands (Story 1.2), switch this to `auth.info` for a
+// cheaper, side-effect-free identity check.
 #[test]
 #[ignore = "contract test: needs OUTLINE_TEST_URL / OUTLINE_TEST_API_KEY"]
-fn auth_info_succeeds_against_real_workspace() {
+fn documents_search_succeeds_against_real_workspace() {
     let Some((url, key)) = contract_credentials() else {
         eprintln!("skipping: OUTLINE_TEST_URL / OUTLINE_TEST_API_KEY not set");
         return;
@@ -32,20 +36,22 @@ fn auth_info_succeeds_against_real_workspace() {
         .unwrap()
         .env("OUTLINE_URL", &url)
         .env("OUTLINE_API_KEY", &key)
-        .args(["api", "auth.info"])
+        .args(["api", "documents.search", "query=contract-smoke"])
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "otl api auth.info failed: {}",
+        "otl api documents.search failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let payload: serde_json::Value =
         serde_json::from_str(&stdout).expect("stdout should be JSON for jq consumption");
+    // `otl api` prints the `data` field of the Outline envelope; for
+    // documents.search that is an array of search results (possibly empty).
     assert!(
-        payload.get("user").is_some() || payload.get("team").is_some(),
-        "auth.info payload should describe the authenticated identity"
+        payload.is_array(),
+        "documents.search data payload should be an array, got: {payload}"
     );
 }
