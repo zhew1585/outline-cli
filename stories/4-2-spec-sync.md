@@ -29,15 +29,17 @@ so that 新端点无需等 CLI 发版。
   - [x] 操作名/请求路径安全校验（`is_safe_op_name` / `is_safe_path`）
   - [x] `tests/spec_parity.rs`：vendored spec 编译期产物与运行时产物逐字段相等
 - [x] Task 2: 文档下载通道 (AC: 1)
-  - [x] `engine::fetch::fetch_document`：单次无认证 GET、16 MiB 上限、UTF-8 校验、错误响应体不回显
+  - [x] `engine::fetch::DocumentFetch`：无认证 GET、16 MiB 上限、UTF-8 校验、错误响应体不回显
+  - [x] 复用 `RetryPolicy` + `Throttle`：429 按 Retry-After/退避重试、每次尝试过节流、耗尽为独立错误（退 8）
   - [x] URL 校验（http/https、有 host、无 userinfo），错误信息不回显 URL
-  - [x] 新增 `EngineError::InvalidDocumentUrl`（退出码 2）与 `EngineError::UnusableDocument`（退出码 1）
+  - [x] 独立错误域 `FetchError` + `errors::map_fetch_error`（退出码语义不变，文案不提 Outline 凭证/实例）
 - [x] Task 3: bincode IR 缓存 (AC: 1, 2)
   - [x] `crates/otl/src/spec/cache.rs`：magic + 布局版本 + SHA-256 + bincode body
   - [x] 缓存 key 三要素：spec hash（provenance）+ CLI 版本 + IR schema 版本，任一不符整体废弃
   - [x] 位置经 `directories` 解析（Linux `~/.cache/outline-cli`、macOS `~/Library/Caches/outline-cli`、Windows `%LOCALAPPDATA%\outline-cli\cache`）；`OTL_CACHE_DIR` 覆盖
-  - [x] 写入：同目录 temp → fsync → rename；Unix 上直接以 0600 创建；失败清理 temp
-  - [x] 读取：尺寸上限 + bincode limit + 校验和 + 版本 + 逐 op 路径安全校验
+  - [x] 写入：同目录随机名 temp（`tempfile`，O_EXCL + Unix 0600）→ fsync → persist（Windows 亦替换）；失败即清理
+  - [x] 写入前校验：load 侧全部规则 + 编码长度上限（bincode limit 只约束解码）
+  - [x] 读取：文件尺寸 → magic → 布局版本 → 校验和 → 解码且无尾随字节 → 版本 → provenance → 逐 op 校验
 - [x] Task 4: 运行时表解析 (AC: 1, 2, 3)
   - [x] `ops::table()`：`OnceLock` 惰性解析，缓存优先、内置兜底
   - [x] 缓存不可用 → stderr 一行警告（区分 damaged / outdated）+ 修复命令，退出码不受影响
@@ -51,8 +53,9 @@ so that 新端点无需等 CLI 发版。
   - [x] wiremock 端到端：sync 后 `api list` 含新端点且可 dispatch
   - [x] 损坏/截断/空/异物/目录占位缓存 → 全部退 0 回退内置
   - [x] 版本不匹配（布局版本 / IR schema / CLI 版本）→ 废弃且判定为 outdated
-  - [x] `tests/no_phone_home.rs`：网络入口收敛 + 本地命令在出口全断时仍成功
-  - [x] `docs/exit-codes.md` 登记新错误类；README 更新（唯一通道表述、spec 生命周期）
+  - [x] `tests/no_phone_home.rs`：网络入口收敛（约束 reqwest crate 与裸 socket）+ 本地命令在出口全断时仍成功
+  - [x] 旧 CLI 测试统一隔离 `OTL_CACHE_DIR`（`tests/common/mod.rs`）
+  - [x] `docs/exit-codes.md` 登记新错误类与两个错误域的文案约束；README 更新；`project-context.md` 登记第 3 条 HTTP 例外
 
 ## Dev Notes
 
@@ -67,14 +70,25 @@ so that 新端点无需等 CLI 发版。
 - **缓存 key 里的 spec hash**：加载时无法用 hash 做查找（运行时手里没有 spec 可以算 hash），所以 hash 是 provenance +
   「是否需要重写」的判据，CLI 版本与 IR schema 版本才是准入校验。三者都在 header 里。
 - **缓存是独立信任边界**：文件可能被截断、位翻转、被别的进程写、被上一版 CLI 留下。加载顺序为
-  尺寸 → magic → 布局版本 → 校验和 → bincode → IR schema 版本 → CLI 版本 → 每个 op 的 name/path 安全性。
-  任一失败即整体废弃，**不做迁移**。
+  文件尺寸 → magic → 布局版本 → 校验和 → bincode 解码且无尾随字节 → IR schema 版本 → CLI 版本 →
+  provenance → 每个 op 的 name/path/绑定/文本。任一失败即整体废弃，**不做迁移**。
 - **路径校验是安全需求不是洁癖**：engine 以 `format!("{base}{path}")` 拼 URL。若 IR 里出现 `@evil.example/x`，
   `https://host` + 该 path = `https://host@evil.example/x`，host 变成 userinfo，Bearer token 直接送给攻击者。
   因此下载的 spec 与缓存文件两侧都强制「纯绝对路径」白名单（禁 `@ : ? # % //` 与 `..`）。
-- **两条 HTTP 通道的取舍**：spec 下载既不能带 token（第三方主机），也没有 429 退避/节流/信封映射的意义，塞进
-  `Client::send` 会污染那条通道的不变量。所以 HTTP 仍全部在 engine 内，但分成「认证请求通道」与「明文文档通道」两处，
-  由 `tests/no_phone_home.rs` 断言只有这两处出现 `.send()`。
+- **两条 HTTP 通道的取舍**（R1 审查后修正）：spec 下载不能带 token（第三方主机），但**「不带 token」不等于「可以没有退避」**——
+  初版把 429 当普通 HTTP 错误一次性返回，绕过了唯一通道的 retry/throttle，这是审查判定的 BLOCKER。现在
+  `engine::fetch::DocumentFetch` 复用 `RetryPolicy` 与 `Throttle`：429 按 Retry-After/带抖动退避重试、每次尝试都过节流、
+  重试耗尽是独立错误（CLI 退出码 8）。同时错误域独立（`FetchError`），因为文档主机不是 Outline API：它的 401 不该提示
+  用户检查 `OUTLINE_API_KEY`（fetch 从不发送它），它的连接失败不该提示检查 `OUTLINE_URL`（与失败地址无关）。
+  该例外连同附加义务已登记进 `project-context.md`（第 3 条 HTTP 例外）。
+- **不受信输入的三层校验**（R1 后加强）：
+  1. **编译期**：路径/操作名白名单 + 递归深度 + 「有语义的文本」（content type、参数名、format、enum 值）控制字符与长度校验；
+     纯展示文本（summary）改为**清洗**（丢控制字符 + 截断）而不是拒绝——`api list` 是行协议，一个 `\t` 就能伪造一列。
+  2. **缓存加载**：同一套规则再跑一遍，外加 `path == "/api/" + name` 这个**语义绑定**断言。只校验字符安全是不够的：
+     name=`documents.search` / path=`/api/documents.delete` 两个字段各自都合法，却能让无害命令带着 Bearer token 打到删除端点。
+  3. **provenance**：`source` 与 `spec_hash` 也会被打印，同样校验（hex 摘要 + 可打印且限长）。
+- **复杂度是攻击面**：宽 schema 的属性去重/required 标记原为线性扫描（O(n²)，实测 64k 属性约 4.4s CPU，输入只有几 MB），
+  sync 变更报告的 diff 原为嵌套 contains（O(n×m)）。两处都改为 hash set。
 - **启动预算**：实测 `otl --help` 3.64 ms（阈值 10 ms，release，hyperfine -N，794 runs）；缓存解析只在真正需要
   操作表时发生，实测 113 op / 16 KB 缓存约 +0.3 ms（`api list` 6.0 → 6.3 ms）。release 二进制 2.65 MB。
 - **stale 也会警告**：CLI 升级后缓存必然失效。静默回退会让「昨天还能用的端点今天报 unknown operation」变成谜题，
@@ -87,16 +101,15 @@ so that 新端点无需等 CLI 发版。
 ```
 crates/
   speccompile/            # 新：共用 OpenAPI -> IR 编译器（无 vendor 特定内容）
-    src/{lib.rs, schema.rs}
+    src/{lib.rs, schema.rs, text.rs}
   engine/
-    src/fetch.rs          # 新：明文文档通道
-    src/error.rs          # +2 variants
+    src/fetch.rs          # 新：明文文档通道（独立错误域 + 复用 retry/throttle）
   otl/
     build.rs              # 瘦身：只渲染静态表
     src/spec/{mod.rs, cache.rs}   # 新：spec 生命周期 + bincode 缓存
     src/ops.rs            # 表解析（缓存优先，内置兜底）
     src/commands/spec.rs  # 新：sync / reset
-    tests/{spec_cache.rs, spec_sync_e2e.rs, spec_parity.rs, no_phone_home.rs}
+    tests/{spec_cache.rs, spec_sync_e2e.rs, spec_parity.rs, no_phone_home.rs, common/mod.rs}
 ```
 
 ### References
@@ -123,11 +136,37 @@ claude-opus-5 (Claude Code agent), 2026-08-26
   为此在 `engine::fetch` 暴露 `document_origin`。
 - `directories` 在 macOS 上不认 `XDG_CACHE_HOME`，所以测试覆盖走专用的 `OTL_CACHE_DIR`。
 
+### Review R1 处置（codex gpt-5.6-sol，1 BLOCKER + 10 MAJOR + 5 MINOR，全部修复）
+
+| # | 处置 |
+|---|------|
+| 1 BLOCKER 第二通道绕过 429/节流/错误映射 | `DocumentFetch` 复用 `RetryPolicy`+`Throttle`，429 退避重试、耗尽退 8；例外与附加义务写入 `project-context.md`。测试：retry / Retry-After 计时 / 精确请求数的耗尽 / pacing / CLI 退 8 |
+| 2 fetch 错误进 Outline 错误映射 | 独立 `FetchError` + `errors::map_fetch_error`；撤回上一版加进 `EngineError` 的两个 variant（engine/src/error.rs 回到 develop 状态）。测试：401/403/404/500/418 与不可达地址均断言不出现 `OUTLINE_API_KEY`/`OUTLINE_URL` |
+| 3 缓存可同源重映射 | `validate_ops` 断言 `path == "/api/" + name`，并加重名检查。测试：单测 + 缓存文件级 |
+| 4 不受信文本进终端 | summary 清洗、有语义文本拒绝且不回显、长度上限；缓存加载与 provenance 同样校验。测试：编译器 5 例 + 缓存 2 例 + CLI e2e |
+| 5 temp 名可预测 / 权限继承 | 改用 `tempfile`（随机名 + `create_new` + Unix 0600 + drop 清理）。测试：symlink 不被穿透、0666 旧文件不被继承、预放 temp 无影响 |
+| 6 Windows rename 不替换 | `NamedTempFile::persist`（内部 `MOVEFILE_REPLACE_EXISTING`）。`a_store_replaces_an_existing_cache` 现在是 Windows 回归测试（CI 三平台矩阵会跑） |
+| 7 尺寸上限不对称 | 一个上限派生出 body 上限；encode 后显式校验（bincode limit 只管解码），store 侧同时跑 load 侧规则。测试：超限拒绝且不落文件、近上限往返 |
+| 8 属性 O(n²) | `HashSet` 去重与 required。测试：20k 属性（整套编译器测试 0.1s） |
+| 9 diff O(n×m) | `HashSet` |
+| 10 `$ref` 二次转义 | 改为按 RFC 6901 **反转义**后直接索引 schema map。测试：`A/B`、`A~B`、`A~1B`、`a/b/c` |
+| 11 旧测试未隔离 cache | 新增 `tests/common/mod.rs`，api_list / api_params / api_e2e / paging_e2e / startup_guard / contract_smoke 全部指向一个**故意不存在**的 cache 目录 |
+| 12 尾随字节被接受 | 校验 `consumed == body.len()` |
+| 13 `.send()` 守卫太弱 | 守卫改为约束 **reqwest crate 本身**与裸 socket（`std::net`/`TcpStream`/`UdpSocket`），并加「manifest 不得出现第二个 HTTP/TLS 栈」与「allowlist 文件必须存在」两条断言 |
+| 14 allowlist 粒度太粗 | allowlist 改为「文件 + 模式 + 该行必须含的上下文」，另加「runtime 不得出现 `read_to_string`（除用户指定路径的两处）」。已用报告里的原样 bypass 实验验证会被抓住 |
+| 15 `--spec` 对 FIFO 阻塞 | 打开前先 `fs::metadata` 判类型，非普通文件即 usage error。测试：FIFO（带看门狗，回归时失败而非挂死）+ 目录 |
+| 16 函数 >50 行 | `fetch_document` 拆成 `DocumentFetch` 的方法、`collect_facets` 抽出 `merge_facets`；脚本核对本 story 新增/改动的函数全部 <50 行（仓库里仅剩 Epic 1 的 `client::send`、`extract_error_parts`、`paginate::fetch_all_pages` 超限，不在本 story 范围） |
+
+审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
+
 ### Completion Notes List
 
 - 偏差 1：`--spec` 实现为 `spec sync --spec <path>` 而非全局 flag（理由见 Dev Notes）。
 - 偏差 2：额外加了 `otl spec reset`。没有它，用户 sync 到一份坏 spec 后无法自助恢复（需要知道缓存路径去手删）。
 - 偏差 3：为缓存错误在 otl 引入 thiserror（anyhow 仍是边界类型）。"stale vs damaged" 需要可判定，字符串不够。
+  （R1 审查确认该读法与现有文字规则不冲突。）
+- 偏差 4（R1 后）：`tempfile` 从 dev-dependency 提为 otl 的正式依赖。原子写要的是「随机名 + O_EXCL + Unix 0600 +
+  Windows 替换语义 + 失败自清理」，手写这四件事只会写出更差的版本。
 - `crates/engine/src/ir.rs` **未改动一行**（IR 已 derive Serialize/Deserialize 且已有 `IR_SCHEMA_VERSION`，
   `Cow<'static, _>` 反序列化为 Owned 即可）。这是为了不与 Epic 4a 的 schema 驱动列改动冲突。
 - `build.rs` 大幅瘦身（432 → 165 行）：解析逻辑整体搬到 `spec-compile`，只留渲染与两个变体名映射函数。
@@ -137,19 +176,21 @@ claude-opus-5 (Claude Code agent), 2026-08-26
   vendored spec 的断言失真。
 - `tests/startup_guard.rs`：二进制内容检查从「文件名」改为「文件路径」（上游 URL 恰好以同名文件结尾），
   并加了两条 allowlist（上游 URL 常量、`--spec` flag 名）。守卫语义未削弱：运行时仍不得定位 vendored spec。
-- 质量门：`cargo fmt --all -- --check` / `cargo clippy --all-targets --all-features -D warnings` /
-  `cargo test --workspace`（341 passed, 0 failed, 1 ignored）/ `scripts/bench-startup.sh`（3.637 ms < 10 ms）全绿。
+- 质量门（R1 修复后重跑）：`cargo fmt --all -- --check` / `cargo clippy --all-targets --all-features -D warnings` /
+  `cargo test --workspace` / `scripts/bench-startup.sh` 全绿，数字见汇报。
 - 架构红线复查：`grep -ri outline crates/engine crates/speccompile` 零命中。
 
 ### File List
 
 - Cargo.toml, Cargo.lock
-- crates/speccompile/Cargo.toml, crates/speccompile/src/{lib.rs, schema.rs}
-- crates/engine/Cargo.toml（无改动）, crates/engine/src/{lib.rs, error.rs, fetch.rs}, crates/engine/tests/fetch.rs
+- crates/speccompile/Cargo.toml, crates/speccompile/src/{lib.rs, schema.rs, text.rs}
+- crates/engine/Cargo.toml（无改动）, crates/engine/src/{lib.rs, fetch.rs}, crates/engine/tests/fetch.rs
+  （crates/engine/src/error.rs 在 R1 后回到 develop 原状：fetch 用独立错误类型）
 - crates/otl/Cargo.toml, crates/otl/build.rs
 - crates/otl/src/{lib.rs, ops.rs, errors.rs, main.rs}
 - crates/otl/src/spec/{mod.rs, cache.rs}
 - crates/otl/src/commands/{mod.rs, api.rs, spec.rs}
-- crates/otl/tests/{spec_cache.rs, spec_sync_e2e.rs, spec_parity.rs, no_phone_home.rs, ir_table.rs, startup_guard.rs}
-- docs/exit-codes.md, README.md
+- crates/otl/tests/{spec_cache.rs, spec_sync_e2e.rs, spec_parity.rs, no_phone_home.rs, ir_table.rs, startup_guard.rs,
+  common/mod.rs}；cache 隔离补丁另涉 {api_list.rs, api_params.rs, api_e2e.rs, paging_e2e.rs, contract_smoke.rs}
+- docs/exit-codes.md, README.md, project-context.md（第 3 条 HTTP 例外 + 两条 Windows/终端注入的反模式）
 - stories/4-2-spec-sync.md
