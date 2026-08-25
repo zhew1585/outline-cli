@@ -14,8 +14,14 @@ use serde_json::Value;
 
 /// Prefix selecting the operation subset compiled in this milestone.
 const OP_PATH_PREFIX: &str = "/documents.";
+/// Outline URL convention: every RPC path lives under this prefix. This is
+/// an Outline-specific rule, so it is applied here (the otl layer), never
+/// in the engine - the engine joins `base_url + op.path` verbatim.
+const API_PATH_PREFIX: &str = "/api";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
 const IR_SCHEMA_VERSION: u32 = 1;
+/// JSON pointer prefix for local component-schema references.
+const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
 
 struct Op {
     name: String,
@@ -81,8 +87,8 @@ fn extract_ops(spec: &Value) -> Vec<Op> {
         .filter_map(|(path, item)| {
             item.get("post").map(|post| Op {
                 name: path.trim_start_matches('/').to_string(),
-                path: path.clone(),
-                params: extract_params(post),
+                path: format!("{API_PATH_PREFIX}{path}"),
+                params: extract_params(post, spec),
             })
         })
         .collect();
@@ -92,28 +98,82 @@ fn extract_ops(spec: &Value) -> Vec<Op> {
 
 /// Extract scalar request-body parameters from one POST operation.
 ///
-/// Only top-level scalar properties are typed; everything else (objects,
-/// arrays, unions, $ref) is marked `Json`. Non-JSON bodies yield no params.
-fn extract_params(post: &Value) -> Vec<Param> {
+/// `allOf` compositions and local `$ref`s into `components.schemas` are
+/// expanded. Only top-level scalar properties are typed; everything else
+/// (objects, arrays, unions) is marked `Json`. Non-JSON bodies yield no
+/// params.
+fn extract_params(post: &Value, spec: &Value) -> Vec<Param> {
     let schema = post
         .pointer("/requestBody/content/application~1json/schema")
         .unwrap_or(&Value::Null);
-    let required: Vec<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    properties
-        .iter()
-        .map(|(name, prop)| Param {
-            name: name.clone(),
-            ty: param_type(prop),
-            required: required.contains(&name.as_str()),
+    let mut params: Vec<Param> = Vec::new();
+    let mut required: Vec<String> = Vec::new();
+    collect_schema(schema, spec, 0, &mut params, &mut required);
+    params
+        .into_iter()
+        .map(|param| Param {
+            required: required.iter().any(|name| name == &param.name),
+            ..param
         })
         .collect()
+}
+
+/// Maximum `$ref`/`allOf` expansion depth (guards against reference cycles).
+const MAX_SCHEMA_DEPTH: usize = 8;
+
+/// Recursively collect `properties` and `required` from a schema,
+/// expanding `allOf` branches and local `$ref`s. Later duplicate property
+/// names are ignored (first definition wins).
+fn collect_schema(
+    schema: &Value,
+    spec: &Value,
+    depth: usize,
+    params: &mut Vec<Param>,
+    required: &mut Vec<String>,
+) {
+    if depth > MAX_SCHEMA_DEPTH {
+        panic!("schema $ref/allOf nesting exceeds {MAX_SCHEMA_DEPTH} levels (cycle?)");
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        collect_schema(
+            resolve_ref(reference, spec),
+            spec,
+            depth + 1,
+            params,
+            required,
+        );
+        return;
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            collect_schema(branch, spec, depth + 1, params, required);
+        }
+    }
+    if let Some(list) = schema.get("required").and_then(Value::as_array) {
+        required.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, prop) in properties {
+            if params.iter().all(|existing| existing.name != *name) {
+                params.push(Param {
+                    name: name.clone(),
+                    ty: param_type(prop),
+                    required: false,
+                });
+            }
+        }
+    }
+}
+
+/// Resolve a local `#/components/schemas/...` reference.
+fn resolve_ref<'a>(reference: &str, spec: &'a Value) -> &'a Value {
+    let Some(name) = reference.strip_prefix(COMPONENTS_SCHEMAS_REF) else {
+        panic!("unsupported $ref {reference:?}: only {COMPONENTS_SCHEMAS_REF}* is handled");
+    };
+    match spec.pointer(&format!("/components/schemas/{name}")) {
+        Some(resolved) => resolved,
+        None => panic!("$ref {reference:?} does not resolve in the vendored spec"),
+    }
 }
 
 fn param_type(prop: &Value) -> &'static str {

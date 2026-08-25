@@ -22,14 +22,16 @@ fn table_contains_key_operations() {
 }
 
 #[test]
-fn every_op_is_a_documents_op_with_matching_path() {
+fn every_op_is_a_documents_op_with_api_prefixed_path() {
     for op in ops::OPS {
         assert!(
             op.name.starts_with("documents."),
             "unexpected op {:?}",
             op.name
         );
-        assert_eq!(op.path.as_ref(), format!("/{}", op.name));
+        // The Outline URL convention (`/api/...`) is applied by the otl
+        // build pipeline; the engine joins base + path verbatim.
+        assert_eq!(op.path.as_ref(), format!("/api/{}", op.name));
     }
 }
 
@@ -38,6 +40,53 @@ fn documents_info_has_string_id_param() {
     let op = ops::find("documents.info").unwrap();
     let param = op.param("id").unwrap();
     assert_eq!(param.ty, ParamType::String);
+}
+
+#[test]
+fn documents_search_expands_all_of_params() {
+    // `documents.search` composes its schema via allOf + $ref (Pagination);
+    // the build pipeline must expand both.
+    let op = ops::find("documents.search").unwrap();
+    let query = op.param("query").unwrap();
+    assert_eq!(query.ty, ParamType::String);
+    // From the referenced Pagination component schema.
+    let limit = op.param("limit").unwrap();
+    assert_eq!(limit.ty, ParamType::Number);
+    let offset = op.param("offset").unwrap();
+    assert_eq!(offset.ty, ParamType::Number);
+    // Array parameter falls back to Json.
+    let filters = op.param("filters").unwrap();
+    assert_eq!(filters.ty, ParamType::Json);
+}
+
+#[test]
+fn documents_list_expands_multiple_refs() {
+    // `documents.list` composes Pagination + Sorting + inline properties.
+    let op = ops::find("documents.list").unwrap();
+    assert_eq!(op.param("sort").unwrap().ty, ParamType::String);
+    assert_eq!(op.param("direction").unwrap().ty, ParamType::String);
+    assert_eq!(op.param("limit").unwrap().ty, ParamType::Number);
+    assert!(op.param("collectionId").is_some());
+}
+
+#[test]
+fn no_all_of_op_has_an_empty_param_table() {
+    // Regression guard for the allOf bug: these ops declare params only
+    // through allOf and must not end up with empty tables.
+    for name in [
+        "documents.search",
+        "documents.search_titles",
+        "documents.list",
+        "documents.drafts",
+        "documents.viewed",
+        "documents.archived",
+        "documents.deleted",
+        "documents.answerQuestion",
+        "documents.group_memberships",
+    ] {
+        let op = ops::find(name).unwrap();
+        assert!(!op.params.is_empty(), "{name} has an empty param table");
+    }
 }
 
 #[test]
