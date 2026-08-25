@@ -95,12 +95,33 @@ otl --url https://other.example.com api auth.info
 OUTLINE_CONFIG= otl api auth.info             # empty value: ignore the config file entirely
 ```
 
-The config file holds no secrets, by construction: an `api_key` or `token` key anywhere in it is a hard
-error pointing at `credentials.toml`. A missing config file is not an error — the environment-only path
-works on a fresh machine — but a file named explicitly with `--config`/`OUTLINE_CONFIG` must exist, and
-an unknown key, an unknown profile, or malformed TOML fails with exit code 2 before any request. Parse
-errors report a location and a kind, never a quoted line, so a secret wrongly placed in the file is not
-echoed back.
+**Credentials are scoped to their instance.** A profile names a server, so its key is read from that
+profile's own variable and from nowhere else:
+
+```sh
+export OUTLINE_API_KEY=...                    # used only when no profile is in effect
+export OUTLINE_API_KEY_WORK=...               # used by --profile work
+export OUTLINE_API_KEY_PERSONAL=...           # used by --profile personal
+```
+
+The name is `OUTLINE_API_KEY_` plus the profile name upper-cased, with anything other than an ASCII
+letter or digit becoming `_` (`self-hosted` → `OUTLINE_API_KEY_SELF_HOSTED`). A profile never falls back
+to the global `OUTLINE_API_KEY`: falling back would send the key that happens to be exported to whichever
+instance the selected profile points at, which is one workspace's credential going to another
+workspace's server. When a profile is missing its key, `otl` says which variable to set and exits 2
+without making a request. If `OUTLINE_URL` points somewhere other than the selected profile declares,
+precedence still applies (env beats the file) but a warning goes to stderr, since the profile's
+credential is then travelling to an instance the profile did not name; `--url` is the deliberate way to
+redirect a profile and is not warned about.
+
+The config file holds no secrets, by construction: an `api_key` or `token` key — at the top level or in a
+profile — is a hard error pointing at `credentials.toml`, and any other unrecognized key (including a
+deeper table holding one) is rejected as an unknown key. A missing config file is not an error — the
+environment-only path works on a fresh machine — but a file named explicitly with
+`--config`/`OUTLINE_CONFIG` must exist, and an unknown key, an unknown profile, or malformed TOML fails
+with exit code 2 before any request. Parse diagnostics are built from a line number, a description `otl`
+owns, and the schema itself — never from the TOML parser's own text, which quotes the offending value —
+so a secret wrongly placed in the file is never echoed back.
 
 ## Shell completions
 
@@ -111,7 +132,12 @@ otl completions zsh > ~/.zfunc/_otl          # bash, zsh, fish, powershell, elvi
 Candidates are generated from the same command tree the binary parses with, so subcommands and flags can
 never drift from the build; `otl api` operation names come from the compiled IR table. bash, zsh and fish
 complete operation names; powershell and elvish get subcommands and flags only, because their upstream
-generators emit no candidates for positional arguments.
+generators emit no candidates for positional arguments. Every generated script states its own coverage in
+a header comment, so an installed file never over-claims.
+
+Completion scripts are executable code, so candidate text is constrained rather than trusted: an
+operation name must be a plain `resource.method` token (ASCII letters, digits, `.`, `_`, `-`) or it is
+not written at all, and the build fails outright if the vendored spec ever contains one that is not.
 
 ## Credential handling
 

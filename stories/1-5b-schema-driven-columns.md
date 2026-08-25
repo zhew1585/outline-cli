@@ -16,9 +16,12 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
 1. **Given** IR 中带有操作的响应字段描述
    **When** 在 TTY 上渲染列表响应
    **Then** 关键列由 schema 自动挑选，列选择是一套通用策略（无任何端点专属渲染代码或 IR 数据）
-2. **Given** 同一操作的两次响应携带了不同的可选字段
+2. **Given** 同一操作的两次响应
    **When** 渲染
-   **Then** 表头相同（列集合是操作的属性，不是某次响应的属性）
+   **Then** 列的**排序规则**来自 schema（操作的属性，与响应无关）；**出现哪些列**取决于响应实际携带了
+   哪些字段——因为 OpenAPI 的 `nullable: false` 只约束「出现时不为 null」，不代表字段必然存在，且
+   vendored spec 里所有响应 schema 的 `required` 均为空。同字段集的两次响应表头相同；
+   稀疏响应不得出现「整列全空」或「真实存在的字段被空列挤掉」
 3. **Given** schema 未描述的响应（raw `--body`、spec 未声明响应、spec 漂移）
    **When** 渲染
    **Then** 回退到 1.5 的数据驱动策略，不出现空表
@@ -38,9 +41,11 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
   - [x] `Facets` 增加 `read_only`（`readOnly`）
   - [x] build 依赖的 `serde_json` 开 `preserve_order`：schema 声明顺序是列排序的关键信号
 - [x] Task 3: 通用列选择策略 (AC: 1, 2, 3)
-  - [x] `select_schema_columns`：容器字段丢弃 → identity → label → 时间戳 → 其余必填 → 可空
+  - [x] `rank_schema_columns`：容器字段丢弃 → identity → label → 时间戳 → 其余非空 → 可空；
+        返回**完整排名**而非前四名
   - [x] 全部并列关系用 schema 声明顺序决胜
-  - [x] schema 的列在响应里完全不命中时回退数据驱动（`select_data_columns`，即原策略）
+  - [x] 调用方按「响应里至少一行有该字段」过滤排名，再取前 `MAX_TABLE_COLUMNS` 个
+  - [x] schema 一个候选都没贡献时回退数据驱动（`select_data_columns`，即原策略）
 - [x] Task 4: 接线 (AC: 1)
   - [x] `render::render(payload, mode, schema)`，`api.rs` 传 `&op.response_fields`
 - [x] Task 5: 测试 (AC: 1-4)
@@ -65,9 +70,21 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
   的裸字符串候选是 `text` < `title`——会把整篇 markdown 正文选成 label。所以 build 依赖开
   `preserve_order`。resolver 2 不在 build 依赖与普通依赖之间统一 feature，运行时的 `serde_json` 仍是排序
   map，`--json` 输出的键序因此完全没变（既有 JSON golden 原样通过，可作证据）。
-- **为什么不按数据裁剪 schema 列**：「响应里没出现的列就不显示」听起来贴心，但那会把列集合重新变成某次响应的
-  属性——正是 1-5b 要消灭的东西。只有「schema 的列在响应里一个都不命中」时才整体回退数据驱动（spec 漂移、
-  raw `--body` 返回了别的形状）。代价是偶尔出现一整列空值，换来确定性。
+- **为什么最终按数据裁剪 schema 列（R1 finding 6 的处置）**：原实现把 `nullable = false` 当成「字段必然
+  存在」，只要任一选中列命中就保留其余全空列。这在 OpenAPI 里不成立——non-nullable 只说「出现时不能是
+  null」——而且 vendored spec 里 32 个带 properties 的 component schema 的 `required` 全部为空，所以
+  「必然存在」这个信息**根本不在 schema 里**（也因此没有把 `required` 加进 `FieldSpec`：它对全部 schema
+  都是 false，是纯粹的死重量）。
+  实测退化：`[{"id":"d1","icon":"🔥"}]` 得到 id/title/createdAt/updatedAt 四列，后三列每行全空，
+  而真实存在的 `icon` 被四列上限挤掉。原测试 `schema_columns_do_not_depend_on_which_optional_fields...`
+  恰好用了只含 id 的稀疏行，却只断言表头不变，于是把退化当成了稳定性——审查者点得对。
+  **改为**：schema 提供**完整排名**（操作级、确定），调用方丢掉「没有任何一行携带」的字段后再取前四。
+  `nullable` 的语义随之更正为「非空字段当它出现时永远不是空单元格，因此更值得占一列」，不再声称「必然存在」。
+  新的确定性表述：**排序**与响应无关；**出现哪些列**只取决于响应携带的字段集合，与行序、map 迭代序无关。
+  新增测试：`a_sparse_response_shows_the_fields_it_has_not_empty_columns`（逐列断言「不得每行都空」）、
+  `a_present_field_is_never_crowded_out_by_an_absent_one`、
+  `the_schema_still_supplies_the_ranking_not_the_payload`、
+  `schema_columns_are_stable_for_responses_carrying_the_same_fields`。
 - **既有 golden 未变**：`render()` 只是多了一个 schema 参数，空切片即原策略。数据驱动策略保留为回退，
   两条路径各自有 golden。新增的 schema golden 里 `createdAt` 在 `updatedAt` 之前（schema 声明顺序），
   而数据驱动 golden 里 `updatedAt` 在前（那条策略的固定优先级表）——两者各自内部一致，互不影响。
@@ -76,6 +93,13 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
 - **`documents.search` 之类的操作**：`SearchResult` 只有 `context`(string)/`ranking`(number)/`document`
   (object)，策略给出 `context, ranking`——没有 identity 也不崩，这是 schema 的实际形状。
 - **无响应描述的操作**（如 `documents.delete`）`response_fields` 为空，直接走数据驱动/JSON 回退。
+
+### R1 对抗审查处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| 6 | MAJOR | 已修：schema 只提供排名，出现哪些列由响应字段集决定；不再把 `nullable=false` 当作「必然存在」；`required` 明确不入 IR（全 spec 皆空，纯死重量）；四个新测试钉住稀疏响应行为 |
+| — | 验证 | 审查者独立确认 resolver-2 的 build-dep feature 隔离成立（`.fingerprint` 里 runtime `["default","std"]` 与 build-script `[...,"preserve_order",...]` 两套 artifact 并存） |
 
 ### 故意留下的缺口
 

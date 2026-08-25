@@ -10,9 +10,14 @@ so that 不背命令。
 
 ## Acceptance Criteria
 
-1. **Given** `otl completions zsh`（bash/fish 同理）
+1. **Given** `otl completions <bash|zsh|fish|powershell|elvish>`
    **When** 装入 shell
-   **Then** 子命令、api 操作名、flag 名均可补全，补全内容由 IR 生成
+   **Then** 五个 shell 均可补全子命令与 flag 名；**bash / zsh / fish** 另可补全 api 操作名，
+   补全内容全部由 IR 生成。powershell / elvish 不含操作名（上游生成器对 positional 值不产候选，
+   见 Dev Notes），且每份生成脚本在头部注释里自陈其覆盖范围，不做超出实际的声明
+1b. **Given** 生成脚本会被 shell 执行
+   **When** IR 里出现含引号 / `$()` / 反引号 / 换行 / 控制字符的操作名
+   **Then** 该名字不写入脚本（build 期直接拒绝该 spec，运行期再过一次白名单）
 2. **Given** 输出被管道消费或重定向
    **When** 生成补全脚本
    **Then** 脚本走 stdout、诊断走 stderr；提前关闭管道不 panic
@@ -29,6 +34,11 @@ so that 不背命令。
   - [x] 生成前把 `ops::OPS` 的操作名（外加保留名 `list`）挂到 `api` 的 operation positional 上
   - [x] 只改用于生成的命令树副本：真实 parser 仍接受任意操作名，未知操作继续走 otl 自己的错误消息
   - [x] 用 `mut_args` 而不是 `mut_arg`（后者会重排 positional 索引，触发 clap 自身的 debug assert）
+- [x] Task 2b: 候选文本受约束而非受信任 (AC: 1b)
+  - [x] `is_safe_operation_name`：白名单 `[A-Za-z0-9._-]`，长度上限
+  - [x] `build.rs` 对 vendored spec 的操作名做同样检查，不合规直接 panic（构建失败）
+  - [x] fish 描述转义再加「丢弃控制字符 + 截断」
+  - [x] 每份脚本头部注释自陈覆盖范围（`#` 在五个 shell 里都是行注释）
 - [x] Task 3: 管道安全 (AC: 2)
   - [x] 脚本先生成到内存再经 `stdio::write_data` 写出（broken pipe = 正常结束，退出码 0）
   - [x] 生成路径不需要任何配置：无 URL、无 API key、无配置文件也必须成功
@@ -55,11 +65,35 @@ so that 不背命令。
   当公共 API 的 CLI 来说，押注 unstable API 不划算。
 - **启动预算**：`ops::OPS` 只在 completions 路径被遍历，`--help` 路径完全不碰。实测 3.38 ms。
   release 体积 2 783 488 字节（新增 clap_complete + toml + directories + IR 响应字段共 +216 KiB，预算 ~5 MB）。
-- **fish 描述转义**：单引号字符串里 `\` 与 `'` 需转义（操作摘要含撇号，如 “Change a users role”）。
+- **fish 描述转义**：单引号字符串里 `\` 与 `'` 需转义（操作摘要含撇号，如 “Change a users role”），
+  并丢弃控制字符——摘要来自 spec，ESC 若存活到补全描述里会在候选显示时被终端解释。
+- **候选文本是可执行代码（R1 finding 4 的处置）**：操作名会进入 bash 的 `opts="..."`、zsh 的
+  `_arguments` 单引号值表、fish 的 `-a "..."`。原实现只依赖「当前 spec 恰好安全」。现在两道防线：
+  `build.rs` 对 vendored spec 的操作名做白名单校验（不合规 → 构建失败，这是唯一能**排除**而非过滤问题的
+  地方），运行期 `is_safe_operation_name` 再过一遍（覆盖将来 `spec sync` 缓存这条不经过 build.rs 的路径）。
+  测试含 16 个敌对名字的白名单单测、对已编译 IR 全表的断言、从 fish 脚本里反向抽取候选再逐个验白名单、
+  以及 `bash -n` / `zsh -n` 语法检查。
+- **为什么 powershell / elvish 不补操作名（R1 finding 5 的处置）**：审查者认可「上游生成器不支持
+  positional values」是事实，但指出「宣称支持五种 shell 却只交付三种」是口径问题。处置是**收敛口径**而非
+  硬塞实现：AC 已按 shell 明确写清；`completions` 子命令的 long help 写清；README 写清；每份生成脚本
+  头部注释写清（powershell/elvish 的脚本会明说 “operation names are NOT completed here”，并指向
+  `otl api list`）。测试 `each_script_states_its_own_coverage` 与
+  `a_shell_that_claims_operation_names_actually_carries_them` 用同一个
+  `completes_operation_names(shell)` 判定表双向核对——脚本里的声明与实际内容不一致即失败。
+  不为这两个 shell 做 splice 注入的理由：它们的脚本是嵌套结构（elvish 的 `&'otl;api'= {...}` 映射、
+  powershell 的 `switch` 块），注入要手写两种新方言的 shell 代码，正是 finding 4 警告的那类风险；
+  fish 之所以例外，是因为它的格式是行式 `complete` 语句，可以纯追加。
+
+### R1 对抗审查处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| 4 | MAJOR | 已修：build 期白名单（构建失败）+ 运行期白名单 + 描述去控制字符；含敌对 fixture 与 `bash -n`/`zsh -n` 检查 |
+| 5 | MAJOR | 已修（收敛口径）：AC / long help / README / 每份脚本头部注释均按 shell 写明覆盖范围，双向测试核对 |
 
 ### 故意留下的缺口
 
-- powershell / elvish 不补全 api 操作名（上游生成器限制，见上）。AC 点名的 zsh/bash/fish 均已覆盖。
+- powershell / elvish 不补全 api 操作名（上游生成器限制，见上）。已在 AC、help、README 与脚本内自陈。
 - fish 在 `otl api <op> ` 之后仍会继续提供操作名候选（fish 的 `complete` 条件无法表达「第 N 个位置」）。
   噪声可接受，替代方案是为 200 个名字生成 `not __fish_seen_subcommand_from` 条件，代价远大于收益。
 - 不提供 `otl completions --install`（自动写入 shell 配置）：那属于分发范围（Story 4.5），且会往用户的

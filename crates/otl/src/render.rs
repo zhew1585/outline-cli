@@ -5,11 +5,13 @@
 //! - `Json`: pretty JSON, jq-consumable, no color or decoration. Chosen by
 //!   `--json` or whenever stdout is not a TTY.
 //! - `Table`: schema-driven table for list-shaped payloads, chosen only on
-//!   a TTY. Columns are picked from the operation's compiled response
-//!   schema by one generic policy - there is no per-endpoint rendering code
-//!   and no per-endpoint data anywhere in the IR. Non-list payloads fall
-//!   back to JSON, and so does a payload whose keys the schema does not
-//!   describe (spec drift, or a response shape the spec never declared).
+//!   a TTY. Column RANKING comes from the operation's compiled response
+//!   schema via one generic policy - there is no per-endpoint rendering code
+//!   and no per-endpoint data anywhere in the IR - and the payload decides
+//!   which of the ranked fields are actually shown, since no schema facet
+//!   here states that a field is always present. Non-list payloads fall back
+//!   to JSON, and so does a payload whose keys the schema does not describe
+//!   at all (spec drift, or a shape the spec never declared).
 //!
 //! Nothing here emits ANSI escapes, and cell text is scrubbed of control
 //! characters: server-controlled strings must not smuggle escapes or line
@@ -116,43 +118,59 @@ fn try_render_table(payload: &Value, schema: &[FieldSpec]) -> Option<String> {
 /// Pick up to [`MAX_TABLE_COLUMNS`] columns, from the response schema when
 /// it describes this payload and from the data itself otherwise.
 ///
-/// The schema is preferred because it is the only source that makes the
-/// header a property of the OPERATION rather than of one response: two
-/// responses that happen to omit different optional fields still render the
-/// same columns. The data-driven policy remains for payloads no schema
-/// describes - a raw `--body` call, an operation whose spec declares no
-/// response shape, or spec drift - and is chosen when none of the schema's
-/// columns appear in the payload at all.
+/// The schema supplies the RANKING, which is a property of the operation and
+/// therefore stable across responses. Which of the ranked fields become
+/// columns depends on what the payload actually carries, because an OpenAPI
+/// schema cannot say that: `nullable: false` only forbids an explicit null
+/// for a field that IS present, and the vendored spec declares no `required`
+/// list for any response schema at all. Selecting purely from the schema
+/// would therefore print columns that are empty in every row while crowding
+/// out fields the response does carry.
+///
+/// So a schema field becomes a candidate only if some row has it, and the
+/// top [`MAX_TABLE_COLUMNS`] candidates win, in ranked order. Neither row
+/// order nor map iteration order can influence the result.
+///
+/// The data-driven policy remains for payloads no schema describes - a raw
+/// `--body` call, an operation whose spec declares no response shape, or
+/// spec drift - and is chosen when the schema contributes no candidate.
 fn select_columns<'a>(rows: &[&'a Map<String, Value>], schema: &'a [FieldSpec]) -> Vec<&'a str> {
-    let from_schema = select_schema_columns(schema);
-    let matches_payload = from_schema
-        .iter()
-        .any(|key| rows.iter().any(|row| row.contains_key(*key)));
-    if matches_payload {
-        return from_schema;
+    let from_schema: Vec<&'a str> = rank_schema_columns(schema)
+        .into_iter()
+        .filter(|key| rows.iter().any(|row| row.contains_key(*key)))
+        .take(MAX_TABLE_COLUMNS)
+        .collect();
+    if from_schema.is_empty() {
+        return select_data_columns(rows);
     }
-    select_data_columns(rows)
+    from_schema
 }
 
-/// The generic schema-driven column policy.
+/// Rank EVERY displayable schema field, best column first.
 ///
 /// One rule set for every operation, derived from facets any OpenAPI schema
 /// can state - there is no per-endpoint knowledge here or in the IR:
 ///
 /// 1. anything not displayable as a single value (objects, arrays, unions)
 ///    is dropped;
-/// 2. the IDENTITY column is the first non-nullable `uuid`-formatted field,
-///    or else a field literally named `id`;
-/// 3. the LABEL column is the first non-nullable plain string (a string with
-///    no `format`, so not an id, timestamp, URL or e-mail), preferring one
-///    the schema does NOT mark `readOnly`: a writable string is the name the
-///    user gave the object, while a read-only one is derived from it;
-/// 4. then the non-nullable timestamps, in declaration order;
-/// 5. then the remaining non-nullable values, then the nullable ones.
+/// 2. the IDENTITY column is the first `uuid`-formatted field that cannot be
+///    null, or else a field literally named `id`;
+/// 3. the LABEL column is the first plain string that cannot be null (a
+///    string with no `format`, so not an id, timestamp, URL or e-mail),
+///    preferring one the schema does NOT mark `readOnly`: a writable string
+///    is the name the user gave the object, while a read-only one is derived
+///    from it;
+/// 4. then the timestamps that cannot be null, in declaration order;
+/// 5. then the remaining fields that cannot be null, then the nullable ones.
 ///
-/// Ties are always broken by the schema's own declaration order, which is
-/// how the spec ranks its fields.
-fn select_schema_columns(schema: &[FieldSpec]) -> Vec<&str> {
+/// `nullable: false` is used as "worth a column when present" - a value that
+/// cannot be null is never a blank cell - and never as "always present",
+/// which no OpenAPI facet here states. Ties are always broken by the
+/// schema's own declaration order, which is how the spec ranks its fields.
+///
+/// The full ranking is returned, not the top four: the caller drops fields
+/// the payload does not carry before taking a limited number of columns.
+fn rank_schema_columns(schema: &[FieldSpec]) -> Vec<&str> {
     let scalars: Vec<&FieldSpec> = schema
         .iter()
         .filter(|field| field.ty != ParamType::Json)
@@ -176,24 +194,22 @@ fn select_schema_columns(schema: &[FieldSpec]) -> Vec<&str> {
     let timestamps = rest
         .clone()
         .filter(|(_, f)| f.format == DATE_TIME_FORMAT && !f.nullable);
-    let required = rest
+    let non_null = rest
         .clone()
         .filter(|(_, f)| f.format != DATE_TIME_FORMAT && !f.nullable);
-    let optional = rest.filter(|(_, f)| f.nullable);
+    let nullable = rest.filter(|(_, f)| f.nullable);
 
-    let ordered = identity
+    identity
         .into_iter()
         .chain(label)
-        .chain(timestamps.chain(required).chain(optional).map(|(i, _)| i));
-    ordered
-        .take(MAX_TABLE_COLUMNS)
+        .chain(timestamps.chain(non_null).chain(nullable).map(|(i, _)| i))
         .map(|index| scalars[index].name.as_ref())
         .collect()
 }
 
 /// Whether a field reads as the object's human label: a string the schema
 /// constrains no further (an id, timestamp, URL or e-mail all carry a
-/// `format`) and that is always present.
+/// `format`) and that cannot be null.
 fn is_plain_label(field: &FieldSpec) -> bool {
     field.ty == ParamType::String && field.format.is_empty() && !field.nullable
 }

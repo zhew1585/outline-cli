@@ -477,30 +477,90 @@ fn schema_prefers_a_writable_label_over_a_read_only_one() {
     );
 }
 
+/// Column NAMES for a payload, ignoring the padding (which follows the
+/// widest cell and is therefore data-dependent by design).
+fn header_of(payload: &Value, schema: &[FieldSpec]) -> Vec<String> {
+    render(payload, OutputMode::Table, schema)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
-fn schema_columns_do_not_depend_on_which_optional_fields_a_response_omits() {
-    // The whole point of 1-5b: two responses of the same operation that
-    // carry different optional fields still render the same header.
+fn schema_columns_are_stable_for_responses_carrying_the_same_fields() {
+    // Two responses of the same operation with the same field set render the
+    // same header, whatever the row order or the values.
     let schema = document_schema();
-    // Column NAMES, not the padded header line: padding follows the widest
-    // cell, which is data, while the column set must not.
-    let header_of = |payload: &Value| -> Vec<String> {
-        render(payload, OutputMode::Table, &schema)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    };
-    let full = header_of(&documents_payload());
-    let sparse = header_of(&json!([{ "id": "doc-9" }]));
-    let extra = header_of(&json!([
-        { "id": "doc-9", "title": "T", "createdAt": "x", "updatedAt": "y", "icon": "e" }
-    ]));
-    assert_eq!(full, sparse, "header drifted with an omitted field");
-    assert_eq!(full, extra, "header drifted with an extra field");
+    let first = header_of(&documents_payload(), &schema);
+    let reordered = json!([
+        documents_payload()[1].clone(),
+        documents_payload()[0].clone()
+    ]);
+    assert_eq!(header_of(&reordered, &schema), first);
+    let same_shape = json!([
+        { "id": "x", "title": "T", "text": "b", "collectionId": "c",
+          "updatedAt": "u", "createdAt": "c2" }
+    ]);
+    assert_eq!(header_of(&same_shape, &schema), first);
+}
+
+#[test]
+fn a_sparse_response_shows_the_fields_it_has_not_empty_columns() {
+    // R1 finding 6: `nullable: false` is not `required`, and the vendored
+    // spec declares no `required` list for any response schema. Selecting
+    // columns from the schema alone gave `[{"id":"d1","icon":"..."}]` four
+    // columns, three of them empty in every row, with the one real field
+    // squeezed out by the column cap.
+    let schema = document_schema();
+    let sparse = json!([{ "id": "d1", "icon": "flame" }]);
+    let header = header_of(&sparse, &schema);
+    assert_eq!(header, vec!["id", "icon"], "degenerate column set");
+
+    let rendered = render(&sparse, OutputMode::Table, &schema).unwrap();
+    assert!(rendered.contains("flame"), "present field lost: {rendered}");
+
+    // No column may be empty in every row.
+    let lines: Vec<&str> = rendered.lines().collect();
+    for (index, name) in header.iter().enumerate() {
+        let has_data = lines[1..].iter().any(|line| {
+            line.split_whitespace()
+                .nth(index)
+                .is_some_and(|c| !c.is_empty())
+        });
+        assert!(has_data, "column {name} is empty in every row: {rendered}");
+    }
+}
+
+#[test]
+fn a_present_field_is_never_crowded_out_by_an_absent_one() {
+    // `title` outranks `icon`, but a response without `title` must still
+    // show `icon` rather than reserving the column for nothing.
+    let schema = document_schema();
+    let without_title = json!([
+        { "id": "d1", "icon": "a", "urlId": "u1", "createdAt": "c", "updatedAt": "up" },
+        { "id": "d2", "icon": "b", "urlId": "u2", "createdAt": "c", "updatedAt": "up" }
+    ]);
+    let header = header_of(&without_title, &schema);
+    assert!(!header.contains(&"title".to_string()), "{header:?}");
+    assert_eq!(header.len(), 4, "{header:?}");
+    assert!(header.starts_with(&["id".to_string()]), "{header:?}");
+}
+
+#[test]
+fn the_schema_still_supplies_the_ranking_not_the_payload() {
+    // Which fields appear follows the payload; the ORDER follows the schema.
+    // `updatedAt` is declared after `createdAt`, and `text` after `title`,
+    // whatever order the response happens to list them in.
+    let schema = document_schema();
+    let payload = json!([{
+        "updatedAt": "u", "text": "body", "title": "T", "createdAt": "c", "id": "d1"
+    }]);
+    let header = header_of(&payload, &schema);
+    assert_eq!(header, vec!["id", "title", "createdAt", "updatedAt"]);
 }
 
 #[test]
