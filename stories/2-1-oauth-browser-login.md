@@ -1,6 +1,6 @@
 # Story 2.1: OAuth 浏览器登录（预注册路径）
 
-Status: review
+Status: review (R1 fixes applied)
 
 ## Story
 
@@ -56,6 +56,21 @@ so that 用工作区身份安全登录。
 ## Dev Notes
 
 - **先读 `project-context.md`**。本 story 最相关红线：engine 禁止 OAuth 内容（全部落 otl）、除凭证文件外任何位置不得出现凭证、硬编码值提常量。
+- **安全决策 0（R1 后新增：TLS 强制）**：`auth/transport.rs` 要求实例 URL 与所有广播端点为 `https://`，
+  唯一例外是**回环 IP 字面量**（`127.0.0.0/8`、`[::1]`）。理由：授权码、PKCE verifier、refresh token、
+  client secret、撤销令牌全部在请求体里；明文 HTTP 下这些对路径上任何人可读，而 refresh token 是长期凭证。
+  例外只给字面量、**不给 `localhost` 这个名字**——名字要过解析器，hosts 文件或 DNS 应答就能把它指到别处。
+  这也是为什么 e2e 测试用 `http://127.0.0.1:PORT` 的 wiremock 是合法路径而非掩盖问题：它走的正是这条
+  文档化的例外；另有 `a_plaintext_remote_instance_is_refused_before_any_request` /
+  `a_plaintext_localhost_by_name_is_refused_too` 两条反向测试钉住远程明文与按名回环都被拒。
+- **安全决策 0b（R1 后新增：禁用重定向）**：OAuth 端点客户端与 engine 请求通道都设
+  `redirect::Policy::none()`。307/308 会保留方法并**重放请求体**，而 reqwest 的跨源敏感头剥离只处理
+  header、不碰 body，且只在**跨 host** 时触发——同 host 的 `https:`→`http:` 降级会保留 Authorization。
+  同源校验校验的是「我们选的 URL」，管不到服务器在请求执行期间把我们送去哪。发现请求同样禁用，
+  否则是一个可达内网的 SSRF 原语。RPC 风格 API 的 POST 没有任何正当重定向理由。
+- **安全决策 0c（R1 后新增：RFC 8414 issuer 必须存在且精确匹配）**：比较的是**完整标识符**而非 origin——
+  同一 host 上的两个租户只差路径，而这正是 origin 比较会放过的情形。issuer 是服务器控制的文本，
+  报错时只说「期望值是什么」，不回显它。
 - **安全决策 1（同源端点，故意收紧）**：`metadata.rs` 要求 `authorization_endpoint` / `token_endpoint` /
   `registration_endpoint` / `revocation_endpoint` 与实例 origin 完全一致（scheme+host+port）。
   理由：授权码、PKCE verifier、refresh token 都会 POST 到 token 端点，被篡改的元数据文档

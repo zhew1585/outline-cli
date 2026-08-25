@@ -524,6 +524,7 @@ fn stored_session_absent(dir: &Path) -> bool {
 fn seed_session(dir: &Path, base: &str, expires_at: Option<i64>) {
     let store = store(dir);
     let mut file = CredentialFile::default();
+    file.profile_mut("default").origin = engine::base_url_origin(base);
     file.profile_mut("default").oauth = Some(OAuthSession {
         access_token: "access-old".to_string(),
         refresh_token: Some("refresh-old".to_string()),
@@ -691,7 +692,7 @@ async fn losing_rotated_tokens_is_reported_instead_of_being_swallowed() {
             seed_session(&path, &base, Some(0));
             // Create the lock file while the directory is still writable, so
             // the failure lands on the credential WRITE and not earlier.
-            drop(otl::auth::lock::RefreshLock::acquire(&path).unwrap());
+            drop(otl::auth::lock::CredentialLock::acquire(&path).unwrap());
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
             let output = otl(&path, &base)
                 .args(["api", "documents.info", "id=doc-1"])
@@ -891,5 +892,537 @@ async fn purge_deletes_the_dynamic_registration_from_the_server() {
         !store(dir.path()).path().exists(),
         "purge must leave no credential file behind"
     );
+    drop(server);
+}
+
+// --- finding [3]: credential-bearing requests must not follow redirects ---
+
+/// Mount a token endpoint that answers 308 pointing at `elsewhere`.
+async fn mount_redirecting_token_endpoint(server: &MockServer, elsewhere: &str) {
+    let base = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata(&base)))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            // 307/308 preserve the method AND replay the body, and
+            // reqwest's cross-origin header stripping does not touch
+            // bodies - so following this would post the refresh token to
+            // `elsewhere`.
+            ResponseTemplate::new(308).insert_header("location", format!("{elsewhere}/steal")),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirecting_token_endpoint_never_forwards_the_refresh_token() {
+    let attacker = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/steal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "attacker-issued",
+            "token_type": "Bearer"
+        })))
+        .mount(&attacker)
+        .await;
+
+    let server = MockServer::start().await;
+    mount_redirecting_token_endpoint(&server, &attacker.uri()).await;
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let (code, stderr) = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(0));
+            let output = otl(&path, &base)
+                .args(["api", "documents.info", "id=doc-1"])
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_ne!(code, Some(0), "the redirect was followed: {stderr}");
+    // The attacker's server saw nothing at all.
+    let stolen = attacker.received_requests().await.unwrap_or_default();
+    assert!(
+        stolen.is_empty(),
+        "the refresh token was forwarded to a redirect target: {} request(s)",
+        stolen.len()
+    );
+    // And the 3xx is surfaced as the unexpected status it is.
+    assert!(stderr.contains("308"), "stderr: {stderr}");
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirecting_api_endpoint_never_forwards_the_bearer_token() {
+    // Same exposure on the ordinary request channel: reqwest only strips
+    // Authorization across a HOST change, so a same-host scheme downgrade
+    // would keep it - and bodies are never stripped.
+    let attacker = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/steal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&attacker)
+        .await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/steal", attacker.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let code = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(otl::auth::oauth::now_unix() + 3600));
+            otl(&path, &base)
+                .args(["api", "documents.info", "id=doc-1"])
+                .output()
+                .unwrap()
+                .status
+                .code()
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_ne!(code, Some(0), "the redirect was followed");
+    assert!(
+        attacker
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the bearer token was forwarded to a redirect target"
+    );
+    drop(server);
+}
+
+// --- finding [2]: plaintext transport --------------------------------------
+
+#[test]
+fn a_plaintext_remote_instance_is_refused_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = otl(dir.path(), "http://docs.example.invalid")
+        .args(["auth", "login", "--no-browser"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("https://"), "stderr: {stderr}");
+    assert!(stderr.contains("instance URL"), "stderr: {stderr}");
+    // Refused locally, so no DNS lookup or connection was attempted: the
+    // message is about transport, not about the network.
+    assert!(!stderr.contains("network error"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_plaintext_localhost_by_name_is_refused_too() {
+    // `localhost` is a NAME: a resolver or hosts file can point it
+    // elsewhere, so only IP literals get the loopback exception.
+    let dir = tempfile::tempdir().unwrap();
+    let output = otl(dir.path(), "http://localhost:3000")
+        .args(["auth", "login", "--no-browser"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("127.0.0.1"), "stderr: {stderr}");
+}
+
+// --- finding [12]: RFC 8414 issuer ----------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_metadata_document_claiming_another_issuer_is_refused() {
+    let server = MockServer::start().await;
+    let base = server.uri();
+    let mut document = metadata(&base);
+    // Same origin, different tenant path: origin checks alone pass.
+    document["issuer"] = json!(format!("{base}/other-tenant"));
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(document))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let run = tokio::task::spawn_blocking(move || drive_login(&path, &base, &[], |_| {}))
+        .await
+        .unwrap();
+
+    assert_eq!(run.code, Some(4), "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("issuer"), "stderr: {}", run.stderr);
+    assert!(!store(dir.path()).path().exists());
+}
+
+// --- finding [4]: a failed purge keeps the management credential ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_purge_keeps_the_credential_that_can_retry_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    // The server refuses the deletion.
+    Mock::given(method("DELETE"))
+        .and(path("/oauth/clients/dcr-client-1"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "error": "unavailable" })))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let (code, stderr) = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(otl::auth::oauth::now_unix() + 3600));
+            let output = otl(&path, &base)
+                .args(["auth", "logout", "--purge"])
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+
+    // Not success: the application is still registered on the server.
+    assert_ne!(code, Some(0), "a failed purge reported success: {stderr}");
+    assert!(stderr.contains("retried"), "stderr: {stderr}");
+
+    // The management credential survived, so purge can actually be retried.
+    let registration = stored_client(dir.path());
+    assert_eq!(
+        registration.registration_access_token.as_deref(),
+        Some("rat-1"),
+        "the only credential that can delete the orphan was discarded"
+    );
+    assert_eq!(
+        registration.registration_client_uri.as_deref(),
+        Some(&*format!("{base}/oauth/clients/dcr-client-1"))
+    );
+    // The session itself is gone: the local logout still happened.
+    assert!(stored_session_absent(dir.path()));
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retried_purge_succeeds_once_the_server_recovers() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/oauth/clients/dcr-client-1"))
+        .and(header("authorization", "Bearer rat-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let code = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            // A credential file left behind by a failed purge: registration
+            // still recorded, session already gone.
+            seed_session(&path, &base, Some(otl::auth::oauth::now_unix() + 3600));
+            let store = store(&path);
+            let mut file = store.load().unwrap();
+            file.profile_mut("default").oauth = None;
+            store.save(&file).unwrap();
+
+            otl(&path, &base)
+                .args(["auth", "logout", "--purge"])
+                .output()
+                .unwrap()
+                .status
+                .code()
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(code, Some(0));
+    assert!(
+        !store(dir.path()).path().exists(),
+        "a confirmed purge must leave nothing behind"
+    );
+    drop(server);
+}
+
+// --- findings [8] and [9]: never leave an undeletable registration --------
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_that_cannot_be_saved_is_deleted_again() {
+    // The window: DCR succeeded on the server, but the local save failed.
+    // The registration_access_token is the only thing that can delete that
+    // application, and it is about to be lost - so the flow must undo the
+    // registration rather than leave an orphan nobody can remove.
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    mount_full_instance(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/oauth/clients/dcr-client-1"))
+        .and(header("authorization", "Bearer rat-1"))
+        .respond_with(ResponseTemplate::new(204))
+        // Exactly one compensating delete.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("readonly");
+    std::fs::create_dir(&config).unwrap();
+    // Writable enough to create the lock file, then sealed before the save.
+    let path = config.clone();
+
+    let run = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            // Pre-create the lock so the failure lands on the credential
+            // write and not on lock creation.
+            drop(otl::auth::lock::CredentialLock::acquire(&path).unwrap());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let outcome = drive_login(&path, &base, &[], |_| {});
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+            outcome
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_ne!(run.code, Some(0), "a failed save reported success");
+    // `.expect(1)` on the DELETE is what proves the compensation happened.
+    drop(server);
+    assert!(
+        !config.join("credentials.toml").exists(),
+        "nothing should have been written"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_orphan_that_cannot_be_undone_is_reported_with_its_client_id() {
+    // Save failed AND the compensating delete failed: an application is
+    // stranded on the server. The user has to be told, with the client id
+    // an administrator needs to find it.
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    mount_full_instance(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/oauth/clients/dcr-client-1"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("readonly");
+    std::fs::create_dir(&config).unwrap();
+    let path = config.clone();
+
+    let run = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            drop(otl::auth::lock::CredentialLock::acquire(&path).unwrap());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let outcome = drive_login(&path, &base, &[], |_| {});
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+            outcome
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_ne!(run.code, Some(0));
+    assert!(
+        run.stderr.contains("orphaned"),
+        "the stranded application was not reported: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("dcr-client-1"),
+        "the client id an admin needs is missing: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("Settings -> Applications"),
+        "stderr: {}",
+        run.stderr
+    );
+    // A client id is not a secret (it travels in the authorization URL),
+    // but the management token is.
+    assert!(!run.stderr.contains("rat-1"), "stderr: {}", run.stderr);
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_registration_that_cannot_be_removed_blocks_re_registration() {
+    // The stored registration is pinned to a port that is now taken, and
+    // the server refuses to delete it. Registering a replacement would
+    // overwrite the only credential that could ever delete the old one, so
+    // the flow must stop instead.
+    let server = MockServer::start().await;
+    mount_full_instance(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/oauth/clients/dcr-client-1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Hold the port the stored registration is pinned to, so rebinding
+    // fails and retirement is attempted.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+
+    let path = dir.path().to_path_buf();
+    let run = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(otl::auth::oauth::now_unix() + 3600));
+            // Repin the stored registration to the occupied port and drop
+            // the session, so login has to reuse-or-replace the client.
+            let store = store(&path);
+            let mut file = store.load().unwrap();
+            file.profile_mut("default").oauth = None;
+            if let Some(client) = file.profile_mut("default").client.as_mut() {
+                client.redirect_uri = format!("http://127.0.0.1:{taken}/callback");
+            }
+            store.save(&file).unwrap();
+            drive_login(&path, &base, &[], |_| {})
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("--force-new-client"),
+        "no escape hatch offered: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("overwrite"),
+        "the reason must be stated: {}",
+        run.stderr
+    );
+    // The old management credential is intact, so a retry is possible.
+    let registration = stored_client(dir.path());
+    assert_eq!(
+        registration.registration_access_token.as_deref(),
+        Some("rat-1")
+    );
+    // And no replacement was registered.
+    let registrations = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request: &Request| request.url.path() == "/oauth/register")
+        .count();
+    assert_eq!(registrations, 0, "a replacement was registered anyway");
+    drop(squatter);
+}
+
+// --- finding [16]: a short-lived token must not restart the stampede ------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_processes_refresh_once_even_with_a_short_lived_token() {
+    // The server issues a token whose lifetime is INSIDE the local safety
+    // margin. The winner's result must still be reused by the waiters:
+    // refreshing again would spend one single-use refresh token per waiter
+    // and, at the second one, fail with invalid_grant.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-short",
+            "refresh_token": "refresh-next",
+            "token_type": "Bearer",
+            // Well inside EXPIRY_SKEW_SECONDS.
+            "expires_in": 5,
+            "scope": "read write"
+        })))
+        // Exactly one refresh across every process.
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .and(header("authorization", "Bearer access-short"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "data": { "title": "Renewed" } })),
+        )
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let outcomes = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(0));
+            let children: Vec<_> = (0..4)
+                .map(|_| {
+                    otl(&path, &base)
+                        .args(["api", "documents.info", "id=doc-1"])
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect::<Vec<_>>()
+        }
+    })
+    .await
+    .unwrap();
+
+    for output in &outcomes {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "a waiter failed instead of reusing the winner's token: {stderr}"
+        );
+    }
+    // `.expect(1)` on the refresh grant is the assertion that matters.
     drop(server);
 }

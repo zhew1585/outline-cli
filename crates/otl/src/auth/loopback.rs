@@ -40,18 +40,34 @@ pub const AUTH_TIMEOUT: Duration = Duration::from_secs(240);
 /// How often the listener is polled while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Read timeout for one accepted connection.
+/// Longest a single connection may take to send its request line.
+///
+/// Also clamped to whatever is left of the overall deadline, so a slow
+/// client cannot extend the login past the timeout the user was promised.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum bytes read from one request line.
 const MAX_REQUEST_LINE_BYTES: u64 = 8 * 1024;
 
-/// Maximum connections handled before giving up.
+/// Sanity bound on connections handled in one login.
 ///
-/// Browsers send stray requests (favicon, prefetch) that must be answered
-/// and ignored, but an unbounded loop would let a local process keep the
-/// login hanging.
-const MAX_CONNECTIONS: u32 = 64;
+/// The real limit is the DEADLINE, not this: browsers send stray requests
+/// (favicon, prefetch, connection reuse) that must be answered and ignored,
+/// and failing the login because a local process opened some sockets would
+/// hand any unprivileged local user a way to break every login. This exists
+/// only so a client that connects and disconnects instantly cannot spin the
+/// loop forever, and it is generous enough that legitimate traffic never
+/// reaches it.
+const MAX_CONNECTIONS: u32 = 4096;
+
+/// Pause after a connection that yielded nothing, so a peer that connects
+/// and closes immediately cannot spin the accept loop at full speed.
+///
+/// Sized together with [`MAX_CONNECTIONS`]: the product
+/// (4096 x 5ms ~ 20s) is comfortably under [`AUTH_TIMEOUT`], so a flood of
+/// empty connections runs out the iteration bound only long after the user
+/// would have finished consenting - it cannot end a login early.
+const EMPTY_CONNECTION_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Every redirect URI an administrator must allow when pre-registering an
 /// application, in the order `otl` tries them.
@@ -149,9 +165,19 @@ impl CallbackServer {
     pub fn wait_for_code(&self, state: &str, timeout: Duration) -> Result<String, OAuthError> {
         let deadline = Instant::now() + timeout;
         for _ in 0..MAX_CONNECTIONS {
+            // Checked before every connection AND inside the accept poll,
+            // so the announced timeout is the real bound on this loop. A
+            // per-connection read timeout alone would let N slow clients
+            // stretch the wait to N times its length.
+            if Instant::now() >= deadline {
+                break;
+            }
             let stream = self.accept_before(deadline, timeout)?;
-            let Some(target) = read_request_target(&stream) else {
+            let Some(target) = read_request_target(&stream, deadline) else {
                 respond(&stream, "400 Bad Request", "Malformed request.");
+                // Nothing usable arrived; do not spin on a peer that keeps
+                // connecting and closing.
+                std::thread::sleep(EMPTY_CONNECTION_BACKOFF);
                 continue;
             };
             let Some(redirect) = parse_redirect(&target) else {
@@ -162,11 +188,8 @@ impl CallbackServer {
             };
             return self.finish(&stream, redirect, state);
         }
-        Err(OAuthError::Callback {
-            reason: format!(
-                "gave up after {MAX_CONNECTIONS} local connections without a \
-                 usable redirect"
-            ),
+        Err(OAuthError::CallbackTimeout {
+            seconds: timeout.as_secs(),
         })
     }
 
@@ -221,6 +244,10 @@ impl CallbackServer {
     }
 
     /// Accept the next connection, or time out.
+    ///
+    /// Per-connection read and write timeouts are clamped to the time left
+    /// before `deadline`, so no accepted connection can outlive the login's
+    /// own budget.
     fn accept_before(&self, deadline: Instant, budget: Duration) -> Result<TcpStream, OAuthError> {
         loop {
             match self.listener.accept() {
@@ -229,8 +256,9 @@ impl CallbackServer {
                     // its own timeout, and polling a socket byte by byte
                     // buys nothing.
                     let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-                    let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
+                    let window = connection_window(deadline);
+                    let _ = stream.set_read_timeout(Some(window));
+                    let _ = stream.set_write_timeout(Some(window));
                     return Ok(stream);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -254,7 +282,10 @@ impl CallbackServer {
 ///
 /// Only `GET` is accepted; the read is capped, so a client that never sends
 /// a newline cannot make the CLI allocate without bound.
-fn read_request_target(stream: &TcpStream) -> Option<String> {
+fn read_request_target(stream: &TcpStream, deadline: Instant) -> Option<String> {
+    // Re-clamped here as well: `accept_before` set the window when the
+    // connection arrived, and time has passed since.
+    let _ = stream.set_read_timeout(Some(connection_window(deadline)));
     let mut reader = BufReader::new(stream.try_clone().ok()?).take(MAX_REQUEST_LINE_BYTES);
     let mut line = String::new();
     if reader.read_line(&mut line).ok()? == 0 {
@@ -265,6 +296,19 @@ fn read_request_target(stream: &TcpStream) -> Option<String> {
     let target = parts.next()?;
     (method == "GET").then(|| target.to_string())
 }
+
+/// How long one connection may take: the shorter of [`READ_TIMEOUT`] and
+/// the time left before the login's own deadline.
+///
+/// Never zero - a zero timeout means "block forever" to the socket API,
+/// which is the opposite of what is wanted here.
+fn connection_window(deadline: Instant) -> Duration {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    remaining.min(READ_TIMEOUT).max(MINIMUM_WINDOW)
+}
+
+/// Floor for a per-connection timeout, since zero means "never time out".
+const MINIMUM_WINDOW: Duration = Duration::from_millis(50);
 
 /// Parse a redirect target, or `None` if it is not the callback path.
 fn parse_redirect(target: &str) -> Option<Redirect> {
@@ -421,6 +465,78 @@ mod tests {
     fn redirect_text_is_length_capped() {
         let cleaned = sanitize_redirect_text(&"x".repeat(1000));
         assert_eq!(cleaned.chars().count(), MAX_REDIRECT_TEXT_CHARS);
+    }
+
+    #[test]
+    fn a_stalled_connection_cannot_outlive_the_announced_timeout() {
+        // Reported: the per-connection read timeout was a flat 10s and the
+        // deadline was only checked when `accept` would have blocked, so a
+        // peer that kept connections ready could stretch a 240s login to
+        // roughly 64 x 10s. Clamping each connection to the time remaining
+        // makes the announced timeout the real bound.
+        use std::net::TcpStream;
+
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let port = port_of(server.redirect_uri()).expect("a bound port");
+
+        // Connect and then say nothing at all, holding the socket open.
+        let _stalled = TcpStream::connect((CALLBACK_HOST, port)).expect("local connect");
+
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let error = server
+            .wait_for_code("state", budget)
+            .expect_err("no redirect is coming");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, OAuthError::CallbackTimeout { .. }),
+            "expected a timeout, got {error:?}"
+        );
+        // Generous, but far below the old flat per-connection timeout: the
+        // point is that one silent peer cannot add 10s to the wait.
+        assert!(
+            elapsed < READ_TIMEOUT,
+            "a stalled connection extended the wait to {elapsed:?}, past the \
+             {budget:?} budget and up to the {READ_TIMEOUT:?} read timeout"
+        );
+    }
+
+    #[test]
+    fn stray_connections_do_not_consume_the_login() {
+        // A local peer opening and closing sockets used to burn the whole
+        // connection budget and fail the login outright. Only the deadline
+        // may end the wait, so after several stray connections the listener
+        // is still willing to serve the real redirect.
+        use std::io::Write as _;
+        use std::net::TcpStream;
+
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let port = port_of(server.redirect_uri()).expect("a bound port");
+
+        // More stray connections than the OLD budget allowed in total.
+        std::thread::spawn(move || {
+            for _ in 0..80 {
+                if let Ok(stream) = TcpStream::connect((CALLBACK_HOST, port)) {
+                    drop(stream);
+                }
+            }
+            // Then the genuine redirect.
+            if let Ok(mut stream) = TcpStream::connect((CALLBACK_HOST, port)) {
+                let _ = stream.write_all(
+                    b"GET /callback?code=real-code&state=state HTTP/1.1\r\n\
+                      Host: 127.0.0.1\r\n\r\n",
+                );
+                let _ = stream.flush();
+                // Keep the socket alive long enough to be read.
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+
+        let code = server
+            .wait_for_code("state", Duration::from_secs(20))
+            .expect("stray connections must not defeat the real redirect");
+        assert_eq!(code, "real-code");
     }
 
     #[test]

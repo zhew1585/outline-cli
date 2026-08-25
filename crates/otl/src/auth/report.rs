@@ -45,6 +45,14 @@ pub struct CredentialHealth {
     pub permissions: Permissions,
     /// Whether the file may be used as it stands.
     pub usable: bool,
+    /// Absolute path of the directory holding it.
+    pub directory: PathBuf,
+    /// Why the directory is unusable, if it is.
+    ///
+    /// Reported as well as the file's own state: a directory other users
+    /// can write to lets them replace the credential file or the refresh
+    /// lock, whatever the file's mode says.
+    pub directory_problem: Option<String>,
     /// One entry per profile that has anything stored.
     pub profiles: Vec<ProfileHealth>,
     /// Whether `OUTLINE_API_KEY` is set in this environment.
@@ -61,11 +69,23 @@ pub fn credential_health(store: &CredentialStore) -> CredentialHealth {
     let permissions = store.permissions();
     let exists = !matches!(permissions, Permissions::Missing);
     let loaded = store.load().ok();
+    // Only reported when the directory is already there: a directory that
+    // does not exist yet is not a problem, it is a fresh installation.
+    let directory_problem = store
+        .dir()
+        .is_dir()
+        .then(|| crate::auth::secret_file::require_private_dir(store.dir()).err())
+        .flatten()
+        .map(|error| error.to_string());
     CredentialHealth {
         path: store.path().to_path_buf(),
         exists,
-        usable: permissions.usable() && (!exists || loaded.is_some()),
+        usable: permissions.usable()
+            && directory_problem.is_none()
+            && (!exists || loaded.is_some()),
         permissions,
+        directory: store.dir().to_path_buf(),
+        directory_problem,
         profiles: loaded.as_ref().map(profiles_of).unwrap_or_default(),
         env_api_key: crate::auth::source::env_api_key().is_some(),
     }
@@ -133,6 +153,7 @@ impl CredentialHealth {
             format!("credential file:  {}", self.path.display()),
             format!("exists:           {}", yes_no(self.exists)),
             format!("permissions:      {}", self.permissions.describe()),
+            format!("directory:        {}", self.describe_directory()),
             format!("usable:           {}", yes_no(self.usable)),
             format!(
                 "OUTLINE_API_KEY:  {}",
@@ -162,6 +183,16 @@ impl CredentialHealth {
             }
         }
         lines
+    }
+}
+
+impl CredentialHealth {
+    /// One line about the directory holding the credential file.
+    fn describe_directory(&self) -> String {
+        match &self.directory_problem {
+            Some(problem) => format!("{} - PROBLEM: {problem}", self.directory.display()),
+            None => format!("{} (owner-only)", self.directory.display()),
+        }
     }
 }
 
@@ -303,6 +334,47 @@ mod tests {
             rendered.contains("cannot delete it from the server"),
             "{rendered}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_other_users_can_write_is_reported_as_a_problem() {
+        // The report used to claim it covered the directory and did not.
+        // A directory others can write to lets them swap the credential
+        // file or the refresh lock, whatever the file's own mode says.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = scratch();
+        populated(&store);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let health = credential_health(&store);
+        assert!(health.directory_problem.is_some(), "{health:?}");
+        assert!(
+            !health.usable,
+            "a directory anyone can write to must make the store unusable"
+        );
+        let rendered = health.lines().join("\n");
+        assert!(rendered.contains("directory:"), "{rendered}");
+        assert!(rendered.contains("PROBLEM"), "{rendered}");
+        assert!(rendered.contains("0777"), "{rendered}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    fn a_healthy_directory_is_named_without_a_problem() {
+        let (_dir, store) = scratch();
+        populated(&store);
+        let health = credential_health(&store);
+        assert!(health.directory_problem.is_none(), "{health:?}");
+        let rendered = health.lines().join("\n");
+        assert!(
+            rendered.contains(&store.dir().display().to_string()),
+            "the directory must be named: {rendered}"
+        );
+        assert!(!rendered.contains("PROBLEM"), "{rendered}");
     }
 
     #[test]

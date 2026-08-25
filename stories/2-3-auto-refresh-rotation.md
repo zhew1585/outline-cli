@@ -1,6 +1,6 @@
 # Story 2.3: 自动续期与轮换安全
 
-Status: review
+Status: review (R1 fixes applied)
 
 ## Story
 
@@ -72,6 +72,23 @@ so that 永远不需要手动重新登录。
 - **60 秒 skew** 覆盖时钟偏差 + 请求在途时间。宁可早刷一次（成本：一次多余的 token 请求），
   也不要晚一步（成本：一次失败请求 + 一次重放）。
 - **过期时间存绝对值**（unix 秒）而非服务器给的 `expires_in`：读盘时不需要「相对于何时」的记忆。
+
+### R1 审查后的修正
+
+- **续期后旧 token 仍在脱敏上下文里**。`Client::send` 现在维护 `used: Vec<String>`（本次请求用过的
+  每一个凭证），全部传给脱敏管线。服务器见过 T1，被攻陷的服务器完全可以在第二次响应里故意回显 T1；
+  只知道 T2 的管线会把 T1 原样打出来。
+- **单飞在短寿命 token 上退化**。`is_usable` 拆成两个语义明确的谓词：`fresh_enough`（主动路径，
+  **应用** 60 秒安全裕量，为的是提前刷新）与 `superseded_by`（锁内复用判定，**不应用**裕量，
+  只问「是不是和已知作废的那个不同」+「是否真的还没过期」）。原来对等待者也套裕量，
+  会导致服务器给出短寿命 token 时每个排队进程各刷一次、各花掉一个一次性 refresh token，
+  第二个开始必然 invalid_grant——恰好破坏「只刷新一次」。
+  测试 `concurrent_processes_refresh_once_even_with_a_short_lived_token` 用 `expires_in=5` +
+  wiremock `.expect(1)` 钉住。
+- **目录 fsync 错误被吞**。`sync_dir` 现在返回 `Result` 并由 `write_atomic` 向上传播；
+  Windows 分支显式 no-op（该平台无法把目录当文件打开，`MoveFileEx` 本身已提供原子替换）。
+  轮换后写盘只要不能确认落盘，就必须报 `RotationLost`。
+- **锁只包住 refresh 路径**（见 Story 2.6 的事务锁修正）。
 
 ### 已知缺口（有意保留）
 

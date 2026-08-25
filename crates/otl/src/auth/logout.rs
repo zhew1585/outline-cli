@@ -11,14 +11,22 @@
 //! case - leaving a machine for good - and is the only way to remove a
 //! dynamic client at all, since Outline's admin UI cannot.
 //!
-//! Every server-side step is best-effort. Local removal is what the user
-//! asked for and must happen even when the instance is unreachable;
-//! anything that could not be done on the server is reported, never
-//! silently swallowed.
+//! Local removal is what the user asked for and happens even when the
+//! instance is unreachable. Server-side steps are attempted first and
+//! anything that fails is reported, never silently swallowed - and the exit
+//! code says so, because "signed out locally, application still on the
+//! server" is not success.
+//!
+//! One thing is NOT best-effort: the `registration_access_token` is only
+//! deleted from disk once the server has confirmed the registration it
+//! manages is gone. Dropping it after a failed DELETE would leave an
+//! application that nothing can ever remove.
 
 use reqwest::blocking::Client as HttpClient;
 
-use crate::auth::credentials::{ClientRegistration, CredentialStore, OAuthSession};
+use crate::auth::credentials::{
+    ClientRegistration, CredentialFile, CredentialStore, OAuthSession, ProfileCredentials,
+};
 use crate::auth::oauth::ClientAuth;
 use crate::auth::{dcr, endpoint, oauth, AuthError};
 
@@ -40,6 +48,9 @@ pub struct Report {
     pub registration_deleted: bool,
     /// Whether the credential file itself is now gone.
     pub file_removed: bool,
+    /// Whether something the user asked for could not be done on the
+    /// server, so the command must not report plain success.
+    pub remote_cleanup_failed: bool,
     /// Problems worth telling the user about, none of which stopped the
     /// local removal.
     pub warnings: Vec<String>,
@@ -47,8 +58,7 @@ pub struct Report {
 
 /// Forget the profile's credentials, revoking what can be revoked.
 pub fn run(profile: &str, store: &CredentialStore, options: Options) -> Result<Report, AuthError> {
-    let mut file = store.load()?;
-    let Some(entry) = file.profile(profile).cloned() else {
+    let Some(entry) = store.load()?.profile(profile).cloned() else {
         return Ok(Report::default());
     };
     let mut report = Report {
@@ -57,6 +67,9 @@ pub fn run(profile: &str, store: &CredentialStore, options: Options) -> Result<R
     };
     let http = endpoint::http_client()?;
 
+    // Network work happens BEFORE the lock is taken: revocation and
+    // deregistration are slow, and holding the credential lock across them
+    // would block every other otl process on this machine.
     if let Some(session) = &entry.oauth {
         revoke_tokens(&http, session, entry.client.as_ref(), &mut report);
     }
@@ -64,16 +77,50 @@ pub fn run(profile: &str, store: &CredentialStore, options: Options) -> Result<R
         purge_registration(&http, entry.client.as_ref(), &mut report);
     }
 
-    // Local removal happens regardless of what the server said.
-    let profile_entry = file.profile_mut(profile);
-    profile_entry.oauth = None;
-    profile_entry.api_key = None;
-    if options.purge || report.registration_deleted {
-        profile_entry.client = None;
-    }
-    store.save(&file)?;
+    // Local removal happens regardless of what the server said - the user
+    // asked for these credentials to be gone from this machine - but the
+    // MANAGEMENT credential only goes once the server confirmed the
+    // registration it manages is gone. See `drop_registration`.
+    let drop_client = drop_registration(options, &entry, &report);
+    store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+        let profile_entry = file.profile_mut(profile);
+        profile_entry.oauth = None;
+        profile_entry.api_key = None;
+        if drop_client {
+            profile_entry.client = None;
+        }
+        if profile_entry.client.is_none() {
+            // Nothing left for the binding to protect, and a stale one
+            // would only confuse the next `auth info`.
+            profile_entry.origin = None;
+        }
+        Ok(())
+    })?;
     report.file_removed = !store.path().exists();
     Ok(report)
+}
+
+/// Whether the local client registration record may be discarded.
+///
+/// The rule that matters: **a `registration_access_token` is thrown away
+/// only once the server has confirmed the registration it manages is
+/// gone.** It is the only credential that can delete a dynamically
+/// registered client - Outline's admin UI cannot - so dropping it after a
+/// failed DELETE would leave an application nobody can ever remove. That is
+/// exactly the outcome the persistence rule exists to prevent, so a failed
+/// purge KEEPS the record and stays retryable.
+///
+/// A registration an administrator created carries no management token, and
+/// nothing on the server belongs to us, so dropping its cached client id
+/// orphans nothing.
+fn drop_registration(options: Options, entry: &ProfileCredentials, report: &Report) -> bool {
+    if report.registration_deleted {
+        return true;
+    }
+    match &entry.client {
+        Some(registration) => options.purge && !registration.dynamic,
+        None => false,
+    }
 }
 
 /// Ask the server to revoke the stored tokens.
@@ -136,17 +183,24 @@ fn purge_registration(
     }
     match dcr::delete(http, registration) {
         Ok(true) => report.registration_deleted = true,
-        Ok(false) => report.warnings.push(
-            "the stored registration has no management token, so the \
-             application cannot be deleted from the server; ask an admin to \
-             remove it (Settings -> Applications)"
-                .to_string(),
-        ),
-        Err(error) => report.warnings.push(format!(
-            "the application could not be deleted from the server ({error}); \
-             the local record was kept so `otl auth logout --purge` can be \
-             retried"
-        )),
+        Ok(false) => {
+            report.remote_cleanup_failed = true;
+            report.warnings.push(
+                "the stored registration has no management token, so the \
+                 application cannot be deleted from the server; ask an admin \
+                 to remove it (Settings -> Applications)"
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            report.remote_cleanup_failed = true;
+            report.warnings.push(format!(
+                "the application could not be deleted from the server \
+                 ({error}). The credential that manages it has been KEPT on \
+                 disk so `otl auth logout --purge` can be retried - deleting \
+                 it would leave an application nobody can remove"
+            ));
+        }
     }
 }
 
@@ -155,7 +209,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::auth::credentials::CredentialFile;
 
     fn scratch() -> (tempfile::TempDir, CredentialStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -232,8 +285,15 @@ mod tests {
         );
         assert!(after.profile("default").unwrap().oauth.is_none());
 
+        // This registration has no management credentials, so the server
+        // never confirmed anything: the local record is KEPT so the orphan
+        // stays visible and `--purge` stays retryable.
         let report = run("default", &store, Options { purge: true }).unwrap();
-        assert!(!store.path().exists(), "purge must leave nothing behind");
+        assert!(!report.registration_deleted);
+        assert!(
+            report.remote_cleanup_failed,
+            "an undeletable registration must not count as a clean purge"
+        );
         assert!(
             report
                 .warnings
@@ -242,6 +302,66 @@ mod tests {
             "an undeletable registration must be reported: {:?}",
             report.warnings
         );
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .profile("default")
+                .and_then(|entry| entry.client.as_ref())
+                .is_some(),
+            "the record of an orphan on the server must not be discarded"
+        );
+    }
+
+    #[test]
+    fn purge_keeps_management_credentials_when_the_server_did_not_confirm() {
+        // The rule from `drop_registration`: a registration_access_token is
+        // the only thing that can delete a dynamic client, so it survives
+        // any purge the server did not confirm. Dropping it would leave an
+        // application nobody could ever remove.
+        let mut registration = dynamic_registration();
+        registration.registration_access_token = Some("rat".to_string());
+        registration.registration_client_uri =
+            Some("https://docs.example.com/oauth/clients/c".to_string());
+        let entry = ProfileCredentials {
+            origin: Some("https://docs.example.com".to_string()),
+            api_key: None,
+            oauth: Some(session()),
+            client: Some(registration),
+        };
+        let failed = Report {
+            registration_deleted: false,
+            remote_cleanup_failed: true,
+            ..Report::default()
+        };
+        assert!(
+            !drop_registration(Options { purge: true }, &entry, &failed),
+            "a failed purge must keep the credential that manages the orphan"
+        );
+
+        let confirmed = Report {
+            registration_deleted: true,
+            ..Report::default()
+        };
+        assert!(
+            drop_registration(Options { purge: true }, &entry, &confirmed),
+            "a confirmed deletion may drop the local record"
+        );
+    }
+
+    #[test]
+    fn a_plain_logout_never_drops_a_registration() {
+        let entry = ProfileCredentials {
+            origin: Some("https://docs.example.com".to_string()),
+            api_key: None,
+            oauth: Some(session()),
+            client: Some(dynamic_registration()),
+        };
+        assert!(!drop_registration(
+            Options { purge: false },
+            &entry,
+            &Report::default()
+        ));
     }
 
     #[test]

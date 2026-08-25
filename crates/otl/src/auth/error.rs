@@ -55,6 +55,57 @@ pub enum StoreError {
         mode: String,
     },
 
+    /// The credential path is not a regular file.
+    ///
+    /// A directory, device, socket, FIFO or symlink at that path is not
+    /// something this program wrote, so it is refused rather than parsed.
+    #[error(
+        "{path} is {kind}, not a credential file; refusing to use it.\n\
+         Move whatever is at that path aside and authenticate again."
+    )]
+    NotARegularFile {
+        /// Absolute path of the offending entry.
+        path: String,
+        /// What was found there instead, in words.
+        kind: &'static str,
+    },
+
+    /// The credential file or directory belongs to another user.
+    #[error(
+        "{path} is owned by uid {owner}, not by you (uid {us}); refusing to \
+         use it.\n\
+         Another user's file could be replaced at any moment, so it cannot \
+         be trusted with credentials."
+    )]
+    ForeignOwner {
+        /// Absolute path of the offending entry.
+        path: String,
+        /// Owning uid found on disk.
+        owner: u32,
+        /// This process's effective uid.
+        us: u32,
+    },
+
+    /// The credential directory is writable by other users.
+    ///
+    /// Write access to the directory is enough to swap the credential file
+    /// or the refresh lock, so it is refused. Read access is not: the
+    /// files' own `0600` governs that, and `~/.config` at `0755` is normal.
+    #[error(
+        "credential directory {path} is writable by other users \
+         (permissions {mode}); refusing to use it.\n\
+         Anyone who can write there can replace the credential file or the \
+         refresh lock.\n\
+         Fix it with:\n\
+         \x20 chmod 700 {path}"
+    )]
+    DirectoryTooOpen {
+        /// Absolute path of the directory.
+        path: String,
+        /// Octal permission bits, rendered (e.g. `0777`).
+        mode: String,
+    },
+
     /// The credential file could not be read.
     #[error("cannot read credential file {path}: {reason}")]
     Read {
@@ -224,6 +275,106 @@ pub enum OAuthError {
         origin: String,
         /// Which advertised endpoint is off-origin.
         endpoint: &'static str,
+    },
+
+    /// A URL that would carry credentials is not TLS-protected.
+    ///
+    /// Refused rather than warned about: the authorization code, the PKCE
+    /// verifier, the refresh token and the client secret all travel in
+    /// request bodies, and a warning cannot recall bytes already on the
+    /// wire. See [`crate::auth::transport`] for the loopback exception.
+    #[error("refusing to use {what}: {detail}")]
+    InsecureTransport {
+        /// Which URL was refused (authored text, never the URL itself,
+        /// whose path may carry per-tenant identifiers).
+        what: &'static str,
+        /// Why it was refused, and what would be accepted instead.
+        detail: String,
+    },
+
+    /// The metadata document's `issuer` does not identify this instance.
+    ///
+    /// RFC 8414 section 3.3 requires the issuer in the document to match
+    /// the one the well-known URL was derived from. Without that check a
+    /// same-origin reverse proxy, a multi-tenant deployment or a poisoned
+    /// cache could hand back another tenant's authorization server.
+    #[error(
+        "OAuth metadata from {origin} identifies a different authorization \
+         server than the instance it was fetched from{detail}; refusing to \
+         continue"
+    )]
+    IssuerMismatch {
+        /// Origin (`scheme://host[:port]`) of the instance.
+        origin: String,
+        /// Authored detail (that the field is absent, or that it differs).
+        detail: String,
+    },
+
+    /// Stored credentials belong to a different instance.
+    ///
+    /// Fail closed rather than warn: a warning is printed after the
+    /// credential has already been handed to the request channel.
+    #[error(
+        "the credentials stored for profile {profile:?} belong to {stored}, \
+         but this command is pointed at {current}.\n\
+         Sending them would hand {current} a credential it was never issued \
+         for, so this is refused.\n\
+         Use a separate profile for each instance (OUTLINE_PROFILE=<name>), \
+         or run `otl auth login` to authenticate against {current}."
+    )]
+    InstanceMismatch {
+        /// Active profile name.
+        profile: String,
+        /// Origin the stored credentials were issued by.
+        stored: String,
+        /// Origin this command is pointed at.
+        current: String,
+    },
+
+    /// A dynamic registration exists on the server but could not be
+    /// recorded locally, and the compensating delete also failed.
+    ///
+    /// The worst outcome in the whole flow: an application on the server
+    /// that nothing can ever delete. Reported with the client id so an
+    /// administrator can find it (a public client's id is not a secret -
+    /// it travels in the authorization URL).
+    #[error(
+        "otl registered itself on {origin} as client {client_id}, but the \
+         registration could not be saved ({reason}) and could not be undone \
+         ({cleanup}).\n\
+         That application is now orphaned on the server: ask an admin to \
+         remove it under Settings -> Applications."
+    )]
+    OrphanedRegistration {
+        /// Origin the registration was created on.
+        origin: String,
+        /// Client id of the orphaned registration (not a secret).
+        client_id: String,
+        /// Why the local save failed.
+        reason: String,
+        /// Why the compensating delete failed.
+        cleanup: String,
+    },
+
+    /// A superseded dynamic registration could not be removed, so a new one
+    /// was NOT created.
+    ///
+    /// Registering again would overwrite the only credential that can ever
+    /// delete the old one, so the flow stops instead.
+    #[error(
+        "the client registration stored for this instance can no longer be \
+         used (its callback port {port} is taken), and removing it from the \
+         server failed: {reason}.\n\
+         Registering a new one would overwrite the only credential that can \
+         delete the old one, so nothing was changed. Free that port and \
+         retry, or run `otl auth login --force-new-client` to abandon it \
+         (leaving an application an admin has to remove by hand)."
+    )]
+    RetireFailed {
+        /// The callback port the stored registration is pinned to.
+        port: String,
+        /// Why removal failed.
+        reason: String,
     },
 
     /// The instance does not offer dynamic client registration.

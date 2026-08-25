@@ -1,6 +1,6 @@
 # Story 2.2: DCR 自注册优先
 
-Status: review
+Status: review (R1 fixes applied)
 
 ## Story
 
@@ -63,6 +63,17 @@ so that 无需找管理员即可 OAuth 登录。
 - **`--purge` 不碰管理员的 client_id**：`dynamic = false` 的注册是别人创建的资产，删除它超出 CLI 的权限范畴。
   `logout --purge` 会明确说明它被跳过了。
 - 硬编码值全部提常量：`CLIENT_NAME`、`CLIENT_URI`、`AUTH_METHOD_NONE`。
+
+### R1 审查后的修正
+
+- **注册成功但首次保存失败 → 补偿删除**（原为缺口）。`login::persist_registration` 在
+  `store.update` 失败时用内存里仍在的管理凭证发 RFC 7592 DELETE。若补偿删除也失败，
+  抛 `OrphanedRegistration`，消息里带 **client_id**（公共客户端的 id 不是秘密——它本来就出现在
+  授权 URL 里；没有它管理员根本找不到那个应用）但**不带** registration_access_token。
+- **旧注册退役失败 → 不再继续注册**（原为「best-effort，失败也继续」）。理由：注册新的会覆盖
+  唯一能删掉旧的那个凭证，等于把「一次登录失败」换成「服务器上永久多一个谁也删不掉的应用」。
+  现在报 `RetireFailed`（退出码 2）并提供显式逃生阀 `otl auth login --force-new-client`，
+  后者会把孤儿的存在明确告知用户，是用户的知情选择而非静默后果。
 
 ### 已知缺口（有意保留）
 

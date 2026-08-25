@@ -29,6 +29,7 @@
 //!   from.
 
 use std::env;
+use std::fmt;
 use std::sync::Mutex;
 
 use engine::{CredentialError, CredentialSource};
@@ -39,7 +40,7 @@ use crate::auth::credentials::{
 };
 use crate::auth::endpoint;
 use crate::auth::error::{OAuthError, StoreError};
-use crate::auth::lock::RefreshLock;
+use crate::auth::lock::CredentialLock;
 use crate::auth::oauth::{self, ClientAuth};
 use crate::config::ENV_API_KEY;
 use crate::stdio;
@@ -137,6 +138,8 @@ enum State {
 }
 
 /// The `engine::CredentialSource` for one profile.
+///
+/// `Debug` is hand-written (see below): the state it holds is a credential.
 pub struct CredentialProvider {
     store: CredentialStore,
     profile: String,
@@ -149,9 +152,33 @@ pub struct CredentialProvider {
     available: Vec<Method>,
 }
 
+impl fmt::Debug for CredentialProvider {
+    /// Manual impl: the state holds an access token or an API key, so only
+    /// the non-secret shape of this provider is printable.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialProvider")
+            .field("profile", &self.profile)
+            .field("method", &self.method)
+            .field("credential", &"***")
+            .finish_non_exhaustive()
+    }
+}
+
 impl CredentialProvider {
     /// Resolve the credential for `profile` from `file` and the
     /// environment, returning `None` when there is nothing to use.
+    ///
+    /// `origin` is the instance this command is pointed at, and stored
+    /// credentials are only offered if they were issued BY that instance.
+    /// Without the check, re-pointing `OUTLINE_URL` at another host would
+    /// hand it this profile's bearer token - and, once the token expired,
+    /// would mint a fresh one at the original instance and send that too.
+    /// The check refuses rather than warns: a warning is printed after the
+    /// credential has already gone to the request channel.
+    ///
+    /// An environment API key is exempt, and deliberately so: it is
+    /// supplied per invocation by whoever set it, alongside `OUTLINE_URL`,
+    /// so there is no stored binding it could contradict.
     ///
     /// The plaintext-environment warning is emitted here - once per
     /// command run, at the moment the key is actually chosen, rather than
@@ -160,8 +187,10 @@ impl CredentialProvider {
         store: CredentialStore,
         profile: &str,
         file: &CredentialFile,
+        origin: &str,
     ) -> Result<Option<Self>, OAuthError> {
         let entry = file.profile(profile);
+        check_binding(entry, profile, origin)?;
         let available = available(entry);
         let Some(&method) = available.first() else {
             return Ok(None);
@@ -226,10 +255,12 @@ impl CredentialProvider {
 
     /// Refresh the access token, taking the cross-process lock first.
     ///
-    /// `rejected` is the value the server just refused, when the refresh
-    /// was triggered by a 401 rather than by the stored expiry.
-    fn refresh_locked(&self, rejected: Option<&str>) -> Result<String, OAuthError> {
-        let _lock = RefreshLock::acquire(self.store.dir())?;
+    /// `superseded` is the access token this process considers spent: the
+    /// value the server just refused with a 401, or the one that reached
+    /// its expiry. Whatever is on disk under a DIFFERENT value was put
+    /// there by another process that already did this work.
+    fn refresh_locked(&self, superseded: &str) -> Result<String, OAuthError> {
+        let _lock = CredentialLock::acquire(self.store.dir())?;
         // Inside the lock the file is the authority: whoever held the lock
         // before us may already have rotated the tokens.
         let mut file = self.store.load()?;
@@ -240,7 +271,7 @@ impl CredentialProvider {
                 profile: self.profile.clone(),
                 detail: " (no OAuth session is stored any more)".to_string(),
             })?;
-        if is_usable(&stored, rejected) {
+        if superseded_by(&stored, superseded) {
             self.adopt(&stored);
             return Ok(stored.access_token.clone());
         }
@@ -309,13 +340,21 @@ impl CredentialProvider {
         }
     }
 
-    /// The current session's access token, if it is still usable.
-    fn usable_access_token(&self) -> Option<String> {
-        let state = self.state.lock().ok()?;
+    /// The credential to send, or the one that needs replacing.
+    fn current_token(&self) -> Current {
+        let Ok(state) = self.state.lock() else {
+            // A poisoned mutex means another thread panicked mid-refresh;
+            // treat the in-memory view as unusable rather than guess.
+            return Current::Spent(String::new());
+        };
         match &*state {
-            State::Fixed(key) => Some(key.clone()),
+            State::Fixed(key) => Current::Usable(key.clone()),
             State::Session(session) => {
-                is_usable(session, None).then(|| session.access_token.clone())
+                if fresh_enough(session) {
+                    Current::Usable(session.access_token.clone())
+                } else {
+                    Current::Spent(session.access_token.clone())
+                }
             }
         }
     }
@@ -328,39 +367,87 @@ impl CredentialProvider {
 
 impl CredentialSource for CredentialProvider {
     fn bearer(&self) -> Result<String, CredentialError> {
-        if let Some(token) = self.usable_access_token() {
-            return Ok(token);
+        match self.current_token() {
+            Current::Usable(token) => Ok(token),
+            // Only an OAuth session can get here: a fixed key is always
+            // usable, so there is nothing to refresh.
+            Current::Spent(spent) => self.refresh_locked(&spent).map_err(credential_error),
         }
-        // Only an OAuth session can get here: a fixed key is always usable.
-        self.refresh_locked(None).map_err(credential_error)
     }
 
     fn renew(&self, rejected: &str) -> Result<Option<String>, CredentialError> {
         if !self.renewable() {
             return Ok(None);
         }
-        self.refresh_locked(Some(rejected))
+        self.refresh_locked(rejected)
             .map(Some)
             .map_err(credential_error)
     }
 }
 
-/// Whether a stored session can be used as-is.
+/// Whether a session may be sent without refreshing it first.
 ///
-/// `rejected` makes the difference between the two callers: on the
-/// expiry-driven path any unexpired token will do, while after a 401 the
-/// exact value the server refused must be replaced even if its recorded
-/// expiry says otherwise (the server is right, the record is not).
-fn is_usable(session: &OAuthSession, rejected: Option<&str>) -> bool {
-    if rejected == Some(session.access_token.as_str()) {
-        return false;
-    }
+/// Applies the safety margin: a token inside [`EXPIRY_SKEW_SECONDS`] of its
+/// expiry is refreshed EARLY, so clock skew and time in flight cannot turn
+/// it into a failed request.
+fn fresh_enough(session: &OAuthSession) -> bool {
     match session.expires_at {
         Some(at) => oauth::now_unix() + EXPIRY_SKEW_SECONDS < at,
         // No expiry was recorded: use it and let a 401 sort it out, rather
         // than refreshing on every single request.
         None => true,
     }
+}
+
+/// Whether the session on disk already replaces `superseded`.
+///
+/// This is the single-flight acceptance test, and it deliberately does NOT
+/// apply the safety margin. The margin exists to refresh early; applying it
+/// here would make a queue of waiting processes each refresh again whenever
+/// the server issues a short-lived token, spending one single-use refresh
+/// token per waiter and turning a successful batch into an authentication
+/// failure. What matters to a waiter is only: is this a different token
+/// than the one we know is spent, and has it not actually expired yet.
+fn superseded_by(session: &OAuthSession, superseded: &str) -> bool {
+    if session.access_token == superseded {
+        return false;
+    }
+    match session.expires_at {
+        Some(at) => oauth::now_unix() < at,
+        None => true,
+    }
+}
+
+/// What the in-memory state can offer right now.
+enum Current {
+    /// A credential good to send.
+    Usable(String),
+    /// A credential that needs replacing; carries the spent value so the
+    /// refresh can tell "mine is stale" from "someone else replaced it".
+    Spent(String),
+}
+
+/// Refuse stored credentials that belong to another instance.
+fn check_binding(
+    entry: Option<&ProfileCredentials>,
+    profile: &str,
+    origin: &str,
+) -> Result<(), OAuthError> {
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    // Nothing stored means nothing to misdirect.
+    if entry.is_empty() || entry.is_bound_to(origin) {
+        return Ok(());
+    }
+    Err(OAuthError::InstanceMismatch {
+        profile: profile.to_string(),
+        stored: entry
+            .origin
+            .clone()
+            .unwrap_or_else(|| "an unrecorded instance".to_string()),
+        current: origin.to_string(),
+    })
 }
 
 /// Fold a token response into the stored session.
@@ -432,6 +519,8 @@ mod tests {
 
     use super::*;
 
+    const ORIGIN: &str = "https://docs.example.com";
+
     fn session(expires_in: Option<i64>, refresh: Option<&str>) -> OAuthSession {
         OAuthSession {
             access_token: "access-1".to_string(),
@@ -446,38 +535,87 @@ mod tests {
         }
     }
 
+    /// A profile bound to [`ORIGIN`] holding the given credentials.
+    fn bound(api_key: Option<&str>, oauth: Option<OAuthSession>) -> ProfileCredentials {
+        ProfileCredentials {
+            origin: Some(ORIGIN.to_string()),
+            api_key: api_key.map(str::to_string),
+            oauth,
+            client: None,
+        }
+    }
+
+    // --- expiry and the safety margin ----------------------------------
+
     #[test]
     fn a_token_well_before_its_expiry_is_used_as_is() {
-        assert!(is_usable(&session(Some(3600), Some("rt")), None));
+        assert!(fresh_enough(&session(Some(3600), Some("rt"))));
     }
 
     #[test]
-    fn a_token_inside_the_skew_window_is_treated_as_spent() {
+    fn a_token_inside_the_skew_window_is_refreshed_early() {
         assert!(
-            !is_usable(&session(Some(EXPIRY_SKEW_SECONDS - 1), Some("rt")), None),
+            !fresh_enough(&session(Some(EXPIRY_SKEW_SECONDS - 1), Some("rt"))),
             "a token expiring within the skew window must be refreshed early"
         );
     }
 
     #[test]
     fn an_expired_token_is_not_used() {
-        assert!(!is_usable(&session(Some(-10), Some("rt")), None));
+        assert!(!fresh_enough(&session(Some(-10), Some("rt"))));
     }
 
     #[test]
     fn a_token_without_a_recorded_expiry_is_used_rather_than_refreshed_every_time() {
-        assert!(is_usable(&session(None, Some("rt")), None));
+        assert!(fresh_enough(&session(None, Some("rt"))));
+    }
+
+    // --- single flight: what a waiter accepts --------------------------
+
+    #[test]
+    fn a_waiter_accepts_the_token_another_process_just_obtained() {
+        let mut stored = session(Some(3600), Some("rt"));
+        stored.access_token = "access-2".to_string();
+        assert!(
+            superseded_by(&stored, "access-1"),
+            "a waiter must reuse the winner's token instead of refreshing again"
+        );
     }
 
     #[test]
-    fn the_exact_value_the_server_refused_is_never_reused() {
-        // Even with an expiry far in the future: the server is the
-        // authority on whether its own token is still good.
-        let session = session(Some(3600), Some("rt"));
-        assert!(!is_usable(&session, Some("access-1")));
-        // Another process having already rotated it makes it usable again.
-        assert!(is_usable(&session, Some("some-older-token")));
+    fn a_waiter_accepts_a_short_lived_token_rather_than_refreshing_again() {
+        // The reported bug: with the safety margin applied here, every
+        // queued process would refresh again whenever the server issues a
+        // short-lived token, spending one single-use refresh token each and
+        // breaking the "refresh once" guarantee outright.
+        let mut stored = session(Some(EXPIRY_SKEW_SECONDS - 1), Some("rt"));
+        stored.access_token = "access-2".to_string();
+        assert!(
+            superseded_by(&stored, "access-1"),
+            "a freshly issued short-lived token must still be reused"
+        );
+        // It is nonetheless below the margin for the proactive path, which
+        // is what makes the two predicates different.
+        assert!(!fresh_enough(&stored));
     }
+
+    #[test]
+    fn a_waiter_does_not_accept_the_token_that_was_just_refused() {
+        let stored = session(Some(3600), Some("rt"));
+        assert!(
+            !superseded_by(&stored, "access-1"),
+            "the value the server refused must never be reused"
+        );
+    }
+
+    #[test]
+    fn a_waiter_does_not_accept_an_already_expired_token() {
+        let mut stored = session(Some(-10), Some("rt"));
+        stored.access_token = "access-2".to_string();
+        assert!(!superseded_by(&stored, "access-1"));
+    }
+
+    // --- rotation merge ------------------------------------------------
 
     #[test]
     fn a_refresh_response_that_rotates_the_token_replaces_it() {
@@ -514,13 +652,65 @@ mod tests {
         assert_eq!(merged.refresh_token.as_deref(), Some("rt-old"));
     }
 
+    // --- instance binding ----------------------------------------------
+
+    #[test]
+    fn credentials_bound_to_another_instance_are_refused() {
+        // The attack: log in to A, then point OUTLINE_URL at B. Without
+        // this check B receives A's bearer token, and once it expires the
+        // CLI mints a fresh one at A and sends that to B as well.
+        let entry = bound(Some("key"), Some(session(Some(3600), Some("rt"))));
+        let error = check_binding(Some(&entry), "default", "https://evil.example.net")
+            .expect_err("credentials for another instance must be refused");
+        let text = error.to_string();
+        assert!(text.contains("https://docs.example.com"), "{text}");
+        assert!(text.contains("https://evil.example.net"), "{text}");
+        assert!(text.contains("OUTLINE_PROFILE"), "{text}");
+        assert!(text.contains("otl auth login"), "{text}");
+    }
+
+    #[test]
+    fn credentials_bound_to_this_instance_are_accepted() {
+        let entry = bound(Some("key"), None);
+        assert!(check_binding(Some(&entry), "default", ORIGIN).is_ok());
+    }
+
+    #[test]
+    fn credentials_with_no_recorded_binding_fail_closed() {
+        // A hand-written or pre-binding file must not be treated as valid
+        // everywhere: the safe default for "unknown" is refusal.
+        let entry = ProfileCredentials {
+            origin: None,
+            api_key: Some("key".to_string()),
+            oauth: None,
+            client: None,
+        };
+        let error = check_binding(Some(&entry), "default", ORIGIN)
+            .expect_err("an unbound credential must not be usable");
+        assert!(error.to_string().contains("unrecorded"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_or_absent_profile_has_nothing_to_misdirect() {
+        assert!(check_binding(None, "default", ORIGIN).is_ok());
+        assert!(check_binding(Some(&ProfileCredentials::default()), "default", ORIGIN).is_ok());
+    }
+
+    #[test]
+    fn resolution_refuses_a_profile_bound_elsewhere() {
+        let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
+        let mut file = CredentialFile::default();
+        *file.profile_mut("default") = bound(Some("key"), None);
+        let error = CredentialProvider::resolve(store, "default", &file, "https://other.example")
+            .expect_err("resolution must refuse a foreign binding");
+        assert!(error.to_string().contains("refused"), "{error}");
+    }
+
+    // --- precedence ----------------------------------------------------
+
     #[test]
     fn precedence_is_oauth_then_stored_key_then_environment() {
-        let mut profile = ProfileCredentials::default();
-        // No environment key in this process unless set below.
-        assert!(env_api_key().is_none() || true);
-
-        profile.api_key = Some("stored".to_string());
+        let mut profile = bound(Some("stored"), None);
         assert_eq!(
             available(Some(&profile)).first().copied(),
             Some(Method::StoredApiKey)
@@ -535,32 +725,30 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_with_nothing_stored_has_no_method() {
-        assert!(
-            available(Some(&ProfileCredentials::default())).is_empty() || env_api_key().is_some()
-        );
-        let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
-        let file = CredentialFile::default();
-        // With no environment key this resolves to nothing at all.
-        if env_api_key().is_none() {
-            assert!(CredentialProvider::resolve(store, "default", &file)
-                .unwrap()
-                .is_none());
-        }
-    }
-
-    #[test]
     fn a_fixed_key_provider_never_claims_it_can_renew() {
         let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
         let mut file = CredentialFile::default();
-        file.profile_mut("default").api_key = Some("k".to_string());
-        let provider = CredentialProvider::resolve(store, "default", &file)
+        *file.profile_mut("default") = bound(Some("k"), None);
+        let provider = CredentialProvider::resolve(store, "default", &file, ORIGIN)
             .unwrap()
             .expect("a stored key resolves");
         assert_eq!(provider.method(), Method::StoredApiKey);
         assert_eq!(provider.bearer().unwrap(), "k");
         assert_eq!(provider.renew("k").unwrap(), None);
     }
+
+    #[test]
+    fn a_profile_with_nothing_stored_has_no_method() {
+        let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
+        let file = CredentialFile::default();
+        if env_api_key().is_none() {
+            assert!(CredentialProvider::resolve(store, "default", &file, ORIGIN)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    // --- error classification ------------------------------------------
 
     #[test]
     fn a_store_failure_reaching_the_channel_stays_actionable() {

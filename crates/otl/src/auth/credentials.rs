@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::error::{StoreError, CREDENTIAL_FORMAT_VERSION};
+use crate::auth::lock::CredentialLock;
 use crate::auth::paths::{self, CREDENTIALS_FILE_NAME};
 use crate::auth::secret_file::{self, Permissions};
 
@@ -81,6 +82,19 @@ impl CredentialFile {
 /// obtained with.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct ProfileCredentials {
+    /// Origin (`scheme://host[:port]`) these credentials were issued by.
+    ///
+    /// A credential is only meaningful to the instance that issued it, and
+    /// sending it anywhere else hands a bearer token to a server that was
+    /// never supposed to have it. The binding is recorded here and checked
+    /// on every use, so re-pointing `OUTLINE_URL` at another host cannot
+    /// silently forward this profile's credentials to it.
+    ///
+    /// `None` means "written before the binding existed, or by hand": that
+    /// is treated as unusable rather than as universally valid, so the
+    /// failure mode of a missing binding is a refusal, not a leak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// A personal API key, as stored by `otl auth set-key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -95,6 +109,7 @@ pub struct ProfileCredentials {
 impl fmt::Debug for ProfileCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProfileCredentials")
+            .field("origin", &self.origin)
             .field("api_key", &presence(self.api_key.as_deref()))
             .field("oauth", &self.oauth)
             .field("client", &self.client)
@@ -104,8 +119,18 @@ impl fmt::Debug for ProfileCredentials {
 
 impl ProfileCredentials {
     /// Whether nothing at all is stored for this profile.
+    ///
+    /// The origin binding alone is not a credential: a profile that holds
+    /// only a leftover binding is empty and gets pruned.
     pub fn is_empty(&self) -> bool {
         self.api_key.is_none() && self.oauth.is_none() && self.client.is_none()
+    }
+
+    /// Whether these credentials may be sent to `origin`.
+    ///
+    /// Fails closed: an unrecorded binding is not usable anywhere.
+    pub fn is_bound_to(&self, origin: &str) -> bool {
+        self.origin.as_deref() == Some(origin)
     }
 }
 
@@ -297,6 +322,37 @@ impl CredentialStore {
     /// Remove the credential file entirely.
     pub fn delete(&self) -> Result<(), StoreError> {
         secret_file::remove(&self.path)
+    }
+
+    /// Take the credential lock, so a caller can run a longer transaction
+    /// (a refresh) with the file to itself.
+    pub fn lock(&self) -> Result<CredentialLock, StoreError> {
+        CredentialLock::acquire(&self.dir)
+    }
+
+    /// Run one read-modify-write of the credential file as a transaction.
+    ///
+    /// **This is the only correct way to change the credential file.** The
+    /// file is loaded INSIDE the lock and saved before the lock is
+    /// released, so a caller can never write back a snapshot taken before
+    /// another process rotated the tokens - which would resurrect a refresh
+    /// token the server has already retired and force a fresh login.
+    ///
+    /// The closure must not wait for a human, a browser, or the network:
+    /// the lock is held for its whole duration and every other `otl`
+    /// process blocks behind it. Gather input first, then call this.
+    pub fn update<T, E>(
+        &self,
+        edit: impl FnOnce(&mut CredentialFile) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let _lock = self.lock()?;
+        let mut file = self.load()?;
+        let outcome = edit(&mut file)?;
+        self.save(&file)?;
+        Ok(outcome)
     }
 }
 

@@ -41,6 +41,9 @@ fn seed(dir: &Path, base: &str, oauth: bool, stored_key: bool) {
     }
     let store = CredentialStore::at(dir.to_path_buf());
     let mut file = CredentialFile::default();
+    // Credentials are bound to the instance that issued them; without the
+    // binding they are refused outright (see the cross-instance test).
+    file.profile_mut("default").origin = engine::base_url_origin(base);
     if stored_key {
         file.profile_mut("default").api_key = Some(STORED_KEY.to_string());
     }
@@ -192,6 +195,89 @@ async fn the_plaintext_warning_can_be_silenced() {
     .unwrap();
 
     assert!(stderr.is_empty(), "expected silence, got: {stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn credentials_are_never_sent_to_an_instance_that_did_not_issue_them() {
+    // The attack: sign in to instance A, then point OUTLINE_URL at an
+    // instance the attacker controls. Nothing must be sent to B - not the
+    // stored access token, and not a freshly minted one either.
+    let attacker = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&attacker)
+        .await;
+
+    let victim = "https://docs.example.com";
+    let attacker_url = attacker.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let (code, stderr) = {
+        let attacker_url = attacker_url.clone();
+        tokio::task::spawn_blocking(move || {
+            // Credentials issued by the victim instance...
+            seed(&path, victim, true, true);
+            // ...and a command pointed at the attacker's.
+            let output = otl(&path, &attacker_url)
+                .args(["api", "documents.info", "id=d"])
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        })
+        .await
+        .unwrap()
+    };
+
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("docs.example.com"), "stderr: {stderr}");
+    assert!(stderr.contains("refused"), "stderr: {stderr}");
+    // Nothing at all reached the attacker.
+    assert!(
+        attacker
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a request reached an instance that never issued these credentials"
+    );
+    for secret in [OAUTH_TOKEN, STORED_KEY] {
+        assert!(!stderr.contains(secret), "{secret} leaked: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_environment_key_is_not_bound_to_a_stored_instance() {
+    // An environment key is supplied per invocation next to OUTLINE_URL, so
+    // there is no stored binding for it to contradict and it must keep
+    // working against any instance.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&server)
+        .await;
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let code = tokio::task::spawn_blocking(move || {
+        otl(&path, &base)
+            .env("OUTLINE_API_KEY", ENV_KEY)
+            .env("OUTLINE_NO_KEY_WARNING", "1")
+            .args(["api", "documents.info", "id=d"])
+            .output()
+            .unwrap()
+            .status
+            .code()
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, Some(0));
 }
 
 #[test]

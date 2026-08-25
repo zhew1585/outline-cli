@@ -21,7 +21,7 @@ use std::time::Duration;
 use engine::sanitize::clean_server_text;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION};
-use reqwest::StatusCode;
+use reqwest::{redirect, StatusCode};
 use serde_json::Value;
 
 use crate::auth::error::{OAuthError, Stage};
@@ -42,9 +42,26 @@ const MAX_CODE_CHARS: usize = 64;
 const UNKNOWN_ORIGIN: &str = "the authorization server";
 
 /// Build the HTTP client used for every OAuth endpoint call.
+///
+/// **Redirects are disabled, and that is a security requirement, not a
+/// preference.** Every request this client makes carries a credential in
+/// its BODY - an authorization code, a PKCE verifier, a refresh token, a
+/// client secret, a token being revoked. On a 307 or 308 reqwest preserves
+/// the method and replays the body to the new `Location`, and its
+/// cross-origin header stripping does not touch bodies. So a legitimate,
+/// same-origin token endpoint that answers `308 Location: https://evil/`
+/// would hand the credential to `evil` before any same-origin check could
+/// run - those checks validate the URL we chose, not where a server sends
+/// us mid-request. The discovery request is included: following a redirect
+/// there is an SSRF primitive that can reach internal addresses.
+///
+/// With no redirect policy, a 3xx is simply a non-success status and is
+/// reported like any other. No OAuth endpoint has a legitimate reason to
+/// redirect a POST.
 pub fn http_client() -> Result<Client, OAuthError> {
     Client::builder()
         .timeout(OAUTH_TIMEOUT)
+        .redirect(redirect::Policy::none())
         .build()
         .map_err(|error| OAuthError::Transport {
             stage: Stage::Discovery,

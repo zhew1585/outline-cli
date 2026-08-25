@@ -1,6 +1,6 @@
 # Story 2.6: 凭证文件卫生
 
-Status: review
+Status: review (R1 fixes applied)
 
 ## Story
 
@@ -109,9 +109,35 @@ so that 明文存储的风险被压到只剩「磁盘被物理读取」这一层
   既有的 Epic 1 测试也补上了同样的隔离（指向一个不存在的目录），否则本机存在凭证文件时它们的
   「缺 OUTLINE_API_KEY」断言会变得依赖环境。
 
-### 已知缺口（有意保留）
+### R1 审查后的修正
 
-- 目录权限过宽只报告不拒绝（见上文理由）。
+- **目录权限从「只报告」改为「按写权限拒绝」**。原来的取舍（文件硬失败、目录只报告）在写权限上
+  站不住：能写目录的人可以替换凭证文件，也可以替换那个让 refresh 单飞的 `.lock`。
+  现在的界线是 **write**：`ensure_dir` / `require_private_dir` 拒绝 group/other **可写**的目录
+  (`0o022`) 和非本人所有的目录，但**接受** `0755`——目录可读不泄漏任何凭证（文件自身是 0600），
+  而 `~/.config` 在绝大多数系统上就是 0755，对它硬失败会让工具不可用。
+  测试同时钉住三种情形：0777 拒、0770 拒、0755 accept。
+- **健康报告真的报告目录了**（源码注释原先声称却没做）。`CredentialHealth` 新增
+  `directory` / `directory_problem`，并计入 `usable`。
+- **锁文件与凭证文件按 fd 校验**：类型（必须是 regular file）、owner（必须是本人）、mode（owner-only）。
+  预埋的 0666 锁文件、symlink 锁路径都会被拒。
+- **锁路径替换可被检测**：`still_same_file` 在取到锁后比对 (dev, ino)。锁在 inode 上，
+  但别的进程按 pathname 找它——路径被 unlink/rename 后，下一个进程会在**新 inode** 上「拿到锁」，
+  两边都以为独占。这条把竞态变成明确报错。
+- **锁超时提示不再建议删除锁文件**。holder 还在跑时删掉 pathname 正是上面那种分裂。
+  新文案让用户等待或找卡住的 otl 进程，并明确写出「不要删」。测试
+  `a_contended_lock_never_advises_deleting_the_lock_file` 反向钉住。
+- **凭证路径用 `O_NOFOLLOW | O_NONBLOCK` 打开**（新增 `rustix` 依赖，仅 unix）。
+  `O_NOFOLLOW` 让 symlink 变成错误而不是静默重定向（`symlink_metadata` 预检会留窗口，
+  在 open 里拒绝则没有窗口）；`O_NONBLOCK` 是因为**对无写端的 FIFO 做 open 会永久阻塞**——
+  在任何权限或类型检查之前，一个 0600 的 FIFO 就能让所有需要凭证的命令永久挂起。
+  测试里真的创建 FIFO 来验证（若测试回归，测试本身会挂住）。
+- **目录 fsync 错误向上传播**（见 Story 2.3）。
+- **所有凭证文件写入纳入同一把事务锁**：`CredentialStore::update` 取锁 → **锁内 load** → 修改 → save。
+  原来只有 refresh 路径持锁，`set-key` / `login` / `logout` 各自「读快照 → 改 → 写回」，
+  与并发 refresh 相互覆盖。锁绝不跨越等人输入或等浏览器的阶段。
+
+### 已知缺口（有意保留）
 - Windows 上不主动设置 ACL（stack.md 明确的决策），只在报告里说清依赖 profile 目录 ACL。
 - 「进程被 kill 导致半写」用「反复替换 + 每次读回」间接验证，而不是真的在写中途发 SIGKILL：
   原子性由 `rename` 提供，注入式测试只能验证同一件事却引入不确定性。
@@ -134,6 +160,8 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 - `startup_guard.rs` 的源码扫描禁止 `crates/*/src` 出现 `read_dir`。原本放在
   `secret_file.rs` 里的「原子写不留 temp」测试因此移到 `tests/credential_hygiene.rs`，
   并在原处留了注释说明去向。守卫本身未放宽。
+- R1 修复期间新增两个依赖：`rpassword`（关闭终端回显）与 `rustix`（`O_NOFOLLOW`/`O_NONBLOCK` 与
+  fd 上的 fstat/geteuid，避免自己写 unsafe）。两者都已在依赖图里（tempfile / fs4 传递引入 rustix）。
 
 ### File List
 

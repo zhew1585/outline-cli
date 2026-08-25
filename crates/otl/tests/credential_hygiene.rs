@@ -15,19 +15,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use otl::auth::credentials::{CredentialFile, CredentialStore, OAuthSession};
-use otl::auth::lock::RefreshLock;
+use otl::auth::lock::CredentialLock;
 use otl::auth::report;
 use otl::auth::secret_file::{self, Permissions};
 
 /// A distinctive value that must never appear in any output.
 const SECRET: &str = "TOKEN-SECRET-9c7a";
 
+/// The instance these test credentials are bound to; the commands below are
+/// pointed at the same origin.
+const INSTANCE: &str = "http://127.0.0.1:9";
+
 /// `otl` with credential state pinned to `config_dir`.
 fn otl(config_dir: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("otl"));
     cmd.env_remove("OUTLINE_API_KEY")
         .env_remove("OUTLINE_PROFILE")
-        .env("OUTLINE_URL", "http://127.0.0.1:9")
+        .env("OUTLINE_URL", INSTANCE)
         .env("OUTLINE_CONFIG_DIR", config_dir)
         .env("OUTLINE_NO_KEY_WARNING", "1");
     cmd
@@ -38,6 +42,7 @@ fn seed(dir: &Path) -> CredentialStore {
     let store = CredentialStore::at(dir.to_path_buf());
     let mut file = CredentialFile::default();
     let entry = file.profile_mut("default");
+    entry.origin = Some(INSTANCE.to_string());
     entry.api_key = Some(SECRET.to_string());
     entry.oauth = Some(OAuthSession {
         access_token: SECRET.to_string(),
@@ -248,14 +253,14 @@ fn concurrent_refreshes_are_serialized_by_the_lock_file() {
     // The property the refresh path depends on: while one holder has the
     // lock, no other can take it, and it becomes free again afterwards.
     let dir = tempfile::tempdir().unwrap();
-    let held = RefreshLock::acquire(dir.path()).unwrap();
+    let held = CredentialLock::acquire(dir.path()).unwrap();
 
     let path = Arc::new(dir.path().to_path_buf());
     let contenders: Vec<_> = (0..4)
         .map(|_| {
             let path = Arc::clone(&path);
             std::thread::spawn(move || {
-                RefreshLock::acquire_within(&path, Duration::from_millis(80)).is_ok()
+                CredentialLock::acquire_within(&path, Duration::from_millis(80)).is_ok()
             })
         })
         .collect();
@@ -267,7 +272,7 @@ fn concurrent_refreshes_are_serialized_by_the_lock_file() {
     }
 
     drop(held);
-    RefreshLock::acquire_within(dir.path(), Duration::from_secs(2))
+    CredentialLock::acquire_within(dir.path(), Duration::from_secs(2))
         .expect("the lock must be free once the holder is gone");
 }
 
@@ -332,4 +337,154 @@ fn set_key_with_empty_input_stores_nothing() {
         !dir.path().join("credentials.toml").exists(),
         "a rejected key must not create a credential file"
     );
+}
+
+// --- finding [7]: every writer takes the same lock -------------------------
+
+#[test]
+fn a_read_modify_write_cannot_clobber_a_concurrent_rotation() {
+    // The reported lost update: a writer that snapshots the file, waits,
+    // and then saves would put back the token another process has already
+    // rotated - and the server has already retired the old one, so the next
+    // refresh fails and the user has to log in again.
+    //
+    // `update` closes that by loading INSIDE the lock: the closure only
+    // ever sees current state.
+    let dir = tempfile::tempdir().unwrap();
+    let store = CredentialStore::at(dir.path().to_path_buf());
+
+    let mut initial = CredentialFile::default();
+    let entry = initial.profile_mut("default");
+    entry.origin = Some(INSTANCE.to_string());
+    entry.oauth = Some(rotating_session("access-1", "refresh-1"));
+    store.save(&initial).unwrap();
+
+    // A stale snapshot, taken before the rotation below.
+    let stale = store.load().unwrap();
+    assert_eq!(
+        stale
+            .profile("default")
+            .unwrap()
+            .oauth
+            .as_ref()
+            .unwrap()
+            .refresh_token
+            .as_deref(),
+        Some("refresh-1")
+    );
+
+    // Another process rotates the tokens.
+    store
+        .update(
+            |file: &mut CredentialFile| -> Result<(), otl::auth::error::StoreError> {
+                file.profile_mut("default").oauth = Some(rotating_session("access-2", "refresh-2"));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    // Now the first writer adds an API key. It must NOT write `stale` back.
+    store
+        .update(
+            |file: &mut CredentialFile| -> Result<(), otl::auth::error::StoreError> {
+                file.profile_mut("default").api_key = Some("added-later".to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let after = store.load().unwrap();
+    let session = after.profile("default").unwrap().oauth.as_ref().unwrap();
+    assert_eq!(
+        session.refresh_token.as_deref(),
+        Some("refresh-2"),
+        "a stale snapshot resurrected a refresh token the server retired"
+    );
+    assert_eq!(session.access_token, "access-2");
+    assert_eq!(
+        after.profile("default").unwrap().api_key.as_deref(),
+        Some("added-later"),
+        "the concurrent edit was lost instead"
+    );
+}
+
+#[test]
+fn an_update_runs_under_the_credential_lock() {
+    // If `update` did not hold the lock, this nested acquisition would
+    // succeed and the transaction guarantee would be fictional.
+    let dir = tempfile::tempdir().unwrap();
+    let store = CredentialStore::at(dir.path().to_path_buf());
+    let observed = store
+        .update(
+            |_file: &mut CredentialFile| -> Result<bool, otl::auth::error::StoreError> {
+                Ok(CredentialLock::acquire_within(dir.path(), Duration::from_millis(60)).is_err())
+            },
+        )
+        .unwrap();
+    assert!(observed, "update did not hold the credential lock");
+}
+
+/// A session with the given token pair, bound to the test instance.
+fn rotating_session(access: &str, refresh: &str) -> OAuthSession {
+    OAuthSession {
+        access_token: access.to_string(),
+        refresh_token: Some(refresh.to_string()),
+        expires_at: Some(otl::auth::oauth::now_unix() + 3600),
+        scope: Some("read write".to_string()),
+        client_id: "client-1".to_string(),
+        token_endpoint: "https://docs.example.com/oauth/token".to_string(),
+        revocation_endpoint: None,
+        account: None,
+        workspace: None,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn set_key_does_not_lose_a_rotation_that_happened_while_it_waited() {
+    // End-to-end version of the same race, through the real binary: the key
+    // is read from stdin first and the file is re-read under the lock, so a
+    // rotation that lands in between survives.
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CredentialStore::at(dir.path().to_path_buf());
+    let mut initial = CredentialFile::default();
+    let entry = initial.profile_mut("default");
+    entry.origin = Some(INSTANCE.to_string());
+    entry.oauth = Some(rotating_session("access-9", "refresh-9"));
+    store.save(&initial).unwrap();
+
+    let mut child = otl(dir.path())
+        .args(["auth", "set-key"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"ol_api_LATER\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = store.load().unwrap();
+    let profile = after.profile("default").unwrap();
+    assert_eq!(profile.api_key.as_deref(), Some("ol_api_LATER"));
+    assert_eq!(
+        profile.oauth.as_ref().unwrap().refresh_token.as_deref(),
+        Some("refresh-9"),
+        "set-key clobbered the stored session"
+    );
+    // And it recorded which instance the key is for.
+    assert_eq!(profile.origin.as_deref(), Some(INSTANCE));
 }

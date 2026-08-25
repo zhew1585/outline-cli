@@ -34,7 +34,9 @@ mod scalar;
 pub mod throttle;
 
 pub use body::build_request_body;
-pub use client::{base_url_origin, is_valid_base_url, Client, ErrorDetail, DEFAULT_TIMEOUT};
+pub use client::{
+    base_url_origin, check_base_url, is_valid_base_url, Client, ErrorDetail, DEFAULT_TIMEOUT,
+};
 pub use credential::{CredentialError, CredentialFault, CredentialSource, StaticCredential};
 pub use error::{EngineError, TransportKind};
 pub use ir::{BodyMode, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION};

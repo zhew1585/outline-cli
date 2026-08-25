@@ -37,6 +37,10 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 fs4 = { workspace = true }
+rpassword = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

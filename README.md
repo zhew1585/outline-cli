@@ -68,6 +68,18 @@ When several credentials exist for a profile, the order is OAuth session, then t
 key, then `OUTLINE_API_KEY`. Using the environment variable prints a one-time note about where plaintext
 in the environment tends to end up; `OUTLINE_NO_KEY_WARNING=1` silences it.
 
+Four rules the OAuth flow will not bend on, because each protects a credential in flight and a warning
+after the fact protects nothing:
+
+- **TLS**, unless the host is a loopback IP literal. `http://` to anything else is refused, and
+  `localhost` does not count as loopback — it is a name, and a resolver can point it elsewhere.
+- **No redirects on credential-bearing requests.** A 307 or 308 replays the request body, and reqwest's
+  cross-origin header stripping does not cover bodies, so following one could post an authorization code
+  or refresh token to whoever the `Location` names.
+- **Discovered endpoints must be the instance's own**, matching its origin and its RFC 8414 `issuer`.
+- **Credentials are bound to the instance that issued them.** Pointing `OUTLINE_URL` at a different
+  instance without switching profile sends nothing at all. Use one profile per instance.
+
 ## Design
 
 **Two crates.** `engine` is a generic OpenAPI RPC client with no knowledge of Outline whatsoever — the

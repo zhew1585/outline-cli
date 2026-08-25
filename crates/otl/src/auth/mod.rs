@@ -11,6 +11,7 @@
 //! - [`endpoint`]: the one place that speaks HTTP to an OAuth endpoint.
 //! - [`metadata`], [`pkce`], [`loopback`], [`oauth`], [`dcr`]: the pieces of
 //!   the authorization-code flow.
+//! - [`transport`]: the TLS rule every OAuth URL has to pass.
 //! - [`source`]: the `engine::CredentialSource` the request channel calls.
 //! - [`login`], [`logout`], [`report`]: what the `otl auth` subcommands do.
 //!
@@ -34,13 +35,14 @@ pub mod pkce;
 pub mod report;
 pub mod secret_file;
 pub mod source;
+pub mod transport;
 
 use std::sync::Arc;
 
 use engine::EngineError;
 use thiserror::Error;
 
-use crate::auth::credentials::{CredentialFile, CredentialStore};
+use crate::auth::credentials::CredentialStore;
 use crate::auth::error::{OAuthError, StoreError};
 use crate::auth::source::CredentialProvider;
 use crate::config::{ConfigError, ENV_API_KEY, ENV_URL};
@@ -109,18 +111,22 @@ pub fn base_url() -> Result<String, AuthError> {
 }
 
 /// Resolve the active profile's credentials.
+///
+/// The instance's origin is passed into resolution, which refuses stored
+/// credentials issued by a DIFFERENT instance. That check is why this
+/// function exists rather than each command wiring up its own provider: it
+/// must not be possible to build a request-channel client without it.
 pub fn open_session() -> Result<Session, AuthError> {
     // URL first: with no instance to talk to, which credential would be
     // used is not yet an interesting question.
     let base_url = base_url()?;
+    let origin = instance_origin(&base_url)?;
     let profile = paths::active_profile()?;
     let store = CredentialStore::discover()?;
     let file = store.load()?;
-    let provider =
-        CredentialProvider::resolve(store.clone(), &profile, &file)?.ok_or_else(|| {
-            AuthError::NoCredentials {
-                profile: profile.clone(),
-            }
+    let provider = CredentialProvider::resolve(store.clone(), &profile, &file, &origin)?
+        .ok_or_else(|| AuthError::NoCredentials {
+            profile: profile.clone(),
         })?;
     Ok(Session {
         base_url,
@@ -130,15 +136,53 @@ pub fn open_session() -> Result<Session, AuthError> {
     })
 }
 
-/// The credential store and profile, without requiring any credential.
+/// The origin stored credentials are bound to for a given instance URL.
+///
+/// Origin, not the whole URL: a bearer credential is scoped to a host, and
+/// a differing path (a trailing slash, a sub-path) does not make it a
+/// different server. A URL with no usable origin cannot be matched against
+/// anything, so it is refused here rather than treated as a wildcard.
+pub fn instance_origin(base_url: &str) -> Result<String, AuthError> {
+    // Validate through the engine first, so a malformed URL produces the
+    // engine's own specific diagnosis (a query string, embedded userinfo, a
+    // bad scheme) rather than a vaguer one invented here.
+    engine::check_base_url(base_url)?;
+    engine::base_url_origin(base_url).ok_or_else(|| {
+        AuthError::Engine(EngineError::InvalidBaseUrl {
+            reason: "it has no usable scheme/host origin, so credentials \
+                     cannot be bound to it"
+                .to_string(),
+        })
+    })
+}
+
+/// The credential store, profile and instance origin, without requiring
+/// any credential to exist yet.
 ///
 /// Used by `auth login` and `auth set-key`, which run precisely when there
-/// is nothing stored yet.
-pub fn open_store() -> Result<(String, CredentialStore, CredentialFile), AuthError> {
-    let profile = paths::active_profile()?;
-    let store = CredentialStore::discover()?;
-    let file = store.load()?;
-    Ok((profile, store, file))
+/// is nothing stored.
+pub fn open_store() -> Result<StoreContext, AuthError> {
+    let base_url = base_url()?;
+    let origin = instance_origin(&base_url)?;
+    Ok(StoreContext {
+        profile: paths::active_profile()?,
+        store: CredentialStore::discover()?,
+        base_url,
+        origin,
+    })
+}
+
+/// Where credentials for this invocation live, and which instance they are
+/// for.
+pub struct StoreContext {
+    /// Active profile name.
+    pub profile: String,
+    /// The credential store.
+    pub store: CredentialStore,
+    /// Instance base URL.
+    pub base_url: String,
+    /// Instance origin, which credentials get bound to.
+    pub origin: String,
 }
 
 /// Build the request-channel client for the active profile.
@@ -238,11 +282,20 @@ fn oauth_exit_code(error: &OAuthError) -> ExitCode {
         | OAuthError::AuthorizationDenied { .. }
         | OAuthError::StateMismatch
         | OAuthError::CallbackTimeout { .. }
-        | OAuthError::ForeignEndpoint { .. } => ExitCode::Auth,
-        // Fixable locally: get a client id, free a port.
-        OAuthError::RegistrationUnavailable { .. } | OAuthError::NoCallbackPort { .. } => {
-            ExitCode::Usage
-        }
+        | OAuthError::ForeignEndpoint { .. }
+        | OAuthError::IssuerMismatch { .. } => ExitCode::Auth,
+        // Fixable locally: get a client id, free a port, point the CLI at
+        // the instance the credentials belong to, use https.
+        OAuthError::RegistrationUnavailable { .. }
+        | OAuthError::NoCallbackPort { .. }
+        | OAuthError::InstanceMismatch { .. }
+        | OAuthError::InsecureTransport { .. }
+        | OAuthError::RetireFailed { .. } => ExitCode::Usage,
+        // A registration exists on the server that nothing can remove. Not
+        // a local configuration problem, and not something a retry fixes:
+        // it needs an administrator, so it gets the generic failure code
+        // rather than pretending to be actionable here.
+        OAuthError::OrphanedRegistration { .. } => ExitCode::Failure,
         OAuthError::Transport { .. } => ExitCode::Network,
         OAuthError::Endpoint { status, .. } => match status {
             401 | 403 => ExitCode::Auth,

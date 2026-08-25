@@ -29,10 +29,9 @@ use crate::stdio;
 /// file from being stored as a credential.
 const MAX_API_KEY_BYTES: u64 = 4096;
 
-/// Prompt shown when stdin is a terminal.
-const KEY_PROMPT: &str = "Paste your Outline API key (Settings -> API) and press Enter.\n\
-     Note: the key will be visible as you type - hidden input is not \
-     implemented yet. Piping avoids that: otl auth set-key < key.txt";
+/// Prompt shown when stdin is a terminal. Input is not echoed.
+const KEY_PROMPT: &str = "Paste your Outline API key (Settings -> API) and press Enter. \
+     Input is hidden.";
 
 /// `otl auth <subcommand>`.
 #[derive(Debug, Args)]
@@ -75,6 +74,16 @@ pub struct LoginArgs {
     /// Seconds to wait for the browser redirect.
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     timeout: Option<u64>,
+
+    /// Register a new application even if the stored one cannot be removed
+    /// from the server first.
+    ///
+    /// Only needed when a previous registration's callback port is
+    /// permanently unavailable AND the server refuses to delete it. It
+    /// leaves an application an administrator has to remove by hand, so it
+    /// is never the default.
+    #[arg(long)]
+    force_new_client: bool,
 }
 
 /// Arguments for `otl auth logout`.
@@ -109,8 +118,7 @@ pub fn run(args: &AuthArgs, mode: OutputMode) -> Result<(), CliError> {
 
 /// `otl auth login`.
 fn run_login(args: &LoginArgs, mode: OutputMode) -> Result<(), CliError> {
-    let base_url = auth::base_url().map_err(auth::map_auth_error)?;
-    let (profile, store, file) = auth::open_store().map_err(auth::map_auth_error)?;
+    let context = auth::open_store().map_err(auth::map_auth_error)?;
     let options = login::Options {
         client_id: args.client_id.clone(),
         scope: args.scope.clone(),
@@ -118,33 +126,73 @@ fn run_login(args: &LoginArgs, mode: OutputMode) -> Result<(), CliError> {
             .timeout
             .map_or(loopback::AUTH_TIMEOUT, Duration::from_secs),
         open_browser: !args.no_browser,
+        force_new_client: args.force_new_client,
     };
-    let outcome =
-        login::run(&base_url, &profile, &store, file, &options).map_err(auth::map_auth_error)?;
-    emit(login_output(&profile, &outcome), mode)
+    let outcome = login::run(
+        &context.base_url,
+        &context.profile,
+        &context.origin,
+        &context.store,
+        &options,
+    )
+    .map_err(auth::map_auth_error)?;
+    emit(login_output(&context.profile, &outcome), mode)
 }
 
 /// `otl auth logout`.
+///
+/// Exits non-zero when a server-side step the user asked for did not
+/// happen: the local credentials are gone either way, but "the application
+/// is still registered on the server" is not success, and a script needs to
+/// be able to see that so the purge can be retried.
 fn run_logout(args: &LogoutArgs, mode: OutputMode) -> Result<(), CliError> {
-    let (profile, store, _) = auth::open_store().map_err(auth::map_auth_error)?;
-    let report = logout::run(&profile, &store, logout::Options { purge: args.purge })
-        .map_err(auth::map_auth_error)?;
+    let context = auth::open_store().map_err(auth::map_auth_error)?;
+    let report = logout::run(
+        &context.profile,
+        &context.store,
+        logout::Options { purge: args.purge },
+    )
+    .map_err(auth::map_auth_error)?;
     for warning in &report.warnings {
         stdio::write_diagnostic_line(&format!("warning: {warning}"));
     }
-    emit(logout_output(&profile, &report), mode)
+    emit(logout_output(&context.profile, &report), mode)?;
+    if report.remote_cleanup_failed {
+        return Err(CliError::new(
+            ExitCode::ApiRequest,
+            anyhow!(
+                "signed out locally, but the application could not be removed \
+                 from the server; the credential that manages it was kept so \
+                 `otl auth logout --purge` can be retried"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `otl auth set-key`.
+///
+/// The key is read BEFORE the credential lock is taken, and the file is
+/// then re-read inside it. Holding the lock across a prompt would block
+/// every other `otl` process for as long as the terminal sits there, and
+/// saving a snapshot read before the prompt would write back whatever a
+/// concurrent token refresh had already rotated.
 fn run_set_key(mode: OutputMode) -> Result<(), CliError> {
-    let (profile, store, mut file) = auth::open_store().map_err(auth::map_auth_error)?;
+    let context = auth::open_store().map_err(auth::map_auth_error)?;
     let key = read_api_key()?;
-    file.profile_mut(&profile).api_key = Some(key);
-    store
-        .save(&file)
-        .map_err(|error| auth::map_auth_error(AuthError::Store(error)))?;
-    let health = report::credential_health(&store);
-    emit(set_key_output(&profile, &health), mode)
+    context
+        .store
+        .update(
+            |file: &mut auth::credentials::CredentialFile| -> Result<(), AuthError> {
+                let entry = file.profile_mut(&context.profile);
+                entry.origin = Some(context.origin.clone());
+                entry.api_key = Some(key);
+                Ok(())
+            },
+        )
+        .map_err(auth::map_auth_error)?;
+    let health = report::credential_health(&context.store);
+    emit(set_key_output(&context.profile, &health), mode)
 }
 
 /// `otl auth info`.
@@ -155,11 +203,13 @@ fn run_info(args: &InfoArgs, mode: OutputMode) -> Result<(), CliError> {
         .map_err(|error| auth::map_auth_error(AuthError::Store(error)))?;
     let health = report::credential_health(&store);
     let base_url = auth::base_url().ok();
+    let origin = base_url.as_deref().and_then(engine::base_url_origin);
 
     // A report must work even when the file cannot be used - that is
-    // exactly when it is needed - so resolution failures become part of
-    // the output rather than aborting it.
-    let resolved = resolve_for_info(&store, &profile);
+    // exactly when it is needed - so resolution failures (including a
+    // credential bound to another instance) become part of the output
+    // rather than aborting it.
+    let resolved = resolve_for_info(&store, &profile, origin.as_deref());
     let identity = live_identity(args, &base_url, &resolved);
     emit(
         info_output(&profile, base_url.as_deref(), &health, &resolved, &identity),
@@ -171,11 +221,17 @@ fn run_info(args: &InfoArgs, mode: OutputMode) -> Result<(), CliError> {
 fn resolve_for_info(
     store: &auth::credentials::CredentialStore,
     profile: &str,
+    origin: Option<&str>,
 ) -> Result<Option<Arc<CredentialProvider>>, String> {
     let file = store
         .load()
         .map_err(|error: StoreError| error.to_string())?;
-    CredentialProvider::resolve(store.clone(), profile, &file)
+    // With no instance configured there is nothing to bind against, so the
+    // report describes the file rather than claiming a usable credential.
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    CredentialProvider::resolve(store.clone(), profile, &file, origin)
         .map(|provider| provider.map(Arc::new))
         .map_err(|error| error.to_string())
 }
@@ -201,19 +257,23 @@ fn live_identity(
 }
 
 /// Read an API key from stdin, refusing anything unusable as a header.
+///
+/// On a terminal the key is read with ECHO DISABLED, so it never appears on
+/// screen, in a screen recording, or in the terminal's scrollback. Telling
+/// the user to pipe instead is not a substitute: a pipe puts the key in
+/// shell history or in another process's arguments, which is the same
+/// exposure in a different place.
+///
+/// When stdin is not a terminal (a pipe, a file, a test harness) there is no
+/// echo to suppress and the bytes are read directly.
 fn read_api_key() -> Result<String, CliError> {
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
+    let raw = if std::io::stdin().is_terminal() {
         stdio::write_diagnostic_line(KEY_PROMPT);
-    }
-    let mut raw = String::new();
-    stdin
-        .lock()
-        .take(MAX_API_KEY_BYTES + 1)
-        .read_to_string(&mut raw)
-        .map_err(|error| {
-            CliError::usage(anyhow!("could not read the API key from stdin: {error}"))
-        })?;
+        rpassword::read_password()
+            .map_err(|error| CliError::usage(anyhow!("could not read the API key: {error}")))?
+    } else {
+        read_piped_key()?
+    };
     if raw.len() as u64 > MAX_API_KEY_BYTES {
         return Err(CliError::usage(anyhow!(
             "the input is longer than {MAX_API_KEY_BYTES} bytes, which an API \
@@ -221,6 +281,19 @@ fn read_api_key() -> Result<String, CliError> {
         )));
     }
     validate_api_key(raw.trim())
+}
+
+/// Read a key from a non-terminal stdin, capped.
+fn read_piped_key() -> Result<String, CliError> {
+    let mut raw = String::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_API_KEY_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|error| {
+            CliError::usage(anyhow!("could not read the API key from stdin: {error}"))
+        })?;
+    Ok(raw)
 }
 
 /// Check a key can be used, without ever echoing it.
@@ -541,6 +614,8 @@ mod tests {
                 mode: "0644".to_string(),
             },
             usable: false,
+            directory: std::path::PathBuf::from("/home/u/.config/outline-cli"),
+            directory_problem: None,
             profiles: Vec::new(),
             env_api_key: false,
         };
@@ -561,6 +636,8 @@ mod tests {
                 mode: "0600".to_string(),
             },
             usable: true,
+            directory: std::path::PathBuf::from("/tmp"),
+            directory_problem: None,
             profiles: Vec::new(),
             env_api_key: true,
         };

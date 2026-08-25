@@ -1,6 +1,6 @@
 # Story 2.4: logout 与 --purge
 
-Status: review
+Status: review (R1 fixes applied)
 
 ## Story
 
@@ -48,6 +48,22 @@ so that 服务器与本地都不残留。
   - [x] 单测：无撤销端点时给出「只在本地删除」的警告
 
 ## Dev Notes
+
+### R1 审查后的修正（BLOCKER）
+
+- **purge 失败仍清本地管理凭证**。原实现的清除条件是 `options.purge || registration_deleted`，
+  于是 `--purge` 无条件清掉本地 `registration_access_token` / `registration_client_uri`——
+  而服务器上的注册还在，且这两个值是**唯一**能删除它的东西。这正是 project-context 里
+  「丢了服务器上就删不掉了」要防的事。
+  现在由 `drop_registration` 决定：**只有服务端确认删除成功**（`registration_deleted`）才清；
+  管理员创建的 client（`dynamic = false`）没有管理凭证、服务器上也没有属于我们的东西，清掉不产生孤儿。
+- **退出码要反映部分失败**。新增 `Report::remote_cleanup_failed`；`run_logout` 在本地清理与报告
+  之后返回退出码 3，stderr 说明「本地已登出，但服务器上的应用仍在，可重试 --purge」。
+  已登记进 docs/exit-codes.md。
+- 测试：`a_failed_purge_keeps_the_credential_that_can_retry_it`（DELETE 返回 503 → 断言
+  rat/uri 仍在盘上、session 已删、退出码非 0）与 `a_retried_purge_succeeds_once_the_server_recovers`
+  （用上一步留下的凭证重试成功、文件被删）。
+
 
 - **为什么 logout 保留注册、只有 --purge 删**：DCR 注册是**可复用**的——下次 `otl auth login`
   会复用它而不是再建一个应用。每次登出都删，等于每次登录都在服务器上多一个应用。

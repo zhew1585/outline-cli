@@ -38,6 +38,9 @@ pub struct Options {
     pub timeout: Duration,
     /// Whether to launch a browser (`--no-browser` prints the URL only).
     pub open_browser: bool,
+    /// Abandon a stored registration that cannot be removed, accepting the
+    /// orphan it leaves on the server.
+    pub force_new_client: bool,
 }
 
 impl Default for Options {
@@ -47,6 +50,7 @@ impl Default for Options {
             scope: DEFAULT_SCOPE.to_string(),
             timeout: loopback::AUTH_TIMEOUT,
             open_browser: true,
+            force_new_client: false,
         }
     }
 }
@@ -97,8 +101,8 @@ struct Acquired {
 pub fn run(
     base_url: &str,
     profile: &str,
+    origin: &str,
     store: &CredentialStore,
-    mut file: CredentialFile,
     options: &Options,
 ) -> Result<Outcome, AuthError> {
     let http = endpoint::http_client()?;
@@ -106,28 +110,79 @@ pub fn run(
     require_s256(&metadata, base_url)?;
     warn_about_unsupported_scopes(&metadata, &options.scope);
 
-    let origin = endpoint::origin_of(base_url);
-    let acquired = acquire_client(&http, &metadata, &origin, &file, profile, options)?;
+    let existing = store.load()?;
+    let acquired = acquire_client(&http, &metadata, origin, &existing, profile, options)?;
     if acquired.source == ClientSource::Registered {
-        // Persist before the browser step: see the module docs.
-        file.profile_mut(profile).client = Some(acquired.registration.clone());
-        store.save(&file)?;
+        // Persist before the browser step: see the module docs. Under the
+        // credential lock and against a freshly read file, so a concurrent
+        // refresh cannot be clobbered by a stale snapshot.
+        persist_registration(store, profile, origin, &acquired, &http)?;
     }
 
     let tokens = authorize(&http, &metadata, &acquired, options)?;
     let session = build_session(&metadata, &acquired.registration, tokens);
     let scope = session.scope.clone();
-    file.profile_mut(profile).client = Some(acquired.registration.clone());
-    file.profile_mut(profile).oauth = Some(session);
-    store.save(&file)?;
+    store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+        let entry = file.profile_mut(profile);
+        // The binding is what stops these tokens being sent to another
+        // instance later; it is written together with them, never after.
+        entry.origin = Some(origin.to_string());
+        entry.client = Some(acquired.registration.clone());
+        entry.oauth = Some(session);
+        Ok(())
+    })?;
 
-    let identity = capture_identity(base_url, profile, store);
+    let identity = capture_identity(base_url, profile, origin, store);
     Ok(Outcome {
         identity,
         scope,
         client_source: acquired.source,
         credential_path: store.path().to_path_buf(),
     })
+}
+
+/// Record a brand-new dynamic registration, undoing it if that fails.
+///
+/// A registration that exists on the server but not on disk is the worst
+/// outcome available: its `registration_access_token` is the only thing
+/// that can ever delete it, and losing that leaves an application no one
+/// can remove. So a failed save triggers a compensating RFC 7592 delete,
+/// and if THAT fails too the orphan is reported loudly with the client id
+/// an administrator needs to find it.
+fn persist_registration(
+    store: &CredentialStore,
+    profile: &str,
+    origin: &str,
+    acquired: &Acquired,
+    http: &HttpClient,
+) -> Result<(), AuthError> {
+    let registration = acquired.registration.clone();
+    let saved = store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+        let entry = file.profile_mut(profile);
+        entry.origin = Some(origin.to_string());
+        entry.client = Some(registration.clone());
+        Ok(())
+    });
+    let Err(error) = saved else {
+        return Ok(());
+    };
+    match dcr::delete(http, &acquired.registration) {
+        // Undone: the server no longer has it, so the failed save is just a
+        // failed save and the original error is the useful one.
+        Ok(true) => Err(error),
+        Ok(false) => Err(AuthError::OAuth(OAuthError::OrphanedRegistration {
+            origin: origin.to_string(),
+            client_id: acquired.registration.client_id.clone(),
+            reason: error.to_string(),
+            cleanup: "the server issued no management token for it".to_string(),
+        })),
+        Err(cleanup) => Err(AuthError::OAuth(OAuthError::OrphanedRegistration {
+            origin: origin.to_string(),
+            client_id: acquired.registration.client_id.clone(),
+            reason: error.to_string(),
+            cleanup: cleanup.to_string(),
+        })),
+    }
 }
 
 /// Refuse to continue without PKCE `S256`.
@@ -203,9 +258,11 @@ fn acquire_client(
                 });
             }
             // A dynamic client is pinned to its exact redirect URI, so a
-            // port we can no longer bind means the registration is
-            // unusable. Remove it from the server instead of orphaning it.
-            None => retire(http, &cached),
+            // port we can no longer bind makes the registration unusable.
+            // It has to come off the server BEFORE a replacement is
+            // created, because creating one overwrites the only credential
+            // that could ever delete it.
+            None => retire(http, &cached, options.force_new_client)?,
         }
     }
     register_new(http, metadata, origin)
@@ -239,23 +296,54 @@ fn rebind(cached: &ClientRegistration) -> Option<CallbackServer> {
     CallbackServer::bind_port(port).ok()
 }
 
-/// Best-effort removal of a dynamic registration that can no longer be used.
-fn retire(http: &HttpClient, registration: &ClientRegistration) {
+/// Remove a dynamic registration that can no longer be used.
+///
+/// Registering a replacement overwrites the stored
+/// `registration_access_token`, which is the ONLY way to delete the old
+/// registration - Outline's admin UI cannot. So this must succeed before a
+/// replacement is created, and a failure stops the flow instead of trading
+/// a working login for a permanent orphan.
+///
+/// `forced` is the user saying, explicitly, that they accept the orphan.
+fn retire(
+    http: &HttpClient,
+    registration: &ClientRegistration,
+    forced: bool,
+) -> Result<(), AuthError> {
     if !registration.dynamic {
-        return;
+        // Nothing on the server belongs to us; the local record is just a
+        // cached client id.
+        return Ok(());
     }
-    let outcome = dcr::delete(http, registration);
-    let note = match outcome {
-        Ok(true) => "removed it from the server".to_string(),
-        Ok(false) => "it cannot be removed automatically because the server \
-             issued no management token for it"
-            .to_string(),
-        Err(error) => format!("removing it failed: {error}"),
+    let port = loopback::port_of(&registration.redirect_uri)
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let failure = match dcr::delete(http, registration) {
+        Ok(true) => {
+            stdio::write_diagnostic_line(
+                "notice: the stored client registration's callback port is no \
+                 longer available; it has been removed from the server and \
+                 will be replaced.",
+            );
+            return Ok(());
+        }
+        Ok(false) => "the server issued no management token for it".to_string(),
+        Err(error) => error.to_string(),
     };
+    if !forced {
+        return Err(AuthError::OAuth(OAuthError::RetireFailed {
+            port,
+            reason: failure,
+        }));
+    }
     stdio::write_diagnostic_line(&format!(
-        "notice: the stored client registration's callback port is no longer \
-         available, so it has been replaced; {note}."
+        "warning: --force-new-client was given, so the old registration \
+         (client {client}) is being abandoned rather than deleted \
+         ({failure}). Ask an admin to remove it under Settings -> \
+         Applications.",
+        client = registration.client_id
     ));
+    Ok(())
 }
 
 /// Register `otl` as a new public client.
@@ -381,8 +469,13 @@ fn build_session(
 ///
 /// Best effort: the tokens are already stored and valid, so a failure here
 /// is a notice, not a failed login.
-fn capture_identity(base_url: &str, profile: &str, store: &CredentialStore) -> Option<Identity> {
-    let identity = match query_identity(base_url, profile, store) {
+fn capture_identity(
+    base_url: &str,
+    profile: &str,
+    origin: &str,
+    store: &CredentialStore,
+) -> Option<Identity> {
+    let identity = match query_identity(base_url, profile, origin, store) {
         Ok(identity) => identity,
         Err(error) => {
             stdio::write_diagnostic_line(&format!(
@@ -405,11 +498,12 @@ fn capture_identity(base_url: &str, profile: &str, store: &CredentialStore) -> O
 fn query_identity(
     base_url: &str,
     profile: &str,
+    origin: &str,
     store: &CredentialStore,
 ) -> Result<Identity, AuthError> {
     let file = store.load()?;
     let provider =
-        CredentialProvider::resolve(store.clone(), profile, &file)?.ok_or_else(|| {
+        CredentialProvider::resolve(store.clone(), profile, &file, origin)?.ok_or_else(|| {
             AuthError::NoCredentials {
                 profile: profile.to_string(),
             }
@@ -424,13 +518,13 @@ fn record_identity(
     store: &CredentialStore,
     identity: &Identity,
 ) -> Result<(), AuthError> {
-    let mut file = store.load()?;
-    if let Some(session) = file.profile_mut(profile).oauth.as_mut() {
-        session.account = identity.account();
-        session.workspace = identity.workspace.clone();
-    }
-    store.save(&file)?;
-    Ok(())
+    store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+        if let Some(session) = file.profile_mut(profile).oauth.as_mut() {
+            session.account = identity.account();
+            session.workspace = identity.workspace.clone();
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -441,7 +535,7 @@ mod tests {
 
     fn metadata(scopes: &[&str], s256: bool) -> Metadata {
         Metadata {
-            issuer: None,
+            issuer: "https://docs.example.com".to_string(),
             authorization_endpoint: "https://docs.example.com/oauth/authorize".to_string(),
             token_endpoint: "https://docs.example.com/oauth/token".to_string(),
             registration_endpoint: None,

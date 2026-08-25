@@ -22,7 +22,7 @@ use crate::error::{is_transport_failure, EngineError, TransportKind};
 use crate::ir::{OpSpec, ValidationMode};
 use crate::paginate::{self, Fetched, PaginationSpec};
 use crate::retry::RetryPolicy;
-use crate::sanitize::{clean_server_text, redact_secret, REDACTED};
+use crate::sanitize::{clean_server_text_for, redact_all, REDACTED};
 use crate::throttle::Throttle;
 
 /// Default total request timeout.
@@ -138,6 +138,15 @@ impl Client {
         let parsed = validate_base_url(base_url)?;
         let http = reqwest::blocking::Client::builder()
             .timeout(timeout)
+            // Redirects are disabled deliberately. Every request carries a
+            // bearer credential, and reqwest only strips the Authorization
+            // header when the redirect crosses a HOST: a same-host
+            // `https://` -> `http://` downgrade keeps it and would put the
+            // credential on the wire in plaintext. Request bodies are never
+            // stripped, and 307/308 replays them. An RPC API has no
+            // legitimate reason to redirect a POST, so a 3xx is reported as
+            // the unexpected status it is.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| EngineError::ClientBuild(error.without_url()))?;
         Ok(Self {
@@ -287,6 +296,12 @@ impl Client {
     /// replay happens per request, so a source that hands back a
     /// still-rejected credential cannot spin the channel.
     ///
+    /// Redaction spans the WHOLE request, not the current attempt: every
+    /// credential this request has used stays in `used` and is passed to
+    /// the hygiene pipeline. The server saw the first token, so the
+    /// response to the replay can echo it back - and a pipeline that only
+    /// knew the renewed value would print the old one verbatim.
+    ///
     /// `detail` decides how much of a server error response may be
     /// surfaced (see [`Client::execute_raw`]).
     fn send(
@@ -296,23 +311,25 @@ impl Client {
         detail: ErrorDetail,
     ) -> Result<Value, EngineError> {
         let url = format!("{}{}", self.base_url, op_path);
-        let mut token = self.credential.bearer()?;
+        let mut used = vec![self.credential.bearer()?];
         let mut renewed = false;
         loop {
-            let rejected = match self.send_once(&url, &body, &token, detail)? {
+            let secrets = borrow(&used);
+            let current = secrets.last().copied().unwrap_or_default();
+            let rejected = match self.send_once(&url, &body, current, &secrets, detail)? {
                 Outcome::Value(value) => return Ok(value),
                 Outcome::Unauthorized(response) => response,
             };
             if !renewed {
-                if let Some(fresh) = self.credential.renew(&token)? {
-                    token = fresh;
+                if let Some(fresh) = self.credential.renew(current)? {
+                    used.push(fresh);
                     renewed = true;
                     continue;
                 }
             }
             // Either the source cannot renew, or the renewed credential
             // was rejected too: report the server's own 401.
-            return Err(api_error(rejected, &token, detail));
+            return Err(api_error(rejected, &borrow(&used), detail));
         }
     }
 
@@ -327,6 +344,7 @@ impl Client {
         url: &str,
         body: &[u8],
         token: &str,
+        secrets: &[&str],
         detail: ErrorDetail,
     ) -> Result<Outcome, EngineError> {
         let mut attempt: u32 = 0;
@@ -340,23 +358,23 @@ impl Client {
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.to_vec())
                 .send()
-                .map_err(|source| self.send_error(source, token))?;
+                .map_err(|source| self.send_error(source, secrets))?;
 
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS {
-                attempt = self.absorb_rate_limit(&response, attempt, token)?;
+                attempt = self.absorb_rate_limit(&response, attempt, secrets)?;
                 continue;
             }
             if status == StatusCode::UNAUTHORIZED {
                 return Ok(Outcome::Unauthorized(response));
             }
             if !status.is_success() {
-                return Err(api_error(response, token, detail));
+                return Err(api_error(response, secrets, detail));
             }
             return response
                 .json()
                 .map(Outcome::Value)
-                .map_err(|source| self.body_error(source, token));
+                .map_err(|source| self.body_error(source, secrets));
         }
     }
 
@@ -366,11 +384,11 @@ impl Client {
         &self,
         response: &reqwest::blocking::Response,
         attempt: u32,
-        token: &str,
+        secrets: &[&str],
     ) -> Result<u32, EngineError> {
         if attempt >= self.retry.max_retries {
             return Err(EngineError::RateLimited {
-                origin: self.display_origin(token),
+                origin: self.display_origin(secrets),
                 retries: attempt,
             });
         }
@@ -381,7 +399,7 @@ impl Client {
         // Diagnostics only ever go to stderr; stdout is data.
         eprintln!(
             "rate limited by {} (HTTP 429); waiting {:.1}s before retry {}/{}",
-            self.display_origin(token),
+            self.display_origin(secrets),
             wait.as_secs_f64(),
             next,
             self.retry.max_retries
@@ -413,14 +431,14 @@ impl Client {
     /// containing a newline). It must not be reported as a network problem,
     /// and the underlying error is NOT retained - a builder error may embed
     /// the offending header value.
-    fn send_error(&self, source: reqwest::Error, secret: &str) -> EngineError {
+    fn send_error(&self, source: reqwest::Error, secrets: &[&str]) -> EngineError {
         if source.is_builder() {
             return EngineError::InvalidRequest {
                 reason: INVALID_HEADER_REASON.to_string(),
             };
         }
         EngineError::Transport {
-            origin: self.display_origin(secret),
+            origin: self.display_origin(secrets),
             kind: TransportKind::classify(&source),
             // reqwest errors embed the full request URL in their Display
             // AND Debug output (reqwest docs warn about this explicitly);
@@ -435,28 +453,33 @@ impl Client {
     /// A body that times out or is cut mid-transfer is a TRANSPORT failure,
     /// not malformed JSON: callers must be able to tell "retry may help"
     /// from "the server sent something unparseable".
-    fn body_error(&self, source: reqwest::Error, secret: &str) -> EngineError {
+    fn body_error(&self, source: reqwest::Error, secrets: &[&str]) -> EngineError {
         if is_transport_failure(&source) {
             return EngineError::Transport {
-                origin: self.display_origin(secret),
+                origin: self.display_origin(secrets),
                 kind: TransportKind::classify(&source),
                 source: source.without_url(),
             };
         }
         EngineError::InvalidResponse {
-            origin: self.display_origin(secret),
+            origin: self.display_origin(secrets),
             // See the Transport arm: strip the URL before retention.
             source: source.without_url(),
         }
     }
 
     /// The origin for error messages, passed through secret redaction as
-    /// defense in depth (an origin should never contain the credential, but
+    /// defense in depth (an origin should never contain a credential, but
     /// no URL-derived text reaches output without going through the
     /// pipeline).
-    fn display_origin(&self, secret: &str) -> String {
-        redact_secret(&self.origin, secret)
+    fn display_origin(&self, secrets: &[&str]) -> String {
+        redact_all(&self.origin, secrets)
     }
+}
+
+/// Borrow every credential in play as a slice of `&str`.
+fn borrow(used: &[String]) -> Vec<&str> {
+    used.iter().map(String::as_str).collect()
 }
 
 /// What one trip to the server produced.
@@ -471,11 +494,11 @@ enum Outcome {
 /// Turn a non-success response into an [`EngineError::Api`].
 fn api_error(
     response: reqwest::blocking::Response,
-    secret: &str,
+    secrets: &[&str],
     detail: ErrorDetail,
 ) -> EngineError {
     let status = response.status().as_u16();
-    let parts = extract_error_parts(response, secret, detail);
+    let parts = extract_error_parts(response, secrets, detail);
     EngineError::Api {
         status,
         code: parts.code,
@@ -519,6 +542,16 @@ fn page_body(body: &Value, spec: &PaginationSpec, offset: u64, limit: u64) -> Va
 /// [`base_url_origin`] for anything user-visible.
 pub fn is_valid_base_url(base_url: &str) -> bool {
     validate_base_url(base_url).is_ok()
+}
+
+/// Check a base URL against [`Client::new`]'s shape rules, reporting WHY
+/// it was rejected.
+///
+/// The Result-returning counterpart of [`is_valid_base_url`], for callers
+/// that need to validate a URL before building a client and want to pass
+/// the engine's own diagnosis on to the user rather than inventing one.
+pub fn check_base_url(base_url: &str) -> Result<(), EngineError> {
+    validate_base_url(base_url).map(|_| ())
 }
 
 /// The origin (`scheme://host[:port]`) of a base URL that passes
@@ -588,11 +621,11 @@ struct ApiErrorParts {
 /// caller's own secret inside it after the fact.
 fn extract_error_parts(
     response: reqwest::blocking::Response,
-    secret: &str,
+    secrets: &[&str],
     detail: ErrorDetail,
 ) -> ApiErrorParts {
     let no_details = |detail: ErrorDetail| match detail {
-        ErrorDetail::CodeOnly => withheld_parts(None, secret),
+        ErrorDetail::CodeOnly => withheld_parts(None, secrets),
         ErrorDetail::Full => ApiErrorParts {
             code: None,
             message: NO_ERROR_DETAILS.to_string(),
@@ -618,7 +651,7 @@ fn extract_error_parts(
     let body = String::from_utf8_lossy(&raw);
     let parsed = serde_json::from_str::<Value>(&body).ok();
     if detail == ErrorDetail::CodeOnly {
-        return withheld_parts(parsed.as_ref(), secret);
+        return withheld_parts(parsed.as_ref(), secrets);
     }
     // Whether a piece of text may itself be cut mid-way governs the
     // cap-tail treatment. A body that PARSED is complete no matter how it
@@ -629,7 +662,7 @@ fn extract_error_parts(
     // every field either way.
     let parts = match parsed {
         Some(json) => {
-            let clean = |text: &str, cap: usize| clean_server_text(text, secret, false, cap);
+            let clean = |text: &str, cap: usize| clean_server_text_for(text, secrets, false, cap);
             ApiErrorParts {
                 code: json
                     .get("error")
@@ -648,7 +681,7 @@ fn extract_error_parts(
         // read cap can have cut mid-token.
         None => ApiErrorParts {
             code: None,
-            message: clean_server_text(&body, secret, capped, MAX_ERROR_MESSAGE_CHARS),
+            message: clean_server_text_for(&body, secrets, capped, MAX_ERROR_MESSAGE_CHARS),
         },
     };
     fallback(parts)
@@ -662,12 +695,12 @@ fn extract_error_parts(
 /// surviving code still goes through [`clean_server_text`] (and is
 /// re-checked afterwards) so that a code that smuggles our own bearer token
 /// is discarded rather than printed.
-fn withheld_parts(parsed: Option<&Value>, secret: &str) -> ApiErrorParts {
+fn withheld_parts(parsed: Option<&Value>, secrets: &[&str]) -> ApiErrorParts {
     let code = parsed
         .and_then(|json| json.get("error").or_else(|| json.get("code")))
         .and_then(Value::as_str)
         .filter(|code| is_error_code(code))
-        .map(|code| clean_server_text(code, secret, false, MAX_ERROR_CODE_CHARS))
+        .map(|code| clean_server_text_for(code, secrets, false, MAX_ERROR_CODE_CHARS))
         .filter(|code| is_error_code(code));
     ApiErrorParts {
         code,
