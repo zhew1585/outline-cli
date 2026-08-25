@@ -1,10 +1,16 @@
+# Publishing contract (SPEC.md): crate/package name is `outline-cli`
+# (`otl` is taken on crates.io); only the binary is named `otl`.
 [package]
-name = "otl"
+name = "outline-cli"
 version = "0.1.0"
 description = "Outline CLI (otl): UX layer over the generic engine"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "otl"
+path = "src/lib.rs"
 
 [[bin]]
 name = "otl"
