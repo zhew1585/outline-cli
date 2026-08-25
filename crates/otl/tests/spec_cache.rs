@@ -183,12 +183,12 @@ fn a_pre_existing_temporary_file_does_not_affect_the_store() {
 #[test]
 fn an_oversized_table_is_refused_without_writing_anything() {
     let (_dir, file) = temp_cache();
-    // 128-byte names (the operation-name limit) reach the body limit in
-    // ~20k operations, which is quick to build and encode.
-    let name = format!("things.{}", "n".repeat(120));
-    let ops: Vec<OpSpec> = (0..30_000)
+    // Stay under the operation-count ceiling and blow the BYTE limit
+    // instead: long (but legal) names at the ceiling encode to megabytes.
+    let filler = "n".repeat(110);
+    let ops: Vec<OpSpec> = (0..cache::MAX_CACHED_OPS)
         .map(|index| {
-            let name = format!("{}{index}", &name[..name.len() - 6]);
+            let name = format!("things.{filler}{index}");
             op(&name, &format!("/api/{name}"))
         })
         .collect();
@@ -208,11 +208,11 @@ fn an_oversized_table_is_refused_without_writing_anything() {
 #[test]
 fn the_store_and_load_size_limits_agree() {
     let (_dir, file) = temp_cache();
-    // Names stay within the operation-name limit (128 bytes); ~20k of them
-    // encode to several MiB, close under the cache limit.
-    let ops: Vec<OpSpec> = (0..20_000)
+    // As close under both limits as a real table could get: the operation
+    // ceiling, with names long enough to approach the byte limit too.
+    let ops: Vec<OpSpec> = (0..cache::MAX_CACHED_OPS)
         .map(|index| {
-            let name = format!("things.{:0>110}{index}", "n");
+            let name = format!("things.{:0>30}{index}", "n");
             op(&name, &format!("/api/{name}"))
         })
         .collect();
@@ -220,7 +220,7 @@ fn the_store_and_load_size_limits_agree() {
 
     let size = fs::metadata(&file).unwrap().len() as usize;
     assert!(
-        size > 4 * 1024 * 1024,
+        size > cache::MAX_CACHE_FILE_BYTES / 2,
         "the test table is too small to exercise the boundary: {size} bytes"
     );
     assert!(
@@ -526,6 +526,188 @@ fn a_cache_with_a_hostile_provenance_record_is_rejected() {
             },
         );
         assert!(cache::load_at(&file).is_err(), "must be rejected");
+    }
+}
+
+/// Run `load_at` on another thread so a regression that blocks (a FIFO
+/// opened without a type check) fails this test instead of hanging the
+/// suite forever.
+fn load_with_watchdog(file: &Path) -> Result<Option<cache::CachedIr>, cache::CacheError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let path = file.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = sender.send(cache::load_at(&path));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("load_at blocked: the cache path was opened without a type check")
+}
+
+/// A cache path that is not a regular file is never something this build
+/// wrote, and reading it can hang (FIFO) or never end (`/dev/zero`).
+#[cfg(unix)]
+#[test]
+fn a_cache_that_is_not_a_regular_file_is_refused_without_reading_it() {
+    // A FIFO with no writer: `File::open` on it blocks indefinitely.
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("ir-cache.bin");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let error = load_with_watchdog(&fifo).expect_err("a FIFO must be refused");
+    assert!(!error.is_stale(), "{error}");
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+
+    // A symlink to an endless device: `fs::metadata` would follow it and
+    // report length 0, then read until memory ran out.
+    let dir = TempDir::new().unwrap();
+    let link = dir.path().join("ir-cache.bin");
+    std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+    let error = load_with_watchdog(&link).expect_err("a symlink must be refused");
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+
+    // Even a symlink to a perfectly good cache file: the loader only ever
+    // reads the file it wrote, at the path it wrote it.
+    let (_keep, real) = temp_cache();
+    cache::store_at(&real, &[op("things.info", "/api/things.info")], &meta()).expect("stores");
+    let dir = TempDir::new().unwrap();
+    let link = dir.path().join("ir-cache.bin");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(load_with_watchdog(&link).is_err(), "symlink accepted");
+}
+
+#[test]
+fn a_cache_path_that_is_a_directory_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let as_dir = dir.path().join("ir-cache.bin");
+    fs::create_dir(&as_dir).unwrap();
+    assert!(load_with_watchdog(&as_dir).is_err());
+}
+
+/// The read is bounded by `take`, not by the size `metadata` reported, so a
+/// file that grows in between cannot slip past the limit.
+#[test]
+fn a_cache_larger_than_the_limit_is_refused_by_the_read_itself() {
+    let (_dir, file) = temp_cache();
+    let oversized = vec![b'x'; cache::MAX_CACHE_FILE_BYTES + 1024];
+    fs::write(&file, &oversized).unwrap();
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(error.to_string().contains("larger than"), "{error}");
+}
+
+/// The decode-amplification attack: a cache whose declared operation count
+/// is small in bytes but enormous once decoded. bincode's byte limit does
+/// not stop it, because a minimal `OpSpec` costs six encoded bytes and over
+/// a hundred decoded.
+#[test]
+fn a_cache_declaring_more_operations_than_allowed_is_refused() {
+    let (_dir, file) = temp_cache();
+    let minimal: Vec<OpSpec> = (0..cache::MAX_CACHED_OPS + 1)
+        .map(|index| {
+            let name = format!("t{index}.i");
+            op(&name, &format!("/api/{name}"))
+        })
+        .collect();
+    // Well inside the byte limit - the count is what has to stop it.
+    write_raw(
+        &file,
+        MAGIC,
+        FORMAT_VERSION,
+        &Body {
+            meta: meta(),
+            ops: minimal,
+        },
+    );
+    let size = fs::metadata(&file).unwrap().len() as usize;
+    assert!(size < cache::MAX_CACHE_FILE_BYTES, "{size} bytes");
+
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(!error.is_stale(), "{error}");
+    assert!(error.to_string().contains("operations"), "{error}");
+}
+
+/// The same amplification through a single operation's parameter list,
+/// which the element count alone would not catch: the decoded footprint is
+/// what stops it.
+#[test]
+fn a_cache_whose_operations_decode_to_too_much_memory_is_refused() {
+    let (_dir, file) = temp_cache();
+    let mut fat = op("things.info", "/api/things.info");
+    // Empty parameters: eight encoded bytes each, ~136 decoded.
+    fat.params = (0..80_000)
+        .map(|_| engine::ir::ParamSpec {
+            name: String::new().into(),
+            ty: engine::ir::ParamType::String,
+            required: false,
+            nullable: false,
+            enum_values: Vec::new().into(),
+            format: String::new().into(),
+            minimum: None,
+            maximum: None,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    write_raw(
+        &file,
+        MAGIC,
+        FORMAT_VERSION,
+        &Body {
+            meta: meta(),
+            ops: vec![fat],
+        },
+    );
+    let size = fs::metadata(&file).unwrap().len() as usize;
+    assert!(size < cache::MAX_CACHE_FILE_BYTES, "{size} bytes");
+
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(!error.is_stale(), "{error}");
+}
+
+/// The ceiling is not off by one, and a table right below it still works.
+#[test]
+fn a_cache_at_the_operation_ceiling_still_loads() {
+    let (_dir, file) = temp_cache();
+    let ops: Vec<OpSpec> = (0..cache::MAX_CACHED_OPS)
+        .map(|index| {
+            let name = format!("t{index}.i");
+            op(&name, &format!("/api/{name}"))
+        })
+        .collect();
+    cache::store_at(&file, &ops, &meta()).expect("stores");
+    assert_eq!(
+        cache::load_at(&file)
+            .expect("loads")
+            .expect("is present")
+            .ops
+            .len(),
+        cache::MAX_CACHED_OPS
+    );
+}
+
+/// `store_at` must not accept metadata that `load_at` would reject as
+/// stale: writing a cache that the next command discards is the same
+/// broken promise as writing an oversized one.
+#[test]
+fn storing_metadata_from_another_build_is_refused() {
+    let (_dir, file) = temp_cache();
+    let ops = [op("things.info", "/api/things.info")];
+    for hostile in [
+        CacheMeta {
+            ir_schema_version: engine::IR_SCHEMA_VERSION + 1,
+            ..meta()
+        },
+        CacheMeta {
+            cli_version: "0.0.0-other".to_string(),
+            ..meta()
+        },
+    ] {
+        assert!(
+            cache::store_at(&file, &ops, &hostile).is_err(),
+            "stale metadata was written"
+        );
+        assert!(!file.exists(), "a rejected store still wrote a file");
     }
 }
 

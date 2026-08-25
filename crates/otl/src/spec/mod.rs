@@ -117,6 +117,18 @@ pub fn validate_ops(ops: &[OpSpec]) -> Result<(), String> {
     if ops.is_empty() {
         return Err("it contains no operations".to_string());
     }
+    // The same ceiling the cache decoder enforces, applied to every table
+    // (a compiled one included) so that "compiles" and "can be cached"
+    // cannot disagree: a document with more operations than this fails at
+    // sync with a clear message instead of producing a cache that the next
+    // command would refuse.
+    if ops.len() > cache::MAX_CACHED_OPS {
+        return Err(format!(
+            "it declares {} operations, more than the {} allowed",
+            ops.len(),
+            cache::MAX_CACHED_OPS
+        ));
+    }
     let mut seen: HashSet<&str> = HashSet::with_capacity(ops.len());
     for op in ops {
         check_identity(op)?;
