@@ -245,20 +245,52 @@ fn check_depth(depth: usize) -> Result<(), CompileError> {
 /// indexed directly, which also keeps `/` inside a name from being read as
 /// pointer structure.
 fn resolve_ref<'a>(reference: &str, document: &'a Value) -> Result<&'a Value, CompileError> {
+    let unsupported = || CompileError::UnsupportedRef {
+        reference: reference.to_string(),
+    };
     let token = reference
         .strip_prefix(COMPONENTS_SCHEMAS_REF)
-        .ok_or_else(|| CompileError::UnsupportedRef {
-            reference: reference.to_string(),
-        })?;
-    // Order matters (RFC 6901): `~1` first, then `~0`, so that the literal
-    // sequence `~01` decodes to `~1` rather than to `/`.
-    let name = token.replace("~1", "/").replace("~0", "~");
+        .ok_or_else(unsupported)?;
+    let name = unescape_token(token).ok_or_else(unsupported)?;
     document
         .pointer(COMPONENT_SCHEMAS_POINTER)
         .and_then(|schemas| schemas.get(&name))
         .ok_or_else(|| CompileError::UnresolvedRef {
             reference: reference.to_string(),
         })
+}
+
+/// Decode one JSON Pointer reference token per RFC 6901, or `None` if it
+/// is not a valid token.
+///
+/// Strict on purpose. A chained `replace("~1", "/").replace("~0", "~")`
+/// silently accepts input that is not a pointer token at all - `A~2B`, a
+/// trailing `~`, an unescaped `/` (which would be pointer STRUCTURE, not
+/// part of a name), or an empty token - and then looks the mangled result
+/// up as a schema name. Accepting a malformed reference from an untrusted
+/// document means resolving to something its author did not write.
+fn unescape_token(token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut name = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            // A raw `/` separates pointer tokens: reaching one here means
+            // the reference points deeper than a component schema.
+            '/' => return None,
+            '~' => match chars.next() {
+                Some('0') => name.push('~'),
+                Some('1') => name.push('/'),
+                // `~` followed by anything else (or by nothing) is not a
+                // legal escape.
+                _ => return None,
+            },
+            other => name.push(other),
+        }
+    }
+    Some(name)
 }
 
 /// Render one enum entry as the text a `key=value` argument must match.
@@ -352,6 +384,38 @@ mod tests {
         let note = params.iter().find(|p| p.name == "note").expect("note");
         assert!(note.nullable);
         assert_eq!(note.format, "uuid");
+    }
+
+    /// A reference token that is not valid RFC 6901 must be refused, not
+    /// mangled into some other schema name. A chained `replace` accepted
+    /// all of these and then looked the result up.
+    #[test]
+    fn rejects_reference_tokens_that_are_not_valid_rfc_6901() {
+        for token in ["A~2B", "A~", "~", "A~1B~", "a/b", "", "A~xB"] {
+            // The schema exists under exactly the raw token as well, so a
+            // rejection cannot be mistaken for "not found".
+            let components = format!(r#"{{"{token}":{{"type":"object"}}}}"#);
+            let error = compile(
+                &body(&format!(r##"{{"$ref":"#/components/schemas/{token}"}}"##)),
+                &components,
+            )
+            .expect_err("must be rejected");
+            assert!(
+                matches!(error, CompileError::UnsupportedRef { .. }),
+                "{token:?}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unescape_token_is_strict() {
+        assert_eq!(unescape_token("A~1B").as_deref(), Some("A/B"));
+        assert_eq!(unescape_token("A~0B").as_deref(), Some("A~B"));
+        assert_eq!(unescape_token("A~01B").as_deref(), Some("A~1B"));
+        assert_eq!(unescape_token("plain").as_deref(), Some("plain"));
+        for bad in ["", "~", "~2", "a~", "a/b", "~x"] {
+            assert!(unescape_token(bad).is_none(), "{bad:?} must be rejected");
+        }
     }
 
     /// A schema name containing `/` or `~` is referenced with the RFC 6901

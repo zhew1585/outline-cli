@@ -292,7 +292,7 @@ fn compile_op(
         params,
         name,
     };
-    check_identifiers(&op)?;
+    check_identifiers(&op, options)?;
     check_text(&op)?;
     Ok(op)
 }
@@ -345,8 +345,9 @@ fn body_kind(content_type: &str, root_union: bool) -> BodyKind {
     }
 }
 
-/// Reject an operation whose name or path cannot be used safely.
-fn check_identifiers(op: &CompiledOp) -> Result<(), CompileError> {
+/// Reject an operation whose name or path cannot be used safely, or whose
+/// two identifiers disagree.
+fn check_identifiers(op: &CompiledOp, options: &CompileOptions) -> Result<(), CompileError> {
     let unsafe_id = |field, reason| CompileError::UnsafeIdentifier {
         operation: op.name.clone(),
         field,
@@ -357,6 +358,15 @@ fn check_identifiers(op: &CompiledOp) -> Result<(), CompileError> {
     }
     if let Err(reason) = check_path(&op.path) {
         return Err(unsafe_id("path", reason));
+    }
+    // The binding between the two, established HERE rather than assumed by
+    // the consumer. Name and path are derived from the same document path,
+    // so they must agree - but only if that document path began with `/`.
+    // A path written `things.delete` (no leading slash) would otherwise be
+    // swallowed by the prefix into `/apithings.delete`, which passes the
+    // character rules above while dispatching somewhere nobody asked for.
+    if op.path != format!("{}/{}", options.path_prefix, op.name) {
+        return Err(unsafe_id("path", PATH_BINDING_RULE));
     }
     Ok(())
 }
@@ -405,6 +415,11 @@ fn extract_summary(post: &Value) -> String {
     let first_line = raw.lines().next().unwrap_or_default();
     text::sanitize_display(first_line)
 }
+
+/// Why an operation path/name binding is rejected.
+const PATH_BINDING_RULE: &str =
+    "the request path must be the configured prefix followed by `/` and the \
+     operation name, which requires the document path to start with `/`";
 
 /// Why an operation name is rejected, as one sentence.
 const SAFE_NAME_RULE: &str =
@@ -519,6 +534,40 @@ mod tests {
             matches!(error, CompileError::UnsafeIdentifier { field, .. } if field == "name"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A document path without a leading slash gets swallowed by the
+    /// prefix: `documents.delete` becomes `/apidocuments.delete`, which
+    /// passes every character rule while dispatching to an endpoint nobody
+    /// named. The compiler must establish the name/path binding itself, not
+    /// leave it to whoever consumes the table.
+    #[test]
+    fn rejects_a_document_path_without_a_leading_slash() {
+        let raw = doc(r#"{"documents.delete":{"post":{}}}"#);
+        let error = compile_json(&raw, &opts()).expect_err("must be rejected");
+        assert!(
+            matches!(error, CompileError::UnsafeIdentifier { field, .. } if field == "path"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("start with `/`"), "{error}");
+    }
+
+    /// Every compiled operation satisfies `path == prefix + "/" + name`,
+    /// with any prefix.
+    #[test]
+    fn the_name_path_binding_holds_for_every_prefix() {
+        for prefix in ["", "/api", "/v1/rpc"] {
+            let options = CompileOptions::with_prefix(prefix);
+            let raw = doc(r#"{"/things.info":{"post":{}},"/things.list":{"post":{}}}"#);
+            let compiled = compile_json(&raw, &options).expect("compiles");
+            for op in &compiled.ops {
+                assert_eq!(
+                    op.path,
+                    format!("{prefix}/{}", op.name),
+                    "prefix {prefix:?}"
+                );
+            }
+        }
     }
 
     #[test]
