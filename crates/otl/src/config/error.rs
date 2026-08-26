@@ -145,6 +145,12 @@ pub enum ConfigError {
         /// The profile in effect.
         profile: String,
     },
+    /// The selected profile's own `url` is not a usable base URL, so no
+    /// binding between its credential and an instance can be established.
+    InvalidProfileUrl {
+        /// The profile in effect.
+        profile: String,
+    },
     /// `OUTLINE_URL` disagrees with the selected profile's own base URL.
     ///
     /// Refused rather than resolved: the profile decides which credential is
@@ -219,6 +225,7 @@ impl fmt::Display for ConfigError {
             } => write_missing_profile_key(f, profile, variable, *global_set),
             Self::ProfileApiKeyVarUnnameable { profile } => write_unnameable_var(f, profile),
             Self::ConflictingUrl { profile } => write_conflicting_url(f, profile),
+            Self::InvalidProfileUrl { profile } => write_invalid_profile_url(f, profile),
             Self::UnboundProfileCredential { profile } => write_unbound_credential(f, profile),
             Self::AmbiguousProfileApiKeyVar {
                 profile,
@@ -314,6 +321,17 @@ fn write_conflicting_url(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Resu
          the wrong server cannot be recalled.\n\
          Unset {ENV_URL}, drop --profile to use {ENV_URL} on its own, or pass \
          --url to redirect this profile deliberately.",
+        sanitize_name(profile)
+    )
+}
+
+fn write_invalid_profile_url(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Result {
+    write!(
+        f,
+        "profile {:?} declares a `url` that is not a usable base URL, so its \
+         API key cannot be tied to an instance, and was not sent.\n\
+         Fix that profile's `url` in {CONFIG_FILE_NAME} (an absolute \
+         http/https URL with a host and no credentials).",
         sanitize_name(profile)
     )
 }
@@ -479,6 +497,7 @@ impl ConfigError {
             Self::ProfileApiKeyVarUnnameable { .. } => "ProfileApiKeyVarUnnameable",
             Self::UnboundProfileCredential { .. } => "UnboundProfileCredential",
             Self::ConflictingUrl { .. } => "ConflictingUrl",
+            Self::InvalidProfileUrl { .. } => "InvalidProfileUrl",
             Self::AmbiguousProfileApiKeyVar { .. } => "AmbiguousProfileApiKeyVar",
             Self::UnknownProfile { .. } => "UnknownProfile",
             Self::ConfigFileUnreadable { .. } => "ConfigFileUnreadable",

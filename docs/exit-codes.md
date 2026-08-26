@@ -29,6 +29,10 @@ Notes:
     one the selected profile declares;
   - **unbound credential** - the base URL was resolved from `OUTLINE_URL` and the selected profile
     declares no `url`, so there is nothing to bind its credential to;
+  - **unusable profile URL** - the base URL was resolved from `OUTLINE_URL` and the selected profile's
+    own `url` is not a usable base URL, so no binding can be established. (A resolved URL that is itself
+    unusable is not this error: nothing can be sent to it, so it goes to the request channel, which
+    reports `invalid base URL`.)
   - **missing URL** - no layer supplied a base URL at all.
 
   Resolution itself always follows flag > env > file, for the base URL as for every other key. The three

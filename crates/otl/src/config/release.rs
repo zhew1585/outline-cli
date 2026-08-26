@@ -6,6 +6,12 @@
 //! is one the resolved CREDENTIAL belongs to, and it is the only place a
 //! secret is obtained.
 //!
+//! The check is only as strong as what it decides from, so the inputs are
+//! locked down too: [`Settings`] cannot be constructed outside
+//! `super::resolve_settings`, and the credential itself cannot be read off
+//! [`EnvLayer`]. An unforgeable proof token issued from forgeable state
+//! would prove nothing.
+//!
 //! The separation matters because the two questions have different answers.
 //! Bending precedence to make a profile's URL win would break the published
 //! configuration model for every user; refusing to release a credential to an
@@ -59,44 +65,58 @@ pub fn release_token(
 /// No profile in effect means no scoping question: the global credential and
 /// the global URL variable belong to the same (single) scope.
 fn check_credential_binding(settings: &Settings) -> Result<BindingChecked, ConfigError> {
-    let Some(profile) = settings.profile.as_deref() else {
+    let Some(profile) = settings.profile() else {
         return Ok(BindingChecked(()));
     };
-    match settings.url_source {
+    match settings.url_source() {
         // Stated in the same command as --profile: a deliberate redirect.
         UrlSource::Flag => Ok(BindingChecked(())),
         // The profile named this origin itself.
         UrlSource::Profile => Ok(BindingChecked(())),
-        UrlSource::Env => match settings.profile_url.as_deref() {
-            Some(declared) if same_origin(declared, &settings.base_url) => Ok(BindingChecked(())),
-            Some(_) => Err(ConfigError::ConflictingUrl {
-                profile: profile.to_string(),
-            }),
-            // Nothing to bind to: the profile scopes the credential but
-            // named no instance, so an ambient variable would be deciding
-            // where that credential goes.
-            None => Err(ConfigError::UnboundProfileCredential {
-                profile: profile.to_string(),
-            }),
-        },
+        UrlSource::Env => check_env_url_binding(profile, settings),
     }
 }
 
-/// Whether two base URLs name the same server.
+/// Decide whether an environment-supplied base URL is the profile's own
+/// instance.
 ///
-/// Compared as normalized origins (`scheme://host[:port]`), so a trailing
-/// slash, host casing and a default port are all equivalent, matching what
-/// the request channel itself tolerates. A URL whose origin cannot be
-/// determined is never "the same" as anything: it will fail validation in
-/// the request channel with a clearer message, and guessing here would be
-/// guessing about a credential's destination.
-fn same_origin(left: &str, right: &str) -> bool {
-    match (
-        engine::base_url_origin(left),
-        engine::base_url_origin(right),
-    ) {
-        (Some(left), Some(right)) => left == right,
-        _ => false,
+/// Three outcomes rather than two, because "the origins differ" and "an
+/// origin could not be determined" are different problems and deserve
+/// different diagnostics:
+///
+/// - the RESOLVED URL has no determinable origin: nothing can be sent to it,
+///   so there is no credential exposure to prevent. The request channel
+///   rejects it with a precise "invalid base URL" message, which is more
+///   useful than this layer guessing;
+/// - the resolved URL is usable but the profile's declared `url` is not: the
+///   binding cannot be established at all, and the profile's own
+///   configuration is what needs fixing;
+/// - both parse: compare normalized origins.
+fn check_env_url_binding(
+    profile: &str,
+    settings: &Settings,
+) -> Result<BindingChecked, ConfigError> {
+    // Nothing to bind to: the profile scopes the credential but named no
+    // instance, so an ambient variable would be deciding where it goes.
+    let Some(declared) = settings.profile_url() else {
+        return Err(ConfigError::UnboundProfileCredential {
+            profile: profile.to_string(),
+        });
+    };
+    let Some(resolved_origin) = engine::base_url_origin(settings.base_url()) else {
+        return Ok(BindingChecked(()));
+    };
+    let Some(declared_origin) = engine::base_url_origin(declared) else {
+        return Err(ConfigError::InvalidProfileUrl {
+            profile: profile.to_string(),
+        });
+    };
+    if resolved_origin == declared_origin {
+        Ok(BindingChecked(()))
+    } else {
+        Err(ConfigError::ConflictingUrl {
+            profile: profile.to_string(),
+        })
     }
 }
 

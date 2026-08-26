@@ -46,10 +46,19 @@
 //! server receiving the credential.
 //!
 //! The gate lives at the credential-release boundary rather than inside a
-//! [`TokenSource`], and [`TokenSource::fetch`] cannot be reached without
-//! passing it: the proof token it requires is only constructible here. A
-//! future credential-file source therefore inherits the check instead of
-//! having to remember it.
+//! [`TokenSource`], and three things together make it structural rather than
+//! a convention an implementation has to remember:
+//!
+//! - [`TokenSource::fetch`] demands a `BindingChecked`, whose only field is
+//!   private, so [`release_token`] is the only way to reach any source;
+//! - [`Settings`] has private fields and no public constructor, so the input
+//!   the gate decides from can only come out of [`resolve_settings`]. A
+//!   caller who could build one by hand would simply claim
+//!   `UrlSource::Flag`;
+//! - [`EnvLayer`]'s secret fields are private with no accessor, so the key
+//!   cannot be read around the gate either.
+//!
+//! A future credential-file source inherits all of it without opting in.
 //!
 //! # Nothing from the config file is echoed back
 //!
@@ -234,20 +243,27 @@ impl fmt::Debug for Overrides {
 }
 
 /// The environment layer, captured as data.
+///
+/// The fields are private and there is no accessor for the secrets: a
+/// credential is obtainable only through [`release_token`], which applies
+/// the binding check first. Public fields would have made that gate
+/// decorative, since a caller could read the key straight out of this
+/// struct. The non-secret parts are readable through [`EnvLayer::profile`],
+/// [`EnvLayer::url`] and [`EnvLayer::config_path`].
 #[derive(Clone, Default)]
 pub struct EnvLayer {
     /// `OUTLINE_PROFILE`.
-    pub profile: Option<String>,
+    profile: Option<String>,
     /// `OUTLINE_URL`.
-    pub url: Option<String>,
+    url: Option<String>,
     /// `OUTLINE_API_KEY`: the key used when NO profile is in effect.
-    pub api_key: Option<String>,
+    api_key: Option<String>,
     /// `OUTLINE_CONFIG`.
-    pub config_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     /// Per-profile API keys, keyed by the variable suffix after
     /// [`ENV_API_KEY_PREFIX`] (so `OUTLINE_API_KEY_WORK` is stored under
     /// `WORK`). A profile's key is looked up here and nowhere else.
-    pub profile_api_keys: BTreeMap<String, String>,
+    profile_api_keys: BTreeMap<String, String>,
 }
 
 impl fmt::Debug for EnvLayer {
@@ -286,6 +302,46 @@ impl EnvLayer {
                 env::var_os(ENV_CONFIG).map(PathBuf::from),
             )
         }
+    }
+
+    /// The selected profile name from `OUTLINE_PROFILE`.
+    pub fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    /// The base URL from `OUTLINE_URL`.
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    /// The config-file path from `OUTLINE_CONFIG`.
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// The layer with `OUTLINE_PROFILE` set.
+    pub fn with_profile(mut self, profile: &str) -> Self {
+        self.profile = non_blank(Some(profile));
+        self
+    }
+
+    /// The layer with `OUTLINE_URL` set.
+    pub fn with_url(mut self, url: &str) -> Self {
+        self.url = non_blank(Some(url));
+        self
+    }
+
+    /// The layer with the global `OUTLINE_API_KEY` set.
+    pub fn with_api_key(mut self, api_key: &str) -> Self {
+        self.api_key = non_blank(Some(api_key));
+        self
+    }
+
+    /// The layer with `OUTLINE_CONFIG` set. An empty path means "read no
+    /// config file", exactly as the variable does.
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
     }
 
     /// The layer with one profile-scoped API key added, applying the same
@@ -468,21 +524,56 @@ pub enum UrlSource {
 }
 
 /// Everything resolved except the secret itself.
+///
+/// The fields are private and there is no public constructor: the only way
+/// to obtain a `Settings` is [`resolve_settings`]. That is what makes the
+/// credential-release gate structural rather than decorative - the gate
+/// decides from [`Settings::url_source`], so a caller able to build a
+/// `Settings` by hand could simply claim `UrlSource::Flag` and be handed a
+/// profile's key for any origin at all. Read the parts through the
+/// accessors; produce one only by resolving.
 #[derive(Clone)]
 pub struct Settings {
     /// Named profile in effect, if any.
-    pub profile: Option<String>,
+    profile: Option<String>,
     /// Base URL of the Outline instance.
-    pub base_url: String,
-    /// Which layer supplied [`Settings::base_url`].
-    pub url_source: UrlSource,
+    base_url: String,
+    /// Which layer supplied `base_url`.
+    url_source: UrlSource,
     /// The selected profile's own `url`, when it declared one.
     ///
     /// Kept so that [`release_token`] can compare origins without needing
     /// the config file again.
-    pub profile_url: Option<String>,
+    profile_url: Option<String>,
     /// How to authenticate to it.
-    pub auth: AuthMethod,
+    auth: AuthMethod,
+}
+
+impl Settings {
+    /// The named profile in effect, if any.
+    pub fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    /// The resolved base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Which layer supplied the base URL.
+    pub fn url_source(&self) -> UrlSource {
+        self.url_source
+    }
+
+    /// The selected profile's own `url`, when it declared one.
+    pub fn profile_url(&self) -> Option<&str> {
+        self.profile_url.as_deref()
+    }
+
+    /// The resolved authentication method.
+    pub fn auth(&self) -> AuthMethod {
+        self.auth
+    }
 }
 
 impl fmt::Debug for Settings {

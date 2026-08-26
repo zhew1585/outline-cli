@@ -33,19 +33,12 @@ fn overrides_for(path: &Path) -> Overrides {
     }
 }
 
-/// A `Settings` for the cases that do not need a config file.
-fn settings_for(profile: Option<&str>, base_url: &str, url_source: UrlSource) -> Settings {
-    Settings {
-        profile: profile.map(str::to_string),
-        base_url: base_url.to_string(),
-        url_source,
-        profile_url: match url_source {
-            // A profile-sourced URL is by definition the declared one.
-            UrlSource::Profile => Some(base_url.to_string()),
-            _ => None,
-        },
-        auth: AuthMethod::ApiKey,
-    }
+/// Resolve a `Settings` without a config file, the only way one can be
+/// obtained: the type has no public constructor, precisely so that the
+/// credential gate cannot be handed a hand-built `UrlSource`.
+fn settings_from_env(dir: &TempDir, env: &EnvLayer) -> Settings {
+    let loaded = otl::config::load_from(&absent_default_source(dir)).unwrap();
+    resolve_settings(&Overrides::default(), env, &loaded).unwrap()
 }
 
 /// Release a credential the way the binary does: through the shared gate,
@@ -81,28 +74,25 @@ fn profile_flag_selects_the_instance() {
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
     let resolved = settings(&overrides, &EnvLayer::default()).unwrap();
-    assert_eq!(resolved.base_url, "https://work.example.com");
-    assert_eq!(resolved.profile.as_deref(), Some("work"));
-    assert_eq!(resolved.auth, AuthMethod::ApiKey);
+    assert_eq!(resolved.base_url(), "https://work.example.com");
+    assert_eq!(resolved.profile(), Some("work"));
+    assert_eq!(resolved.auth(), AuthMethod::ApiKey);
 }
 
 #[test]
 fn profile_env_var_selects_the_instance() {
     let (_dir, path) = config_file(TWO_PROFILES);
-    let env = EnvLayer {
-        profile: Some("work".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_profile("work");
     let resolved = settings(&overrides_for(&path), &env).unwrap();
-    assert_eq!(resolved.base_url, "https://work.example.com");
+    assert_eq!(resolved.base_url(), "https://work.example.com");
 }
 
 #[test]
 fn default_profile_applies_when_nothing_selects_one() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let resolved = settings(&overrides_for(&path), &EnvLayer::default()).unwrap();
-    assert_eq!(resolved.base_url, "https://personal.example.com");
-    assert_eq!(resolved.profile.as_deref(), Some("personal"));
+    assert_eq!(resolved.base_url(), "https://personal.example.com");
+    assert_eq!(resolved.profile(), Some("personal"));
 }
 
 #[test]
@@ -110,12 +100,9 @@ fn profile_flag_beats_profile_env_var() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
-    let env = EnvLayer {
-        profile: Some("personal".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_profile("personal");
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.base_url, "https://work.example.com");
+    assert_eq!(resolved.base_url(), "https://work.example.com");
 }
 
 #[test]
@@ -124,30 +111,27 @@ fn url_precedence_is_flag_then_env_then_file() {
     // has nothing to contribute (only profiles carry URLs).
     let dir = tempfile::tempdir().unwrap();
     let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
-    let env = EnvLayer {
-        url: Some("https://env.example.com".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_url("https://env.example.com");
     let env_wins = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(env_wins.base_url, "https://env.example.com");
+    assert_eq!(env_wins.base_url(), "https://env.example.com");
 
     let overrides = Overrides {
         url: Some("https://flag.example.com".to_string()),
         ..Overrides::default()
     };
     let flag_wins = resolve_settings(&overrides, &env, &loaded).unwrap();
-    assert_eq!(flag_wins.base_url, "https://flag.example.com");
+    assert_eq!(flag_wins.base_url(), "https://flag.example.com");
 
     // With a profile in effect the file supplies the URL, and the flag still
     // outranks it. `OUTLINE_URL` is not a layer here at all - see
     // `an_env_url_pointing_away_from_the_profile_is_refused`.
     let (_dir, path) = config_file(TWO_PROFILES);
     let file_only = settings(&overrides_for(&path), &EnvLayer::default()).unwrap();
-    assert_eq!(file_only.base_url, "https://personal.example.com");
+    assert_eq!(file_only.base_url(), "https://personal.example.com");
     let mut with_flag = overrides_for(&path);
     with_flag.url = Some("https://flag.example.com".to_string());
     let flag_over_file = settings(&with_flag, &EnvLayer::default()).unwrap();
-    assert_eq!(flag_over_file.base_url, "https://flag.example.com");
+    assert_eq!(flag_over_file.base_url(), "https://flag.example.com");
 }
 
 #[test]
@@ -170,21 +154,15 @@ fn precedence_is_applied_per_key_not_per_layer() {
     );
     let mut overrides = overrides_for(&path);
     overrides.url = Some("https://flag.example.com".to_string());
-    let env = EnvLayer {
-        profile: Some("work".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_profile("work");
     let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.profile(), Some("work"), "env profile lost");
     assert_eq!(
-        resolved.profile.as_deref(),
-        Some("work"),
-        "env profile lost"
-    );
-    assert_eq!(
-        resolved.base_url, "https://flag.example.com",
+        resolved.base_url(),
+        "https://flag.example.com",
         "flag URL lost"
     );
-    assert_eq!(resolved.auth, AuthMethod::Oauth, "profile auth was lost");
+    assert_eq!(resolved.auth(), AuthMethod::Oauth, "profile auth was lost");
 }
 
 #[test]
@@ -197,20 +175,15 @@ fn an_env_url_resolves_by_precedence_then_the_gate_refuses_the_credential() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
-    let env = EnvLayer {
-        url: Some("https://elsewhere.example.com".to_string()),
-        ..EnvLayer::default()
-    }
-    .with_profile_api_key("work", "key-for-work");
+    let env = EnvLayer::default()
+        .with_url("https://elsewhere.example.com")
+        .with_profile_api_key("work", "key-for-work");
 
     // Resolution: the env layer wins the URL, as the AC requires.
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.base_url, "https://elsewhere.example.com");
-    assert_eq!(resolved.url_source, UrlSource::Env);
-    assert_eq!(
-        resolved.profile_url.as_deref(),
-        Some("https://work.example.com")
-    );
+    assert_eq!(resolved.base_url(), "https://elsewhere.example.com");
+    assert_eq!(resolved.url_source(), UrlSource::Env);
+    assert_eq!(resolved.profile_url(), Some("https://work.example.com"));
 
     // Release: refused, so no credential exists to send.
     let error = release(&env, &resolved).unwrap_err();
@@ -230,13 +203,11 @@ fn an_env_url_matching_the_profile_origin_releases_the_credential() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
-    let env = EnvLayer {
-        url: Some("https://work.example.com".to_string()),
-        ..EnvLayer::default()
-    }
-    .with_profile_api_key("work", "key-for-work");
+    let env = EnvLayer::default()
+        .with_url("https://work.example.com")
+        .with_profile_api_key("work", "key-for-work");
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.url_source, UrlSource::Env);
+    assert_eq!(resolved.url_source(), UrlSource::Env);
     assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
 }
 
@@ -281,11 +252,9 @@ fn origin_equivalence_is_normalized_not_a_string_comparison() {
         let (_dir, path) = config_file(&format!("[profiles.work]\nurl = \"{declared}\"\n"));
         let mut overrides = overrides_for(&path);
         overrides.profile = Some("work".to_string());
-        let env = EnvLayer {
-            url: Some(from_env.to_string()),
-            ..EnvLayer::default()
-        }
-        .with_profile_api_key("work", "key-for-work");
+        let env = EnvLayer::default()
+            .with_url(from_env)
+            .with_profile_api_key("work", "key-for-work");
         let resolved = settings(&overrides, &env).unwrap();
         assert_eq!(
             release(&env, &resolved).is_ok(),
@@ -302,16 +271,14 @@ fn a_profile_that_declares_no_url_cannot_bind_an_env_url() {
     let (_dir, path) = config_file("[profiles.work]\nauth = \"api-key\"\n");
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
-    let env = EnvLayer {
-        url: Some("https://ambient.example.com".to_string()),
-        ..EnvLayer::default()
-    }
-    .with_profile_api_key("work", "key-for-work");
+    let env = EnvLayer::default()
+        .with_url("https://ambient.example.com")
+        .with_profile_api_key("work", "key-for-work");
 
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.base_url, "https://ambient.example.com");
-    assert_eq!(resolved.url_source, UrlSource::Env);
-    assert_eq!(resolved.profile_url, None);
+    assert_eq!(resolved.base_url(), "https://ambient.example.com");
+    assert_eq!(resolved.url_source(), UrlSource::Env);
+    assert_eq!(resolved.profile_url(), None);
 
     let error = release(&env, &resolved).unwrap_err();
     assert!(
@@ -325,7 +292,7 @@ fn a_profile_that_declares_no_url_cannot_bind_an_env_url() {
     // --url directs the run deliberately and does release the credential.
     overrides.url = Some("https://explicit.example.com".to_string());
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.url_source, UrlSource::Flag);
+    assert_eq!(resolved.url_source(), UrlSource::Flag);
     assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
 }
 
@@ -335,14 +302,12 @@ fn the_url_flag_is_a_deliberate_redirect_and_binds() {
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
     overrides.url = Some("https://elsewhere.example.com".to_string());
-    let env = EnvLayer {
-        url: Some("https://third.example.com".to_string()),
-        ..EnvLayer::default()
-    }
-    .with_profile_api_key("work", "key-for-work");
+    let env = EnvLayer::default()
+        .with_url("https://third.example.com")
+        .with_profile_api_key("work", "key-for-work");
     let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.base_url, "https://elsewhere.example.com");
-    assert_eq!(resolved.url_source, UrlSource::Flag);
+    assert_eq!(resolved.base_url(), "https://elsewhere.example.com");
+    assert_eq!(resolved.url_source(), UrlSource::Flag);
     assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
 }
 
@@ -350,14 +315,12 @@ fn the_url_flag_is_a_deliberate_redirect_and_binds() {
 fn the_env_url_is_still_the_source_when_no_profile_is_in_effect() {
     // Epic 1 path untouched: the restriction is about profile scope only.
     let dir = tempfile::tempdir().unwrap();
-    let env = EnvLayer {
-        url: Some("https://env.example.com".to_string()),
-        api_key: Some("k".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default()
+        .with_url("https://env.example.com")
+        .with_api_key("k");
     let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
     let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(resolved.base_url, "https://env.example.com");
+    assert_eq!(resolved.base_url(), "https://env.example.com");
 }
 
 /// A default (non-explicit) config location pointing at a file that does
@@ -375,16 +338,14 @@ fn pure_env_path_works_with_no_config_file_at_all() {
     // A fresh machine has no config file; the Epic 1 env-only path must
     // keep working unchanged.
     let dir = tempfile::tempdir().unwrap();
-    let env = EnvLayer {
-        url: Some("https://env.example.com".to_string()),
-        api_key: Some("secret-key".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default()
+        .with_url("https://env.example.com")
+        .with_api_key("secret-key");
     let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
     let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(resolved.base_url, "https://env.example.com");
-    assert_eq!(resolved.profile, None);
-    assert_eq!(resolved.auth, AuthMethod::ApiKey);
+    assert_eq!(resolved.base_url(), "https://env.example.com");
+    assert_eq!(resolved.profile(), None);
+    assert_eq!(resolved.auth(), AuthMethod::ApiKey);
 }
 
 #[test]
@@ -411,10 +372,7 @@ fn a_platform_without_a_config_directory_still_resolves_from_env() {
 fn locate_prefers_the_flag_then_the_env_var_then_the_default() {
     let flag = PathBuf::from("/flag/config.toml");
     let from_env = PathBuf::from("/env/config.toml");
-    let env = EnvLayer {
-        config_path: Some(from_env.clone()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_config_path(from_env.clone());
     let overrides = Overrides {
         config_path: Some(flag.clone()),
         ..Overrides::default()
@@ -436,10 +394,7 @@ fn locate_prefers_the_flag_then_the_env_var_then_the_default() {
 fn an_empty_config_override_disables_the_config_file() {
     // The documented way for a script or a test to pin itself to env vars
     // alone, whatever the invoking user has in their config directory.
-    let env = EnvLayer {
-        config_path: Some(PathBuf::new()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_config_path(PathBuf::new());
     let located = otl::config::locate(&Overrides::default(), &env);
     assert_eq!(located.path, None);
     assert!(located.explicit);
@@ -650,11 +605,9 @@ fn oauth_profile_reports_that_only_api_keys_are_wired_up() {
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
     let resolved = settings(&overrides, &EnvLayer::default()).unwrap();
-    let env = EnvLayer {
-        api_key: Some("k".to_string()),
-        ..EnvLayer::default()
-    }
-    .with_profile_api_key("work", "work-key");
+    let env = EnvLayer::default()
+        .with_api_key("k")
+        .with_profile_api_key("work", "work-key");
     let error = release(&env, &resolved).unwrap_err();
     assert!(matches!(error, ConfigError::UnsupportedAuthMethod { .. }));
     let message = error.to_string();
@@ -676,20 +629,20 @@ fn api_key_comes_from_the_environment_not_the_config_file() {
 
 #[test]
 fn missing_api_key_is_reported_before_any_request() {
-    let resolved = settings_for(None, "https://x.example.com", UrlSource::Env);
-    let error = release(&EnvLayer::default(), &resolved).unwrap_err();
+    let dir = tempfile::tempdir().unwrap();
+    let env = EnvLayer::default().with_url("https://x.example.com");
+    let resolved = settings_from_env(&dir, &env);
+    let error = release(&env, &resolved).unwrap_err();
     assert!(matches!(error, ConfigError::MissingApiKey));
     assert!(error.to_string().contains("OUTLINE_API_KEY"));
 }
 
 #[test]
 fn env_layer_debug_redacts_the_api_key() {
-    let env = EnvLayer {
-        api_key: Some("super-secret-key".to_string()),
-        url: Some("https://alice:pw-secret@example.com".to_string()),
-        ..EnvLayer::default()
-    }
-    .with_profile_api_key("work", "profile-secret-key");
+    let env = EnvLayer::default()
+        .with_api_key("super-secret-key")
+        .with_url("https://alice:pw-secret@example.com")
+        .with_profile_api_key("work", "profile-secret-key");
     let rendered = format!("{env:?}");
     assert!(!rendered.contains("super-secret-key"), "{rendered}");
     assert!(!rendered.contains("pw-secret"), "{rendered}");
@@ -698,11 +651,11 @@ fn env_layer_debug_redacts_the_api_key() {
 
 #[test]
 fn settings_debug_redacts_the_base_url() {
-    let resolved = settings_for(
-        Some("work"),
-        "https://alice:pw-secret@example.com/PATH-SECRET",
-        UrlSource::Profile,
-    );
+    let (_dir, path) =
+        config_file("[profiles.work]\nurl = \"https://alice:pw-secret@example.com/PATH-SECRET\"\n");
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    let resolved = settings(&overrides, &EnvLayer::default()).unwrap();
     let rendered = format!("{resolved:?}");
     assert!(!rendered.contains("pw-secret"), "{rendered}");
     assert!(!rendered.contains("PATH-SECRET"), "{rendered}");
@@ -753,7 +706,7 @@ fn blank_env_values_are_treated_as_unset() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let env = EnvLayer::from_values(Some("  "), Some(""), Some(""), None);
     let resolved = settings(&overrides_for(&path), &env).unwrap();
-    assert_eq!(resolved.base_url, "https://personal.example.com");
+    assert_eq!(resolved.base_url(), "https://personal.example.com");
 }
 
 // ---------------------------------------------------------------------------
@@ -879,10 +832,7 @@ fn the_global_api_key_never_reaches_a_profile() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("personal".to_string());
-    let env = EnvLayer {
-        api_key: Some("key-for-work".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_api_key("key-for-work");
     let resolved = settings(&overrides, &env).unwrap();
     let error = release(&env, &resolved).unwrap_err();
     assert!(
@@ -912,14 +862,12 @@ fn one_profiles_key_is_not_reachable_by_another_profile() {
 fn the_global_api_key_still_serves_the_profile_less_path() {
     // Epic 1 behaviour, unchanged: no profile, global variable, no config.
     let dir = tempfile::tempdir().unwrap();
-    let env = EnvLayer {
-        url: Some("https://env.example.com".to_string()),
-        api_key: Some("global-key".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default()
+        .with_url("https://env.example.com")
+        .with_api_key("global-key");
     let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
     let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(resolved.profile, None);
+    assert_eq!(resolved.profile(), None);
     assert_eq!(release(&env, &resolved).unwrap(), "global-key");
 }
 
@@ -949,10 +897,7 @@ fn a_profile_with_no_expressible_variable_name_is_refused_not_defaulted() {
     let (_dir, path) = config_file("[profiles.\"工作\"]\nurl = \"https://x.example.com\"\n");
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("工作".to_string());
-    let env = EnvLayer {
-        api_key: Some("global-key".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_api_key("global-key");
     let resolved = settings(&overrides, &env).unwrap();
     let error = release(&env, &resolved).unwrap_err();
     assert!(
@@ -990,7 +935,7 @@ fn two_profiles_sharing_one_variable_name_are_refused() {
     let mut solo = overrides_for(&path2);
     solo.profile = Some("solo".to_string());
     let resolved = settings(&solo, &EnvLayer::default()).unwrap();
-    assert_eq!(resolved.base_url, "https://c.example.com");
+    assert_eq!(resolved.base_url(), "https://c.example.com");
 }
 
 #[test]
@@ -1021,15 +966,15 @@ fn no_configuration_type_leaks_a_url_through_debug() {
         url: Some(SECRET_URL.to_string()),
         config_path: None,
     };
-    let env = EnvLayer {
-        url: Some(SECRET_URL.to_string()),
-        api_key: Some("KEY-SECRET".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default()
+        .with_url(SECRET_URL)
+        .with_api_key("KEY-SECRET");
     let (_dir, path) = config_file(&format!("[profiles.work]\nurl = \"{SECRET_URL}\"\n"));
     let loaded = otl::config::load_file(&overrides_for(&path), &EnvLayer::default()).unwrap();
     let profile = loaded.file.profiles.get("work").unwrap();
-    let resolved = settings_for(Some("work"), SECRET_URL, UrlSource::Profile);
+    let mut selected = overrides_for(&path);
+    selected.profile = Some("work".to_string());
+    let resolved = settings(&selected, &EnvLayer::default()).unwrap();
     let config = Config {
         base_url: SECRET_URL.to_string(),
         api_key: "KEY-SECRET".to_string(),
@@ -1175,10 +1120,7 @@ fn no_configuration_type_leaks_a_profile_name_through_debug() {
     ));
     let mut overrides = overrides_for(&path);
     overrides.profile = Some(SECRET_NAME.to_string());
-    let env = EnvLayer {
-        profile: Some(SECRET_NAME.to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_profile(SECRET_NAME);
     let loaded = otl::config::load_file(&overrides, &EnvLayer::default()).unwrap();
     let resolved = settings(&overrides, &EnvLayer::default()).unwrap();
     let profile = loaded.file.profiles.get(SECRET_NAME).unwrap();
@@ -1277,6 +1219,9 @@ fn config_error_debug_carries_no_field_text_for_any_variant() {
             profile: secret.clone(),
         },
         ConfigError::ConflictingUrl {
+            profile: secret.clone(),
+        },
+        ConfigError::InvalidProfileUrl {
             profile: secret.clone(),
         },
         ConfigError::AmbiguousProfileApiKeyVar {
@@ -1516,24 +1461,21 @@ fn the_url_key_itself_resolves_flag_over_env_over_file() {
 
     // File only.
     let file_only = settings(&overrides, &EnvLayer::default()).unwrap();
-    assert_eq!(file_only.base_url, "https://work.example.com");
-    assert_eq!(file_only.url_source, UrlSource::Profile);
+    assert_eq!(file_only.base_url(), "https://work.example.com");
+    assert_eq!(file_only.url_source(), UrlSource::Profile);
 
     // Env over file: the env value is the resolution result, and the source
     // is recorded so the credential gate can have its separate say.
-    let env = EnvLayer {
-        url: Some("https://env.example.com".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_url("https://env.example.com");
     let env_over_file = settings(&overrides, &env).unwrap();
-    assert_eq!(env_over_file.base_url, "https://env.example.com");
-    assert_eq!(env_over_file.url_source, UrlSource::Env);
+    assert_eq!(env_over_file.base_url(), "https://env.example.com");
+    assert_eq!(env_over_file.url_source(), UrlSource::Env);
 
     // Flag over env over file.
     overrides.url = Some("https://flag.example.com".to_string());
     let flag_over_all = settings(&overrides, &env).unwrap();
-    assert_eq!(flag_over_all.base_url, "https://flag.example.com");
-    assert_eq!(flag_over_all.url_source, UrlSource::Flag);
+    assert_eq!(flag_over_all.base_url(), "https://flag.example.com");
+    assert_eq!(flag_over_all.url_source(), UrlSource::Flag);
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,10 +1503,7 @@ fn the_binding_gate_applies_to_every_token_source() {
     let (_dir, path) = config_file(TWO_PROFILES);
     let mut overrides = overrides_for(&path);
     overrides.profile = Some("work".to_string());
-    let conflicting = EnvLayer {
-        url: Some("https://elsewhere.example.com".to_string()),
-        ..EnvLayer::default()
-    };
+    let conflicting = EnvLayer::default().with_url("https://elsewhere.example.com");
     let resolved = settings(&overrides, &conflicting).unwrap();
 
     // A source that never refuses anything is still refused by the gate.
@@ -1588,13 +1527,11 @@ fn no_profile_means_no_binding_question() {
     // The global credential and the global URL variable are one scope.
     let dir = tempfile::tempdir().unwrap();
     let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
-    let env = EnvLayer {
-        url: Some("https://env.example.com".to_string()),
-        api_key: Some("global-key".to_string()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default()
+        .with_url("https://env.example.com")
+        .with_api_key("global-key");
     let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(resolved.url_source, UrlSource::Env);
+    assert_eq!(resolved.url_source(), UrlSource::Env);
     assert_eq!(release(&env, &resolved).unwrap(), "global-key");
 }
 
@@ -1666,10 +1603,7 @@ fn no_configuration_type_leaks_a_config_path_through_debug() {
         config_path: Some(path.clone()),
         ..Overrides::default()
     };
-    let env = EnvLayer {
-        config_path: Some(path.clone()),
-        ..EnvLayer::default()
-    };
+    let env = EnvLayer::default().with_config_path(path.clone());
     let source = otl::config::locate(&overrides, &env);
     let loaded = otl::config::load_from(&source).unwrap();
 
@@ -1705,6 +1639,7 @@ fn exit_code_doc_keyword(error: &ConfigError) -> &'static str {
         ConfigError::ProfileApiKeyVarUnnameable { .. } => "**unusable variable name**",
         ConfigError::AmbiguousProfileApiKeyVar { .. } => "**ambiguous variable**",
         ConfigError::ConflictingUrl { .. } => "**conflicting URL**",
+        ConfigError::InvalidProfileUrl { .. } => "**unusable profile URL**",
         ConfigError::UnboundProfileCredential { .. } => "**unbound credential**",
         ConfigError::UnknownProfile { .. } => "naming a profile the file does not define",
         ConfigError::ConfigFileUnreadable { .. } => "cannot be read or is",
@@ -1736,6 +1671,9 @@ fn every_config_error_is_registered_in_the_exit_code_document() {
             variable: "OUTLINE_API_KEY_WORK".to_string(),
         },
         ConfigError::ConflictingUrl {
+            profile: name.clone(),
+        },
+        ConfigError::InvalidProfileUrl {
             profile: name.clone(),
         },
         ConfigError::UnboundProfileCredential {
@@ -1772,4 +1710,207 @@ fn every_config_error_is_registered_in_the_exit_code_document() {
     }
     // And the code these all map to is documented as usage/configuration.
     assert!(doc.contains("| 2 | Usage or configuration error |"));
+}
+
+// ---------------------------------------------------------------------------
+// The gate's INPUT cannot be forged either (R4 finding 1).
+//
+// R3 made the proof token unforgeable, which only moved the problem: the
+// proof is issued from a `Settings`, and that was a public struct anyone
+// could build with `url_source: Flag` and any base URL they liked. The secret
+// was also readable straight off `EnvLayer`, without going near the gate.
+//
+// Both are now closed by construction, which is why the two cases below are
+// COMPILE-FAIL tests rather than runtime ones: there is no value of any
+// argument that reaches the unsafe behaviour, so there is nothing to assert
+// at runtime. `trybuild` is not in the dependency set, so the check is done
+// by compiling a probe crate against the real library.
+// ---------------------------------------------------------------------------
+
+/// Source text that must NOT compile against the public API, with the reason.
+const FORGERY_ATTEMPTS: &[(&str, &str)] = &[
+    (
+        "forge a Flag url_source to unbind a profile's credential",
+        r#"
+        fn main() {
+            let settings = otl::config::Settings {
+                profile: Some("work".to_string()),
+                base_url: "https://attacker.example.com".to_string(),
+                url_source: otl::config::UrlSource::Flag,
+                profile_url: None,
+                auth: otl::config::AuthMethod::ApiKey,
+            };
+            let env = otl::config::EnvLayer::from_process();
+            let _ = otl::config::release_token(&otl::config::EnvApiKey(&env), &settings);
+        }
+        "#,
+    ),
+    (
+        "read the global API key straight off EnvLayer",
+        r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let _leaked: Option<String> = env.api_key;
+        }
+        "#,
+    ),
+    (
+        "read the per-profile API keys straight off EnvLayer",
+        r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let _leaked = env.profile_api_keys.get("WORK").cloned();
+        }
+        "#,
+    ),
+    (
+        "mutate a resolved Settings to claim a different origin",
+        r#"
+        fn main() {
+            let mut settings = resolve();
+            settings.base_url = "https://attacker.example.com".to_string();
+            let env = otl::config::EnvLayer::from_process();
+            let _ = otl::config::release_token(&otl::config::EnvApiKey(&env), &settings);
+        }
+        fn resolve() -> otl::config::Settings { unimplemented!() }
+        "#,
+    ),
+];
+
+/// Compile `source` against the built `otl` library; returns the compiler's
+/// stderr on failure, or `None` when it compiled.
+fn compile_against_otl(source: &str) -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("probe.rs");
+    std::fs::write(&src, source).unwrap();
+
+    // The rlib and its dependencies, as cargo just built them for this test.
+    let deps = std::path::Path::new(env!("CARGO_BIN_EXE_otl"))
+        .parent()
+        .unwrap()
+        .join("deps");
+    let output = std::process::Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
+        .arg("--version")
+        .output();
+    assert!(output.is_ok(), "cargo must be available");
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let otl_rlib = std::fs::read_dir(&deps)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libotl-") && n.ends_with(".rlib"))
+        })
+        .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())?;
+
+    let result = std::process::Command::new(rustc)
+        .arg(&src)
+        .arg("--edition=2021")
+        .arg("--crate-type=bin")
+        .arg("--extern")
+        .arg(format!("otl={}", otl_rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("-o")
+        .arg(dir.path().join("probe"))
+        .output()
+        .unwrap();
+    if result.status.success() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&result.stderr).to_string())
+    }
+}
+
+#[test]
+fn the_gates_inputs_cannot_be_forged_from_outside_the_crate() {
+    // Sanity: a program that only uses the sanctioned API must compile, or a
+    // broken probe harness would make every case below pass vacuously.
+    let sanctioned = r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let overrides = otl::config::Overrides::default();
+            let loaded = otl::config::load_file(&overrides, &env).unwrap();
+            let settings = otl::config::resolve_settings(&overrides, &env, &loaded).unwrap();
+            let _ = settings.url_source();
+            let _ = otl::config::release_token(&otl::config::EnvApiKey(&env), &settings);
+        }
+    "#;
+    let Some(stderr) = compile_against_otl(sanctioned) else {
+        // Compiled, as it must. Now every forgery must fail.
+        for (what, source) in FORGERY_ATTEMPTS {
+            let stderr =
+                compile_against_otl(source).unwrap_or_else(|| panic!("SAFE RUST CAN STILL {what}"));
+            assert!(
+                stderr.contains("private") || stderr.contains("E0451") || stderr.contains("E0616"),
+                "{what}: rejected for the wrong reason:\n{stderr}"
+            );
+        }
+        return;
+    };
+    panic!("the probe harness is broken; sanctioned API did not compile:\n{stderr}");
+}
+
+#[test]
+fn the_gate_still_governs_an_honestly_resolved_flag_redirect() {
+    // The counterpart to the compile-fail cases: a genuine `--url` (the only
+    // way to obtain `UrlSource::Flag`) is still allowed, so the fix closed the
+    // forgery without closing the documented escape hatch.
+    let (_dir, path) = config_file(TWO_PROFILES);
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    overrides.url = Some("https://elsewhere.example.com".to_string());
+    let env = EnvLayer::default().with_profile_api_key("work", "key-for-work");
+    let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.url_source(), UrlSource::Flag);
+    assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
+}
+
+// ---------------------------------------------------------------------------
+// An unusable URL is diagnosed as such, not as a cross-instance conflict
+// (R4 finding 3).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unusable_env_url_is_left_to_the_request_channel() {
+    // Nothing can be sent to it, so there is no credential exposure to
+    // prevent, and the request channel gives the precise message.
+    let (_dir, path) = config_file(TWO_PROFILES);
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    let env = EnvLayer::default()
+        .with_url("not-a-url")
+        .with_profile_api_key("work", "key-for-work");
+    let resolved = settings(&overrides, &env).unwrap();
+    assert_eq!(resolved.base_url(), "not-a-url");
+    assert!(
+        release(&env, &resolved).is_ok(),
+        "an unusable URL was reported as a cross-instance conflict"
+    );
+}
+
+#[test]
+fn an_unusable_profile_url_is_named_as_the_problem() {
+    // Here the binding genuinely cannot be established, and the profile's own
+    // configuration is what needs fixing - so it must not be reported as
+    // OUTLINE_URL naming a different instance.
+    let (_dir, path) = config_file("[profiles.work]\nurl = \"not-a-url\"\n");
+    let mut overrides = overrides_for(&path);
+    overrides.profile = Some("work".to_string());
+    let env = EnvLayer::default()
+        .with_url("https://real.example.com")
+        .with_profile_api_key("work", "key-for-work");
+    let resolved = settings(&overrides, &env).unwrap();
+    let error = release(&env, &resolved).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::InvalidProfileUrl { .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("work"), "{message}");
+    assert!(!message.contains("different instance"), "{message}");
+    assert!(!message.contains("key-for-work"), "{message}");
 }
