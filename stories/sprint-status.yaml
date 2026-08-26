@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-08-25
-last_updated: 2026-08-25
+last_updated: 2026-08-26
 project: outline-cli (otl)
 project_key: NOKEY
 tracking_system: file-system
@@ -54,31 +54,31 @@ development_status:
   1-3-param-validation-and-coercion: done
   1-4-error-mapping-exit-codes: done
   1-5-dual-mode-output: done
-  1-5b-schema-driven-columns: backlog  # follow-up: thread OpSpec/response schema into table renderer after 1-2 IR merges
+  1-5b-schema-driven-columns: done
   1-6-auto-pagination: done
   1-7-rate-limit-backoff: done
   1-8-performance-ci-baseline: done
   epic-1-retrospective: optional
-  epic-2: backlog
-  2-1-oauth-browser-login: backlog
-  2-2-dcr-auto-registration: backlog
-  2-3-auto-refresh-rotation: backlog
-  2-4-logout-and-purge: backlog
-  2-5-api-key-management: backlog
-  2-6-credential-file-hygiene: backlog
+  epic-2: done
+  2-1-oauth-browser-login: done
+  2-2-dcr-auto-registration: done
+  2-3-auto-refresh-rotation: done
+  2-4-logout-and-purge: done
+  2-5-api-key-management: done
+  2-6-credential-file-hygiene: done
   epic-2-retrospective: optional
-  epic-3: backlog
-  3-1-docs-search: backlog
-  3-2-docs-view: backlog
-  3-3-docs-create: backlog
-  3-4-docs-update: backlog
-  3-5-collections-list: backlog
-  3-6-docs-export: backlog
+  epic-3: done
+  3-1-docs-search: done
+  3-2-docs-view: done
+  3-3-docs-create: done
+  3-4-docs-update: done
+  3-5-collections-list: done
+  3-6-docs-export: done
   epic-3-retrospective: optional
-  epic-4: backlog
-  4-1-config-and-profiles: backlog
-  4-2-spec-sync: backlog
+  epic-4: in-progress
+  4-1-config-and-profiles: done
+  4-2-spec-sync: done
   4-3-doctor: backlog
-  4-4-shell-completions: backlog
-  4-5-release-pipeline: backlog
+  4-4-shell-completions: done
+  4-5-release-pipeline: done
   epic-4-retrospective: optional
