@@ -65,9 +65,15 @@ pub(crate) struct Document {
 }
 
 /// A shrinking allowance, threaded through the parse by seed.
+///
+/// `exhausted` exists so the caller can tell two failures apart: a
+/// document that is not JSON, and a document that is perfectly good JSON
+/// and simply too large. serde hands back only a string, and those two
+/// deserve different messages.
 struct Budget {
     remaining: Cell<usize>,
     limit: usize,
+    exhausted: Cell<bool>,
 }
 
 impl Budget {
@@ -75,6 +81,7 @@ impl Budget {
         Self {
             remaining: Cell::new(limit),
             limit,
+            exhausted: Cell::new(false),
         }
     }
 
@@ -85,16 +92,13 @@ impl Budget {
                 self.remaining.set(left);
                 Ok(())
             }
-            None => Err(E::custom(format!(
-                "it expands to more than the {} bytes this parser will hold; \
-                 check that the document is an API description and not \
-                 something else",
-                self.limit
-            ))),
+            None => {
+                self.exhausted.set(true);
+                Err(E::custom("the parse budget is exhausted"))
+            }
         }
     }
 
-    #[cfg(test)]
     fn spent(&self) -> usize {
         self.limit - self.remaining.get()
     }
@@ -105,15 +109,22 @@ impl Budget {
 pub(crate) fn parse(raw: &str, limit: usize) -> Result<Document, CompileError> {
     let budget = Budget::new(limit);
     let mut deserializer = serde_json::Deserializer::from_str(raw);
-    let document = DocumentSeed(&budget)
+    let outcome = DocumentSeed(&budget)
         .deserialize(&mut deserializer)
-        .map_err(|error| CompileError::NotJson {
+        .and_then(|document| deserializer.end().map(|()| document));
+    match outcome {
+        Ok(document) => Ok(document),
+        // Two quite different failures reach here, and "not valid JSON" is
+        // a bad thing to tell someone whose JSON is fine and merely huge.
+        Err(_) if budget.exhausted.get() => Err(CompileError::TooLarge {
+            document_bytes: raw.len(),
+            charged: budget.spent(),
+            limit,
+        }),
+        Err(error) => Err(CompileError::NotJson {
             reason: error.to_string(),
-        })?;
-    deserializer.end().map_err(|error| CompileError::NotJson {
-        reason: error.to_string(),
-    })?;
-    Ok(document)
+        }),
+    }
 }
 
 /// The estimated cost of a parsed document, for tests and diagnostics.
@@ -167,6 +178,20 @@ impl<'de> Visitor<'de> for DocumentVisitor<'_> {
             }
         }
         Ok(Document { paths, components })
+    }
+}
+
+/// Render a byte count the way a person reads it, keeping the exact
+/// figure: `24.0 MiB (25165824 bytes)`.
+pub(crate) fn human_bytes(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB ({bytes} bytes)", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB ({bytes} bytes)", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -277,10 +302,34 @@ mod tests {
         let filler = vec!["0"; 200_000].join(",");
         let raw = format!(r#"{{"paths":{{"/a.b":[{filler}]}}}}"#);
         let error = parse(&raw, 64 * 1024).expect_err("must be refused");
+        let text = error.to_string();
+        // The input is perfectly good JSON: saying otherwise sends the
+        // reader looking for a syntax error that is not there.
         assert!(
-            error.to_string().contains("expands to more than"),
+            !text.contains("not a valid JSON"),
+            "a legal document was called malformed: {text}"
+        );
+        assert!(text.contains("expands to"), "unexpected error: {text}");
+        // Readable size, exact size, and the input's own size.
+        assert!(text.contains("64.0 KiB"), "{text}");
+        assert!(text.contains("65536"), "{text}");
+        assert!(text.contains(&raw.len().to_string()), "{text}");
+    }
+
+    #[test]
+    fn a_genuine_syntax_error_is_still_reported_as_one() {
+        let error = parse("{\"paths\": ", MAX_PARSED_BYTES).expect_err("must fail");
+        assert!(
+            error.to_string().contains("not a valid JSON"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn human_bytes_keeps_the_exact_figure() {
+        assert_eq!(human_bytes(512), "512 bytes");
+        assert_eq!(human_bytes(64 * 1024), "64.0 KiB (65536 bytes)");
+        assert_eq!(human_bytes(24 * 1024 * 1024), "24.0 MiB (25165824 bytes)");
     }
 
     #[test]

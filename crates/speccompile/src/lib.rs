@@ -158,6 +158,28 @@ pub enum CompileError {
         /// serde_json position message (no content).
         reason: String,
     },
+    /// The document is valid JSON, and too large to parse within the
+    /// budget.
+    ///
+    /// Separate from [`CompileError::NotJson`] on purpose: the input is
+    /// well-formed, so telling the reader it is malformed sends them
+    /// looking for a syntax error that does not exist.
+    #[error(
+        "it is {} of JSON that expands to more than the {} this parser will hold \
+         (charged {} before stopping); check that the document is an API \
+         description and not something else",
+        document::human_bytes(*document_bytes),
+        document::human_bytes(*limit),
+        document::human_bytes(*charged)
+    )]
+    TooLarge {
+        /// Size of the input document.
+        document_bytes: usize,
+        /// Estimated heap cost charged before the budget ran out.
+        charged: usize,
+        /// The budget.
+        limit: usize,
+    },
     /// The document has no `paths` object.
     #[error("document has no object at `paths`")]
     NoPaths,

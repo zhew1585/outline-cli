@@ -16,8 +16,11 @@ publish = false
 
 [dependencies]
 # The document parser is hand-written (a seed threading an allocation
-# budget), so serde's traits are needed directly - not the derive macros.
-serde = { workspace = true, default-features = false }
+# budget), so it needs serde's traits directly. It does not use the derive
+# macros, but it takes the workspace feature set as it is: overriding
+# `default-features` here is ignored (the workspace entry does not set it)
+# and cargo warns about that on every build.
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
