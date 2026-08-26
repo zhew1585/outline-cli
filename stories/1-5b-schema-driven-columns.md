@@ -107,6 +107,7 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
 | R3-6 | MAJOR | 已修：`has_content` 判的是**原始字符串**，而单元格经 `sanitize_cell` 后可能完全不可见——`"\u{1b}"` 会变成空格，`"\u{200b}"` 保留但宽度 0，多个这类字段能占满四列。现在判据是「渲染后是否占据终端列」（`renders_visibly`：grapheme 既可打印又宽度 >0）。另外审查者指出我的 invariant 测试用 `split_whitespace().nth(i)` 对齐列不可靠（空的中间列会让后面的值左移），已改为**独立重实现**的 payload 级判据，完全不解析对齐后的表格 |
 | R4-2 | MAJOR | 已修：R3 只把内容判据加在 schema 候选路径上，`from_schema` 为空时转入的 `select_data_columns` 仍只排容器、不查内容——而「schema 一个候选都没有」恰恰意味着所有排名字段都是空的，于是 fallback 又按名字优先级选中同一批空字段，把真正有内容的挤出四列。现在两条路径共用同一个 `has_content`，并新增「两条路径都不得出现全空列」的统一不变量测试 |
 | R5 | VERIFIED | R4-2（三条路径统一走 `has_content`）经复核确认；本轮无新发现。测试文件按关注点拆分为 `render_golden.rs`（数据驱动 + 布局）与 `render_schema.rs`（schema 驱动列），两者均在 800 行铁律内 |
+| R6-3 | **MAJOR** | 已修：表格单元格只清 `is_control()`，U+202E / U+2066 / U+200B / U+FEFF 直达 stdout，而**未闭合的 RLO 会把整行后续内容视觉重排**（不止它自己那一格）。同一个仓库的 `config/error.rs` 与 `engine/sanitize.rs` 都已经处理这些字符——又是一次「三处修了两处」。根因是三处各有一套过滤器，所以修法不是再加一处，而是把**分类**收进新的 `otl::text`（穷尽 enum：Control / BidiFormat / Invisible / Joiner），各表面只决定**如何渲染**每一类：诊断全部替换为可见标记，单元格把控制符换空格、把有作用域的 bidi 换 U+FFFD（篡改要看得见）、把零宽丢弃（宽度要诚实），三者都保留 ZWJ——否则 emoji 连字与波斯语拼写会被破坏。新增 4 个渲染测试 + `otl::text` 自己的分类单测 |
 | — | 验证 | 审查者独立确认 resolver-2 的 build-dep feature 隔离成立（`.fingerprint` 里 runtime `["default","std"]` 与 build-script `[...,"preserve_order",...]` 两套 artifact 并存） |
 
 ### 故意留下的缺口

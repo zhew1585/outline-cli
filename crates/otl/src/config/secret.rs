@@ -25,7 +25,7 @@ use std::env;
 use super::release::{BindingChecked, TokenSource};
 use super::{
     api_key_var_suffix, non_blank, profile_api_key_suffix, AuthMethod, ConfigError, EnvLayer,
-    Settings, ENV_API_KEY, ENV_API_KEY_PREFIX, ENV_NAMES_ARE_CASE_INSENSITIVE,
+    ENV_API_KEY, ENV_API_KEY_PREFIX, ENV_NAMES_ARE_CASE_INSENSITIVE,
 };
 
 /// API keys from the environment: the global one and the per-profile ones.
@@ -101,7 +101,8 @@ impl EnvKeys {
 pub struct EnvApiKey<'layer>(pub &'layer EnvLayer);
 
 impl TokenSource for EnvApiKey<'_> {
-    fn fetch(&self, settings: &Settings, _checked: &BindingChecked) -> Result<String, ConfigError> {
+    fn fetch(&self, checked: &BindingChecked<'_>) -> Result<String, ConfigError> {
+        let settings = checked.settings();
         let keys = self.0.keys();
         if settings.auth() != AuthMethod::ApiKey {
             return Err(ConfigError::UnsupportedAuthMethod {
@@ -124,6 +125,7 @@ impl TokenSource for EnvApiKey<'_> {
                 profile: profile.to_string(),
                 variable: format!("{ENV_API_KEY_PREFIX}{suffix}"),
                 global_set: keys.global.is_some(),
+                source: settings.profile_source(),
             })
     }
 }

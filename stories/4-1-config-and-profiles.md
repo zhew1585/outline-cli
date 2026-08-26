@@ -321,9 +321,26 @@ R4 已 VERIFIED（不再改动）：AC2 同项三层优先级、跨 origin 零�
   the global API key out of the layer`；给 `resolved.rs` 加一个真实子模块 → `resolved.rs:154 declares a
   submodule`。
 
-**给 Epic 2 的接口说明**：凭证文件源实现 `TokenSource` 即可，无需知道闸门存在。但**不要**把它放成
-`config::resolved` / `config::secret` / `config::release` 的子模块——放在 `config` 下的兄弟位置（如
-`config::credentials`）或 config 之外都安全，叶子测试会挡住前一种误放。
+### R6 复核处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| R6-2 | **MAJOR** | 已修：`BindingChecked` 只证明「检查跑过了」，没证明「跑在哪个 Settings 上」。审查者用外部 crate 复现了洗白路径：拿一个合法批准的 token，配上闸门刚拒绝的另一组 settings 调 `fetch`，密钥照样出来。现在 `BindingChecked<'a>(&'a Settings)` 携带它批准的对象，且 **`fetch` 不再接受 settings 参数**——source 只能从 token 里读，洗白在类型上不可表达。新增运行时测试（委托型 source 只能拿到 benign 的全局密钥，拿不到被拒 profile 的密钥）＋外部编译失败探针（旧的洗白写法根本编译不过，报 E0061） |
+| R6-4 | MINOR | 已修：叶子守卫原本是**行前缀文本匹配**，`#[path = "x.rs"] mod x;`、`pub(in crate::config) mod`、`pub(crate)mod`（无空格）、跨行 `mod`、`include!()` 全部绕过（审查者实测三种都能编译并伪造状态）。现在先剥注释与字符串再做**词法扫描**，识别 `mod` / `#[path` / `include!`；新增 guard-the-guard：11 种绕过写法必须全部被拦，5 种正常散文（注释里的 `mod.rs`、`modify` 标识符、字符串字面量）必须不误报 |
+| R6-5 | MINOR | 已修：`is_privacy_rejection` 接受 `E0609`/`no field`，导致**字段被改名**时探针失败的原因与「私有」无法区分，攻击用例静默变成空转仍报绿。现在每个内部攻击都配一个**正向对照**：把目标字段机械放宽为 `pub(super)` 后必须编译成功；改名会同时打断两半并立刻报「positive control is stale」。已变异验证（把 `global` 改名 → 立即失败） |
+| R6-6 | MINOR | 已修：profile 可由 flag / `OUTLINE_PROFILE` / `default_profile` 三种方式选中，而两条诊断一律建议「drop --profile」——对后两种来说是**用户根本无法执行的动作**，而且这恰是「已有 Epic-1 配置在出现 config file 后失效」的那条路径。新增 `ProfileSource` 记录来源，诊断按来源给出 `drop --profile` / `unset OUTLINE_PROFILE` / `remove default_profile` |
+| R6-7 | MINOR | 已修：`sanitize_name` 的文档注释是个悬空片段（首句丢失），而它是 `pub` 项，会原样进 `cargo doc` |
+| R6-8 | MINOR | 已修：`OUTLINE_PROFILE` 走 `non_blank` 而 `--profile` 不走，导致 `--profile "  work  "` 报未知 profile 而环境变量同值可用。现在两层同规则（`overrides.url` 本来就已经如此，属于 `Overrides` 内部的不一致） |
+| 合并前专项 (a) | 确认 | 审查者独立验证：兄弟模块安全、叶子的**后代**确实能伪造——即「叶子性」是真实承重的性质，不是装饰 |
+| 合并前专项 (b) | 已修 | 探针 harness 现在**递归复制**目录模块，并自动带上 config 经 `crate::` 引用的兄弟模块（今天是 `text`）。否则 Epic 2 若用 `config/credentials/mod.rs`，harness 会以「the harness is broken」panic，而最省事的「修法」是放宽断言——那等于静默关掉这套安全测试 |
+
+**给 Epic 2 的接口说明**：凭证文件源实现 `TokenSource` 即可，无需知道闸门存在。三条约束（R6 复核后收紧）：
+
+1. **不要**放成 `config::resolved` / `config::secret` / `config::release` 的**子模块**；扁平兄弟文件
+   `config/credentials.rs` 是推荐位置，config 之外也安全。
+2. 优先用**扁平文件**而非目录模块。harness 现在支持目录模块，但扁平形式更简单，也是审查者的建议。
+3. `fetch` 现在**没有** settings 参数——想服务的 settings 只能从 `checked.settings()` 取。这不是纪律
+   要求，是签名层面的：R6 之前那条「拿批准过的 token 去配另一组 settings」的洗白路径现在写都写不出来。
 
 R2 已 VERIFIED：R1-3（TOML 文本只用于分类）、R1-4（两层白名单）、R1-7（控制字符清理，并额外确认 bidi
 经 Rust Debug 转义后无法改变终端方向状态）。

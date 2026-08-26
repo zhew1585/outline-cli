@@ -25,8 +25,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    AuthMethod, CONFIG_FILE_NAME, CREDENTIALS_FILE_NAME, ENV_API_KEY, ENV_API_KEY_PREFIX, ENV_URL,
-    MAX_PROFILE_VAR_CHARS,
+    AuthMethod, ProfileSource, CONFIG_FILE_NAME, CREDENTIALS_FILE_NAME, ENV_API_KEY,
+    ENV_API_KEY_PREFIX, ENV_URL, MAX_PROFILE_VAR_CHARS,
 };
 
 /// Maximum number of characters kept from any name echoed in a diagnostic.
@@ -48,24 +48,11 @@ const MAX_TEXT_CHARS: usize = 300;
 
 /// Whether a character must not be forwarded into a diagnostic.
 ///
-/// `char::is_control()` alone is not enough. It covers C0/C1 (ESC, BEL,
-/// newline) but not the Unicode FORMAT characters, and those are just as
-/// effective in a terminal: a right-to-left override reverses the visual
-/// order of everything after it, so a path or a reason can be made to read
-/// as something else entirely, and truncating such a string can leave the
-/// direction state open for whatever is printed next. Zero-width characters
-/// are excluded for a related reason - they let two different names render
-/// identically.
+/// Every category from [`crate::text`], with no exceptions: a diagnostic is
+/// the one surface where making tampering visible matters more than
+/// preserving the text, so all three are replaced rather than dropped.
 fn is_unsafe_in_diagnostic(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            // Bidirectional marks, embeddings, overrides and isolates.
-            '\u{061c}' | '\u{200e}' | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            // Zero-width and other invisible formatting.
-            | '\u{00ad}' | '\u{180e}' | '\u{200b}'..='\u{200d}'
-            | '\u{2060}'..='\u{2064}' | '\u{feff}')
+    crate::text::hazard(c).is_some()
 }
 
 /// Replace every unsafe character and cap the length.
@@ -88,8 +75,16 @@ fn scrub(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// or forge additional diagnostic lines on stderr. Applied even when stderr
-/// is not a terminal, because the consumer may be one.
+/// Make a name from the config file or the command line safe to print in a
+/// diagnostic.
+///
+/// A TOML quoted key and a `--profile` argument are both caller-controlled
+/// text, and can carry ESC, BEL, bidi overrides or zero-width characters -
+/// enough to recolour the terminal, retitle its window, reverse the visual
+/// order of the rest of the message, or forge additional diagnostic lines on
+/// stderr. Applied even when stderr is not a terminal, because the consumer
+/// may be one. The result is also length-capped, so a name cannot flood the
+/// output.
 pub fn sanitize_name(name: &str) -> String {
     scrub(name, MAX_NAME_CHARS)
 }
@@ -132,6 +127,9 @@ pub enum ConfigError {
         /// Whether the global `OUTLINE_API_KEY` is set - deliberately not
         /// used here, and worth saying so.
         global_set: bool,
+        /// How the profile was selected, so the advice names an action the
+        /// user can actually take.
+        source: ProfileSource,
     },
     /// A profile name cannot be expressed as an environment variable name.
     ProfileApiKeyVarUnnameable {
@@ -161,6 +159,9 @@ pub enum ConfigError {
     ConflictingUrl {
         /// The profile in effect.
         profile: String,
+        /// How the profile was selected, so the advice names an action the
+        /// user can actually take.
+        source: ProfileSource,
     },
     /// Two profiles map to the same API key variable.
     AmbiguousProfileApiKeyVar {
@@ -222,9 +223,10 @@ impl fmt::Display for ConfigError {
                 profile,
                 variable,
                 global_set,
-            } => write_missing_profile_key(f, profile, variable, *global_set),
+                source,
+            } => write_missing_profile_key(f, profile, variable, *global_set, *source),
             Self::ProfileApiKeyVarUnnameable { profile } => write_unnameable_var(f, profile),
-            Self::ConflictingUrl { profile } => write_conflicting_url(f, profile),
+            Self::ConflictingUrl { profile, source } => write_conflicting_url(f, profile, *source),
             Self::InvalidProfileUrl { profile } => write_invalid_profile_url(f, profile),
             Self::UnboundProfileCredential { profile } => write_unbound_credential(f, profile),
             Self::AmbiguousProfileApiKeyVar {
@@ -311,17 +313,24 @@ fn write_unnameable_var(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Resul
     )
 }
 
-fn write_conflicting_url(f: &mut fmt::Formatter<'_>, profile: &str) -> fmt::Result {
+fn write_conflicting_url(
+    f: &mut fmt::Formatter<'_>,
+    profile: &str,
+    source: ProfileSource,
+) -> fmt::Result {
     // Neither URL is printed: a base URL can carry credentials in its
-    // userinfo, path or query.
+    // userinfo, path or query. The way out is phrased for the layer that
+    // actually selected the profile - "drop --profile" is not an action a
+    // user with `default_profile` in their config file can take.
     write!(
         f,
         "{ENV_URL} names a different instance than profile {:?} declares, so \
          that profile's API key was not sent: a credential that has gone to \
          the wrong server cannot be recalled.\n\
-         Unset {ENV_URL}, drop --profile to use {ENV_URL} on its own, or pass \
-         --url to redirect this profile deliberately.",
-        sanitize_name(profile)
+         Unset {ENV_URL}, {} to use {ENV_URL} on its own, or pass --url to \
+         redirect this profile deliberately.",
+        sanitize_name(profile),
+        source.how_to_drop()
     )
 }
 
@@ -448,6 +457,7 @@ fn write_missing_profile_key(
     profile: &str,
     variable: &str,
     global_set: bool,
+    source: ProfileSource,
 ) -> fmt::Result {
     let variable = sanitize_name(variable);
     write!(
@@ -460,9 +470,10 @@ fn write_missing_profile_key(
     if global_set {
         write!(
             f,
-            "\n{ENV_API_KEY} is set but is deliberately not used with --profile: \
-             sending it would give one workspace's key to another workspace's \
-             server. Drop --profile to use it."
+            "\n{ENV_API_KEY} is set but is deliberately not used with a \
+             profile: sending it would give one workspace's key to another \
+             workspace's server. To use it, {}.",
+            source.how_to_drop()
         )?;
     }
     Ok(())

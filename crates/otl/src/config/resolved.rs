@@ -27,6 +27,32 @@ use super::{
     AuthMethod, ConfigError, EnvLayer, LoadedConfig, Overrides,
 };
 
+/// Which layer selected the profile.
+///
+/// Recorded so a diagnostic can name the action that actually undoes the
+/// selection: telling a user to "drop --profile" when the profile came from
+/// `default_profile` in their config file is advice they cannot take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSource {
+    /// `--profile NAME`.
+    Flag,
+    /// `OUTLINE_PROFILE`.
+    Env,
+    /// `default_profile` in the user config file.
+    DefaultProfile,
+}
+
+impl ProfileSource {
+    /// How to stop selecting this profile, phrased for this source.
+    pub fn how_to_drop(self) -> &'static str {
+        match self {
+            Self::Flag => "drop --profile",
+            Self::Env => "unset OUTLINE_PROFILE",
+            Self::DefaultProfile => "remove `default_profile` from your config file",
+        }
+    }
+}
+
 /// Which layer supplied the base URL.
 ///
 /// Recorded because the credential-release gate treats them differently: a
@@ -59,6 +85,8 @@ pub struct Settings {
     base_url: String,
     /// Which layer supplied `base_url`.
     url_source: UrlSource,
+    /// Which layer selected the profile, when one is in effect.
+    profile_source: ProfileSource,
     /// The selected profile's own `url`, when it declared one.
     ///
     /// Kept so that [`release_token`] can compare origins without needing
@@ -84,6 +112,12 @@ impl Settings {
         self.url_source
     }
 
+    /// Which layer selected the profile. Meaningless when no profile is in
+    /// effect; a diagnostic only reads it when one is.
+    pub fn profile_source(&self) -> ProfileSource {
+        self.profile_source
+    }
+
     /// The selected profile's own `url`, when it declared one.
     pub fn profile_url(&self) -> Option<&str> {
         self.profile_url.as_deref()
@@ -102,6 +136,7 @@ impl fmt::Debug for Settings {
             .field("profile", &redacted_name(self.profile.as_deref()))
             .field("base_url_origin", &redacted_origin(Some(&self.base_url)))
             .field("url_source", &self.url_source)
+            .field("profile_source", &self.profile_source)
             .field(
                 "profile_url_origin",
                 &redacted_origin(self.profile_url.as_deref()),
@@ -117,12 +152,24 @@ pub fn resolve_settings(
     env: &EnvLayer,
     loaded: &LoadedConfig,
 ) -> Result<Settings, ConfigError> {
-    let (requested, from_file) = match overrides.profile.as_deref().or(env.profile.as_deref()) {
-        Some(name) => (Some(name), false),
-        // A name read from the config file is FILE CONTENT, so it is never
-        // echoed back (see the module docs); one the user just typed is not.
-        None => (loaded.file.default_profile.as_deref(), true),
+    // `non_blank` on the flag as well as the env value: the two layers are
+    // interchangeable everywhere else, so `--profile "  work  "` must not
+    // mean something different from `OUTLINE_PROFILE="  work  "`.
+    let from_flag = non_blank(overrides.profile.as_deref());
+    let (requested, profile_source) = match from_flag {
+        Some(ref name) => (Some(name.as_str()), ProfileSource::Flag),
+        None => match env.profile() {
+            Some(name) => (Some(name), ProfileSource::Env),
+            // A name read from the config file is FILE CONTENT, so it is
+            // never echoed back (see the module docs); one the user just
+            // typed is not.
+            None => (
+                loaded.file.default_profile.as_deref(),
+                ProfileSource::DefaultProfile,
+            ),
+        },
     };
+    let from_file = profile_source == ProfileSource::DefaultProfile;
     let profile = match requested {
         Some(name) => Some(lookup_profile(name, loaded, from_file)?),
         None => None,
@@ -146,6 +193,7 @@ pub fn resolve_settings(
         profile: profile.map(|(name, _)| name.to_string()),
         base_url,
         url_source,
+        profile_source,
         profile_url,
         auth: profile.and_then(|(_, p)| p.auth).unwrap_or_default(),
     })

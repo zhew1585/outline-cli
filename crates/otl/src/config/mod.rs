@@ -82,7 +82,7 @@ mod secret;
 pub use error::{sanitize_name, sanitize_path, sanitize_text, ConfigError};
 pub use file::{config_dir, default_config_path, load_file, load_from, locate, CONFIG_FILE_NAME};
 pub use release::{release_token, BindingChecked, TokenSource};
-pub use resolved::{resolve_settings, Settings, UrlSource};
+pub use resolved::{resolve_settings, ProfileSource, Settings, UrlSource};
 pub use secret::EnvApiKey;
 
 use std::collections::BTreeMap;

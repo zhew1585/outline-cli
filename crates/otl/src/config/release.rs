@@ -26,15 +26,29 @@
 
 use super::{ConfigError, Settings, UrlSource};
 
-/// Proof that the credential-binding check has run.
+/// Proof that the credential-binding check has run FOR THESE SETTINGS.
 ///
-/// Its only field is private, so this type cannot be constructed outside
-/// this module. Since [`TokenSource::fetch`] demands one, a credential
-/// cannot be obtained except through [`release_token`] - the check is not
-/// something an implementation has to remember, and a source added later
-/// (the Epic 2 credential file) cannot bypass it.
+/// The proof carries the settings it approved, and that is the whole point:
+/// an unforgeable token saying only "a check ran" can be spent on a
+/// different proposition than the one that was checked. A source handed such
+/// a bare token could pass it, together with settings the gate had just
+/// refused, to another source's `fetch` - laundering one legitimate approval
+/// into a credential for an instance the gate said no to. Binding the two
+/// together makes that unrepresentable: `fetch` receives no settings
+/// argument at all, only this, and reads the approved ones out of it.
+///
+/// The field is private, so the token cannot be built outside this module,
+/// and the lifetime ties it to the settings it borrows.
 #[derive(Debug)]
-pub struct BindingChecked(());
+pub struct BindingChecked<'settings>(&'settings Settings);
+
+impl<'settings> BindingChecked<'settings> {
+    /// The settings this check approved - the only ones a
+    /// [`TokenSource`] may serve.
+    pub fn settings(&self) -> &'settings Settings {
+        self.0
+    }
+}
 
 /// Where the secret comes from.
 ///
@@ -42,10 +56,15 @@ pub struct BindingChecked(());
 /// storage: v1 ships `secret::EnvApiKey`, and the Epic 2 credential file becomes a
 /// second implementation without any change above this line.
 pub trait TokenSource {
-    /// The bearer token for `settings`, or a readable configuration error.
+    /// The bearer token for the approved settings, or a readable
+    /// configuration error.
     ///
-    /// Not callable directly: see [`BindingChecked`] and [`release_token`].
-    fn fetch(&self, settings: &Settings, checked: &BindingChecked) -> Result<String, ConfigError>;
+    /// The settings come out of `checked` rather than as a separate
+    /// argument, so an implementation cannot serve any settings other than
+    /// the ones the gate approved - including by delegating to another
+    /// source. Not callable directly: see [`BindingChecked`] and
+    /// [`release_token`].
+    fn fetch(&self, checked: &BindingChecked<'_>) -> Result<String, ConfigError>;
 }
 
 /// The credential-release boundary: the one place a secret is obtained.
@@ -60,7 +79,7 @@ pub fn release_token(
     settings: &Settings,
 ) -> Result<String, ConfigError> {
     let checked = check_credential_binding(settings)?;
-    source.fetch(settings, &checked)
+    source.fetch(&checked)
 }
 
 /// Refuse to release a profile-scoped credential to an origin the profile
@@ -68,15 +87,15 @@ pub fn release_token(
 ///
 /// No profile in effect means no scoping question: the global credential and
 /// the global URL variable belong to the same (single) scope.
-fn check_credential_binding(settings: &Settings) -> Result<BindingChecked, ConfigError> {
+fn check_credential_binding(settings: &Settings) -> Result<BindingChecked<'_>, ConfigError> {
     let Some(profile) = settings.profile() else {
-        return Ok(BindingChecked(()));
+        return Ok(BindingChecked(settings));
     };
     match settings.url_source() {
         // Stated in the same command as --profile: a deliberate redirect.
-        UrlSource::Flag => Ok(BindingChecked(())),
+        UrlSource::Flag => Ok(BindingChecked(settings)),
         // The profile named this origin itself.
-        UrlSource::Profile => Ok(BindingChecked(())),
+        UrlSource::Profile => Ok(BindingChecked(settings)),
         UrlSource::Env => check_env_url_binding(profile, settings),
     }
 }
@@ -96,10 +115,10 @@ fn check_credential_binding(settings: &Settings) -> Result<BindingChecked, Confi
 ///   binding cannot be established at all, and the profile's own
 ///   configuration is what needs fixing;
 /// - both parse: compare normalized origins.
-fn check_env_url_binding(
+fn check_env_url_binding<'settings>(
     profile: &str,
-    settings: &Settings,
-) -> Result<BindingChecked, ConfigError> {
+    settings: &'settings Settings,
+) -> Result<BindingChecked<'settings>, ConfigError> {
     // Nothing to bind to: the profile scopes the credential but named no
     // instance, so an ambient variable would be deciding where it goes.
     let Some(declared) = settings.profile_url() else {
@@ -108,7 +127,7 @@ fn check_env_url_binding(
         });
     };
     let Some(resolved_origin) = engine::base_url_origin(settings.base_url()) else {
-        return Ok(BindingChecked(()));
+        return Ok(BindingChecked(settings));
     };
     let Some(declared_origin) = engine::base_url_origin(declared) else {
         return Err(ConfigError::InvalidProfileUrl {
@@ -116,10 +135,11 @@ fn check_env_url_binding(
         });
     };
     if resolved_origin == declared_origin {
-        Ok(BindingChecked(()))
+        Ok(BindingChecked(settings))
     } else {
         Err(ConfigError::ConflictingUrl {
             profile: profile.to_string(),
+            source: settings.profile_source(),
         })
     }
 }

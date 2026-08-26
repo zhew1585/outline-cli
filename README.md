@@ -56,6 +56,13 @@ implemented exactly once. There is one `.send()` call in the whole crate.
 **No runtime spec parsing.** `build.rs` compiles the vendored spec into a static IR table. The binary
 contains neither the spec file nor its path, which a test asserts against the built artifact.
 
+**Server text is never printed verbatim.** Document titles, operation summaries, profile names and paths
+all reach a terminal, and control characters are only the obvious half of the problem: an unterminated
+`U+202E` reverses the visual order of everything after it, and zero-width characters hide inside a value.
+One classification (`otl::text`) covers control, bidi and invisible characters, and each surface decides
+how to render each category — a diagnostic marks them, a table cell drops what is invisible and marks
+what has scope, and both keep the zero-width joiner that emoji ligatures and Persian spelling depend on.
+
 **Output is two-state.** Data goes to stdout, diagnostics to stderr, always. On a terminal you get a
 table whose columns come from the operation's response schema — one generic policy over the schema's own
 facets (identity, writable label, timestamps), so the same operation always renders the same columns and
@@ -144,6 +151,9 @@ so a secret wrongly placed in the file is never echoed back.
 ```sh
 otl completions zsh > ~/.zfunc/_otl          # bash, zsh, fish, powershell, elvish
 ```
+
+For zsh this file must keep its `#compdef otl` first line — `compinit` reads only that line when it scans
+`$fpath` — so the coverage comment below is placed after it rather than above.
 
 Candidates are generated from the same command tree the binary parses with, so subcommands and flags can
 never drift from the build; `otl api` operation names come from the compiled IR table. bash, zsh and fish

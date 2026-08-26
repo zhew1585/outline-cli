@@ -103,7 +103,15 @@ so that 不背命令。
 
 | R5-2 | MINOR | 已修：R4 的检查按**整句**二元分类，混合句会漏——`powershell does not complete operation names, but elvish does` 整体被判为否定句，后半句对 elvish 的错误正面声明就没被检查。现在两个粒度：句级用于「必须存在一句点齐全部已覆盖 shell 的正面声明」（逗号列表要完整保留），**子句级**用于漂移检测（在 `.` `;` `,` 与 but/while/whereas/however 处切分）。`affirms_completion` 还识别省略动词的子句（“but elvish does”“elvish too”），否则混合句照样能溜过去。guard-the-guard 现在三个方向各一个样本，并已对真实文档做变异验证：三种漂移全部被检出 |
 
-R2/R3/R4/R5 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
+### R6 复核处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| R6-1 | **BLOCKER** | 已修：覆盖声明注释把 zsh 的 `#compdef otl` 挤到了第 3 行，而 `compinit` 扫描 `$fpath` 时**只读第一行**找这个 tag——于是 README 文档化的 `otl completions zsh > ~/.zfunc/_otl` 装出来的补全根本没注册。这是**前一轮审查要求「每个脚本自陈覆盖范围」时我自己引入的回归**，五轮 substring 断言全都看不见它，因为没有一个断言检查**行的位置**。现在 zsh 的注释放在 `#compdef` 之后，并新增三个测试：第一行断言、五个 shell 各自的「保留首行」表、以及把脚本装进临时 `$fpath` 后用**真实 zsh** 查 `_comps[otl]` 的端到端验证 |
+| R6-9 | MINOR | 已修：fish 描述过滤只看 `is_control()`，bidi/零宽可直达补全菜单；现在与表格单元格共用 `otl::text` 的分类 |
+| R5-2 | PARTIAL → 修 | 从句切分器补上 ` and ` / `:` / ` - ` / ` though ` / ` although ` / ` yet ` / 破折号（` - ` 尤其要紧：**它正是本模块文档自己连接从句的写法**），`is_denial` 补上 never/lacks/unavailable/unsupported/without/excluded/omitted。四种此前漏检的漂移已逐一变异验证 |
+
+R2/R3/R4/R5/R6 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
 进一步验证」——生成期过滤不依赖 build.rs 的编译期拒绝，是独立的第二道，specsync 合并后可直接复验该接缝。
 
 ### 故意留下的缺口

@@ -23,361 +23,196 @@
 
 use std::path::{Path, PathBuf};
 
-use otl::config::{
-    release_token, resolve_settings, ConfigError, ConfigSource, EnvLayer, Overrides, Settings,
-    UrlSource,
-};
 use tempfile::TempDir;
 
-/// Write a config file into a fresh temp dir and return (dir, path).
-fn config_file(body: &str) -> (TempDir, PathBuf) {
+/// Source text that must NOT compile against the public API, with the reason.
+const FORGERY_ATTEMPTS: &[(&str, &str)] = &[
+    (
+        "forge a Flag url_source to unbind a profile's credential",
+        r#"
+        fn main() {
+            let settings = otl::config::Settings {
+                profile: Some("work".to_string()),
+                base_url: "https://attacker.example.com".to_string(),
+                url_source: otl::config::UrlSource::Flag,
+                profile_url: None,
+                auth: otl::config::AuthMethod::ApiKey,
+            };
+            let env = otl::config::EnvLayer::from_process();
+            let _ = otl::config::release_token(&otl::config::EnvApiKey(&env), &settings);
+        }
+        "#,
+    ),
+    (
+        "read the global API key straight off EnvLayer",
+        r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let _leaked: Option<String> = env.api_key;
+        }
+        "#,
+    ),
+    (
+        "read the per-profile API keys straight off EnvLayer",
+        r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let _leaked = env.profile_api_keys.get("WORK").cloned();
+        }
+        "#,
+    ),
+    (
+        "launder a proof onto settings the gate did not approve",
+        r#"
+        struct Launder<'a>(&'a otl::config::EnvLayer, &'a otl::config::Settings);
+        impl otl::config::TokenSource for Launder<'_> {
+            fn fetch(
+                &self,
+                checked: &otl::config::BindingChecked<'_>,
+            ) -> Result<String, otl::config::ConfigError> {
+                // No way to say "serve THESE settings instead": the approved
+                // ones are the only ones `fetch` can be given.
+                otl::config::EnvApiKey(self.0).fetch(self.1, checked)
+            }
+        }
+        fn main() {}
+        "#,
+    ),
+    (
+        "mint a BindingChecked to reach a TokenSource directly",
+        r#"
+        struct Mine;
+        impl otl::config::TokenSource for Mine {
+            fn fetch(
+                &self,
+                _c: &otl::config::BindingChecked<'_>,
+            ) -> Result<String, otl::config::ConfigError> {
+                Ok(String::new())
+            }
+        }
+        fn main() {
+            let settings = resolve();
+            let checked = otl::config::BindingChecked(&settings);
+            let _ = otl::config::TokenSource::fetch(&Mine, &checked);
+        }
+        fn resolve() -> otl::config::Settings { unimplemented!() }
+        "#,
+    ),
+    (
+        "reach the key container EnvLayer holds",
+        r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let _keys = env.keys();
+        }
+        "#,
+    ),
+    (
+        "mutate a resolved Settings to claim a different origin",
+        r#"
+        fn main() {
+            let mut settings = resolve();
+            settings.base_url = "https://attacker.example.com".to_string();
+            let env = otl::config::EnvLayer::from_process();
+            let _ = otl::config::release_token(&otl::config::EnvApiKey(&env), &settings);
+        }
+        fn resolve() -> otl::config::Settings { unimplemented!() }
+        "#,
+    ),
+];
+
+/// Compile `source` against the built `otl` library; returns the compiler's
+/// stderr on failure, or `None` when it compiled.
+fn compile_against_otl(source: &str) -> Option<String> {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, body).unwrap();
-    (dir, path)
-}
+    let src = dir.path().join("probe.rs");
+    std::fs::write(&src, source).unwrap();
 
-/// Overrides naming an explicit config file, so the default location (the
-/// user's real config) is never consulted.
-fn overrides_for(path: &Path) -> Overrides {
-    Overrides {
-        config_path: Some(path.to_path_buf()),
-        ..Overrides::default()
-    }
-}
+    // The rlib and its dependencies, as cargo just built them for this test.
+    let deps = std::path::Path::new(env!("CARGO_BIN_EXE_otl"))
+        .parent()
+        .unwrap()
+        .join("deps");
+    let output = std::process::Command::new(std::env::var("CARGO").unwrap_or("cargo".into()))
+        .arg("--version")
+        .output();
+    assert!(output.is_ok(), "cargo must be available");
 
-/// Resolve settings from explicit layers, exactly as the binary does.
-fn settings(overrides: &Overrides, env: &EnvLayer) -> Result<Settings, ConfigError> {
-    let loaded = otl::config::load_file(overrides, env)?;
-    resolve_settings(overrides, env, &loaded)
-}
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let otl_rlib = std::fs::read_dir(&deps)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libotl-") && n.ends_with(".rlib"))
+        })
+        .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())?;
 
-/// A default (non-explicit) config location pointing at a file that does not
-/// exist - the shape of a fresh machine.
-fn absent_default_source(dir: &TempDir) -> ConfigSource {
-    ConfigSource {
-        path: Some(dir.path().join("config.toml")),
-        explicit: false,
-    }
-}
-
-/// Release a credential the way the binary does: through the shared gate,
-/// never by calling a `TokenSource` directly (which the type system forbids).
-fn release(env: &EnvLayer, resolved: &Settings) -> Result<String, ConfigError> {
-    release_token(&otl::config::EnvApiKey(env), resolved)
-}
-
-const TWO_PROFILES: &str = r#"
-default_profile = "personal"
-
-[profiles.work]
-url = "https://work.example.com"
-auth = "api-key"
-
-[profiles.personal]
-url = "https://personal.example.com"
-"#;
-
-/// A stand-in for a future credential source (the Epic 2 credential file).
-/// It would happily hand out a secret for any settings at all.
-struct AlwaysYields(&'static str);
-
-impl otl::config::TokenSource for AlwaysYields {
-    fn fetch(
-        &self,
-        _settings: &Settings,
-        _checked: &otl::config::BindingChecked,
-    ) -> Result<String, ConfigError> {
-        Ok(self.0.to_string())
+    let result = std::process::Command::new(rustc)
+        .arg(&src)
+        .arg("--edition=2021")
+        .arg("--crate-type=bin")
+        .arg("--extern")
+        .arg(format!("otl={}", otl_rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("-o")
+        .arg(dir.path().join("probe"))
+        .output()
+        .unwrap();
+    if result.status.success() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&result.stderr).to_string())
     }
 }
 
 #[test]
-fn a_profile_reads_its_own_api_key_variable() {
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let env = EnvLayer::default()
-        .with_profile_api_key("work", "key-for-work")
-        .with_profile_api_key("personal", "key-for-personal");
-
-    for (profile, expected) in [("work", "key-for-work"), ("personal", "key-for-personal")] {
-        let mut overrides = overrides_for(&path);
-        overrides.profile = Some(profile.to_string());
-        let resolved = settings(&overrides, &env).unwrap();
-        assert_eq!(
-            release(&env, &resolved).unwrap(),
-            expected,
-            "{profile} got the wrong key"
-        );
-    }
+fn the_gates_inputs_cannot_be_forged_from_outside_the_crate() {
+    // Sanity: a program that only uses the sanctioned API must compile, or a
+    // broken probe harness would make every case below pass vacuously.
+    let sanctioned = r#"
+        fn main() {
+            let env = otl::config::EnvLayer::from_process();
+            let overrides = otl::config::Overrides::default();
+            let loaded = otl::config::load_file(&overrides, &env).unwrap();
+            let settings = otl::config::resolve_settings(&overrides, &env, &loaded).unwrap();
+            let _ = settings.url_source();
+            let _ = otl::config::release_token(&otl::config::EnvApiKey(&env), &settings);
+        }
+    "#;
+    let Some(stderr) = compile_against_otl(sanctioned) else {
+        // Compiled, as it must. Now every forgery must fail.
+        for (what, source) in FORGERY_ATTEMPTS {
+            let stderr =
+                compile_against_otl(source).unwrap_or_else(|| panic!("SAFE RUST CAN STILL {what}"));
+            assert!(
+                is_privacy_rejection(&stderr),
+                "{what}: rejected for the wrong reason:\n{stderr}"
+            );
+        }
+        return;
+    };
+    panic!("the probe harness is broken; sanctioned API did not compile:\n{stderr}");
 }
 
-#[test]
-fn the_global_api_key_never_reaches_a_profile() {
-    // The regression that matters: with only the global variable exported,
-    // `--profile personal` must NOT send it to personal's instance.
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("personal".to_string());
-    let env = EnvLayer::default().with_api_key("key-for-work");
-    let resolved = settings(&overrides, &env).unwrap();
-    let error = release(&env, &resolved).unwrap_err();
-    assert!(
-        matches!(error, ConfigError::MissingProfileApiKey { .. }),
-        "{error:?}"
-    );
-    let message = error.to_string();
-    assert!(message.contains("OUTLINE_API_KEY_PERSONAL"), "{message}");
-    // The message must not echo the key, and must explain the refusal.
-    assert!(!message.contains("key-for-work"), "{message}");
-    assert!(message.contains("deliberately not used"), "{message}");
-}
-
-#[test]
-fn one_profiles_key_is_not_reachable_by_another_profile() {
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let env = EnvLayer::default().with_profile_api_key("work", "key-for-work");
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("personal".to_string());
-    let resolved = settings(&overrides, &env).unwrap();
-    let error = release(&env, &resolved).unwrap_err();
-    assert!(matches!(error, ConfigError::MissingProfileApiKey { .. }));
-    assert!(!error.to_string().contains("key-for-work"));
-}
-
-#[test]
-fn the_global_api_key_still_serves_the_profile_less_path() {
-    // Epic 1 behaviour, unchanged: no profile, global variable, no config.
-    let dir = tempfile::tempdir().unwrap();
-    let env = EnvLayer::default()
-        .with_url("https://env.example.com")
-        .with_api_key("global-key");
-    let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
-    let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(resolved.profile(), None);
-    assert_eq!(release(&env, &resolved).unwrap(), "global-key");
-}
-
-#[test]
-fn profile_names_map_to_predictable_variable_names() {
-    for (profile, expected) in [
-        ("work", Some("OUTLINE_API_KEY_WORK")),
-        ("Personal", Some("OUTLINE_API_KEY_PERSONAL")),
-        ("self-hosted", Some("OUTLINE_API_KEY_SELF_HOSTED")),
-        ("a.b", Some("OUTLINE_API_KEY_A_B")),
-        ("x1", Some("OUTLINE_API_KEY_X1")),
-        // No ASCII alphanumeric: cannot name a variable.
-        ("工作", None),
-        ("-", None),
-        ("", None),
-    ] {
-        assert_eq!(
-            otl::config::api_key_var(profile).as_deref(),
-            expected,
-            "profile {profile:?}"
-        );
-    }
-}
-
-#[test]
-fn a_profile_with_no_expressible_variable_name_is_refused_not_defaulted() {
-    let (_dir, path) = config_file("[profiles.\"工作\"]\nurl = \"https://x.example.com\"\n");
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("工作".to_string());
-    let env = EnvLayer::default().with_api_key("global-key");
-    let resolved = settings(&overrides, &env).unwrap();
-    let error = release(&env, &resolved).unwrap_err();
-    assert!(
-        matches!(error, ConfigError::ProfileApiKeyVarUnnameable { .. }),
-        "{error:?}"
-    );
-    assert!(!error.to_string().contains("global-key"));
-}
-
-#[test]
-fn two_profiles_sharing_one_variable_name_are_refused() {
-    // `my-work` and `my.work` both map to OUTLINE_API_KEY_MY_WORK, so the
-    // key's instance would be ambiguous.
-    let (_dir, path) = config_file(
-        "[profiles.\"my-work\"]\nurl = \"https://a.example.com\"\n\
-         [profiles.\"my.work\"]\nurl = \"https://b.example.com\"\n",
-    );
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("my-work".to_string());
-    let error = settings(&overrides, &EnvLayer::default()).unwrap_err();
-    assert!(
-        matches!(error, ConfigError::AmbiguousProfileApiKeyVar { .. }),
-        "{error:?}"
-    );
-    let message = error.to_string();
-    assert!(message.contains("OUTLINE_API_KEY_MY_WORK"), "{message}");
-
-    // A profile that does NOT share a variable resolves normally, even
-    // though the colliding pair is still in the same file.
-    let (_dir2, path2) = config_file(
-        "[profiles.\"my-work\"]\nurl = \"https://a.example.com\"\n\
-         [profiles.\"my.work\"]\nurl = \"https://b.example.com\"\n\
-         [profiles.solo]\nurl = \"https://c.example.com\"\n",
-    );
-    let mut solo = overrides_for(&path2);
-    solo.profile = Some("solo".to_string());
-    let resolved = settings(&solo, &EnvLayer::default()).unwrap();
-    assert_eq!(resolved.base_url(), "https://c.example.com");
-}
-
-#[test]
-fn a_blank_profile_api_key_variable_counts_as_unset() {
-    // `export OUTLINE_API_KEY_WORK=` must fail like an unset variable, not
-    // send an empty bearer token.
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("work".to_string());
-    let env = EnvLayer::default().with_profile_api_key("work", "   ");
-    let resolved = settings(&overrides, &env).unwrap();
-    let error = release(&env, &resolved).unwrap_err();
-    assert!(matches!(error, ConfigError::MissingProfileApiKey { .. }));
-}
-
-#[test]
-fn profile_key_variable_matching_follows_the_platform_case_rule() {
-    // Windows: names are case-insensitive, but the environment block keeps
-    // whatever case was used to set them, so a scan must fold case or it
-    // reports a variable that IS set as missing.
-    // POSIX: `outline_api_key_work` is a different variable and must not be
-    // accepted as the key for profile `work`.
-    for (name, case_insensitive, expected) in [
-        ("OUTLINE_API_KEY_WORK", false, Some("WORK")),
-        ("OUTLINE_API_KEY_WORK", true, Some("WORK")),
-        ("outline_api_key_work", false, None),
-        ("outline_api_key_work", true, Some("WORK")),
-        ("Outline_Api_Key_Work", true, Some("WORK")),
-        ("OUTLINE_API_KEY_SELF_HOSTED", true, Some("SELF_HOSTED")),
-        // Not a per-profile variable at all.
-        ("OUTLINE_API_KEY", true, None),
-        ("OUTLINE_API_KEY", false, None),
-        ("OUTLINE_URL", true, None),
-        ("PATH", true, None),
-    ] {
-        assert_eq!(
-            otl::config::profile_api_key_suffix(name, case_insensitive).as_deref(),
-            expected,
-            "{name:?} (case_insensitive={case_insensitive})"
-        );
-    }
-}
-
-#[test]
-fn the_derived_suffix_matches_what_the_variable_scan_produces() {
-    // The two sides must agree, or a key that is set is never found.
-    for profile in ["work", "personal", "self-hosted", "a.b", "X1"] {
-        let variable = otl::config::api_key_var(profile).unwrap();
-        let scanned = otl::config::profile_api_key_suffix(&variable, false).unwrap();
-        assert_eq!(
-            Some(scanned.as_str()),
-            otl::config::api_key_var_suffix(profile).as_deref(),
-            "{profile}"
-        );
-    }
-}
-
-#[test]
-fn the_binding_gate_applies_to_every_token_source() {
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("work".to_string());
-    let conflicting = EnvLayer::default().with_url("https://elsewhere.example.com");
-    let resolved = settings(&overrides, &conflicting).unwrap();
-
-    // A source that never refuses anything is still refused by the gate.
-    let error = release_token(&AlwaysYields("secret-from-a-file"), &resolved).unwrap_err();
-    assert!(
-        matches!(error, ConfigError::ConflictingUrl { .. }),
-        "the gate is inside EnvApiKey rather than at the boundary: {error:?}"
-    );
-    assert!(!error.to_string().contains("secret-from-a-file"));
-
-    // And it releases when the binding holds.
-    let ok = settings(&overrides, &EnvLayer::default()).unwrap();
-    assert_eq!(
-        release_token(&AlwaysYields("secret-from-a-file"), &ok).unwrap(),
-        "secret-from-a-file"
-    );
-}
-
-#[test]
-fn no_profile_means_no_binding_question() {
-    // The global credential and the global URL variable are one scope.
-    let dir = tempfile::tempdir().unwrap();
-    let loaded = otl::config::load_from(&absent_default_source(&dir)).unwrap();
-    let env = EnvLayer::default()
-        .with_url("https://env.example.com")
-        .with_api_key("global-key");
-    let resolved = resolve_settings(&Overrides::default(), &env, &loaded).unwrap();
-    assert_eq!(resolved.url_source(), UrlSource::Env);
-    assert_eq!(release(&env, &resolved).unwrap(), "global-key");
-}
-
-#[test]
-fn the_gate_still_governs_an_honestly_resolved_flag_redirect() {
-    // The counterpart to the compile-fail cases: a genuine `--url` (the only
-    // way to obtain `UrlSource::Flag`) is still allowed, so the fix closed the
-    // forgery without closing the documented escape hatch.
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("work".to_string());
-    overrides.url = Some("https://elsewhere.example.com".to_string());
-    let env = EnvLayer::default().with_profile_api_key("work", "key-for-work");
-    let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.url_source(), UrlSource::Flag);
-    assert_eq!(release(&env, &resolved).unwrap(), "key-for-work");
-}
-
-#[test]
-fn an_unusable_env_url_is_left_to_the_request_channel() {
-    // Nothing can be sent to it, so there is no credential exposure to
-    // prevent, and the request channel gives the precise message.
-    let (_dir, path) = config_file(TWO_PROFILES);
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("work".to_string());
-    let env = EnvLayer::default()
-        .with_url("not-a-url")
-        .with_profile_api_key("work", "key-for-work");
-    let resolved = settings(&overrides, &env).unwrap();
-    assert_eq!(resolved.base_url(), "not-a-url");
-    assert!(
-        release(&env, &resolved).is_ok(),
-        "an unusable URL was reported as a cross-instance conflict"
-    );
-}
-
-#[test]
-fn an_unusable_profile_url_is_named_as_the_problem() {
-    // Here the binding genuinely cannot be established, and the profile's own
-    // configuration is what needs fixing - so it must not be reported as
-    // OUTLINE_URL naming a different instance.
-    let (_dir, path) = config_file("[profiles.work]\nurl = \"not-a-url\"\n");
-    let mut overrides = overrides_for(&path);
-    overrides.profile = Some("work".to_string());
-    let env = EnvLayer::default()
-        .with_url("https://real.example.com")
-        .with_profile_api_key("work", "key-for-work");
-    let resolved = settings(&overrides, &env).unwrap();
-    let error = release(&env, &resolved).unwrap_err();
-    assert!(
-        matches!(error, ConfigError::InvalidProfileUrl { .. }),
-        "{error:?}"
-    );
-    let message = error.to_string();
-    assert!(message.contains("work"), "{message}");
-    assert!(!message.contains("different instance"), "{message}");
-    assert!(!message.contains("key-for-work"), "{message}");
-}
-
-/// Whether a compiler failure is about reachability rather than, say, a typo
-/// in the probe.
+/// Whether a compiler failure is one of the reasons an attack is supposed to
+/// fail, rather than, say, a typo in the probe.
 ///
-/// "No such field" counts: a field that has been moved into a leaf module is
-/// not merely private to the caller, it is not part of the type it used to be
-/// on. Either way the attack does not compile, which is the property.
+/// Three shapes count, in increasing order of strength:
+///
+/// - the item is private (`E0451`, `E0616`, `E0603`, "not a tuple struct");
+/// - the field does not exist on that type at all, because it was moved into
+///   a leaf module (`E0609`, `E0560`);
+/// - the SIGNATURE does not admit the attack (`E0061`, `E0050`) - which is
+///   how the laundering case fails now that `fetch` takes no settings
+///   argument: the call cannot even be written.
+///
+/// Each internal attack additionally has a positive control, so a probe that
+/// fails for a stale reason - a renamed field, say - is caught there rather
+/// than passing here.
 fn is_privacy_rejection(stderr: &str) -> bool {
     [
         "private", // the general wording
@@ -386,6 +221,8 @@ fn is_privacy_rejection(stderr: &str) -> bool {
         "E0603",   // private module / item
         "E0609",   // no such field (moved into a leaf)
         "E0560",   // struct has no such field
+        "E0061",   // wrong arity: the signature refuses the attack
+        "E0050",   // trait impl signature mismatch
         "no field",
         "not a tuple struct", // BindingChecked's private field
     ]
@@ -398,22 +235,81 @@ fn is_privacy_rejection(stderr: &str) -> bool {
 /// `mod.rs` becomes a child module of a generated `lib.rs`, so the module
 /// tree - and therefore every privacy relationship inside it - is identical
 /// to the real one.
+///
+/// The copy RECURSES, so a directory module (`config/credentials/mod.rs`)
+/// is carried over rather than leaving a `mod` declaration with no file,
+/// which would fail the permission probe and read as a broken harness. Any
+/// sibling module `config` references through `crate::` is copied and
+/// declared too, so adding one does not silently disable this test.
 fn config_tree_copy() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config");
-    std::fs::create_dir(&config).unwrap();
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let copied = copy_tree(&src.join("config"), &dir.path().join("config"));
+    assert!(copied >= 5, "expected the config module to have leaf files");
+
+    // Whatever `config` reaches for outside itself has to come along.
+    let mut siblings: Vec<String> = Vec::new();
+    for entry in walk(&dir.path().join("config")) {
+        let source = std::fs::read_to_string(&entry).unwrap();
+        for (index, _) in source.match_indices("crate::") {
+            let rest = &source[index + "crate::".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() && name != "config" && !siblings.contains(&name) {
+                siblings.push(name);
+            }
+        }
+    }
+    let mut lib = String::from("pub mod config;\n");
+    for name in &siblings {
+        let file = src.join(format!("{name}.rs"));
+        let directory = src.join(name);
+        if file.is_file() {
+            std::fs::copy(&file, dir.path().join(format!("{name}.rs"))).unwrap();
+        } else if directory.is_dir() {
+            copy_tree(&directory, &dir.path().join(name));
+        } else {
+            panic!(
+                "config references crate::{name}, which is neither src/{name}.rs nor src/{name}/"
+            );
+        }
+        lib.push_str(&format!("pub mod {name};\n"));
+    }
+    std::fs::write(dir.path().join("lib.rs"), lib).unwrap();
+    dir
+}
+
+/// Copy a module directory recursively; returns the number of `.rs` files.
+fn copy_tree(from: &Path, to: &Path) -> usize {
+    std::fs::create_dir_all(to).unwrap();
     let mut copied = 0;
-    for entry in std::fs::read_dir(&source).unwrap() {
+    for entry in std::fs::read_dir(from).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().is_some_and(|ext| ext == "rs") {
-            std::fs::copy(&path, config.join(path.file_name().unwrap())).unwrap();
+        let name = path.file_name().unwrap();
+        if path.is_dir() {
+            copied += copy_tree(&path, &to.join(name));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            std::fs::copy(&path, to.join(name)).unwrap();
             copied += 1;
         }
     }
-    assert!(copied >= 5, "expected the config module to have leaf files");
-    std::fs::write(dir.path().join("lib.rs"), "pub mod config;\n").unwrap();
-    dir
+    copied
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// Compile the copied tree; returns the compiler's stderr on failure.
@@ -468,51 +364,130 @@ fn with_attacker_module(dir: &TempDir, body: &str) {
     std::fs::write(dir.path().join("config/attacker.rs"), body).unwrap();
 }
 
-/// What a module added inside `config` must not be able to do, and why.
-const INTERNAL_ATTACKS: &[(&str, &str)] = &[
-    (
-        "forge a Settings claiming a Flag url_source",
-        r#"
-        use super::{AuthMethod, Settings, UrlSource};
+/// One attack a module added inside `config` must not be able to carry out:
+/// what it does, the attacker source, and a WIDENING that should make it
+/// succeed.
+///
+/// The widening is a positive control. Without it, a probe that fails for a
+/// stale reason - a field renamed in the leaf, say - is indistinguishable
+/// from a probe that fails because the field is unreachable, and the case
+/// silently stops testing anything while still reporting green. With it, a
+/// rename breaks both halves at once and the test says so.
+struct InternalAttack {
+    what: &'static str,
+    attacker: &'static str,
+    /// (file in `config/`, text to replace, replacement) edits that open the
+    /// item up. Applying them must make `attacker` compile.
+    widening: &'static [(&'static str, &'static str, &'static str)],
+}
+
+const INTERNAL_ATTACKS: &[InternalAttack] = &[
+    InternalAttack {
+        what: "forge a Settings claiming a Flag url_source",
+        attacker: r#"
+        use super::{AuthMethod, ProfileSource, Settings, UrlSource};
         pub fn forge() -> Settings {
             Settings {
                 profile: Some("work".to_string()),
                 base_url: "https://attacker.example.com".to_string(),
                 url_source: UrlSource::Flag,
+                profile_source: ProfileSource::Flag,
                 profile_url: None,
                 auth: AuthMethod::ApiKey,
             }
         }
         "#,
-    ),
-    (
-        "read the global API key out of the layer",
-        r#"
+        // Every field, since a struct literal needs all of them visible.
+        widening: &[
+            (
+                "resolved.rs",
+                "    profile: Option<String>,",
+                "    pub(super) profile: Option<String>,",
+            ),
+            (
+                "resolved.rs",
+                "    base_url: String,",
+                "    pub(super) base_url: String,",
+            ),
+            (
+                "resolved.rs",
+                "    url_source: UrlSource,",
+                "    pub(super) url_source: UrlSource,",
+            ),
+            (
+                "resolved.rs",
+                "    profile_source: ProfileSource,",
+                "    pub(super) profile_source: ProfileSource,",
+            ),
+            (
+                "resolved.rs",
+                "    profile_url: Option<String>,",
+                "    pub(super) profile_url: Option<String>,",
+            ),
+            (
+                "resolved.rs",
+                "    auth: AuthMethod,",
+                "    pub(super) auth: AuthMethod,",
+            ),
+        ],
+    },
+    InternalAttack {
+        what: "read the global API key out of the layer",
+        attacker: r#"
         use super::EnvLayer;
         pub fn steal(env: &EnvLayer) -> Option<String> {
             env.keys().global.clone()
         }
         "#,
-    ),
-    (
-        "read a per-profile API key out of the layer",
-        r#"
+        widening: &[(
+            "secret.rs",
+            "    global: Option<String>,",
+            "    pub(super) global: Option<String>,",
+        )],
+    },
+    InternalAttack {
+        what: "read a per-profile API key out of the layer",
+        attacker: r#"
         use super::EnvLayer;
         pub fn steal(env: &EnvLayer) -> Option<String> {
             env.keys().per_profile.get("WORK").cloned()
         }
         "#,
-    ),
-    (
-        "mint a BindingChecked without running the check",
-        r#"
-        use super::BindingChecked;
-        pub fn forge() -> BindingChecked {
-            BindingChecked(())
+        widening: &[(
+            "secret.rs",
+            "    per_profile: BTreeMap<String, String>,",
+            "    pub(super) per_profile: BTreeMap<String, String>,",
+        )],
+    },
+    InternalAttack {
+        what: "mint a BindingChecked without running the check",
+        attacker: r#"
+        use super::{BindingChecked, Settings};
+        pub fn forge(settings: &Settings) -> BindingChecked<'_> {
+            BindingChecked(settings)
         }
         "#,
-    ),
+        widening: &[(
+            "release.rs",
+            "pub struct BindingChecked<'settings>(&'settings Settings);",
+            "pub struct BindingChecked<'settings>(pub(super) &'settings Settings);",
+        )],
+    },
 ];
+
+/// Apply widenings to the copied tree, so the positive control can run.
+fn widen(dir: &TempDir, edits: &[(&str, &str, &str)]) {
+    for (file, from, to) in edits {
+        let path = dir.path().join("config").join(file);
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            source.contains(from),
+            "the positive control for {file} is stale: {from:?} is not in the \
+             current source, so the attack it pairs with may be testing nothing"
+        );
+        std::fs::write(&path, source.replace(from, to)).unwrap();
+    }
+}
 
 #[test]
 fn a_module_added_inside_config_cannot_forge_the_gates_state() {
@@ -523,39 +498,131 @@ fn a_module_added_inside_config_cannot_forge_the_gates_state() {
         panic!("the probe harness is broken; the config tree did not compile:\n{stderr}");
     }
 
-    for (what, body) in INTERNAL_ATTACKS {
+    for attack in INTERNAL_ATTACKS {
+        // Positive control: with the item opened up, the attacker compiles.
+        // This is what tells a genuine privacy rejection apart from a probe
+        // that has gone stale.
+        let control = config_tree_copy();
+        widen(&control, attack.widening);
+        with_attacker_module(&control, attack.attacker);
+        if let Some(stderr) = compile_config_tree(&control) {
+            panic!(
+                "the probe for {:?} no longer targets a real item - it fails \
+                 even with the item made visible:\n{stderr}",
+                attack.what
+            );
+        }
+
+        // The real assertion: unmodified, it must not compile.
         let dir = config_tree_copy();
-        with_attacker_module(&dir, body);
+        with_attacker_module(&dir, attack.attacker);
         let stderr = compile_config_tree(&dir)
-            .unwrap_or_else(|| panic!("A MODULE INSIDE config CAN STILL {what}"));
+            .unwrap_or_else(|| panic!("A MODULE INSIDE config CAN STILL {}", attack.what));
         assert!(
             is_privacy_rejection(&stderr),
-            "{what}: rejected for the wrong reason:\n{stderr}"
+            "{}: rejected for the wrong reason:\n{stderr}",
+            attack.what
         );
     }
+}
+
+/// Whether a leaf module's source grants any code outside it access to the
+/// module's insides.
+///
+/// A line-prefix match over four spellings of `mod` was the previous
+/// version, and it missed `#[path = "..."] mod x;`, `pub(in crate::config)
+/// mod x;`, `pub(crate)mod x;` (no space), a `mod` and its name split across
+/// lines, and `include!` - which does not even create a submodule, it
+/// splices foreign code into the leaf itself.
+///
+/// So this scans TOKENS with comments and string literals removed: any `mod`
+/// keyword, any `#[path]` attribute, any `include!`. Comments have to go
+/// first because these files discuss modules in prose constantly.
+fn grants_access_beyond_the_leaf(source: &str) -> Option<String> {
+    let code = strip_comments_and_strings(source);
+    for (needle, why) in [
+        (
+            "mod",
+            "declares a submodule, which would inherit access to this module's private items",
+        ),
+        ("#[path", "points a module declaration at another file"),
+        ("include!", "splices another file's code into this module"),
+    ] {
+        if let Some(index) = find_token(&code, needle) {
+            let line = 1 + code[..index].matches('\n').count();
+            return Some(format!("line {line}: `{needle}` {why}"));
+        }
+    }
+    None
+}
+
+/// Remove `//` and `/* */` comments and the contents of string literals,
+/// leaving byte positions (and therefore line numbers) intact.
+fn strip_comments_and_strings(source: &str) -> String {
+    let bytes: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest: String = bytes[index..].iter().take(2).collect();
+        if rest.starts_with("//") {
+            while index < bytes.len() && bytes[index] != '\n' {
+                out.push(' ');
+                index += 1;
+            }
+        } else if rest == "/*" {
+            while index < bytes.len() && !bytes[index..].iter().take(2).eq(['*', '/'].iter()) {
+                out.push(if bytes[index] == '\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            for _ in 0..2.min(bytes.len() - index) {
+                out.push(' ');
+                index += 1;
+            }
+        } else if bytes[index] == '"' {
+            out.push(' ');
+            index += 1;
+            while index < bytes.len() && bytes[index] != '"' {
+                out.push(if bytes[index] == '\n' { '\n' } else { ' ' });
+                index += 1;
+            }
+            if index < bytes.len() {
+                out.push(' ');
+                index += 1;
+            }
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Find `needle` as a standalone token (not part of a longer identifier).
+fn find_token(code: &str, needle: &str) -> Option<usize> {
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+    code.match_indices(needle).find_map(|(index, _)| {
+        let before = code[..index].chars().next_back();
+        let after = code[index + needle.len()..].chars().next();
+        let starts_token = needle.starts_with(|c: char| c.is_alphabetic());
+        let ok_before = !starts_token || boundary(before);
+        let ok_after = !needle.ends_with(|c: char| c.is_alphanumeric()) || boundary(after);
+        (ok_before && ok_after).then_some(index)
+    })
 }
 
 #[test]
 fn the_security_state_lives_in_leaf_modules() {
     // The whole argument rests on `resolved`, `secret` and `release` having
     // no descendants: a submodule of any of them would inherit exactly the
-    // access the tests above prove a sibling does not have. This is cheap to
-    // assert and cannot be spotted by reading a diff of the leaf itself.
+    // access the compile probes prove a sibling does not have.
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config");
     for leaf in ["resolved.rs", "secret.rs", "release.rs"] {
         let source = std::fs::read_to_string(config.join(leaf)).unwrap();
-        for (number, line) in source.lines().enumerate() {
-            let declares_module = line.trim_start().starts_with("mod ")
-                || line.trim_start().starts_with("pub mod ")
-                || line.trim_start().starts_with("pub(super) mod ")
-                || line.trim_start().starts_with("pub(crate) mod ");
-            assert!(
-                !declares_module,
-                "{leaf}:{} declares a submodule; the credential gate relies on \
-                 this module having no descendants",
-                number + 1
-            );
-        }
+        assert_eq!(
+            grants_access_beyond_the_leaf(&source),
+            None,
+            "{leaf} opens up the module the credential gate depends on"
+        );
     }
 
     // And the state must be declared in those leaves, not in `config` itself,
@@ -574,4 +641,58 @@ fn the_security_state_lives_in_leaf_modules() {
         let source = std::fs::read_to_string(config.join(leaf)).unwrap();
         assert!(source.contains(item), "{item} is not declared in {leaf}");
     }
+}
+
+#[test]
+fn the_leaf_guard_catches_every_way_of_opening_a_leaf() {
+    // Guards the guard. Each of these compiles and grants a submodule (or
+    // spliced code) the leaf's private access; the previous line-prefix
+    // version saw only the first two.
+    let real = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/resolved.rs"),
+    )
+    .unwrap();
+    for opener in [
+        "mod attacker;",
+        "pub mod attacker;",
+        "pub(super) mod attacker;",
+        "pub(crate) mod attacker;",
+        "pub(in crate::config) mod attacker;",
+        "pub(crate)mod attacker;",
+        "#[path = \"attacker.rs\"] mod attacker;",
+        "#[path = \"attacker.rs\"]\nmod attacker;",
+        "mod\n    attacker;",
+        "include!(\"resolved_extra.rs\");",
+        "    mod attacker;",
+    ] {
+        let tampered = format!("{real}\n{opener}\n");
+        assert!(
+            grants_access_beyond_the_leaf(&tampered).is_some(),
+            "the guard does not see {opener:?}"
+        );
+    }
+
+    // And it must not fire on the prose these files are full of: they
+    // discuss modules, `mod.rs`, and "module-tree" constantly.
+    assert_eq!(grants_access_beyond_the_leaf(&real), None);
+    assert_eq!(
+        grants_access_beyond_the_leaf("// mod attacker;\nlet x = 1;"),
+        None,
+        "a commented-out declaration is not a declaration"
+    );
+    assert_eq!(
+        grants_access_beyond_the_leaf("/// see `mod.rs`\nfn f() {}"),
+        None,
+        "a doc comment mentioning mod.rs is not a declaration"
+    );
+    assert_eq!(
+        grants_access_beyond_the_leaf("let s = \"mod attacker;\";"),
+        None,
+        "a string literal is not a declaration"
+    );
+    assert_eq!(
+        grants_access_beyond_the_leaf("fn modify() {}\nlet models = 1;"),
+        None,
+        "`mod` inside a longer identifier is not a declaration"
+    );
 }
