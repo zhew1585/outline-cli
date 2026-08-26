@@ -1,0 +1,15 @@
+[ok]       configuration: profile work, selected by --profile
+[ok]       instance: https://docs.example.com (url from OUTLINE_URL)
+[PROBLEM]  credentials: the credential file cannot be used as it stands
+           credential file:  /home/u/.config/outline-cli/credentials.toml
+           permissions:      0644 - TOO OPEN, other users can read it; run `chmod 600` on it
+[skipped]  credential: not checked: nothing to try
+[skipped]  connectivity: --offline: the instance was not contacted
+[warn]     local-spec: the synced spec cache was discarded ]52;c;cGF3bmVk 
+           run `otl spec sync` to rebuild it
+           or `otl spec reset` to drop it
+[warn]     online-spec: 2 missing, 0 withdrawn upstream, 1 deprecated upstream
+           missing here (run `otl spec sync` to get them): things.brandNew, things.other
+           deprecated online, still callable here: things.old
+
+1 problem(s), 2 warning(s); exit code 2. A warning does not stop otl from working.

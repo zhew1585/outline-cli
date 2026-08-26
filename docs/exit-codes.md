@@ -89,3 +89,51 @@ Notes:
   - **If a credential written by another process survived** — a concurrent refresh landing a rotated session inside the revocation window — it is reported and the exit code is 9. That session was never revoked, so `revoked` is `false` and the command does not claim to have signed out. Deleting another process's session is never the answer; run `otl auth logout` again to revoke and remove it.
 - `otl auth logout` never requires `OUTLINE_URL`, and never applies the transport rule to it. Everything it contacts comes out of the credential file, anchored to the origin each credential recorded for itself. That is deliberate: cleanup has to work precisely when the configuration is missing, wrong, or predates a rule, and the alternative is a user deleting the file by hand and orphaning a DCR registration for good.
 - A client registration stranded on the server (created, then neither saveable nor deletable) exits **1**: it is neither a local configuration problem nor retryable, and only an administrator can clear it.
+- `otl doctor` introduces **no exit code of its own**, and that is the point: it answers "is this
+  environment usable?", so it exits with the code the first blocking finding *would have produced in any
+  other command*. 0 means nothing is blocking. 2 is something to fix locally (an unusable config file, a
+  credential file whose permissions are too wide or whose contents cannot be read, no credential
+  configured, an instance URL that is missing, plaintext or unusable, a `--spec-url` this CLI will not
+  fetch). 4 means the instance rejected the credential. 1, 3, 5, 6, 7 and 8 are whatever the instance
+  answered, or failed to answer, to the one probe `doctor` sends (`auth.info` through the ordinary request
+  channel) - 1 covers a 200 carrying something that is not JSON, exactly as it would for `otl api`. Code
+  9 is not reachable: `doctor` produces no partial result. Five rules go with that:
+  - **First, not worst.** The checks run in dependency order - config file, instance URL, credential
+    file, chosen credential, reachability, local spec, online spec - and the FIRST blocking one decides
+    the code. An earlier problem is both the cause of what follows and the thing to fix first: reporting
+    the numerically highest code instead would point a user at a network failure that is really a missing
+    `OUTLINE_URL`.
+  - **A warning is never blocking.** A spec cache that had to be discarded, a local table behind the
+    online one, an unreachable spec host, a plaintext key in the environment, a credential DIRECTORY other
+    users can write to around a sound owner-only file: all are reported, none changes the exit code,
+    because none of them stops `otl` from working. In particular a spec host is a third party the CLI
+    consults only when asked, so its 404 or its firewall must never make `otl doctor` call a working
+    environment broken. A `--spec-url` value the fetch channel refuses locally is *not* in this group: it
+    is the invocation being wrong, so it is code 2, like the same mistake in `otl spec sync`.
+  - **The credential FILE and the directory around it are graded apart.** The file itself unusable - mode
+    widened, not a regular file, owned by someone else, malformed, from a newer version - is code 2, and
+    nothing is sent, because `read_checked` refuses it on the open descriptor. A world-writable DIRECTORY
+    holding a sound `0600` file is a warning and the credential is used: another user cannot plant a file
+    the caller owns (the ownership check is on the open descriptor, and symlinks are refused), cannot read
+    the `0600` file, and Story 2.6 deliberately does not re-permission an existing directory. The residual
+    risk is deletion or a replacement that then gets refused - nuisance, not disclosure - and no other
+    command fails in that state either, so `doctor` must not. The *text* obeys the same rule: a report
+    that is about to use the file does not print the store-wide "usable: no", and does not repeat the
+    write path's "refusing to use it" - that sentence is true where a write or the refresh lock is
+    refused, and false of the read this report describes. A symlink at the credential path, dangling or
+    not, is a FILE problem (code 2): the read opens `O_NOFOLLOW`, so the report is built from
+    `symlink_metadata` and gives the same answer rather than calling the path empty.
+  - **The report is always printed**, before the code is decided and whatever the code turns out to be.
+    A `--json` consumer gets the same object on every run; a blocking finding is additionally summarized
+    on stderr, naming the check it came from. The connectivity summary never overstates what happened:
+    only a transport failure (7) says the instance could not be reached, because only that code means the
+    request may never have arrived. A 401, a 500 or a non-JSON body all report that the instance answered,
+    and `"reachable"` is `true` for them. A failure that never left this machine - a credential that
+    cannot be expressed as an HTTP header, a stored session that could not be renewed before the call -
+    reports `"reachable": false` and says nothing was sent. That distinction cannot be read off the exit
+    code, which is why it is decided separately: code 2 covers both a header this machine could not build
+    (nothing sent) and a parameter the spec refused (nothing sent), while code 1 covers both a client that
+    could not be built (nothing sent) and a reply that was not JSON (sent, and answered).
+  - **`doctor` classifies nothing itself.** Every blocking code comes from the same mapper the failing
+    command uses (`auth::exit_code_of`, the borrowing half of `map_auth_error`), so a diagnosis cannot
+    disagree with the command it is diagnosing.

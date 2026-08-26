@@ -187,6 +187,51 @@ pub enum StoreError {
     },
 }
 
+impl StoreError {
+    /// The CONDITION this error reports, with no verdict about what the
+    /// caller is going to do about it.
+    ///
+    /// `Display` is written for the path that REFUSES - a write, or taking
+    /// the refresh lock - and says so ("refusing to use it"). A health
+    /// report refuses nothing: `otl auth info` prints one and carries on,
+    /// and `otl doctor` grades a directory problem as a warning and then
+    /// READS the file, because the read path checks the open descriptor
+    /// rather than the directory around it. Printing the refusal there is
+    /// the report contradicting itself - which is the defect R1 fixed in the
+    /// exit code, the field names and the summary, and left in this text.
+    ///
+    /// Exhaustive on purpose: a new variant has to say which of the two it
+    /// is, rather than inherit a `Display` that may carry a verdict.
+    pub fn condition(&self) -> String {
+        match self {
+            // The three the directory check can produce. Same facts as
+            // `Display`, minus the verdict and the fix instruction (a
+            // report states what it sees; the caller says what it will do).
+            Self::DirectoryTooOpen { path, mode } => format!(
+                "{path} is writable by other users (permissions {mode}); anyone who \
+                 can write there can delete or replace what is in it"
+            ),
+            Self::ForeignOwner { path, owner, us } => {
+                format!("{path} is owned by uid {owner}, not by you (uid {us})")
+            }
+            Self::NotARegularFile { path, kind } => {
+                format!("{path} is {kind}, not a credential file")
+            }
+            // Everything else carries no verdict, or is never turned into a
+            // description: its own message is the honest one.
+            Self::NoConfigDir
+            | Self::Permissions { .. }
+            | Self::Read { .. }
+            | Self::Parse { .. }
+            | Self::Version { .. }
+            | Self::Write { .. }
+            | Self::Directory { .. }
+            | Self::Lock { .. }
+            | Self::ProfileName { .. } => self.to_string(),
+        }
+    }
+}
+
 /// Which OAuth interaction failed, for use in messages.
 ///
 /// A closed set of authored labels, so no caller can inject text through

@@ -12,6 +12,7 @@ use otl::commands::auth::{self, AuthArgs};
 use otl::commands::collections::{self, CollectionsArgs};
 use otl::commands::completions::{self, CompletionsArgs};
 use otl::commands::docs::{self, DocsArgs};
+use otl::commands::doctor::{self, DoctorArgs};
 use otl::commands::spec::{self, SpecArgs};
 use otl::config::Overrides;
 use otl::exit::ExitCode;
@@ -66,6 +67,8 @@ enum Command {
     Collections(CollectionsArgs),
     /// Manage the OpenAPI spec this CLI dispatches from.
     Spec(SpecArgs),
+    /// Check this environment: credentials, instance, and spec drift.
+    Doctor(DoctorArgs),
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
     Completions(CompletionsArgs),
 }
@@ -80,6 +83,7 @@ fn main() -> std::process::ExitCode {
         Command::Docs(args) => docs::run(args, mode, cli.json, &cli.overrides()),
         Command::Collections(args) => collections::run(args, mode, &cli.overrides()),
         Command::Spec(args) => spec::run(args, mode),
+        Command::Doctor(args) => doctor::run(args, mode, &cli.overrides()),
         Command::Completions(args) => completions::run(args, Cli::command()),
     };
     match result {

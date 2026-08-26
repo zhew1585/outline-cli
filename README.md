@@ -211,6 +211,30 @@ otl spec reset                         # go back to the spec built into this bin
 Nothing checks for spec updates on its own: `otl` never contacts the network unless a command you ran
 requires it.
 
+## Checking your environment
+
+```sh
+otl doctor                             # credentials, instance, spec drift - one report
+otl doctor --offline                   # local state only; contacts nothing
+otl doctor --json | jq '.checks[]'     # machine-readable, one object per check
+otl doctor --spec-url <url>            # compare against a mirror instead of upstream
+```
+
+Seven checks in dependency order: which config file and profile are in effect, the instance URL, the
+credential file (where it is, whether its permissions are sound, which kinds each profile holds — never
+the credentials themselves), the credential a request would actually send, whether the instance answers,
+which operation table this binary dispatches from, and how that table differs from the online API
+description — operations you are missing, operations upstream has withdrawn, and operations upstream has
+deprecated while this build still offers them.
+
+`otl doctor` invents no exit code. It prints the whole report, then exits with the code the first
+blocking finding would have produced in any other command: **0** when nothing is blocking, **2** for
+something to fix locally, **4** when the instance rejected the credential, and **1**/**3**/**5**/**6**/**7**/**8**
+for whatever the instance did to the probe. Warnings — a discarded spec cache, a table behind upstream, an
+unreachable spec host, a credential directory other users can write to around a sound `0600` file — are
+reported and leave the exit code at 0, because none of them stops `otl` from working. Both requests happen
+only because you typed the command, and `--offline` skips them.
+
 ## Design
 
 **Two crates.** `engine` is a generic OpenAPI RPC client with no knowledge of Outline whatsoever — the
@@ -221,13 +245,15 @@ layer and reach the engine as data. The boundary is enforced in review, not just
 rate-limit backoff, global throttling, pagination, error mapping, and credential redaction are each
 implemented exactly once. `otl spec sync` adds the one other outbound call in the codebase — a plain
 unauthenticated GET of a public document, deliberately kept apart from the channel that carries your
-token — and a test confines both to their modules.
+token — and a test confines both to their modules. `otl doctor` adds no third: it asks the request
+channel for one `auth.info` and calls `spec sync`'s own fetcher for the document comparison.
 
 **No runtime spec parsing.** `build.rs` compiles the vendored spec into a static IR table. The binary
 contains neither the spec file nor its path, which a test asserts against the built artifact. The single
-exception is `otl spec sync`, which parses a document once on the command you typed and stores the
-compiled IR as a binary cache; every other command only deserializes it, so `otl --help` stays a few
-milliseconds. A cache that is damaged or was written by another version is discarded with a warning and
+exception is the spec lifecycle module: `otl spec sync` parses a document once on the command you typed
+and stores the compiled IR as a binary cache, and `otl doctor` reuses that same entry point to compile a
+document in memory for its comparison (writing nothing). Every other command only deserializes the cache,
+so `otl --help` stays a few milliseconds. A cache that is damaged or was written by another version is discarded with a warning and
 the built-in spec takes over — it can never make the CLI unusable.
 
 **Server text is never printed verbatim — on the human-readable paths.** Document titles, operation

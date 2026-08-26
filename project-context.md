@@ -47,7 +47,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
   - **响应体不可信**：不回显第三方错误页、限制读取体积、校验编码，解析前一律视为敌意输入。
   - 该通道内只允许存在一处 `.send()`；`crates/otl/tests/no_phone_home.rs` 断言 reqwest 与裸 socket 只出现在这两条通道所在文件。
 - build.rs 只做 spec → IR 编译；IR 是静态数据表，禁止走"每端点生成函数"路线。
-- 运行时禁止解析 OpenAPI YAML（唯一例外：`spec sync` 命令路径）。
+- 运行时禁止解析 OpenAPI YAML（唯一例外：`crates/otl/src/commands/spec.rs` 这一个模块——`spec sync` 用它编译并落缓存，`otl doctor` 用它的 `upstream_table()` 在内存里编译一次做差异比对、**不写缓存**。两者都只在用户显式敲命令时发生。例外的归属是「这一个模块」而不是「这一个命令」：新的调用方必须复用同一个入口，否则 `tests/no_phone_home.rs` 对 `fetch_document` / `UPSTREAM_SPEC_URL` 的文件收敛规则会当场拒绝。）
 
 ### Testing Rules
 
@@ -104,4 +104,4 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - 保持精简，只留 agent 会漏的内容。
 - 技术栈变化时更新；定期清理已成常识的规则。
 
-Last Updated: 2026-08-26 (Story 4.2: 第三条 HTTP 通道例外及其附加义务)
+Last Updated: 2026-08-26 (Story 4.3: 运行时 OpenAPI 解析例外的归属从「命令」改述为「模块」，doctor 复用同一入口且不写缓存)

@@ -7,6 +7,7 @@
 
 pub mod cache;
 pub mod completions;
+pub mod doctor;
 pub mod export;
 
 use std::path::{Path, PathBuf};

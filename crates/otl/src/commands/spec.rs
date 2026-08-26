@@ -159,7 +159,20 @@ fn load_document(args: &SyncArgs) -> Result<(String, Source, String), CliError> 
         let document = read_local(path)?;
         return Ok((document, Source::Local, LOCAL_SOURCE.to_string()));
     }
-    let url = args.url.as_deref().unwrap_or(spec::UPSTREAM_SPEC_URL);
+    let (document, label) = fetch_remote(args.url.as_deref())?;
+    Ok((document, Source::Remote, label))
+}
+
+/// Fetch a document from `url` (or the upstream source), and say who
+/// answered.
+///
+/// The ONE place this crate fetches an OpenAPI document. `otl doctor` calls
+/// [`upstream_table`], which calls this, rather than reaching for the
+/// fetcher itself: `tests/no_phone_home.rs` confines `fetch_document` and
+/// `UPSTREAM_SPEC_URL` to this file, and keeping both commands behind one
+/// function is what lets that confinement stay unchanged.
+fn fetch_remote(url: Option<&str>) -> Result<(String, String), CliError> {
+    let url = url.unwrap_or(spec::UPSTREAM_SPEC_URL);
     // Announced on stderr, not stdout: stdout is data.
     stdio::write_diagnostic_line("fetching the OpenAPI document...");
     let fetched =
@@ -169,7 +182,53 @@ fn load_document(args: &SyncArgs) -> Result<(String, Source, String), CliError> 
     } else {
         fetched.origin
     };
-    Ok((fetched.text, Source::Remote, label))
+    Ok((fetched.text, label))
+}
+
+/// What the online API declares, for `otl doctor`'s drift report.
+///
+/// Names only - never a `CompiledOp`, a schema or a parameter: the report
+/// answers "which operations does the online API have that this CLI does
+/// not, and which does it still offer that upstream has withdrawn or
+/// deprecated", and nothing else about the document needs to leave here.
+#[derive(Debug, Clone)]
+pub struct UpstreamTable {
+    /// Origin that answered, as recorded in a cache (never a full URL).
+    pub source: String,
+    /// Hex SHA-256 of the document, comparable with a cache's own record.
+    pub spec_hash: String,
+    /// Every operation the document declares, sorted by name.
+    pub names: Vec<String>,
+    /// The subset the document marks `deprecated`.
+    pub deprecated: Vec<String>,
+}
+
+/// Fetch and compile the online document WITHOUT writing a cache.
+///
+/// `otl doctor` reports a comparison; it must not change what the next
+/// command dispatches from. Nothing here touches the cache - that is
+/// `otl spec sync`'s job, and the doctor's report names it as the remedy.
+///
+/// The document is treated exactly as `spec sync` treats it: compiled by
+/// the same compiler and then re-validated through [`spec::validate_ops`],
+/// so every name this returns has passed the same safety rules a cached
+/// table has to pass before it may be printed.
+pub fn upstream_table(url: Option<&str>) -> Result<UpstreamTable, CliError> {
+    let (document, source) = fetch_remote(url)?;
+    let compiled = compile_document(&document, Source::Remote)?;
+    let ops = spec::to_ir(&compiled);
+    spec::validate_ops(&ops).map_err(|reason| compile_error(&reason, Source::Remote))?;
+    Ok(UpstreamTable {
+        source,
+        spec_hash: cache::spec_hash(&document),
+        names: ops.iter().map(|op| op.name.to_string()).collect(),
+        deprecated: compiled
+            .ops
+            .iter()
+            .filter(|op| op.deprecated)
+            .map(|op| op.name.clone())
+            .collect(),
+    })
 }
 
 /// Read a local document, refusing anything that is not a plain file of
@@ -267,10 +326,18 @@ fn too_large(path: &Path) -> CliError {
     ))
 }
 
+/// Compile a document, treating it as untrusted input.
+fn compile_document(
+    document: &str,
+    source: Source,
+) -> Result<spec_compile::CompiledSpec, CliError> {
+    spec_compile::compile_json(document, &spec::compile_options())
+        .map_err(|error| compile_error(&error.to_string(), source))
+}
+
 /// Compile a document into IR, treating it as untrusted input.
 fn compile(document: &str, source: Source) -> Result<Vec<OpSpec>, CliError> {
-    let compiled = spec_compile::compile_json(document, &spec::compile_options())
-        .map_err(|error| compile_error(&error.to_string(), source))?;
+    let compiled = compile_document(document, source)?;
     let ops = spec::to_ir(&compiled);
     // Belt and braces: the compiler already enforces these rules, and the
     // cache loader enforces them again on the way back in.

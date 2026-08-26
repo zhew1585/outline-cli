@@ -45,6 +45,20 @@ pub struct CredentialHealth {
     pub permissions: Permissions,
     /// Whether the file may be used as it stands.
     pub usable: bool,
+    /// Whether the FILE's own contents could be read as a credential file.
+    /// `true` when there is no file yet: nothing is wrong with an absent one.
+    ///
+    /// Reported separately from [`CredentialHealth::usable`] because the two
+    /// answer different questions. `usable` is "may this store be used as it
+    /// stands", which folds in the DIRECTORY around the file; this is about
+    /// the file itself. `otl doctor` grades the two differently (a file it
+    /// cannot read blocks; a directory other users can write to is a
+    /// warning), so it needs them apart - and one cannot be derived from the
+    /// other, because a bad directory and a malformed file both leave
+    /// `usable` false with nothing to say which of them it was.
+    ///
+    /// One boolean about whether a parse succeeded. Nothing about content.
+    pub file_readable: bool,
     /// Absolute path of the directory holding it.
     pub directory: PathBuf,
     /// Octal mode of the directory, where the platform has one.
@@ -78,13 +92,19 @@ pub fn credential_health(store: &CredentialStore) -> CredentialHealth {
         .is_dir()
         .then(|| crate::auth::secret_file::require_private_dir(store.dir()).err())
         .flatten()
-        .map(|error| error.to_string());
+        // The CONDITION, not the error's own verdict: nothing is being
+        // refused here, and two of this report's consumers go on to read the
+        // file. See `StoreError::condition`.
+        .map(|error| error.condition());
+    // `exists` is symlink-aware (see `file_guard::permissions`), which is
+    // what makes this short-circuit safe: a dangling link is something AT
+    // the path, so the `loaded.is_none()` refusal is not skipped.
+    let file_readable = !exists || loaded.is_some();
     CredentialHealth {
         path: store.path().to_path_buf(),
         exists,
-        usable: permissions.usable()
-            && directory_problem.is_none()
-            && (!exists || loaded.is_some()),
+        usable: permissions.usable() && directory_problem.is_none() && file_readable,
+        file_readable,
         permissions,
         directory: store.dir().to_path_buf(),
         directory_mode: crate::auth::secret_file::directory_mode(store.dir()),
@@ -164,21 +184,49 @@ impl CredentialHealth {
     /// Composed exclusively from paths, booleans and authored labels: there
     /// is no value in scope here that could be a credential.
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![
+        let mut lines = self.where_lines();
+        lines.push(format!("usable:           {}", yes_no(self.usable)));
+        lines.extend(self.what_lines());
+        lines
+    }
+
+    /// The same lines WITHOUT the store-wide `usable:` verdict.
+    ///
+    /// For a surface that grades the file and the directory separately and
+    /// states its own verdict for each: `otl doctor` warns about a directory
+    /// other users can write to and then reads the file anyway, so a
+    /// composite "usable: no" in its own detail block would contradict the
+    /// connectivity check two lines below it.
+    ///
+    /// The two renderings share every other line rather than being written
+    /// twice, so a field added to this report cannot appear in one and be
+    /// forgotten in the other.
+    pub fn lines_without_verdict(&self) -> Vec<String> {
+        let mut lines = self.where_lines();
+        lines.extend(self.what_lines());
+        lines
+    }
+
+    /// Where the credentials live, and what state that location is in.
+    fn where_lines(&self) -> Vec<String> {
+        vec![
             format!("credential file:  {}", self.path.display()),
             format!("exists:           {}", yes_no(self.exists)),
             format!("permissions:      {}", self.permissions.describe()),
             format!("directory:        {}", self.describe_directory()),
-            format!("usable:           {}", yes_no(self.usable)),
-            format!(
-                "OUTLINE_API_KEY:  {}",
-                if self.env_api_key {
-                    "set (plaintext in the environment)"
-                } else {
-                    "not set"
-                }
-            ),
-        ];
+        ]
+    }
+
+    /// What is stored, and what else is lying around in the environment.
+    fn what_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "OUTLINE_API_KEY:  {}",
+            if self.env_api_key {
+                "set (plaintext in the environment)"
+            } else {
+                "not set"
+            }
+        )];
         if self.profiles.is_empty() {
             lines.push("stored profiles:  none".to_string());
             return lines;
@@ -426,6 +474,202 @@ mod tests {
             "the directory must be named: {rendered}"
         );
         assert!(!rendered.contains("PROBLEM"), "{rendered}");
+    }
+
+    /// A file that cannot be parsed is distinguishable from a directory
+    /// problem, which is what lets `otl doctor` grade the two differently.
+    /// Both leave `usable` false, so `usable` alone cannot tell them apart.
+    #[test]
+    fn an_unparsable_file_is_reported_as_unreadable_rather_than_as_a_directory_problem() {
+        let (_dir, store) = scratch();
+        populated(&store);
+        // Overwrites the CONTENT and keeps the 0600 mode the store created,
+        // so this is a file whose permissions are fine and whose contents
+        // are not.
+        std::fs::write(store.path(), b"this is not a credential file").unwrap();
+
+        let health = credential_health(&store);
+        assert!(!health.file_readable, "{health:?}");
+        assert!(!health.usable);
+        assert!(health.permissions.usable(), "the mode is still 0600");
+        assert!(health.directory_problem.is_none(), "{health:?}");
+        assert!(health.profiles.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sound_file_in_a_writable_directory_is_readable_but_not_usable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = scratch();
+        populated(&store);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let health = credential_health(&store);
+        // The other half of the pair above: the FILE is fine, the directory
+        // is not, and the report says which.
+        assert!(health.file_readable, "{health:?}");
+        assert!(health.directory_problem.is_some());
+        assert!(!health.usable);
+
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    fn a_missing_file_counts_as_readable() {
+        let (_dir, store) = scratch();
+        let health = credential_health(&store);
+        assert!(
+            health.file_readable,
+            "there is nothing wrong with a file that does not exist yet"
+        );
+    }
+
+    /// A dangling symlink is something AT the path that every read refuses,
+    /// so the report must not call the path empty and healthy.
+    ///
+    /// This is the case that made link-following metadata visibly wrong:
+    /// `fs::metadata` fails with `NotFound`, which used to become
+    /// `Missing` -> `exists: false` -> `file_readable: true` (nothing there,
+    /// nothing wrong), while `read_checked`'s `O_NOFOLLOW` open failed on the
+    /// same path. One report, two answers.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_a_file_problem_and_not_an_absent_file() {
+        let (dir, store) = scratch();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), store.path()).unwrap();
+
+        let health = credential_health(&store);
+        assert!(health.exists, "something IS at that path: {health:?}");
+        assert!(!health.file_readable, "every read of it fails: {health:?}");
+        assert!(!health.usable);
+        let rendered = health.lines().join("\n");
+        assert!(rendered.contains("symbolic link"), "{rendered}");
+        assert!(
+            !rendered.contains("does not exist yet"),
+            "the path is not empty: {rendered}"
+        );
+    }
+
+    /// A symlink to a perfectly good file is refused too, and for the same
+    /// reason: the read path opens `O_NOFOLLOW`. The permission state
+    /// describes the LINK, not the target it declines to follow.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_sound_file_is_also_a_file_problem() {
+        let (dir, store) = scratch();
+        let real = dir.path().join("real.toml");
+        let inner = CredentialStore::at(dir.path().to_path_buf());
+        populated(&inner);
+        std::fs::rename(inner.path(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, store.path()).unwrap();
+
+        let health = credential_health(&store);
+        assert!(health.exists);
+        assert!(!health.file_readable, "{health:?}");
+        assert!(!health.usable);
+        assert!(health.profiles.is_empty(), "nothing may be read from it");
+    }
+
+    /// The two renderings differ in exactly one line, and it is the
+    /// store-wide verdict: `doctor` grades the file and the directory
+    /// separately, so it must not print a composite one.
+    #[test]
+    fn the_verdict_free_rendering_drops_only_the_usable_line() {
+        let (_dir, store) = scratch();
+        populated(&store);
+        let health = credential_health(&store);
+
+        let full = health.lines();
+        let without = health.lines_without_verdict();
+        assert_eq!(
+            full.len(),
+            without.len() + 1,
+            "exactly one line differs:\n{full:?}\n{without:?}"
+        );
+        assert!(full.iter().any(|line| line.starts_with("usable:")));
+        assert!(
+            !without.iter().any(|line| line.starts_with("usable:")),
+            "the composite verdict must be gone: {without:?}"
+        );
+        // Everything else survives, in order.
+        let kept: Vec<&String> = full
+            .iter()
+            .filter(|line| !line.starts_with("usable:"))
+            .collect();
+        assert_eq!(kept, without.iter().collect::<Vec<&String>>());
+    }
+
+    // --- what a health report may print about a store error ----------
+    //
+    // These live here rather than beside `StoreError` because the property
+    // they protect is THIS module's: `directory_problem` is a description,
+    // and a description must not carry the verdict of a path that refuses.
+    // `Display` keeps that verdict for the write path, which is where it is
+    // true.
+
+    fn too_open() -> crate::auth::error::StoreError {
+        crate::auth::error::StoreError::DirectoryTooOpen {
+            path: "/home/u/.config/outline-cli".to_string(),
+            mode: "0777".to_string(),
+        }
+    }
+
+    /// The two phrasings of one error, side by side, because the difference
+    /// is the whole point: `Display` is the WRITE path refusing, `condition`
+    /// is a report describing. A health report that says "refusing to use
+    /// it" and then reads the file is the contradiction R1 removed from the
+    /// exit code and left in this text.
+    #[test]
+    fn the_display_refuses_and_the_condition_only_describes() {
+        let displayed = too_open().to_string();
+        assert!(displayed.contains("refusing to use it"), "{displayed}");
+        assert!(displayed.contains("chmod 700"), "{displayed}");
+
+        let condition = too_open().condition();
+        assert!(
+            !condition.contains("refusing"),
+            "a description must not carry the write path's verdict: {condition}"
+        );
+        // The FACTS survive: which directory, what mode, what it means.
+        assert!(
+            condition.contains("/home/u/.config/outline-cli"),
+            "{condition}"
+        );
+        assert!(condition.contains("0777"), "{condition}");
+        assert!(condition.contains("writable by other users"), "{condition}");
+    }
+
+    #[test]
+    fn the_other_two_directory_conditions_also_drop_the_verdict() {
+        let foreign = crate::auth::error::StoreError::ForeignOwner {
+            path: "/d".to_string(),
+            owner: 501,
+            us: 502,
+        };
+        assert!(!foreign.condition().contains("refusing"), "{foreign}");
+        assert!(foreign.condition().contains("501"), "{foreign}");
+
+        let wrong_type = crate::auth::error::StoreError::NotARegularFile {
+            path: "/d".to_string(),
+            kind: "a directory",
+        };
+        assert!(!wrong_type.condition().contains("refusing"), "{wrong_type}");
+        assert!(
+            wrong_type.condition().contains("a directory"),
+            "{wrong_type}"
+        );
+    }
+
+    /// A variant that carries no verdict keeps its own message, so nothing
+    /// is lost by describing it.
+    #[test]
+    fn a_verdict_free_variant_describes_itself() {
+        let error = crate::auth::error::StoreError::Parse {
+            path: "/d/credentials.toml".to_string(),
+            reason: "line 3".to_string(),
+        };
+        assert_eq!(error.condition(), error.to_string());
     }
 
     #[test]
