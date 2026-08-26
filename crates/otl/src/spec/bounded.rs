@@ -293,34 +293,7 @@ pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Tabl
     let meta: CacheMeta = decode_record(meta_record, meta_record_config())?;
 
     let count = take_len(body, &mut cursor)?;
-    if count > MAX_CACHED_OPS {
-        return Err(TableError::TooManyOperations {
-            count,
-            limit: MAX_CACHED_OPS,
-        });
-    }
-    // Against the bytes that ACTUALLY remain, not against the format's
-    // maximum: a short body declaring thousands of operations is a lie, and
-    // reserving for it would be the allocation the count check exists to
-    // prevent.
-    let remaining = body.len().saturating_sub(cursor);
-    if count > remaining / MIN_FRAMED_OP_BYTES {
-        return Err(TableError::Framing(format!(
-            "it declares {count} operations but only {remaining} bytes follow"
-        )));
-    }
-
-    // The table's own Vec is charged BEFORE it is reserved: 8192 slots of
-    // `OpSpec` is a megabyte, allocated before a single record is decoded,
-    // and it used to be invisible to the budget that exists to bound
-    // exactly this.
-    let mut footprint = count.saturating_mul(size_of::<OpSpec>());
-    if footprint > MAX_DECODED_BYTES {
-        return Err(TableError::TooMuchMemory {
-            footprint,
-            limit: MAX_DECODED_BYTES,
-        });
-    }
+    let mut footprint = check_declared_count(count, body.len().saturating_sub(cursor))?;
     let mut ops: Vec<OpSpec> = Vec::with_capacity(count);
     for index in 0..count {
         let record = take_op_record(body, &mut cursor, index)?;
@@ -341,6 +314,37 @@ pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Tabl
         )));
     }
     Ok((meta, ops))
+}
+
+/// Vet a declared operation count before anything is reserved for it, and
+/// return what reserving it will cost.
+///
+/// Three ways a count can be refused, and all three happen before the
+/// allocation: more than the format allows, more than the bytes that
+/// ACTUALLY remain could encode (a short body declaring thousands of
+/// operations is simply lying), and more memory than the budget allows for
+/// the table's own `Vec` - 8192 slots of `OpSpec` is a megabyte, and it
+/// used to be invisible to the very budget that exists to bound it.
+fn check_declared_count(count: usize, remaining: usize) -> Result<usize, TableError> {
+    if count > MAX_CACHED_OPS {
+        return Err(TableError::TooManyOperations {
+            count,
+            limit: MAX_CACHED_OPS,
+        });
+    }
+    if count > remaining / MIN_FRAMED_OP_BYTES {
+        return Err(TableError::Framing(format!(
+            "it declares {count} operations but only {remaining} bytes follow"
+        )));
+    }
+    let footprint = count.saturating_mul(size_of::<OpSpec>());
+    if footprint > MAX_DECODED_BYTES {
+        return Err(TableError::TooMuchMemory {
+            footprint,
+            limit: MAX_DECODED_BYTES,
+        });
+    }
+    Ok(footprint)
 }
 
 /// Approximate heap footprint of one decoded operation.
