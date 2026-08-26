@@ -135,12 +135,31 @@ fn isolated_otl(tag: &str) -> (PathBuf, PathBuf) {
 /// exists to avoid: a sibling test's `Command::spawn` forks, inherits the
 /// write descriptor, and holds this binary busy for as long as that child
 /// lives.
+#[cfg(unix)]
 fn flush_to_disk(path: &Path) {
     let file = std::fs::File::open(path)
         .unwrap_or_else(|error| panic!("could not reopen {} to flush: {error}", path.display()));
     file.sync_all()
         .unwrap_or_else(|error| panic!("could not flush {}: {error}", path.display()));
 }
+
+/// Windows has nothing to wait for here, and no way to ask on these terms.
+///
+/// `ETXTBSY` is POSIX. Windows refuses a write to a running image with a
+/// sharing violation instead, and `fs::copy` has closed its own handle by the
+/// time it returns, so there is no in-flight writeback for a later exec to
+/// trip over.
+///
+/// Asking anyway is not free, which is how this was found: `sync_all` is
+/// `FlushFileBuffers`, which needs write access, so on the READ-ONLY
+/// descriptor the Unix arm deliberately uses it fails with "Access is
+/// denied" (os error 5). That took all four `*_with_no_spec_file_reachable`
+/// tests down on windows-latest - and only there, because the copy path is
+/// the normal path on that runner: the workspace is on `D:` and the temp
+/// directory on `C:`, so `hard_link` cannot make the link and the fallback
+/// always runs.
+#[cfg(not(unix))]
+fn flush_to_disk(_path: &Path) {}
 
 /// Command for the isolated binary, running from its temp dir with Outline
 /// env scrubbed.
