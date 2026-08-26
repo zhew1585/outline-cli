@@ -41,10 +41,11 @@ use crate::CompileError;
 /// Ceiling on the estimated heap cost of the parts of a document that are
 /// kept.
 ///
-/// The vendored Outline spec charges about 2 MiB against this, so it is
-/// roughly a twelvefold headroom over a real API description, while a
+/// A real API description of the size this CLI vendors charges about
+/// 2 MiB against it, so the headroom is roughly twelvefold, while a
 /// document engineered to expand is refused long before it becomes
-/// interesting.
+/// interesting. (Measured figures live in the consumer's own tests; this
+/// crate names no service.)
 pub const MAX_PARSED_BYTES: usize = 24 * 1024 * 1024;
 
 /// Approximate cost of one `Value` node, whatever it holds.

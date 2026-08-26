@@ -208,6 +208,19 @@ fn check_text(op: &OpSpec) -> Result<(), String> {
     if !is_display_safe(&op.content_type, spec_compile::MAX_CONTENT_TYPE_BYTES) {
         return unsafe_text("content type");
     }
+    check_param_text(op)?;
+    check_field_text(op)
+}
+
+/// The text of the request parameters.
+fn check_param_text(op: &OpSpec) -> Result<(), String> {
+    let unsafe_text = |field: &str| {
+        Err(format!(
+            "operation {:?} has a {field} that is too long or contains control \
+             characters (the value is not shown: printing it is the attack)",
+            op.name
+        ))
+    };
     for param in op.params.iter() {
         if param.name.is_empty()
             || !is_display_safe(&param.name, spec_compile::MAX_PARAM_NAME_BYTES)
@@ -228,8 +241,19 @@ fn check_text(op: &OpSpec) -> Result<(), String> {
             return unsafe_text("parameter enum value");
         }
     }
-    // Response field names and formats become table column headers, so a
-    // cached table gets the same treatment as a compiled one.
+    Ok(())
+}
+
+/// The text of the response fields, which become table column HEADERS -
+/// about as good a place to hide an escape sequence as exists.
+fn check_field_text(op: &OpSpec) -> Result<(), String> {
+    let unsafe_text = |field: &str| {
+        Err(format!(
+            "operation {:?} has a {field} that is too long or contains control \
+             characters (the value is not shown: printing it is the attack)",
+            op.name
+        ))
+    };
     if op.response_fields.len() > spec_compile::MAX_RESPONSE_FIELDS {
         return unsafe_text("response field list");
     }
