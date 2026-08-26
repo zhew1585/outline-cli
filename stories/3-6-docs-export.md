@@ -98,6 +98,24 @@ so that 内容可进 git 或离线阅读。
   1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
   2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
      递归深度因此被 `MAX_DEPTH` 硬性封顶。
+- **终端清洗改成了在出口做**（R6 finding 1）：诊断消息由「作者写的散文 + 别处来的值」拼成，
+  而前几轮的做法是在**每个插值点**记得调 `text::quote`——标题清了、id 清了、19 个调用点都核过了，
+  然后 R5 新加的「点名遗留文件」消息又漏了。所以现在 `stdio::write_diagnostic_line` 自己
+  把除 `\n` 以外的控制字符与 Cf 格式字符全部清掉：**新加的消息默认就是安全的**，不靠记性。
+  保留 `\n` 是因为导出摘要本来就是多行（一条失败一行），一刀切会让作者写的输出变难读；
+  代价是外来值仍能插入换行，因此「必须留在一行内」的值（id、label、文件名）**仍然**在调用点过 `text::quote`。
+  两层是叠加而非替代：出口那层限定「忘记」的后果，调用点那层对具体值精确。
+  出口层是否真承重，有 `a_path_in_a_diagnostic_cannot_carry_control_characters` 钉住——
+  它走的是 `--out` 路径这个**没有**调用点清洗的插值点，**实测**去掉出口清洗即变红。
+- **遗留物识别收紧为精确形状**（R6 方向 5）：原本按 `.otl-export-` 前缀判定，
+  于是用户自己叫 `.otl-export-notes.md` 的文件会被断言成「我们上次没清干净的残骸」。
+  现在要求完整形状 `.otl-export-<16 位 hex>.md` 且必须是普通文件。
+  顺带修正措辞：`--overwrite` 并不会替换遗留物，只是绕过它们，所以不再那样提示。
+- **`--out a/../b` 不再遗留空目录**（R6 finding 3）：逐组件字面创建的代价是
+  `a` 会被建出来再被 `..` 跨出去，永久留下一个空目录。
+  按词法折叠 `..` 是**错的**——某个组件是符号链接时 `link/..` 是链接目标的父目录，不是链接所在的目录，
+  折叠后的路径指向别处。所以选择在动手前拒绝：只拒绝「`..` 跨出一个本次才要创建的目录」这一种，
+  `--out ../backup`、`--out existing/../backup` 照常工作。
 - **相对 `--out` 曾经必然假警报**（R5 finding 2）：`Path::new("backup").parent()` 是 `Some("")` 而不是 `None`，
   于是 `flush_directory("")` 必然 NotFound，一次**完全成功**的导出被判成 exit 9 + `durable:false` + `complete:false`
   且 `failed` 为空。`--out backup` 失败而 `--out ./backup` 成功——同一个目录。
@@ -117,6 +135,11 @@ so that 内容可进 git 或离线阅读。
 - **文件长度上限也有了门禁**（R5 finding 7）：`tests/limits.rs` 对全工作区执行 `project-context.md`
   的 800 行上限（测试文件不豁免），带一条只会变短的 grandfather 列表。
   它在第一次运行时就抓到 `export.rs` 因本轮修复涨到 919 行，于是拆出 `outdir.rs`（输出目录的校验与创建）。
+- **Windows 交叉检查脚本化**（R6 方向 3）：`scripts/win-check.sh`。
+  手工换 `rustls-no-provider`（绕开 `aws-lc-sys` 需要 `windows.h`）的 footgun 是「忘了还原」——
+  提交里带上 no-provider 会让 reqwest 运行时因无 crypto provider 而 panic。
+  脚本用 `trap ... EXIT INT TERM` 无条件还原。本轮它两次抓到只在 Windows 上炸的问题
+  （`Durability::Flushed` 的 dead_code、cfg 后未使用的 `json!` 导入），都是 CI Windows leg 会红的。
 - **文件系统层拆成两个模块**：`dir.rs`（`Dir` 目录钉住、身份、`flush_directory`、`Durability`）
   与 `target.rs`（temp 写入、落地、`confirm_landing`）。R4 修完后单文件超过 800 行上限，按职责切开。
 - **占位法是错的**（R3 finding 2）：R2 用「先 `create_new` 占名、再 rename 覆盖占位」拿到了互斥，

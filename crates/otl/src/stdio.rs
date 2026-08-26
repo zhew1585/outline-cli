@@ -53,9 +53,98 @@ fn write_stdout(
 /// Diagnostics are best-effort by definition: if stderr is closed there is
 /// nowhere left to report that fact, and panicking would replace the real
 /// exit code with 101.
+///
+/// Every diagnostic passes through [`scrub_terminal_controls`] on the way
+/// out. See that function for why the scrub lives HERE rather than at each
+/// place that builds a message.
 pub fn write_diagnostic_line(text: &str) {
     let stderr = io::stderr();
     let mut handle = stderr.lock();
-    let _ = writeln!(handle, "{text}");
+    let _ = writeln!(handle, "{}", scrub_terminal_controls(text));
     let _ = handle.flush();
+}
+
+/// Remove everything a terminal would EXECUTE, keeping newlines.
+///
+/// Diagnostics are assembled from authored prose plus values that came from
+/// somewhere else - a server, a filesystem, a config file - and a terminal
+/// treats some of those bytes as commands rather than text: `ESC ] 52` sets
+/// the system clipboard, `ESC ] 8` forges a hyperlink, others move the
+/// cursor or repaint the screen. None of that belongs in a diagnostic.
+///
+/// The scrub is at the SINK on purpose. Doing it per call site means every
+/// new message that interpolates a foreign value has to remember, and the
+/// history of this crate is that eventually one does not: titles were
+/// quoted, then ids were found unquoted, then - once those were fixed - a
+/// newly added message interpolated a filename raw. Putting it here makes
+/// the property hold for messages that do not exist yet.
+///
+/// Newlines survive, because a diagnostic legitimately spans lines (the
+/// export summary lists one failure per line) and collapsing those would
+/// make authored output worse to read. A foreign value could therefore
+/// still introduce a line break, which is why values that must stay on one
+/// line ALSO go through [`crate::text::quote`] at their call site. The two
+/// are layers, not alternatives: this one bounds the damage of forgetting,
+/// that one is precise about a particular value.
+///
+/// Invisible and re-ordering format characters go too: they are not
+/// controls, but in a diagnostic they can make the text read as something
+/// other than what it says.
+pub fn scrub_terminal_controls(text: &str) -> String {
+    text.chars()
+        .filter(|c| !crate::text::is_invisible(*c))
+        .map(|c| match c {
+            '\n' => '\n',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrubbing_removes_terminal_control_sequences() {
+        // OSC 52 sets the system clipboard; a diagnostic must not be able to.
+        let scrubbed = scrub_terminal_controls("a\u{1b}]52;c;cGF5bG9hZA==\u{7}b");
+        assert!(!scrubbed.contains('\u{1b}'), "{scrubbed:?}");
+        assert!(!scrubbed.contains('\u{7}'), "{scrubbed:?}");
+        assert!(scrubbed.starts_with('a') && scrubbed.ends_with('b'));
+    }
+
+    #[test]
+    fn scrubbing_keeps_newlines_so_multi_line_diagnostics_survive() {
+        // The export summary is one failure per line; collapsing it would
+        // make authored output worse, and the per-value `text::quote` is
+        // what keeps a foreign value from introducing a break.
+        assert_eq!(
+            scrub_terminal_controls("summary:\n  a: reason\n  b: reason"),
+            "summary:\n  a: reason\n  b: reason"
+        );
+    }
+
+    #[test]
+    fn scrubbing_removes_carriage_returns_and_other_controls() {
+        // `\r` alone would let a message overwrite the line before it.
+        assert_eq!(scrub_terminal_controls("a\rb\tc\u{0}d"), "a b c d");
+    }
+
+    #[test]
+    fn scrubbing_removes_reordering_format_characters() {
+        assert_eq!(scrub_terminal_controls("report-\u{202e}fdp"), "report-fdp");
+    }
+
+    #[test]
+    fn scrubbing_leaves_ordinary_text_alone() {
+        for text in [
+            "warning: something happened",
+            "\u{4e2d}\u{6587}\u{8bca}\u{65ad}",
+            "path/to/file.md",
+            "",
+        ] {
+            assert_eq!(scrub_terminal_controls(text), text);
+        }
+    }
 }

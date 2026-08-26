@@ -1,9 +1,10 @@
-//! Story 3.6: `otl docs export` - robustness, hostile input, and the
-//! guarantees about what reaches the filesystem.
+//! Story 3.6: `otl docs export` - what reaches the FILESYSTEM.
 //!
-//! The ordinary "did it export the right documents" cases live in
-//! `docs_export.rs`; the two files share their fixtures through
-//! `common::export`.
+//! File names that must not escape the output directory, symlinks, atomic
+//! placement, durability, and validation of `--out`. The cases about
+//! hostile text reaching a TERMINAL live in `docs_export_terminal.rs`, and
+//! the ordinary "did it export the right documents" cases in
+//! `docs_export.rs`; all three share fixtures through `common::export`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -14,9 +15,13 @@ use std::collections::BTreeSet;
 use common::export::{row, server_with, tree, COLLECTION};
 use common::{blocking, otl_at};
 use predicates::prelude::*;
+// `json!` is only reached by the Unix-gated tests below, so on another
+// target it is genuinely unused. Silenced per target rather than dropped:
+// CI runs clippy with `-D warnings` on Windows too, and an unused import
+// there fails that leg while looking perfectly fine here.
+#[cfg_attr(not(unix), allow(unused_imports))]
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path as request_path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::MockServer;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hostile_titles_cannot_escape_the_output_directory() {
@@ -348,79 +353,52 @@ async fn an_output_directory_that_is_a_symlink_is_refused() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_hostile_title_on_an_unusable_row_cannot_rewrite_the_terminal() {
-    // The failure summary names an unusable row by its title, and a title
-    // is written by anyone who can edit the document. Untouched, it could
-    // set the clipboard with OSC 52 or use a newline to forge an extra
-    // failure entry in the summary it appears in.
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(request_path("/api/documents.list"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
-                { "title": "evil\u{1b}]52;c;cGF5bG9hZA==\u{7}\nfake-id: forged failure" },
-            ],
-            "pagination": { "offset": 0, "limit": 100 },
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("export");
-    let uri = server.uri();
-    let target = out.clone();
-    let output = blocking(move || {
-        otl_at(&uri)
-            .args(["docs", "export", "--collection", COLLECTION, "--out"])
-            .arg(&target)
-            .output()
-            .unwrap()
-    })
-    .await;
-
-    assert_eq!(output.status.code(), Some(9));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains('\u{1b}'), "ESC reached stderr: {stderr:?}");
-    assert!(!stderr.contains('\u{7}'), "BEL reached stderr: {stderr:?}");
-    // The forged text is still shown - it is the real title - but folded
-    // onto the one line that belongs to this row, so it cannot pose as a
-    // second failure entry.
-    let forged_lines = stderr
-        .lines()
-        .filter(|line| line.trim_start().starts_with("fake-id:"))
-        .count();
-    assert_eq!(forged_lines, 0, "a title forged a failure line: {stderr:?}");
-}
-
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_can_never_leave_an_empty_document_file() {
     // The property the placeholder broke, watched on the path that HAD the
     // placeholder: the default, no-`--overwrite` export into a fresh
-    // directory. (An earlier version of this test ran `--overwrite`, which
-    // never used a placeholder at all - it could not have failed.)
+    // directory. (An earlier version ran `--overwrite`, which never used a
+    // placeholder at all - it could not have failed.)
     //
-    // The structural guarantee is that the destination name is only ever
-    // created by linking a finished temp file; this watcher is the
-    // observable half of it.
-    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    // The structural guarantee is that a destination name is only ever
+    // created by linking a finished temp file, and the unit tests in
+    // `target` assert that directly. This is the observable half, and it is
+    // made deterministic rather than left to luck: five documents through a
+    // paced request channel take hundreds of milliseconds, and the watched
+    // file is the LAST one written, so the poller gets many samples before
+    // it appears and the file is certainly there once the export returns.
+    let server = server_with(vec![
+        row("a", "Alpha", None),
+        row("b", "Bravo", None),
+        row("c", "Charlie", None),
+        row("d", "Delta", None),
+        row("e", "Echo", None),
+    ])
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("export");
 
-    let watched = out.clone();
+    // Siblings are written in (title, id) order, so `Echo.md` is last.
+    let watched = out.join("Echo.md");
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher_stop = std::sync::Arc::clone(&stop);
     let watcher = std::thread::spawn(move || {
         let mut sightings = 0_usize;
         let mut empty = 0_usize;
-        while !watcher_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Ok(content) = std::fs::read(watched.join("Alpha.md")) {
+        loop {
+            if let Ok(content) = std::fs::read(&watched) {
                 sightings += 1;
                 if content.is_empty() {
                     empty += 1;
                 }
             }
+            // One more pass after the export has finished, so "did the
+            // watcher look at all" cannot fail for want of scheduling.
+            if watcher_stop.load(std::sync::atomic::Ordering::Relaxed) && sightings > 0 {
+                break;
+            }
+            std::thread::yield_now();
         }
         (sightings, empty)
     });
@@ -442,71 +420,11 @@ async fn a_crash_can_never_leave_an_empty_document_file() {
         empty, 0,
         "the destination existed with no content at some point"
     );
-    // The watcher has to have actually seen the file, or "never empty"
-    // would be true of a test that looked at nothing.
+    // Not vacuous: the file was really looked at.
     assert!(sightings > 0, "the watcher never observed the file at all");
-    assert!(std::fs::read_to_string(out.join("Alpha.md"))
+    assert!(std::fs::read_to_string(out.join("Echo.md"))
         .unwrap()
-        .contains("body of a"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_hostile_document_id_cannot_rewrite_the_terminal() {
-    // The id of a document that FAILED goes into the failure summary. Like
-    // a title it is server text; unlike a title it also has to stay
-    // verbatim in the JSON so the user can retry with it. So the JSON keeps
-    // it raw and the terminal summary quotes it.
-    const HOSTILE: &str = "evil\u{1b}]52;c;cGF5bG9hZA==\u{7}\n  forged: failure";
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(request_path("/api/documents.list"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{
-                "id": HOSTILE,
-                "title": "Hostile",
-                "updatedAt": "2026-08-01T00:00:00.000Z",
-            }],
-            "pagination": { "offset": 0, "limit": 100 },
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(request_path("/api/documents.info"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "ok": false,
-            "error": "not_found",
-            "message": "Document not found",
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("export");
-    let uri = server.uri();
-    let target = out.clone();
-    let output = blocking(move || {
-        otl_at(&uri)
-            .args(["docs", "export", "--collection", COLLECTION, "--out"])
-            .arg(&target)
-            .output()
-            .unwrap()
-    })
-    .await;
-
-    assert_eq!(output.status.code(), Some(9));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains('\u{1b}'), "ESC reached stderr: {stderr:?}");
-    assert!(!stderr.contains('\u{7}'), "BEL reached stderr: {stderr:?}");
-    let forged = stderr
-        .lines()
-        .filter(|line| line.trim_start().starts_with("forged:"))
-        .count();
-    assert_eq!(forged, 0, "an id forged a failure line: {stderr:?}");
-
-    // The JSON keeps the id exactly as the server sent it: that is what a
-    // retry needs, and JSON encoding makes it safe to carry.
-    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(parsed["failed"][0]["id"], json!(HOSTILE));
+        .contains("body of e"));
 }
 
 #[cfg(unix)]
@@ -765,4 +683,79 @@ async fn ordinary_content_still_gets_the_ordinary_not_empty_message() {
         .code(2)
         .stderr(predicate::str::contains("is not empty"))
         .stderr(predicate::str::contains("leftover").not());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_output_path_that_steps_out_of_a_new_directory_is_refused() {
+    // `--out a/../b` used to succeed and leave an empty `a/` behind: the
+    // components are created one at a time, so `a` gets made and then
+    // stepped out of. Collapsing `..` lexically instead would be wrong when
+    // a component is a symlink, so this is refused rather than rewritten.
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = server.uri();
+    let cwd = dir.path().to_path_buf();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .current_dir(&cwd)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--out",
+                "a/../b",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("steps back out"), "{stderr}");
+    // Nothing was created, and no request was made.
+    assert!(
+        !dir.path().join("a").exists(),
+        "an empty directory was left"
+    );
+    assert!(!dir.path().join("b").exists());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_segment_after_an_existing_directory_still_works() {
+    // The counterpart: `..` is only refused when it steps out of something
+    // this run would have to create.
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("here")).unwrap();
+    let uri = server.uri();
+    let cwd = dir.path().to_path_buf();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .current_dir(&cwd)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--out",
+                "here/../backup",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        tree(&dir.path().join("backup")),
+        BTreeSet::from(["Alpha.md".to_string()])
+    );
 }

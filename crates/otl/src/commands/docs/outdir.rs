@@ -16,8 +16,12 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 
 use crate::exit::CliError;
+use crate::text;
 
 use super::target;
+
+/// Hex digits in a temporary file name (see [`super::target::TempNames`]).
+const TEMP_HEX_DIGITS: usize = 16;
 
 /// Validate and create the output directory, before any network request,
 /// and return its CANONICAL path.
@@ -107,6 +111,7 @@ pub(super) struct Prepared {
 /// once, here, before anything is written.
 pub(super) fn create_dir_recording(out: &Path) -> Result<Vec<PathBuf>, CliError> {
     let usage = |message: String| CliError::usage(anyhow!(message));
+    reject_pointless_parent_segment(out)?;
     let mut created = Vec::new();
     let mut path = PathBuf::new();
     for component in out.components() {
@@ -134,6 +139,41 @@ pub(super) fn create_dir_recording(out: &Path) -> Result<Vec<PathBuf>, CliError>
         }
     }
     Ok(created)
+}
+
+/// Refuse a `..` that steps back out of a directory this run would create.
+///
+/// Components are created literally, one at a time, which is what makes it
+/// possible to know afterwards which ones are new. The consequence is that
+/// `--out a/../b` with no `a` creates `a`, steps back out of it, creates
+/// `b`, and leaves an empty `a` behind for good - a backup command
+/// littering the working directory.
+///
+/// Collapsing `..` lexically instead would be WRONG: when a component is a
+/// symlink, `link/..` is the parent of the link's target, not the directory
+/// the link sits in, so the collapsed path names somewhere else entirely.
+/// Refusing is therefore the honest option, and it costs nothing real -
+/// `--out ../backup` and `--out existing/../backup` still work, because
+/// their `..` only ever follows a directory that was already there.
+fn reject_pointless_parent_segment(out: &Path) -> Result<(), CliError> {
+    let mut path = PathBuf::new();
+    let mut creating = false;
+    for component in out.components() {
+        if creating && component == std::path::Component::ParentDir {
+            return Err(CliError::usage(anyhow!(
+                "{} steps back out of a directory that does not exist yet, \
+                 so creating it would leave an empty directory behind. Give \
+                 --out a path whose `..` segments only follow directories \
+                 that already exist, or write the destination out in full.",
+                out.display()
+            )));
+        }
+        path.push(component);
+        if !creating && !path.exists() {
+            creating = true;
+        }
+    }
+    Ok(())
 }
 
 /// The parent directories of newly created ones, deepest first, deduplicated.
@@ -199,13 +239,31 @@ fn inspect_dir(dir: &Path) -> Result<Contents, CliError> {
             CliError::usage(anyhow!("cannot read {}: {}", dir.display(), error.kind()))
         })?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(target::TEMP_PREFIX) {
+        if is_our_leftover(&name) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
             contents.leftovers.push(name);
         } else {
             contents.others += 1;
         }
     }
     Ok(contents)
+}
+
+/// Whether a name is one of THIS command's temporary files.
+///
+/// Matched exactly - prefix, sixteen lowercase hex digits, `.md` - rather
+/// than by prefix alone. The message this feeds says "an earlier export
+/// left this behind", and saying that about a file the user created and
+/// happened to name `.otl-export-notes.md` would be a confident lie. It
+/// also has to be a regular FILE: a directory by that name is not
+/// something this command ever creates.
+fn is_our_leftover(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(target::TEMP_PREFIX) else {
+        return false;
+    };
+    let Some(hex) = rest.strip_suffix(".md") else {
+        return false;
+    };
+    hex.len() == TEMP_HEX_DIGITS && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// The error for an output directory that already holds something.
@@ -219,14 +277,23 @@ fn not_empty_error(dir: &Path, contents: &Contents) -> CliError {
             dir.display()
         ));
     }
+    // The names came off the filesystem, which allows any byte but NUL and
+    // `/`. `stdio` scrubs the terminal-control classes on the way out, and
+    // `text::quote` here additionally keeps each name on one line so it
+    // cannot pose as a second sentence of the message.
+    let named: Vec<String> = contents
+        .leftovers
+        .iter()
+        .map(|name| text::quote(name))
+        .collect();
     CliError::usage(anyhow!(
         "{} holds {} leftover temporary file(s) from an earlier export that \
          did not finish cleaning up: {}. They are hidden files, so the \
-         directory looks empty. Delete them and run again, or pass \
-         --overwrite to export over them.",
+         directory looks empty. Delete them and run again; --overwrite \
+         would leave them in place rather than replace them.",
         dir.display(),
-        contents.leftovers.len(),
-        contents.leftovers.join(", ")
+        named.len(),
+        named.join(", ")
     ))
 }
 
@@ -310,5 +377,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_exact_temporary_names_count_as_our_leftovers() {
+        // The message these feed says "an earlier export left this behind".
+        // Saying that about a file the user made and happened to name
+        // `.otl-export-notes.md` would be a confident lie.
+        assert!(is_our_leftover(".otl-export-0123456789abcdef.md"));
+        assert!(is_our_leftover(".otl-export-ffffffffffffffff.md"));
+        for name in [
+            ".otl-export-notes.md",             // not hex
+            ".otl-export-0123456789abcdef.txt", // not .md
+            ".otl-export-0123456789abcde.md",   // 15 digits
+            ".otl-export-0123456789abcdef0.md", // 17 digits
+            ".otl-export-.md",                  // no digits
+            "otl-export-0123456789abcdef.md",   // no leading dot
+            "Alpha.md",
+            "",
+        ] {
+            assert!(!is_our_leftover(name), "{name:?} was claimed as ours");
+        }
+    }
+
+    #[test]
+    fn a_hostile_leftover_name_cannot_carry_control_characters_into_the_message() {
+        // A filename may contain any byte but NUL and `/`, and this one goes
+        // into a message that reaches a terminal.
+        let contents = Contents {
+            others: 0,
+            leftovers: vec![
+                ".otl-export-\u{1b}]52;c;cGF5bG9hZA==\u{7}.md".to_string(),
+                "second\nforged: line".to_string(),
+            ],
+        };
+        let rendered = not_empty_error(Path::new("out"), &contents).to_string();
+        assert!(!rendered.contains('\u{1b}'), "ESC survived: {rendered:?}");
+        assert!(!rendered.contains('\u{7}'), "BEL survived: {rendered:?}");
+        assert!(
+            !rendered.contains('\n'),
+            "a name forged a line break: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_content_keeps_the_overwrite_advice() {
+        let contents = Contents {
+            others: 1,
+            leftovers: Vec::new(),
+        };
+        let rendered = not_empty_error(Path::new("out"), &contents).to_string();
+        assert!(rendered.contains("--overwrite"), "{rendered}");
+        assert!(!rendered.contains("leftover"), "{rendered}");
+    }
+
+    #[test]
+    fn a_parent_segment_after_a_missing_directory_is_refused() {
+        // `--out a/../b` with no `a` would create `a`, step out of it and
+        // leave it behind empty.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a").join("..").join("b");
+        let error =
+            create_dir_recording(&out).expect_err("a pointless parent segment must be refused");
+        assert_eq!(error.code, crate::exit::ExitCode::Usage);
+        assert!(error.to_string().contains("steps back out"), "{error}");
+        // Nothing was created: the check runs before any mkdir.
+        assert!(
+            !dir.path().join("a").exists(),
+            "an empty directory was left"
+        );
+        assert!(!dir.path().join("b").exists());
+    }
+
+    #[test]
+    fn parent_segments_after_existing_directories_are_fine() {
+        // `..` is only a problem when it follows something this run would
+        // have to create. These shapes leave nothing behind.
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+
+        let out = existing.join("..").join("target");
+        create_dir_recording(&out).expect("a `..` after an existing directory");
+        assert!(dir.path().join("target").is_dir());
+
+        // And a plain relative `..` at the front.
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let up = nested.join("..").join("sibling");
+        create_dir_recording(&up).expect("a leading `..`");
+        assert!(dir.path().join("sibling").is_dir());
     }
 }

@@ -56,6 +56,10 @@ so that 终端内完成阅读。
   传给 `docs::run`，因为 `OutputMode::Json` 无法区分"用户要 JSON"与"stdout 不是终端"。
   其余五个命令仍是标准双态。
 - **分页判定**：`mode == Table` 已经等价于「stdout 是 TTY 且没有 --json」，再叠加 `!--raw` 与「超一屏」。
+- **stdout 与 stderr 的清洗规则不同，而且都在出口**（R6 finding 1）：
+  stderr 侧由 `stdio::write_diagnostic_line` 统一清掉除 `\n` 以外的控制字符与 Cf 格式字符，
+  所以所有诊断路径（包括以后新增的）默认安全；stdout 侧的文档正文走 `pager`，
+  规则是下面这条（交互路径清洗、管道逐字节）。两侧刻意分开：正文是用户要读的数据，诊断不是。
 - **交互路径是"显示"，管道路径是"数据"**（R1 findings 6/11）：文档正文由任何有编辑权的人写入，
   而终端会把其中一部分字节当**命令**执行（OSC 52 改剪贴板、OSC 8 伪造超链接、光标移动重绘）。
   这些都不是 markdown，所以 TTY 路径一律替换为 U+FFFD 并在 stderr 说明可用 `--raw` 拿原始字节；

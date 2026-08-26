@@ -87,16 +87,82 @@ fn platform_specific_code_is_behind_a_cfg() {
 
 /// Whether the platform module used on `index` is covered by a `cfg`.
 ///
-/// Looks upwards for a `#[cfg(...)]` mentioning the platform, at an
-/// indentation no deeper than the use itself - an attribute indented
+/// Looks upwards for a `#[cfg(...)]` that enables the code on that platform,
+/// at an indentation no deeper than the use itself - an attribute indented
 /// further belongs to something nested, not to the item in hand.
 fn is_guarded(lines: &[&str], index: usize, module: &str) -> bool {
     let platform = module.rsplit("::").next().unwrap_or(module);
     let depth = indentation(lines[index]);
     let start = index.saturating_sub(GUARD_WINDOW);
-    lines[start..=index].iter().rev().any(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("#[cfg") && trimmed.contains(platform) && indentation(line) <= depth
+    lines[start..=index]
+        .iter()
+        .rev()
+        .any(|line| is_cfg_for(line.trim_start(), platform) && indentation(line) <= depth)
+}
+
+/// Whether one attribute line is a `cfg` that ENABLES code for `platform`.
+///
+/// Two ways to get this wrong, both of which produce a guard that reassures
+/// without checking anything:
+///
+/// - `#[cfg_attr(unix, ...)]` is not a compilation guard at all. It applies
+///   another attribute conditionally; the item itself still compiles
+///   everywhere, so a `std::os::unix` use under it still breaks Windows.
+/// - `#[cfg(not(unix))]` MENTIONS the platform while meaning the opposite.
+///   On Windows `not(unix)` is true and `std::os::unix` does not exist, so
+///   accepting it is exactly the failure this test exists to catch. A plain
+///   substring search accepts it, which is how it slipped through: the
+///   negation is stripped before looking.
+fn is_cfg_for(attribute: &str, platform: &str) -> bool {
+    if !attribute.starts_with("#[cfg(") {
+        return false;
+    }
+    mentions_word(&strip_negations(attribute), platform)
+}
+
+/// The attribute with every `not( ... )` group removed.
+///
+/// Balanced removal rather than a text match, so `not(any(unix, windows))`
+/// goes as a whole and a nested `all(unix, not(test))` keeps its `unix`.
+fn strip_negations(attribute: &str) -> String {
+    let mut out = String::with_capacity(attribute.len());
+    let mut rest = attribute;
+    while let Some(at) = rest.find("not(") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "not(".len()..];
+        let mut depth = 1_usize;
+        let mut end = after.len();
+        for (offset, byte) in after.bytes().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `haystack` contains `needle` as a whole identifier.
+///
+/// So a `feature = "unixsocket"` predicate does not read as a `unix` guard.
+fn mentions_word(haystack: &str, needle: &str) -> bool {
+    let boundary = |byte: Option<u8>| match byte {
+        Some(byte) => !byte.is_ascii_alphanumeric() && byte != b'_',
+        None => true,
+    };
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(needle).any(|(at, _)| {
+        boundary(at.checked_sub(1).map(|before| bytes[before]))
+            && boundary(bytes.get(at + needle.len()).copied())
     })
 }
 
@@ -195,6 +261,69 @@ fn the_guard_recognizes_guarded_and_unguarded_uses() {
         "}",
     ];
     assert!(!is_guarded(&wrong, 2, "std::os::unix"));
+
+    // A NEGATED guard mentions the platform while meaning the opposite. On
+    // Windows `not(unix)` is true and `std::os::unix` does not exist, so
+    // this is precisely the break this test exists to catch - and a plain
+    // substring search accepts it, which is how it went unnoticed.
+    let negated = vec![
+        "#[cfg(not(unix))]",
+        "fn t() {",
+        "    use std::os::unix::fs::symlink;",
+        "}",
+    ];
+    assert!(
+        !is_guarded(&negated, 2, "std::os::unix"),
+        "a negated cfg was accepted as a guard for the thing it excludes"
+    );
+
+    // `not(windows)` is true on wasi too, where `std::os::unix` is also
+    // absent, so it is not a guard for it either.
+    let not_windows = vec![
+        "#[cfg(not(windows))]",
+        "fn t() {",
+        "    use std::os::unix::fs::symlink;",
+        "}",
+    ];
+    assert!(!is_guarded(&not_windows, 2, "std::os::unix"));
+
+    // Compound predicates that DO enable the code still count.
+    for guard in [
+        "#[cfg(all(unix, target_pointer_width = \"64\"))]",
+        "#[cfg(any(unix, windows))]",
+        "#[cfg(all(unix, not(test)))]",
+    ] {
+        let compound = vec![
+            guard,
+            "fn t() {",
+            "    use std::os::unix::fs::symlink;",
+            "}",
+        ];
+        assert!(
+            is_guarded(&compound, 2, "std::os::unix"),
+            "{guard} was not accepted"
+        );
+    }
+
+    // `cfg_attr` is not a compilation guard: it applies another attribute
+    // conditionally and the item compiles everywhere regardless.
+    let cfg_attr = vec![
+        "#[cfg_attr(unix, allow(dead_code))]",
+        "fn t() {",
+        "    use std::os::unix::fs::symlink;",
+        "}",
+    ];
+    assert!(!is_guarded(&cfg_attr, 2, "std::os::unix"));
+
+    // A predicate that merely contains the platform name inside a longer
+    // identifier is not a guard.
+    let lookalike = vec![
+        "#[cfg(feature = \"unixsocket\")]",
+        "fn t() {",
+        "    use std::os::unix::fs::symlink;",
+        "}",
+    ];
+    assert!(!is_guarded(&lookalike, 2, "std::os::unix"));
 
     // An attribute belonging to a more deeply nested item does not count.
     let nested = vec![
