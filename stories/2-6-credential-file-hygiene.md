@@ -233,6 +233,60 @@ so that 明文存储的风险被压到只剩「磁盘被物理读取」这一层
 - **服务器文本清洗补上 27 个 `Cf` 码点**，见 2-1 集成记录第 5 节。凭证文件路径与诊断
   经由 `sanitize_path` / `text::quote`，现在两层读同一张表。
 
+## CI 修复：Windows clippy 在 `file_guard.rs` 上失败
+
+`develop` 上 windows-latest 的 `cargo clippy --workspace --all-targets -- -D warnings` 报了两条：
+
+```
+error: unused import: `File`            crates/otl/src/auth/file_guard.rs:10
+error: variable does not need to be mutable   crates/otl/src/auth/file_guard.rs:136
+```
+
+两处都只在 `#[cfg(not(unix))]` 下失效：`File` 只被 unix 版 `require_private_dir` 用，
+`mut` 只为 unix 分支里的 `builder.mode(DIR_MODE)` 而存在。macOS/Linux 全绿。
+
+**修法不是加 `#[allow]`**：
+- `use std::fs::File` 移进 unix 版 `require_private_dir` 函数体（它本来就有一个局部
+  `use std::os::unix::fs::MetadataExt`）；
+- `DirBuilder` 的构造拆成 `dir_builder()` 的两个 `#[cfg]` 版本——这个文件里**其他每一处**
+  平台差异本来就是这个形状（`classify`、`require_private_dir`、`directory_mode`），
+  唯独这一处用了「一个绑定 + 内嵌 cfg 块」，而这正是它能在 Windows 上出问题的原因。
+  Windows 版的文档注释说明保护来自用户 profile 目录的 ACL，与凭证文件本身同一条依据。
+
+### 为什么没被本地门禁抓到
+
+`file_guard.rs` 是最后一轮把 `secret_file.rs` 拆分时**新建**的文件，拆完没有再跑
+`scripts/win-check.sh`——那个脚本正是为这类问题写的（此前当场抓到过 `Durability::Flushed`
+未构造和一个多余 import）。
+
+已验证脚本本身没有缺口：
+- 把两处错误装回去，`win-check.sh` 复现 CI 的**同样两条**（同文件、同行号 10 与 136）；
+- 在 `#[cfg(test)] mod` 里植入一个未加 guard 的 `use std::os::unix::fs::PermissionsExt`，
+  脚本同样报错——即 `--all-targets` 确实覆盖了 `lib test` 目标（CI 那两条错误分别来自
+  `lib` 与 `lib test`，只查 `lib` 会漏掉测试代码里的同类问题）。
+
+### 让它不容易被忘
+
+根因是**它不在清单上**：README 的 Development 段列了 `cargo test` / `clippy` / `fmt` /
+`bench-startup` / `check-binary-size`，唯独没有 `win-check.sh`。所以：
+
+1. README Development 段加上 `bash scripts/win-check.sh`，并写明为什么它是五条里最容易漏、
+   漏掉代价最大的一条：另外四条都只为当前机器跑，而 `#[cfg(unix)]` 会在 Windows 上留下
+   未使用的 import / `mut` / 整个函数，CI 用同一条 clippy 加 `-D warnings` 把每一条变成
+   构建失败——本地完全看不见，只能主动要求。
+2. `portability.rs` 的模块文档原本声称「把同样的检查搬到了本地门禁」，这句**只对一半成立**：
+   它抓「未加 guard 地引用平台模块」，抓不到「cfg 留下的死代码」——后者是 lint、
+   对 cfg 敏感，判定它就等于为另一个 target 跑一遍编译器。文档改准，并新增
+   `the_windows_cross_check_is_offered_to_developers`：断言脚本还在、还可读、仍然传
+   `--all-targets` 与 `-D warnings`、且仍被 README 的 Development 段点名。
+   它**不**声称「跑过了」（本地无从得知），它守的是**提醒本身不被删掉或改弱**。
+   三条断言各自做了回退验证：删掉 README 那一行、去掉 `--all-targets`、去掉 `-D warnings`，
+   分别变红。
+3. **完成清单**（本 track 之后每一轮都按这个跑）：`cargo fmt --all -- --check`、
+   `cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、
+   **`./scripts/win-check.sh`**、`./scripts/check-binary-size.sh`。
+   规则：**新建或拆分任何带 `#[cfg]` 的文件之后，必须跑 `win-check.sh`。**
+
 ## Dev Agent Record
 
 ### Agent Model Used

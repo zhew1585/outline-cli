@@ -420,9 +420,16 @@ and full-disk encryption.
 cargo test --workspace                                  # unit, wiremock, golden-file, and CLI tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
+bash scripts/win-check.sh                               # lints for Windows from a Unix machine
 bash scripts/bench-startup.sh                           # asserts otl --help stays under 10ms
 bash scripts/check-binary-size.sh                       # asserts the shipped binary stays under 4 MiB
 ```
+
+`win-check.sh` is the one that is easy to skip and expensive to skip. Three of the five commands above
+run for the machine you are on; a `#[cfg(unix)]` block leaves imports, `mut` bindings and whole
+functions unused on Windows, where CI runs the same clippy with `-D warnings` and turns each into a
+build failure. None of that is visible locally, so it has to be asked for — always after splitting or
+adding a file that carries a `cfg`.
 
 Releasing is `git tag`: [`dist-workspace.toml`](dist-workspace.toml) is the single description of every
 distribution channel, and `.github/workflows/release.yml` is generated from it by

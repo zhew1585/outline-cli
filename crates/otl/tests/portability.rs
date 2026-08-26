@@ -13,6 +13,24 @@
 //!
 //! CI does build on Windows and would catch it, but only after a push. This
 //! test moves the same check into the local gate, where the mistake is made.
+//!
+//! # What it does NOT catch
+//!
+//! Only the shape above: a platform module named without a guard. It cannot
+//! see the OTHER half of the same mistake, which is what a `cfg` leaves
+//! BEHIND - an import, a `mut` binding or a whole function that is used only
+//! inside `#[cfg(unix)]` and is therefore dead on Windows. Those are lints,
+//! they are cfg-sensitive, and deciding them means running the compiler for
+//! the other target. This guard would have to reimplement rustc to guess.
+//!
+//! `scripts/win-check.sh` runs that compile (`cargo clippy --target
+//! x86_64-pc-windows-msvc --workspace --all-targets -- -D warnings`), which
+//! is the only thing that does catch them - and it is the local gate that
+//! gets forgotten, because it is the one the other four commands do not
+//! imply. It was forgotten right after `auth/secret_file.rs` was split into
+//! `auth/file_guard.rs`, and Windows CI failed on exactly those two lints in
+//! the new file. [`the_windows_cross_check_is_offered_to_developers`] keeps
+//! the reminder from being deleted; running it is still a human act.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -334,4 +352,47 @@ fn the_guard_recognizes_guarded_and_unguarded_uses() {
         "}",
     ];
     assert!(!is_guarded(&nested, 3, "std::os::unix"));
+}
+
+/// The cross-compile lint, which is the only thing that catches what this
+/// file cannot.
+const WIN_CHECK: &str = "scripts/win-check.sh";
+
+#[test]
+fn the_windows_cross_check_is_offered_to_developers() {
+    // Not "was it run" - nothing local can know that. What this pins is that
+    // the script still exists, is still runnable, and is still named in the
+    // one place a contributor looks for the list of local gates. The failure
+    // it guards against is the quiet one: the script rots or the line in the
+    // README is tidied away, and the next `cfg`-heavy split breaks Windows
+    // with nothing having asked for the check.
+    let root = workspace_root();
+    let script = root.join(WIN_CHECK);
+    assert!(
+        script.is_file(),
+        "{WIN_CHECK} is gone: the lint that catches cfg-only dead code on \
+         Windows now runs nowhere before a push"
+    );
+    let source = std::fs::read_to_string(&script).unwrap();
+    assert!(
+        source.contains("--all-targets"),
+        "{WIN_CHECK} no longer passes --all-targets, so it would miss the \
+         same mistake in test code - which is where it takes the whole \
+         harness down"
+    );
+    assert!(
+        source.contains("-D warnings"),
+        "{WIN_CHECK} no longer denies warnings, so it would not fail on the \
+         unused import and unused mut that Windows CI fails on"
+    );
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    let development = readme
+        .split_once("## Development")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(
+        development.contains(WIN_CHECK),
+        "{WIN_CHECK} is not listed under README's Development section, which \
+         is the checklist it has to be on to be remembered"
+    );
 }

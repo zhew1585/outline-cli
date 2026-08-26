@@ -7,7 +7,7 @@
 //! descriptor, so a path swapped between the check and the use cannot get
 //! past it.
 
-use std::fs::{self, DirBuilder, File};
+use std::fs::{self, DirBuilder};
 use std::path::Path;
 
 use crate::auth::error::StoreError;
@@ -133,18 +133,39 @@ fn create_dir(dir: &Path) -> Result<(), StoreError> {
             fs::create_dir_all(parent).map_err(failed)?;
         }
     }
-    let mut builder = DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(DIR_MODE);
-    }
-    match builder.create(dir) {
+    match dir_builder().create(dir) {
         Ok(()) => Ok(()),
         // Another process won the race; the directory is what matters.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(failed(error)),
     }
+}
+
+/// A `DirBuilder` that creates the directory owner-only.
+///
+/// Two `cfg` functions rather than one function with a `cfg` block inside:
+/// the mode is the only thing that needs `mut`, so a single binding is
+/// `unused_mut` on Windows - which `cargo clippy -- -D warnings` on
+/// windows-latest treats as an error. Every other platform difference in this
+/// module is already shaped this way, and this one being different is what
+/// let it break the Windows build.
+#[cfg(unix)]
+fn dir_builder() -> DirBuilder {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = DirBuilder::new();
+    builder.mode(DIR_MODE);
+    builder
+}
+
+/// A plain `DirBuilder`: Windows has no POSIX bits to ask for.
+///
+/// The directory is protected by the per-user ACL of the profile directory it
+/// is created under, which is the same thing that protects the credential
+/// file there. Stated rather than left implied - see [`Permissions`].
+#[cfg(not(unix))]
+fn dir_builder() -> DirBuilder {
+    DirBuilder::new()
 }
 
 /// Refuse a credential directory anyone but its owner can write to.
@@ -153,6 +174,7 @@ fn create_dir(dir: &Path) -> Result<(), StoreError> {
 /// the subsequent operations will actually use.
 #[cfg(unix)]
 pub fn require_private_dir(dir: &Path) -> Result<(), StoreError> {
+    use std::fs::File;
     use std::os::unix::fs::MetadataExt;
 
     let handle = File::open(dir).map_err(|error| StoreError::Directory {
