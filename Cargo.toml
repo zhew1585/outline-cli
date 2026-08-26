@@ -5,7 +5,7 @@ members = ["crates/engine", "crates/otl"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/weizhesafeheron/outline-cli"
+repository = "https://github.com/zhew1585/outline-cli"
 rust-version = "1.85"
 # Release-pipeline metadata (Story 4.5). The MSI's Manufacturer field is
 # taken from `authors`, and the Homebrew formula's `homepage` from
@@ -13,7 +13,7 @@ rust-version = "1.85"
 # Deliberately no e-mail address: these strings are embedded verbatim in
 # published installer metadata.
 authors = ["weizhe"]
-homepage = "https://github.com/weizhesafeheron/outline-cli"
+homepage = "https://github.com/zhew1585/outline-cli"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

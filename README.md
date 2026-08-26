@@ -21,18 +21,18 @@ contract the release pipeline implements, and they start working with the first 
 **Homebrew** (macOS and Linux):
 
 ```sh
-brew install weizhesafeheron/tap/outline-cli
+brew install zhew1585/tap/outline-cli
 ```
 
 **Shell installer** (macOS and Linux; installs into `$CARGO_HOME/bin`):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/weizhesafeheron/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
+  https://github.com/zhew1585/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
 ```
 
 **Windows**: download `outline-cli-x86_64-pc-windows-msvc.msi` from the
-[latest release](https://github.com/weizhesafeheron/outline-cli/releases/latest) and run it. The MSI adds
+[latest release](https://github.com/zhew1585/outline-cli/releases/latest) and run it. The MSI adds
 `otl` to `PATH` and uninstalls through Settings → Apps like any other Windows program. It is **not
 code-signed** — SmartScreen will warn on first run, and "More info → Run anyway" is the way past it.
 Signing needs a purchased certificate; until there is one, verify the download with the attestation
@@ -53,7 +53,7 @@ it was produced by this repository's release workflow rather than merely that it
 published alongside it:
 
 ```sh
-gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo weizhesafeheron/outline-cli
+gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo zhew1585/outline-cli
 ```
 
 **`otl` never checks for updates.** No telemetry, no update ping, no background spec fetch — the binary
@@ -63,7 +63,7 @@ re-run the shell installer, or install the newer MSI.
 **From source** (Rust stable, `rust-version` 1.85):
 
 ```sh
-git clone https://github.com/weizhesafeheron/outline-cli
+git clone https://github.com/zhew1585/outline-cli
 cd outline-cli
 cargo build --release
 # binary at target/release/otl
