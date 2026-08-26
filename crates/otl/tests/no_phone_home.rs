@@ -7,10 +7,31 @@
 //!
 //! Two layers:
 //!
-//! 1. a source scan proving that only `spec sync` can reach the document
-//!    fetch, and that HTTP lives in exactly two known places in `engine`;
+//! 1. a source scan over `crates/*/src/**`: the document fetch and the
+//!    upstream URL appear only where they belong, the HTTP client crate
+//!    and raw sockets appear only in the two engine channels, each channel
+//!    has exactly one request-sending call, the two channels do not call
+//!    each other, and the document channel's public surface is the
+//!    reviewed one;
 //! 2. a behavioural check that a local command completes with every
 //!    outbound connection pointed at a dead proxy.
+//!
+//! # What this is, and what it is not
+//!
+//! These are REGRESSION GUARDS over this codebase's source text, not a
+//! proof that no request can be made. A string scan does not parse Rust:
+//! a request expressed in a form none of the patterns below name - a
+//! renamed import, a macro, a subprocess, a dependency doing it on our
+//! behalf - would pass. What the guards do guarantee is that the shapes
+//! this codebase actually uses cannot be added silently: a new send site,
+//! a new public entry point in the fetch module, a new HTTP dependency in
+//! any manifest or in `Cargo.lock`, or a raw socket all fail here, and
+//! adding one means editing this file - which is the review these tests
+//! stand in for.
+//!
+//! The invariant they support (not replace) is the one in
+//! `project-context.md`: every outbound request goes through one of the
+//! engine's two channels, and only a command the user typed causes one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -196,8 +217,7 @@ fn allowlisted_files_all_exist() {
 }
 
 /// HTTP clients and TLS backends that must not appear anywhere in the
-/// dependency graph. `hyper` and `rustls` are deliberately absent from the
-/// list: they are reqwest's own.
+/// dependency graph, manifests and lock file alike.
 const FORBIDDEN_CRATES: &[&str] = &[
     "ureq",
     "curl",
@@ -210,6 +230,13 @@ const FORBIDDEN_CRATES: &[&str] = &[
     "openssl-sys",
 ];
 
+/// Crates that legitimately appear in `Cargo.lock` because reqwest brings
+/// them, but that this workspace must not depend on DIRECTLY.
+///
+/// A lock-file scan cannot tell "pulled in by reqwest" from "used by us",
+/// so the distinction is made where it is visible: our own manifests.
+const INDIRECT_ONLY_CRATES: &[&str] = &["hyper", "rustls", "h2", "tokio-rustls"];
+
 /// No new dependency may bring a second HTTP stack or TLS client in
 /// through the back door, which would make the source rules above moot.
 ///
@@ -217,6 +244,11 @@ const FORBIDDEN_CRATES: &[&str] = &[
 /// member crate can declare its own dependencies - and so is `Cargo.lock`,
 /// which is where anything that actually got resolved shows up, including
 /// transitively.
+///
+/// Limits: the forbidden list is the set of stacks worth naming today, not
+/// every HTTP client that exists. A crate nobody listed here would pass -
+/// but it would still have to appear in a manifest diff, and its use would
+/// still have to get past the source rules above.
 #[test]
 fn no_second_http_stack_reaches_the_dependency_graph() {
     let root = workspace_root();
@@ -238,6 +270,31 @@ fn no_second_http_stack_reaches_the_dependency_graph() {
                 manifest.display()
             );
         }
+        // reqwest's own dependencies are fine in the lock file and not
+        // fine as a direct dependency of ours: using one directly means
+        // speaking HTTP or TLS outside the two channels.
+        for indirect in INDIRECT_ONLY_CRATES {
+            // A dependency KEY (`rustls = ...`, `rustls.workspace = true`),
+            // not a feature string inside an array - enabling reqwest's
+            // `rustls` feature is how the TLS backend is chosen, and that
+            // is the point.
+            let declared = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .filter(|line| line.contains('='))
+                .any(|line| {
+                    let trimmed = line.trim_start();
+                    [" ", "=", "."]
+                        .iter()
+                        .any(|separator| trimmed.starts_with(&format!("{indirect}{separator}")))
+                });
+            assert!(
+                !declared,
+                "{indirect:?} is declared directly in {}: it may only arrive \
+                 as a dependency of reqwest",
+                manifest.display()
+            );
+        }
     }
 
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
@@ -250,12 +307,41 @@ fn no_second_http_stack_reaches_the_dependency_graph() {
     }
 }
 
-/// One request-sending call per channel, and no more.
+/// Other ways reqwest can be told to perform a request.
 ///
-/// A file-wide allowlist cannot express "this module makes exactly one
-/// request": a second `.send()`, or a call into the OTHER channel, would
-/// pass it. Counting per file does, and it is the invariant the
-/// single-channel rule actually rests on.
+/// Forbidden INSIDE the two channel files, where a reqwest client is in
+/// scope: each channel sends with `.send()` and nothing else, so that
+/// counting the sends means something. Elsewhere `.execute(` is the
+/// ENGINE's own dispatcher (`client.execute(op, ...)`), which is how a
+/// command is supposed to call the API - and reqwest cannot be reached
+/// from there anyway, because the `reqwest` rule confines it to these two
+/// files.
+const CHANNEL_SEND_APIS: &[&str] = &[
+    ".execute(",
+    "blocking::get(",
+    "reqwest::get(",
+    ".send_with(",
+    "Request::new(",
+];
+
+/// Shapes that name reqwest outright, forbidden everywhere outside the two
+/// channels (the `reqwest` confinement rule covers these too; they are
+/// listed for a clearer failure message).
+const NAMED_REQWEST_SENDS: &[&str] = &["blocking::get(", "reqwest::get("];
+
+/// One request-sending call per channel, and no other way of sending.
+///
+/// Counting is what a file-wide allowlist cannot do: it makes a SECOND
+/// request site inside an already-allowlisted file fail. The alternative
+/// APIs above are forbidden outright, because they would not change the
+/// count.
+///
+/// Limits (see the module docs): this counts a literal `.send()` on a
+/// line. A call split across lines, or built through a renamed alias,
+/// would not be recognised - the count would then fail closed on the
+/// EXPECTED side (a channel with zero recognised sends is also an error),
+/// which is why the expected number is asserted exactly rather than as a
+/// maximum.
 #[test]
 fn each_channel_has_exactly_one_send() {
     for (file, expected) in [
@@ -263,17 +349,38 @@ fn each_channel_has_exactly_one_send() {
         ("crates/engine/src/fetch.rs", 1),
     ] {
         let source = std::fs::read_to_string(workspace_root().join(file)).unwrap();
-        let sends = source
+        let code: Vec<&str> = source
             .lines()
             // Skip doc comments: they discuss the rule.
             .filter(|line| !line.trim_start().starts_with("//"))
-            .filter(|line| line.contains(".send()"))
-            .count();
+            .collect();
+        let sends = code.iter().filter(|line| line.contains(".send()")).count();
         assert_eq!(
             sends, expected,
             "{file} has {sends} `.send()` calls, expected {expected}: each \
              channel must have exactly one place where a request is made"
         );
+        for api in CHANNEL_SEND_APIS {
+            let hits: Vec<&&str> = code.iter().filter(|line| line.contains(api)).collect();
+            assert!(
+                hits.is_empty(),
+                "{file} uses {api:?} ({hits:?}): a channel sends with `.send()` \
+                 and nothing else, so that counting it means something"
+            );
+        }
+    }
+
+    // And nowhere else at all.
+    for (path, source) in runtime_sources() {
+        if path.ends_with("client.rs") || path.ends_with("fetch.rs") {
+            continue;
+        }
+        for api in NAMED_REQWEST_SENDS {
+            assert!(
+                !source.contains(api),
+                "{path} uses {api:?}: only the engine's two channels may send"
+            );
+        }
     }
 }
 
@@ -322,9 +429,14 @@ fn the_two_channels_do_not_compose() {
 /// The document channel's public surface is pinned.
 ///
 /// This is what closes the "add a new entry point inside an allowlisted
-/// file" route: a new `pub fn` there is a new way to make a request, and
-/// it has to be added here deliberately - which is exactly the review this
-/// module is standing in for.
+/// file" route: a new public item there is a new way to make a request,
+/// and it has to be added here deliberately - which is exactly the review
+/// this module is standing in for.
+///
+/// Both directions are checked: nothing unexpected is exported, and
+/// everything expected is still exported (so renaming an item cannot
+/// quietly empty the list). `pub use` is included in the scan, because a
+/// re-export is an entry point too.
 #[test]
 fn the_document_channel_exports_only_what_is_reviewed() {
     const EXPECTED: &[&str] = &[
@@ -344,37 +456,49 @@ fn the_document_channel_exports_only_what_is_reviewed() {
     let exported: Vec<String> = source
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("pub "))
-        // Struct/enum FIELDS are `pub` too but are not entry points.
+        .filter(|line| !line.starts_with("//"))
+        // Every form a public item can start with, `pub use` and
+        // `pub async fn` included. Struct and enum FIELDS are `pub` too,
+        // but they are not entry points, so they are filtered out below by
+        // requiring one of these keywords.
         .filter(|line| {
-            line.starts_with("pub fn")
-                || line.starts_with("pub const")
-                || line.starts_with("pub struct")
-                || line.starts_with("pub enum")
+            [
+                "pub fn ",
+                "pub async fn ",
+                "pub const ",
+                "pub struct ",
+                "pub enum ",
+                "pub use ",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
         })
         .map(|line| {
-            let end = line
-                .find(['(', ':', '<', ' ', '{'].as_ref())
-                .unwrap_or(line.len());
-            let name_end = line[end..]
-                .find(['(', ':', '<', '{'].as_ref())
-                .map_or(line.len(), |offset| end + offset);
-            line[..name_end].trim().to_string()
+            // Keep the declaration head: everything up to the first
+            // delimiter that starts parameters, bounds or a body.
+            let head: String = line
+                .chars()
+                .take_while(|character| !matches!(character, '(' | '<' | '{' | ':' | ';' | '='))
+                .collect();
+            head.trim().to_string()
         })
         .collect();
+
     for item in &exported {
         assert!(
-            EXPECTED.iter().any(|expected| item.starts_with(expected)),
+            EXPECTED.contains(&item.as_str()),
             "fetch.rs exports {item:?}, which is not in the reviewed list: a \
              new public item in the document channel is a new way to make a \
              request"
         );
     }
-    assert!(
-        exported.len() >= EXPECTED.len(),
-        "expected at least {} exports, found {exported:?}",
-        EXPECTED.len()
-    );
+    for expected in EXPECTED {
+        assert!(
+            exported.iter().any(|item| item == expected),
+            "fetch.rs no longer exports {expected:?}: the reviewed list is \
+             stale, so it no longer constrains anything"
+        );
+    }
 }
 
 /// A local command must not need the network at all. Both proxy variables

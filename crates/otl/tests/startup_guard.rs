@@ -33,9 +33,22 @@
 //! time - that is its whole job, and SPEC.md carves it out explicitly. It
 //! never touches the vendored file though: the document arrives from the
 //! network (or from a path the user typed), is compiled once, and is stored
-//! as a bincode IR cache that later commands only deserialize. Every guard
+//! as a framed IR cache that later commands only deserialize. Every guard
 //! below therefore still holds, unchanged: no runtime source locates the
 //! vendored spec, and startup parses no document.
+//!
+//! # What the source scan is, and what it is not
+//!
+//! Layers 1 and 3 are REGRESSION GUARDS over source text, not proofs.
+//! A string scan does not parse Rust, and a path can always be assembled
+//! from pieces - so what the scan actually guarantees is narrower and more
+//! useful than "the spec cannot be read": every way this codebase opens a
+//! file is registered here, at the CALL SITE, and adding an unregistered
+//! one fails. A read performed by a subprocess, by a dependency, or
+//! through an API nobody listed would pass the scan - and would still have
+//! to get past layer 2 (the shipped binary carries neither the spec path
+//! nor its content) and layer 3 (the process works with no spec file
+//! anywhere near it).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -201,20 +214,28 @@ const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
     },
 ];
 
-/// Ways to get at a file's contents. None of them may appear in a runtime
-/// source outside [`FILE_READ_ALLOWLIST`].
+/// Ways to get at a file's contents. Every one of them must appear only
+/// at a registered call site ([`FILE_READ_ALLOWLIST`]).
 ///
 /// This is the rule that makes the literal-string rules above hard to
 /// dodge. A path can always be assembled out of pieces
 /// (`["spec/spec3", ".json"].concat()`), so no amount of substring
 /// matching on path literals is conclusive - but a read still has to go
-/// through one of these, and there are only so many of them. Whoever needs
-/// a new one has to add it here and say why, which is the review this
-/// module stands in for.
+/// through one of these, `.open(` included, which covers the aliases
+/// (`File::options()`, a renamed `OpenOptions`) that name-based matching
+/// would miss.
+///
+/// What this does NOT do: recognise a read performed by a subprocess, a
+/// dependency, or an API added to std after this list was written. It is a
+/// registry of the ways this codebase opens files, and it makes adding an
+/// unregistered one fail - which is the review it stands in for, not a
+/// proof.
 const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
     ("read_to_string", "reading a file by name"),
     ("File::open", "opening a file by name"),
+    ("File::options", "opening a file by name"),
     ("OpenOptions", "opening a file by name"),
+    (".open(", "opening a file, whatever the type is called"),
     ("fs::read", "reading a file by name"),
     // `read_to_end`/`read` on an already-open handle are deliberately NOT
     // here: they are how a response body is read, and getting a FILE handle
@@ -224,19 +245,50 @@ const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
     ("include_bytes!", "embedding a file at compile time"),
 ];
 
-/// Files allowed to read a file at runtime, with the reason.
+/// The registered file-opening call sites, as (file, pattern, line
+/// context).
 ///
-/// All three read a path the USER supplied on the command line, or a file
-/// this process itself wrote. None of them can reach the vendored spec:
-/// that would need a path derived from the build, which
-/// `manifest_dir_absent_from_release_binary` forbids.
-const FILE_READ_ALLOWLIST: &[&str] = &[
-    // The `--spec <PATH>` document, named by the user on the command line.
-    "crates/otl/src/commands/spec.rs",
-    // The `--body @file.json` request body, likewise user-named (Story 1.3).
-    "crates/otl/src/commands/api.rs",
-    // The IR cache, written by this process into its own cache directory.
-    "crates/otl/src/spec/cache.rs",
+/// Per CALL SITE, not per file: a second read added to one of these files
+/// fails the guard, because its line will not match the registered
+/// context. Each entry names what it opens and why that is not the
+/// vendored spec.
+const FILE_READ_ALLOWLIST: &[Exception] = &[
+    // The `--body @file.json` request body, named by the user (Story 1.3).
+    Exception {
+        file: "crates/otl/src/commands/api.rs",
+        pattern: "File::open",
+        context: "let file = File::open(path)",
+    },
+    Exception {
+        file: "crates/otl/src/commands/api.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut raw)",
+    },
+    // The `--spec <PATH>` document, likewise named by the user.
+    Exception {
+        file: "crates/otl/src/commands/spec.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut raw)",
+    },
+    // The one place the runtime opens a path: a watchdogged open used by
+    // both the `--spec` path and the cache.
+    Exception {
+        file: "crates/otl/src/spec/openfile.rs",
+        pattern: "File::open",
+        context: "sender.send(File::open(owned))",
+    },
+    // Test-only, in that module's own tests: opening the write end of a
+    // FIFO so the blocked worker thread finishes.
+    Exception {
+        file: "crates/otl/src/spec/openfile.rs",
+        pattern: "OpenOptions",
+        context: "let _writer",
+    },
+    Exception {
+        file: "crates/otl/src/spec/openfile.rs",
+        pattern: ".open(",
+        context: "let _writer",
+    },
 ];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
@@ -290,6 +342,21 @@ fn unexcused_lines<'a>(file: &Path, source: &'a str, pattern: &str) -> Vec<&'a s
         .collect()
 }
 
+/// Code lines containing `pattern` that no registered call site covers.
+fn unexcused_read_lines<'a>(file: &Path, source: &'a str, pattern: &str) -> Vec<&'a str> {
+    let path = relative(file);
+    let sites: Vec<&Exception> = FILE_READ_ALLOWLIST
+        .iter()
+        .filter(|entry| entry.pattern == pattern && path.ends_with(entry.file))
+        .collect();
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| line.contains(pattern))
+        .filter(|line| !sites.iter().any(|entry| line.contains(entry.context)))
+        .collect()
+}
+
 #[test]
 fn runtime_sources_never_reach_for_the_spec() {
     let mut violations = Vec::new();
@@ -304,14 +371,17 @@ fn runtime_sources_never_reach_for_the_spec() {
                 ));
             }
         }
-        let path = relative(&file);
         for (pattern, reason) in FORBIDDEN_FILE_READS {
-            if source.contains(pattern)
-                && !FILE_READ_ALLOWLIST
-                    .iter()
-                    .any(|allowed| path.ends_with(allowed))
-            {
-                violations.push(format!("  {}: {pattern} - {reason}", file.display()));
+            // Comment lines are skipped for THIS family only: a comment
+            // cannot open a file, and these modules have to be able to
+            // explain themselves. The spec-path patterns above deliberately
+            // do scan comments, because there a mention is worth reviewing.
+            for line in unexcused_read_lines(&file, &source, pattern) {
+                violations.push(format!(
+                    "  {}: {pattern} - {reason}\n    at: {}",
+                    file.display(),
+                    line.trim()
+                ));
             }
         }
     }
