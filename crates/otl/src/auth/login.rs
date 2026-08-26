@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use reqwest::blocking::Client as HttpClient;
 
+use crate::auth::client_acquisition::acquire_client;
 use crate::auth::credentials::{ClientRegistration, CredentialFile, CredentialStore, OAuthSession};
 use crate::auth::error::{OAuthError, Stage};
 use crate::auth::loopback::{self, CallbackServer};
@@ -96,10 +97,10 @@ pub struct Outcome {
 }
 
 /// The bound callback listener plus the client it belongs to.
-struct Acquired {
-    registration: ClientRegistration,
-    server: CallbackServer,
-    source: ClientSource,
+pub struct Acquired {
+    pub registration: ClientRegistration,
+    pub server: CallbackServer,
+    pub source: ClientSource,
 }
 
 /// Run the whole login flow.
@@ -132,8 +133,30 @@ pub fn run(
     let tokens = authorize(&http, &metadata, &acquired, options)?;
     let session = build_session(&metadata, &acquired.registration, tokens);
     let scope = session.scope.clone();
+    let access_token = session.access_token.clone();
+    if let Err(error) = persist_session(store, profile, origin, &acquired, session) {
+        return Err(abandon(&http, &acquired, error));
+    }
+
+    let identity = capture_identity(base_url, profile, origin, store, &access_token);
+    Ok(Outcome {
+        identity,
+        scope,
+        client_source: acquired.source,
+        credential_path: store.path().to_path_buf(),
+    })
+}
+
+/// Store the session these tokens belong to, if the profile is still ours.
+fn persist_session(
+    store: &CredentialStore,
+    profile: &str,
+    origin: &str,
+    acquired: &Acquired,
+    session: OAuthSession,
+) -> Result<(), AuthError> {
     let registration = acquired.registration.clone();
-    let claimed = store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+    store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
         crate::auth::ensure_bindable(file.profile(profile), profile, origin)?;
         // The client on disk must still be the one these tokens were issued
         // for. A concurrent login that finished first owns the profile now,
@@ -147,17 +170,6 @@ pub fn run(
         entry.client = Some(registration.clone());
         entry.oauth = Some(session);
         Ok(())
-    });
-    if let Err(error) = claimed {
-        return Err(abandon(&http, &acquired, error));
-    }
-
-    let identity = capture_identity(base_url, profile, origin, store);
-    Ok(Outcome {
-        identity,
-        scope,
-        client_source: acquired.source,
-        credential_path: store.path().to_path_buf(),
     })
 }
 
@@ -313,169 +325,8 @@ fn abandon(http: &HttpClient, acquired: &Acquired, cause: AuthError) -> AuthErro
 /// application - but it IS server-controlled text arriving on a terminal.
 /// Without this, a hostile registration endpoint could return a client id
 /// containing newlines or escape sequences and forge diagnostic lines.
-fn display_client_id(client_id: &str) -> String {
+pub fn display_client_id(client_id: &str) -> String {
     engine::sanitize::clean_server_text(client_id, "", false, MAX_CLIENT_ID_CHARS)
-}
-
-/// Pick the OAuth client to use and bind its callback port.
-fn acquire_client(
-    http: &HttpClient,
-    metadata: &Metadata,
-    origin: &str,
-    file: &CredentialFile,
-    profile: &str,
-    options: &Options,
-) -> Result<Acquired, AuthError> {
-    if let Some(client_id) = &options.client_id {
-        let server = CallbackServer::bind_fixed()?;
-        return Ok(Acquired {
-            registration: administered(client_id, server.redirect_uri(), origin),
-            server,
-            source: ClientSource::Provided,
-        });
-    }
-    if let Some(cached) = cached_for(file, profile, origin) {
-        match rebind(&cached) {
-            Some(server) => {
-                let mut registration = cached;
-                registration.redirect_uri = server.redirect_uri().to_string();
-                return Ok(Acquired {
-                    registration,
-                    server,
-                    source: ClientSource::Cached,
-                });
-            }
-            // A dynamic client is pinned to its exact redirect URI, so a
-            // port we can no longer bind makes the registration unusable.
-            // It has to come off the server BEFORE a replacement is
-            // created, because creating one overwrites the only credential
-            // that could ever delete it.
-            None => retire(http, &cached, options.force_new_client)?,
-        }
-    }
-    register_new(http, metadata, origin)
-}
-
-/// The registration recorded for this profile and instance, if reusable.
-fn cached_for(file: &CredentialFile, profile: &str, origin: &str) -> Option<ClientRegistration> {
-    let cached = file.profile(profile)?.client.clone()?;
-    match cached.origin.as_deref() {
-        Some(recorded) if recorded != origin => {
-            stdio::write_diagnostic_line(&format!(
-                "notice: the stored client registration for profile {profile:?} \
-                 belongs to {recorded}, not {origin}; registering a new one. \
-                 Run `otl auth logout --purge` against {recorded} to remove the \
-                 old registration there."
-            ));
-            None
-        }
-        _ => Some(cached),
-    }
-}
-
-/// Bind the callback port a cached registration needs.
-fn rebind(cached: &ClientRegistration) -> Option<CallbackServer> {
-    if !cached.dynamic {
-        // An administrator registered every documented port, so any free
-        // one will do.
-        return CallbackServer::bind_fixed().ok();
-    }
-    let port = loopback::port_of(&cached.redirect_uri)?;
-    CallbackServer::bind_port(port).ok()
-}
-
-/// Remove a dynamic registration that can no longer be used.
-///
-/// Registering a replacement overwrites the stored
-/// `registration_access_token`, which is the ONLY way to delete the old
-/// registration - Outline's admin UI cannot. So this must succeed before a
-/// replacement is created, and a failure stops the flow instead of trading
-/// a working login for a permanent orphan.
-///
-/// `forced` is the user saying, explicitly, that they accept the orphan.
-fn retire(
-    http: &HttpClient,
-    registration: &ClientRegistration,
-    forced: bool,
-) -> Result<(), AuthError> {
-    if !registration.dynamic {
-        // Nothing on the server belongs to us; the local record is just a
-        // cached client id.
-        return Ok(());
-    }
-    let port = loopback::port_of(&registration.redirect_uri)
-        .map(|port| port.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let failure = match dcr::delete(http, registration) {
-        Ok(true) => {
-            stdio::write_diagnostic_line(
-                "notice: the stored client registration's callback port is no \
-                 longer available; it has been removed from the server and \
-                 will be replaced.",
-            );
-            return Ok(());
-        }
-        Ok(false) => "the server issued no management token for it".to_string(),
-        Err(error) => error.to_string(),
-    };
-    if !forced {
-        return Err(AuthError::OAuth(OAuthError::RetireFailed {
-            port,
-            reason: failure,
-        }));
-    }
-    stdio::write_diagnostic_line(&format!(
-        "warning: --force-new-client was given, so the old registration \
-         (client {client}) is being abandoned rather than deleted \
-         ({failure}). Ask an admin to remove it under Settings -> \
-         Applications.",
-        client = display_client_id(&registration.client_id)
-    ));
-    Ok(())
-}
-
-/// Register `otl` as a new public client.
-fn register_new(
-    http: &HttpClient,
-    metadata: &Metadata,
-    origin: &str,
-) -> Result<Acquired, AuthError> {
-    let Some(endpoint) = metadata.registration_endpoint.as_deref() else {
-        return Err(AuthError::OAuth(unavailable()));
-    };
-    // Bind first, register the exact port second.
-    let server = CallbackServer::bind_ephemeral()?;
-    let registration = match dcr::register(http, endpoint, server.redirect_uri(), origin) {
-        Ok(registration) => registration,
-        Err(error) if error.is_not_found() => return Err(AuthError::OAuth(unavailable())),
-        Err(error) => return Err(AuthError::OAuth(error)),
-    };
-    Ok(Acquired {
-        registration,
-        server,
-        source: ClientSource::Registered,
-    })
-}
-
-/// The fallback guidance when dynamic registration is not on offer.
-fn unavailable() -> OAuthError {
-    OAuthError::RegistrationUnavailable {
-        redirect_uri: loopback::documented_redirect_uris().join("\n\x20 "),
-    }
-}
-
-/// A client id an administrator created, recorded so a later login can
-/// reuse it without the flag.
-fn administered(client_id: &str, redirect_uri: &str, origin: &str) -> ClientRegistration {
-    ClientRegistration {
-        client_id: client_id.to_string(),
-        client_secret: None,
-        registration_access_token: None,
-        registration_client_uri: None,
-        redirect_uri: redirect_uri.to_string(),
-        dynamic: false,
-        origin: Some(origin.to_string()),
-    }
 }
 
 /// Send the user through the browser and exchange the resulting code.
@@ -562,6 +413,7 @@ fn capture_identity(
     profile: &str,
     origin: &str,
     store: &CredentialStore,
+    access_token: &str,
 ) -> Option<Identity> {
     let identity = match query_identity(base_url, profile, origin, store) {
         Ok(identity) => identity,
@@ -573,7 +425,7 @@ fn capture_identity(
             return None;
         }
     };
-    if let Err(error) = record_identity(profile, store, &identity) {
+    if let Err(error) = record_identity(profile, store, &identity, access_token) {
         stdio::write_diagnostic_line(&format!(
             "notice: signed in, but your name could not be cached for \
              `otl auth info` ({error})"
@@ -605,11 +457,21 @@ fn record_identity(
     profile: &str,
     store: &CredentialStore,
     identity: &Identity,
+    access_token: &str,
 ) -> Result<(), AuthError> {
     store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
-        if let Some(session) = file.profile_mut(profile).oauth.as_mut() {
-            session.account = identity.account();
-            session.workspace = identity.workspace.clone();
+        // Only label the session THIS login wrote. A full `auth.info` round
+        // trip separates the session write from this one, and a concurrent
+        // login can land in between - labelling its session with our
+        // identity would make `otl auth info` confidently report the wrong
+        // account for the token actually in use. Same rule as
+        // `claim_client` here and `clear_if_unchanged` in logout.
+        match file.profile_mut(profile).oauth.as_mut() {
+            Some(session) if session.access_token == access_token => {
+                session.account = identity.account();
+                session.workspace = identity.workspace.clone();
+            }
+            _ => {}
         }
         Ok(())
     })
@@ -618,6 +480,60 @@ fn record_identity(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn identity_labels_only_land_on_the_session_this_login_wrote() {
+        // R3 [32]: `record_identity` runs after a full `auth.info` round
+        // trip, so a concurrent login can replace the session in between.
+        // Labelling whatever is on disk would make `otl auth info` report
+        // the wrong account for the token actually in use.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::at(dir.path().to_path_buf());
+        let mut file = CredentialFile::default();
+        let entry = file.profile_mut("default");
+        entry.origin = Some("https://docs.example.com".to_string());
+        entry.oauth = Some(OAuthSession {
+            access_token: "written-by-another-login".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scope: None,
+            client_id: "c".to_string(),
+            token_endpoint: "https://docs.example.com/oauth/token".to_string(),
+            revocation_endpoint: None,
+            account: None,
+            workspace: None,
+        });
+        store.save(&file).unwrap();
+
+        let identity = Identity {
+            user: Some("Ours".to_string()),
+            email: None,
+            workspace: Some("Our workspace".to_string()),
+        };
+        record_identity("default", &store, &identity, "the-token-we-wrote").unwrap();
+
+        let after = store.load().unwrap();
+        let session = after.profile("default").unwrap().oauth.as_ref().unwrap();
+        assert!(
+            session.account.is_none(),
+            "another login's session was labelled with our identity"
+        );
+
+        // And it does label its own.
+        record_identity("default", &store, &identity, "written-by-another-login").unwrap();
+        let after = store.load().unwrap();
+        assert_eq!(
+            after
+                .profile("default")
+                .unwrap()
+                .oauth
+                .as_ref()
+                .unwrap()
+                .account
+                .as_deref(),
+            Some("Ours")
+        );
+    }
 
     use super::*;
 
@@ -655,52 +571,16 @@ mod tests {
     }
 
     #[test]
-    fn a_provided_client_id_is_recorded_as_not_dynamic() {
-        let registration = administered(
-            "admin-client",
-            "http://127.0.0.1:8586/callback",
-            "https://docs.example.com",
-        );
-        assert!(
-            !registration.dynamic,
-            "an administrator's client must never be deleted by --purge"
-        );
-        assert!(registration.registration_access_token.is_none());
-        assert_eq!(
-            registration.origin.as_deref(),
-            Some("https://docs.example.com")
-        );
-    }
-
-    #[test]
-    fn a_cached_registration_for_another_instance_is_not_reused() {
-        let mut file = CredentialFile::default();
-        file.profile_mut("default").client = Some(administered(
-            "c",
-            "http://127.0.0.1:8586/callback",
-            "https://other.example.com",
-        ));
-        assert!(
-            cached_for(&file, "default", "https://docs.example.com").is_none(),
-            "a client id from another instance must not be reused"
-        );
-        assert!(cached_for(&file, "default", "https://other.example.com").is_some());
-    }
-
-    #[test]
-    fn the_dcr_fallback_lists_every_documented_redirect_uri() {
-        let text = unavailable().to_string();
-        for port in loopback::CALLBACK_PORTS {
-            assert!(
-                text.contains(&format!("127.0.0.1:{port}/callback")),
-                "port {port} missing from the admin instructions: {text}"
-            );
-        }
-    }
-
-    #[test]
     fn a_session_captures_the_endpoints_a_later_refresh_needs() {
-        let registration = administered("c", "http://127.0.0.1:8586/callback", "https://d.example");
+        let registration = ClientRegistration {
+            client_id: "c".to_string(),
+            client_secret: None,
+            registration_access_token: None,
+            registration_client_uri: None,
+            redirect_uri: "http://127.0.0.1:8586/callback".to_string(),
+            dynamic: false,
+            origin: Some("https://d.example".to_string()),
+        };
         let mut meta = metadata(&[], true);
         meta.revocation_endpoint = Some("https://docs.example.com/oauth/revoke".to_string());
         let session = build_session(

@@ -80,7 +80,12 @@ so that 两种认证方式都有一等体验。
   （两次都必要：另一进程可能在提示打开期间绑定该 profile）。
 - **第二道防线：session 自证来源**。`ProfileCredentials::session_origin()` 从登录时记录的
   `token_endpoint` 推导 session 自己的 origin（discovery 当时已校验过同源），`check_binding` 额外比对它。
-  即便 `profile.origin` 被手工改写或被将来某条忘记加守卫的写路径改写，那个 session 也**不可用**而非危险。
+  **边界（R3 审查者划清，记在这里以免被误用）**：
+  它只覆盖 **OAuth session**——stored API key 没有任何等价机制，因为一个 key 不携带来源信息。
+  而且 `token_endpoint` 同样来自磁盘，所以它**不是**对「能任意编辑凭证文件的攻击者」的防线
+  （那种攻击者本来就能直接读走 token）。它真正的价值是对**代码 bug** 的第二层：
+  任何未来只改写 `profile.origin` 而忘记清理其余凭证的写路径，都会得到「不可用」而非「危险」。
+  **不能当作 `ensure_bindable` 的替代品**——写入侧的守卫才是主防线。
 
 ### R1 审查后的修正
 

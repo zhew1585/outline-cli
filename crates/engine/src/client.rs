@@ -653,38 +653,45 @@ fn extract_error_parts(
     if detail == ErrorDetail::CodeOnly {
         return withheld_parts(parsed.as_ref(), secrets);
     }
-    // Whether a piece of text may itself be cut mid-way governs the
-    // cap-tail treatment. A body that PARSED is complete no matter how it
-    // was capped - JSON tolerates unlimited trailing whitespace, so a
-    // complete envelope can sit inside a capped body - and dropping the
-    // last word of a complete field would corrupt a legitimate diagnostic
-    // for no security gain. The skeleton smuggling check still applies to
-    // every field either way.
-    let parts = match parsed {
-        Some(json) => {
-            let clean = |text: &str, cap: usize| clean_server_text_for(text, secrets, false, cap);
-            ApiErrorParts {
-                code: json
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(|code| clean(code, MAX_ERROR_CODE_CHARS))
-                    .filter(|code| !code.is_empty()),
-                message: json
-                    .get("message")
-                    .or_else(|| json.get("error"))
-                    .and_then(Value::as_str)
-                    .map(|message| clean(message, MAX_ERROR_MESSAGE_CHARS))
-                    .unwrap_or_default(),
-            }
-        }
+    fallback(surfaced_parts(parsed.as_ref(), &body, capped, secrets))
+}
+
+/// Pull the code and message out of an error body that may be shown.
+///
+/// Whether a piece of text may itself be cut mid-way governs the cap-tail
+/// treatment. A body that PARSED is complete no matter how it was capped -
+/// JSON tolerates unlimited trailing whitespace, so a complete envelope can
+/// sit inside a capped body - and dropping the last word of a complete
+/// field would corrupt a legitimate diagnostic for no security gain. The
+/// fragment check still applies to every field either way.
+fn surfaced_parts(
+    parsed: Option<&Value>,
+    body: &str,
+    capped: bool,
+    secrets: &[&str],
+) -> ApiErrorParts {
+    let Some(json) = parsed else {
         // Raw text straight out of the body: this is the only text that a
         // read cap can have cut mid-token.
-        None => ApiErrorParts {
+        return ApiErrorParts {
             code: None,
-            message: clean_server_text_for(&body, secrets, capped, MAX_ERROR_MESSAGE_CHARS),
-        },
+            message: clean_server_text_for(body, secrets, capped, MAX_ERROR_MESSAGE_CHARS),
+        };
     };
-    fallback(parts)
+    let clean = |text: &str, cap: usize| clean_server_text_for(text, secrets, false, cap);
+    ApiErrorParts {
+        code: json
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|code| clean(code, MAX_ERROR_CODE_CHARS))
+            .filter(|code| !code.is_empty()),
+        message: json
+            .get("message")
+            .or_else(|| json.get("error"))
+            .and_then(Value::as_str)
+            .map(|message| clean(message, MAX_ERROR_MESSAGE_CHARS))
+            .unwrap_or_default(),
+    }
 }
 
 /// Describe an error response without repeating any free-form text.

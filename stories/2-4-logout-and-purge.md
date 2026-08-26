@@ -49,6 +49,29 @@ so that 服务器与本地都不残留。
 
 ## Dev Notes
 
+### R3 审查后的修正（§1 / [26] / [28]）
+
+审查者同意「本地移除绝不能被阻塞」这个方向，但指出 R2 的实现把它变成了**单向损坏**：
+破坏性的一半（本地删除）无条件执行，补救性的一半（撤销）却锚在 `OUTLINE_URL` 上。
+锚点不一致，于是指错实例时净效果是纯损失，还 exit 0。三条都改了：
+
+- **撤销锚到 session 自己记录的 origin**（`session_origin()`，即 token_endpoint 的 origin），
+  不再锚到环境变量。`dcr::delete` 早就是这么做的——同一条命令里 DCR 删除跨实例成功、
+  token 撤销被拒，正好证明正确的锚点已经存在、只是没用在撤销上。
+  把 A 的 token 撤销到 A 不向 B 泄露任何东西；同源校验要防的是被篡改的文件，
+  而那个基准是凭证自证的 issuer，不是用户可以随便指的环境变量。
+- **撤销失败进入退出码**。新增 `Report::unrevocable`（无法重试：没有撤销端点／端点不可用）
+  与 `Report::retryable`（可以重试：端点存在但这次失败），两者都置 `remote_cleanup_failed` → exit 3。
+  R2 里三条撤销失败分支**一条都没有**置这个标志，于是模块自述的
+  「anything that fails is reported... and the exit code says so」对撤销路径是假的。
+- **logout 不再走 `instance_origin` 传输门**。它根本不需要 base_url——要联系的 URL 全在凭证文件里。
+  新增 `open_store_without_instance()`。绑定在明文 http 上的 profile（早于本规则、或从别的机器拷来）
+  以前 `logout` 直接 exit 2，用户只能手删文件、连 RAT 一起丢、把 DCR 注册变永久孤儿——
+  正是 project-context DON'T-MISS 条款要防的终局。
+- **默认不做不可逆的事**（审查者 §1.4 第 4 点）。可重试的失败**保留**本地凭证并 exit 3；
+  `--force` 是用户明说「我知道这些撤不掉了，还是删」。`--force` 同样覆盖注册记录，
+  并在警告里点名那个孤儿 client id——否则用户还是只能 `rm`，那是更糟的静默版本。
+
 ### R2 审查后的修正（MAJOR [20]）
 
 - **清理决定只应用到本次真正操作过的那个对象**。R1 的 logout 用**网络之前**的快照决定删什么，

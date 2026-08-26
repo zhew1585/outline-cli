@@ -109,6 +109,28 @@ so that 明文存储的风险被压到只剩「磁盘被物理读取」这一层
   既有的 Epic 1 测试也补上了同样的隔离（指向一个不存在的目录），否则本机存在凭证文件时它们的
   「缺 OUTLINE_API_KEY」断言会变得依赖环境。
 
+### R3 审查后的修正
+
+- **回调改为并发处理**（[13] PARTIAL / [27] MAJOR）。R2 删掉了连接预算、用「暂停即是界」钳住
+  迭代次数，那半边成立；但真正的危害换了机制仍然可达：**单线程串行 accept + 每连接 10s 读窗**，
+  握手后一个字节都不发的连接就能占住唯一的 reader，浏览器回调排在后面。审查者用 out-of-tree
+  harness 实测 `stalled=3, budget=25s -> LOGIN FAILED`；按同一算式 240s 只需 24 条静默连接。
+  现在每条连接交给自己的 worker 线程（回调是单次事件，不需要串行），读窗降到 2s，
+  并发上限 `MAX_LIVE_HANDLERS = 64` 且超限直接丢弃而非排队——排队才会吃掉 deadline。
+  R2 那个 60 个 favicon 的测试**按构造抓不到这个**（快连接不占读窗），新测试用 8 条**保持静默不关闭**
+  的连接 + 6s 预算（串行下需要 16s），算术上只有并发才可能通过。
+- **hygiene 守卫扩到函数长度与嵌套层数**（[30]）。R2 只实现了三条铁律里的一条，
+  而写那条守卫的同一个提交就违反了另一条。守卫现在同时检查文件行数、函数行数、嵌套深度，
+  并且**能看到 impl 块里的方法**（第一版只认顶层函数，会漏掉这个代码库的大部分代码，
+  给出一个令人安心的空结果）。修掉了 4 处生产代码违规：`login::run`、`errors::classify`、
+  `client::extract_error_parts`、`paginate::fetch_all_pages`。
+  **有意的收窄（这次写明）**：函数长度/嵌套只管 `src/`，测试函数豁免——那条规则约束的是
+  「改动一个函数时要在脑子里装多少东西」，而测试是没有分支的线性脚本，拆成 helper 往往反而
+  毁掉让它可读的那条叙事线。文件行数**不豁免测试**：1500 行的文件不论装什么都难导航。
+- **超限测试文件已拆**：`auth_oauth_e2e.rs`（1667 行）拆成 `auth_login_e2e` / `auth_refresh_e2e` /
+  `auth_logout_e2e` + 共享 `oauth_harness`；`engine/tests/pagination.rs`（1264 行）拆成
+  `pagination`（核心翻页）+ `pagination_echo`（服务器谎报 offset/hint/descriptor）+ 共享 `paging_harness`。
+
 ### R2 审查后的修正
 
 - **回调连接预算彻底取消**（[13] NOT FIXED → fixed）。R1 只钳制了总 deadline 与单连接 read window，

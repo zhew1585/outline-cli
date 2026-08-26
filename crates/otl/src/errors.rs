@@ -79,10 +79,21 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
             code,
             message,
         } => classify_api(*status, code.as_deref(), message),
+        other => classify_local(other),
+    }
+}
+
+/// Classify the errors that never reached the network, plus the ones whose
+/// class does not depend on any server response.
+///
+/// Split out of [`classify`] only to keep both within the project's
+/// function-length rule; the arms are still listed one by one on purpose, so
+/// a new engine variant must fail to compile here rather than silently
+/// inherit a class.
+fn classify_local(error: &EngineError) -> (ExitCode, String) {
+    match error {
         // Local validation: rejected before a single byte went on the wire,
         // so these are usage errors (exit code 2) like a bad flag would be.
-        // Listed one by one on purpose: a new engine variant must fail to
-        // compile here rather than silently inherit a class.
         EngineError::UnknownParam { .. }
         | EngineError::MissingParam { .. }
         | EngineError::ComplexParam { .. }
@@ -101,12 +112,17 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
         // A server that breaks its own pagination contract mid-fetch, or a
         // descriptor that cannot be used: both are "the result is not
         // trustworthy", never a partial success.
-        EngineError::Pagination { .. } | EngineError::InvalidPaginationSpec { .. } => {
-            (ExitCode::Failure, error.to_string())
-        }
-        EngineError::ClientBuild(_) | EngineError::InvalidResponse { .. } => {
-            (ExitCode::Failure, error.to_string())
-        }
+        EngineError::Pagination { .. }
+        | EngineError::InvalidPaginationSpec { .. }
+        | EngineError::ClientBuild(_)
+        | EngineError::InvalidResponse { .. } => (ExitCode::Failure, error.to_string()),
+        // Handled by `classify`; listed so the match stays exhaustive and a
+        // new variant still breaks the build.
+        EngineError::Credential(_)
+        | EngineError::InvalidBaseUrl { .. }
+        | EngineError::InvalidRequest { .. }
+        | EngineError::Transport { .. }
+        | EngineError::Api { .. } => (ExitCode::Failure, error.to_string()),
     }
 }
 

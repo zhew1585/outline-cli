@@ -15,6 +15,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use reqwest::Url;
@@ -42,22 +44,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Longest a single connection may take to send its request line.
 ///
-/// Also clamped to whatever is left of the overall deadline, so a slow
-/// client cannot extend the login past the timeout the user was promised.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Short on purpose. Concurrency already stops a stalled connection from
+/// delaying the real redirect, so this only bounds how long one worker
+/// thread lingers. A browser that has opened a connection sends its request
+/// line immediately.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum bytes read from one request line.
 const MAX_REQUEST_LINE_BYTES: u64 = 8 * 1024;
 
-/// Pause applied after any connection that did not carry the redirect.
+/// Most connections served at once.
 ///
-/// This is what bounds the loop: the DEADLINE is the only thing that ends
-/// the wait, and every unproductive connection costs at least this long, so
-/// the iteration count can never exceed `timeout / EMPTY_CONNECTION_BACKOFF`
-/// however fast a peer connects. A fixed connection budget was tried first
-/// and was wrong: a local process could spend it on stray requests and make
-/// the login fail before the user had finished consenting.
-const EMPTY_CONNECTION_BACKOFF: Duration = Duration::from_millis(5);
+/// A ceiling on threads, not on the login: handlers are short-lived
+/// (bounded by [`READ_TIMEOUT`]), so the cap frees continuously and a peer
+/// cannot hold it. Beyond it a connection is dropped unread, which costs a
+/// browser a retry - unlike queueing it, which would cost the login its
+/// deadline.
+const MAX_LIVE_HANDLERS: usize = 64;
 
 /// Every redirect URI an administrator must allow when pre-registering an
 /// application, in the order `otl` tries them.
@@ -152,131 +155,162 @@ impl CallbackServer {
     /// `state` is compared before the code is even read out of the query:
     /// a redirect that did not come from this login attempt must not have
     /// its code exchanged, whatever else it carries.
+    ///
+    /// **Each connection is served on its own thread.** Reading a request
+    /// serially was the flaw: a peer that completes a TCP handshake and
+    /// then sends nothing holds the single reader for its whole read
+    /// window, and the browser's redirect waits behind it in the accept
+    /// queue. At the previous 10s window, 24 silent connections were enough
+    /// to consume a 240s login - and no privilege is needed, since
+    /// 127.0.0.1 accepts connections from every user on the machine.
+    /// Ordinary browsers cause a milder version of the same thing with
+    /// prefetch and keep-alive connections that go quiet.
+    ///
+    /// Concurrency removes the head-of-line blocking outright: a stalled
+    /// connection now occupies one short-lived thread and nothing else, and
+    /// the real redirect is handled the moment it arrives.
     pub fn wait_for_code(&self, state: &str, timeout: Duration) -> Result<String, OAuthError> {
         let deadline = Instant::now() + timeout;
-        // Bounded by the deadline and NOTHING ELSE. Browsers send stray
-        // requests (favicon, prefetch, connection reuse) that must be
-        // answered and ignored, and any local process can send more; a
-        // connection budget would let that end the login early, which is a
-        // denial of service handed to every unprivileged user on the box.
+        let (sender, outcomes) = mpsc::channel();
+        let live = Arc::new(AtomicUsize::new(0));
         while Instant::now() < deadline {
-            let stream = self.accept_before(deadline, timeout)?;
-            let handled = self.handle(&stream, state, deadline);
-            match handled {
-                Some(outcome) => return outcome,
-                // Not the redirect. Answer, pause, keep waiting: the pause
-                // is what stops a peer that connects and closes in a tight
-                // loop from spinning this thread at full speed, and it is
-                // what bounds the iteration count.
-                None => std::thread::sleep(EMPTY_CONNECTION_BACKOFF),
+            if let Some(outcome) = collect(&outcomes) {
+                return outcome;
             }
+            let Some(stream) = self.accept_now()? else {
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            };
+            self.serve(stream, state, &sender, &live);
         }
-        Err(OAuthError::CallbackTimeout {
+        // Drain anything a handler produced in the final moments.
+        collect(&outcomes).unwrap_or(Err(OAuthError::CallbackTimeout {
             seconds: timeout.as_secs(),
-        })
+        }))
     }
 
-    /// Serve one connection: `Some` when it was the redirect (successfully
-    /// or not), `None` when it was anything else and the wait continues.
-    fn handle(
+    /// Hand one connection to a worker thread.
+    ///
+    /// Above [`MAX_LIVE_HANDLERS`] the connection is dropped unread rather
+    /// than queued: unbounded thread spawning is its own denial of service,
+    /// and a dropped connection costs a browser a retry while a queued one
+    /// would cost the login its deadline. Handlers are short-lived, so the
+    /// cap frees continuously.
+    fn serve(
         &self,
-        stream: &TcpStream,
+        stream: TcpStream,
         state: &str,
-        deadline: Instant,
-    ) -> Option<Result<String, OAuthError>> {
-        let Some(target) = read_request_target(stream, deadline) else {
-            respond(stream, "400 Bad Request", "Malformed request.");
-            return None;
-        };
-        let Some(redirect) = parse_redirect(&target) else {
-            // A stray request: answer it and keep waiting for the real one.
-            respond(stream, "404 Not Found", "Not the otl callback.");
-            return None;
-        };
-        Some(self.finish(stream, redirect, state))
+        sender: &mpsc::Sender<Result<String, OAuthError>>,
+        live: &Arc<AtomicUsize>,
+    ) {
+        if live.load(Ordering::SeqCst) >= MAX_LIVE_HANDLERS {
+            return;
+        }
+        live.fetch_add(1, Ordering::SeqCst);
+        let expected = state.to_string();
+        let sender = sender.clone();
+        let held = Arc::clone(live);
+        let spawned = std::thread::Builder::new()
+            .name("otl-oauth-callback".to_string())
+            .spawn(move || {
+                if let Some(outcome) = handle(&stream, &expected) {
+                    // A departed receiver just means the login already
+                    // finished; there is nothing left to report to.
+                    let _ = sender.send(outcome);
+                }
+                held.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            live.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
-    /// Validate one redirect and turn it into a code or a typed failure.
-    fn finish(
-        &self,
-        stream: &TcpStream,
-        redirect: Redirect,
-        expected_state: &str,
-    ) -> Result<String, OAuthError> {
-        // State first: nothing else in the query may be acted on until the
-        // redirect is known to belong to this login.
-        if redirect.state.as_deref() != Some(expected_state) {
-            respond(
-                stream,
-                "400 Bad Request",
-                "State mismatch: this redirect did not come from the otl login \
-                 that is running. Nothing was exchanged.",
-            );
-            return Err(OAuthError::StateMismatch);
+    /// Accept a connection if one is waiting, without blocking.
+    fn accept_now(&self) -> Result<Option<TcpStream>, OAuthError> {
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                // Blocking for this connection's own thread, bounded by its
+                // own read timeout rather than by the login's deadline.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
+                Ok(Some(stream))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(OAuthError::Callback {
+                reason: format!("cannot accept the browser redirect ({error})"),
+            }),
         }
-        if let Some(code) = redirect.error {
+    }
+}
+
+/// Serve one connection: `Some` when it was the redirect (successfully or
+/// not), `None` when it was anything else and the wait continues.
+fn handle(stream: &TcpStream, expected_state: &str) -> Option<Result<String, OAuthError>> {
+    let Some(target) = read_request_target(stream) else {
+        respond(stream, "400 Bad Request", "Malformed request.");
+        return None;
+    };
+    let Some(redirect) = parse_redirect(&target) else {
+        // A stray request: answer it and keep waiting for the real one.
+        respond(stream, "404 Not Found", "Not the otl callback.");
+        return None;
+    };
+    Some(finish(stream, redirect, expected_state))
+}
+
+/// Take the first outcome a handler has produced, if any.
+fn collect(
+    outcomes: &mpsc::Receiver<Result<String, OAuthError>>,
+) -> Option<Result<String, OAuthError>> {
+    outcomes.try_recv().ok()
+}
+
+/// Validate one redirect and turn it into a code or a typed failure.
+fn finish(
+    stream: &TcpStream,
+    redirect: Redirect,
+    expected_state: &str,
+) -> Result<String, OAuthError> {
+    // State first: nothing else in the query may be acted on until the
+    // redirect is known to belong to this login.
+    if redirect.state.as_deref() != Some(expected_state) {
+        respond(
+            stream,
+            "400 Bad Request",
+            "State mismatch: this redirect did not come from the otl login \
+                 that is running. Nothing was exchanged.",
+        );
+        return Err(OAuthError::StateMismatch);
+    }
+    if let Some(code) = redirect.error {
+        respond(
+            stream,
+            "200 OK",
+            "Authorization was not granted. You can close this tab.",
+        );
+        return Err(OAuthError::AuthorizationDenied {
+            code: sanitize_redirect_text(&code),
+            detail: match redirect.description {
+                Some(text) => format!(": {}", sanitize_redirect_text(&text)),
+                None => String::new(),
+            },
+        });
+    }
+    match redirect.code {
+        Some(code) => {
             respond(
                 stream,
                 "200 OK",
-                "Authorization was not granted. You can close this tab.",
+                "Signed in. You can close this tab and go back to the terminal.",
             );
-            return Err(OAuthError::AuthorizationDenied {
-                code: sanitize_redirect_text(&code),
-                detail: match redirect.description {
-                    Some(text) => format!(": {}", sanitize_redirect_text(&text)),
-                    None => String::new(),
-                },
-            });
+            Ok(code)
         }
-        match redirect.code {
-            Some(code) => {
-                respond(
-                    stream,
-                    "200 OK",
-                    "Signed in. You can close this tab and go back to the terminal.",
-                );
-                Ok(code)
-            }
-            None => {
-                respond(stream, "400 Bad Request", "Redirect carried no code.");
-                Err(OAuthError::Callback {
-                    reason: "the redirect carried neither a code nor an error".to_string(),
-                })
-            }
-        }
-    }
-
-    /// Accept the next connection, or time out.
-    ///
-    /// Per-connection read and write timeouts are clamped to the time left
-    /// before `deadline`, so no accepted connection can outlive the login's
-    /// own budget.
-    fn accept_before(&self, deadline: Instant, budget: Duration) -> Result<TcpStream, OAuthError> {
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    // Back to blocking for this connection: the read has
-                    // its own timeout, and polling a socket byte by byte
-                    // buys nothing.
-                    let _ = stream.set_nonblocking(false);
-                    let window = connection_window(deadline);
-                    let _ = stream.set_read_timeout(Some(window));
-                    let _ = stream.set_write_timeout(Some(window));
-                    return Ok(stream);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    return Err(OAuthError::Callback {
-                        reason: format!("cannot accept the browser redirect ({error})"),
-                    })
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(OAuthError::CallbackTimeout {
-                    seconds: budget.as_secs(),
-                });
-            }
-            std::thread::sleep(POLL_INTERVAL);
+        None => {
+            respond(stream, "400 Bad Request", "Redirect carried no code.");
+            Err(OAuthError::Callback {
+                reason: "the redirect carried neither a code nor an error".to_string(),
+            })
         }
     }
 }
@@ -285,10 +319,7 @@ impl CallbackServer {
 ///
 /// Only `GET` is accepted; the read is capped, so a client that never sends
 /// a newline cannot make the CLI allocate without bound.
-fn read_request_target(stream: &TcpStream, deadline: Instant) -> Option<String> {
-    // Re-clamped here as well: `accept_before` set the window when the
-    // connection arrived, and time has passed since.
-    let _ = stream.set_read_timeout(Some(connection_window(deadline)));
+fn read_request_target(stream: &TcpStream) -> Option<String> {
     let mut reader = BufReader::new(stream.try_clone().ok()?).take(MAX_REQUEST_LINE_BYTES);
     let mut line = String::new();
     if reader.read_line(&mut line).ok()? == 0 {
@@ -299,19 +330,6 @@ fn read_request_target(stream: &TcpStream, deadline: Instant) -> Option<String> 
     let target = parts.next()?;
     (method == "GET").then(|| target.to_string())
 }
-
-/// How long one connection may take: the shorter of [`READ_TIMEOUT`] and
-/// the time left before the login's own deadline.
-///
-/// Never zero - a zero timeout means "block forever" to the socket API,
-/// which is the opposite of what is wanted here.
-fn connection_window(deadline: Instant) -> Duration {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    remaining.min(READ_TIMEOUT).max(MINIMUM_WINDOW)
-}
-
-/// Floor for a per-connection timeout, since zero means "never time out".
-const MINIMUM_WINDOW: Duration = Duration::from_millis(50);
 
 /// Parse a redirect target, or `None` if it is not the callback path.
 fn parse_redirect(target: &str) -> Option<Redirect> {
@@ -468,6 +486,60 @@ mod tests {
     fn redirect_text_is_length_capped() {
         let cleaned = sanitize_redirect_text(&"x".repeat(1000));
         assert_eq!(cleaned.chars().count(), MAX_REDIRECT_TEXT_CHARS);
+    }
+
+    #[test]
+    fn stalled_connections_cannot_starve_the_real_redirect() {
+        // The R3 finding, reproduced. With a serial reader, a peer that
+        // completes a handshake and then sends NOTHING held the single
+        // reader for its whole read window; the browser's redirect waited
+        // behind it. At a 10s window, 24 silent connections consumed a 240s
+        // login - from any unprivileged local process, since 127.0.0.1
+        // accepts from every user on the machine.
+        //
+        // The reviewer's harness showed 3 stalled connections defeating a
+        // 25s budget. This asserts the opposite now holds, with a budget
+        // far smaller than the stalled connections would previously have
+        // consumed.
+        use std::io::Write as _;
+        use std::net::TcpStream;
+
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let port = port_of(server.redirect_uri()).expect("a bound port");
+
+        // Hold them open for the whole test: silent, never closed.
+        let stalled: Vec<TcpStream> = (0..8)
+            .filter_map(|_| TcpStream::connect((CALLBACK_HOST, port)).ok())
+            .collect();
+        assert_eq!(stalled.len(), 8, "could not set up the stalled peers");
+
+        std::thread::spawn(move || {
+            // Arrives after the silent peers are already queued.
+            std::thread::sleep(Duration::from_millis(150));
+            if let Ok(mut stream) = TcpStream::connect((CALLBACK_HOST, port)) {
+                let _ = stream.write_all(
+                    b"GET /callback?code=real-code&state=state HTTP/1.1\r\n\
+                      Host: 127.0.0.1\r\n\r\n",
+                );
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        // 8 stalled peers x the 2s read window is 16s of serial reading;
+        // this budget is a fraction of that, so it can only pass if the
+        // redirect is served concurrently.
+        let started = Instant::now();
+        let code = server
+            .wait_for_code("state", Duration::from_secs(6))
+            .expect("a silent peer must not starve the real redirect");
+        assert_eq!(code, "real-code");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the redirect waited behind the stalled peers: {:?}",
+            started.elapsed()
+        );
+        drop(stalled);
     }
 
     #[test]

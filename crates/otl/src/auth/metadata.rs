@@ -70,9 +70,15 @@ pub struct Metadata {
 /// is being used, and would be answered by whoever is on the path.
 pub fn discover(http: &Client, base_url: &str) -> Result<Metadata, OAuthError> {
     transport::require_secure(base_url, "the instance URL")?;
-    let issuer = base_url.trim_end_matches('/').to_string();
+    // The expected issuer goes through the SAME URL parser the endpoint
+    // origin check uses. Comparing the user's raw `OUTLINE_URL` text
+    // against a server's canonical identifier made every equivalent-but-
+    // differently-spelled URL - a mixed-case host, an explicit `:443`, a
+    // legacy numeric IPv4 form - fail login while working everywhere else,
+    // and blamed the server for it.
+    let issuer = canonical_issuer(base_url)?;
     let origin = endpoint::origin_of(base_url);
-    let url = format!("{issuer}{METADATA_PATH}");
+    let url = format!("{}{METADATA_PATH}", base_url.trim_end_matches('/'));
     let call = Call {
         stage: Stage::Discovery,
         url: &url,
@@ -144,7 +150,12 @@ fn require_issuer(document: &Value, expected: &str, origin: &str) -> Result<Stri
             " (it has no {FIELD_ISSUER} field, which RFC 8414 requires)"
         )));
     };
-    if strip_one_slash(&claimed) != strip_one_slash(expected) {
+    let Some(claimed_canonical) = canonical_issuer(&claimed).ok() else {
+        return Err(mismatch(format!(
+            " (its {FIELD_ISSUER} is not a usable URL)"
+        )));
+    };
+    if claimed_canonical != expected {
         // The claimed value is server-controlled text, so it is not echoed:
         // naming the expectation is enough to act on, and enough to avoid
         // putting an attacker's string on the terminal.
@@ -153,6 +164,23 @@ fn require_issuer(document: &Value, expected: &str, origin: &str) -> Result<Stri
         )));
     }
     Ok(claimed)
+}
+
+/// Reduce an issuer to the one spelling two parties can agree on.
+///
+/// Parsing normalizes case, default ports, and legacy address forms, so two
+/// URLs that name the same server compare equal however they were typed.
+/// Exactly ONE trailing slash is then dropped - never more, because
+/// `https://host/tenant///` and `https://host/tenant` are different paths
+/// to a reverse proxy that routes on the path without collapsing repeated
+/// separators, and those can be different security domains.
+fn canonical_issuer(url: &str) -> Result<String, OAuthError> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| OAuthError::Malformed {
+        stage: Stage::Discovery,
+        origin: endpoint::origin_of(url),
+        reason: format!("{url:?} is not a valid URL ({error})"),
+    })?;
+    Ok(strip_one_slash(parsed.as_str()).to_string())
 }
 
 /// Drop at most ONE trailing slash.
@@ -229,7 +257,12 @@ mod tests {
 
     /// Validate a document as if it had been fetched from [`ISSUER`].
     fn check(document: &Value) -> Result<Metadata, OAuthError> {
-        build(document, ISSUER, ORIGIN, call())
+        build(
+            document,
+            &canonical_issuer(ISSUER).expect("a valid test issuer"),
+            ORIGIN,
+            call(),
+        )
     }
 
     fn full_document() -> Value {
@@ -429,6 +462,67 @@ mod tests {
         document["authorization_endpoint"] = json!("https://docs.example.com/oauth/authorize");
         document["token_endpoint"] = json!("https://docs.example.com/oauth/token");
         assert!(build(&document, expected, ORIGIN, call()).is_err());
+    }
+
+    #[test]
+    fn an_equivalent_spelling_of_the_instance_url_still_matches() {
+        // R3 [29]: the expected issuer was the user's RAW `OUTLINE_URL`
+        // text while endpoints were compared as parsed origins. Any
+        // equivalent-but-not-byte-identical spelling then failed login -
+        // and blamed the server for it - while working in every other
+        // command. Both sides now go through the same parser.
+        for spelling in [
+            "https://DOCS.example.com",
+            "https://docs.example.com:443",
+            "https://docs.example.com/",
+        ] {
+            let document = full_document();
+            assert!(
+                build(
+                    &document,
+                    &canonical_issuer(spelling).unwrap(),
+                    ORIGIN,
+                    call()
+                )
+                .is_ok(),
+                "{spelling:?} was rejected as a different issuer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_numeric_address_normalizes_to_the_same_issuer() {
+        // `0177.0.0.1` is a legal spelling of 127.0.0.1 that the URL parser
+        // canonicalizes; the two must not be treated as different servers.
+        assert_eq!(
+            canonical_issuer("http://0177.0.0.1:45124").unwrap(),
+            canonical_issuer("http://127.0.0.1:45124").unwrap()
+        );
+    }
+
+    #[test]
+    fn canonicalizing_does_not_merge_different_paths() {
+        // Normalization must not become laxity: distinct tenants stay
+        // distinct, and repeated separators are not collapsed.
+        let base = canonical_issuer("https://docs.example.com/tenant").unwrap();
+        for other in [
+            "https://docs.example.com/other",
+            "https://docs.example.com/tenant///",
+            "https://docs.example.com",
+        ] {
+            assert_ne!(
+                canonical_issuer(other).unwrap(),
+                base,
+                "{other:?} was merged with {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_claimed_issuer_is_refused() {
+        let mut document = full_document();
+        document["issuer"] = json!("not a url");
+        assert!(check(&document).is_err());
     }
 
     #[test]

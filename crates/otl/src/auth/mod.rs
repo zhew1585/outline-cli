@@ -17,6 +17,7 @@
 //! - [`selection`]: which credential a profile offers, and whether it may
 //!   be used against the instance in hand.
 //! - [`source`]: the `engine::CredentialSource` the request channel calls.
+//! - [`client_acquisition`]: which OAuth client a login speaks as.
 //! - [`login`], [`logout`], [`report`]: what the `otl auth` subcommands do.
 //!
 //! The profile helper here is deliberately minimal (an environment variable
@@ -24,6 +25,7 @@
 //! elsewhere, and this module only needs a name to file credentials under.
 
 pub mod browser;
+pub mod client_acquisition;
 pub mod credentials;
 pub mod dcr;
 pub mod endpoint;
@@ -209,6 +211,20 @@ pub fn ensure_bindable(
         // the user strand an application on the server.
         purge_hint: if dynamic_client { " --purge" } else { "" },
     }))
+}
+
+/// The credential store and profile, WITHOUT requiring an instance URL.
+///
+/// `otl auth logout` uses this: every URL it talks to comes out of the
+/// credential file, so requiring `OUTLINE_URL` - and putting it through the
+/// transport rule - would make cleanup impossible in exactly the states
+/// that need cleaning up most: no instance configured, the wrong one
+/// configured, or a plaintext value stored before that rule existed. The
+/// only alternative left to a user then is deleting the file by hand, which
+/// takes the `registration_access_token` with it and orphans the DCR
+/// registration for good.
+pub fn open_store_without_instance() -> Result<(String, CredentialStore), AuthError> {
+    Ok((paths::active_profile()?, CredentialStore::discover()?))
 }
 
 /// The credential store, profile and instance origin, without requiring

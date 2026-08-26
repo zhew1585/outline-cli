@@ -159,22 +159,6 @@ impl ProfileCredentials {
                 .unwrap_or_else(|| UNKNOWN_ORIGIN.to_string()),
         )
     }
-
-    /// Discard everything that does not belong to `origin`, then bind to it.
-    ///
-    /// Returns whether anything had to be discarded, so a caller can say so
-    /// out loud. Used only where discarding is what the user asked for.
-    pub fn rebind_to(&mut self, origin: &str) -> bool {
-        if self.is_bound_to(origin) || self.is_empty() {
-            self.origin = Some(origin.to_string());
-            return false;
-        }
-        *self = Self {
-            origin: Some(origin.to_string()),
-            ..Self::default()
-        };
-        true
-    }
 }
 
 /// Stand-in when a stored endpoint has no recoverable origin. Never equal

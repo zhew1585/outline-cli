@@ -56,6 +56,7 @@ otl auth set-key < key.txt            # store an API key in the credential file 
 otl auth info                         # which credential is in use, and where it lives
 otl auth logout                       # revoke and forget this profile's credentials
 otl auth logout --purge               # also delete the application otl registered for itself
+otl auth logout --force               # discard them even if the server could not be told
 ```
 
 `otl auth login` discovers the instance's OAuth endpoints, registers `otl` as a public client if the
@@ -63,6 +64,11 @@ instance allows it (otherwise it tells you exactly what an admin has to create),
 on a loopback port. Access tokens are then renewed inside the request channel, so no command ever fails
 because a token aged out. Outline rotates the refresh token on every use, so renewal takes an advisory
 file lock: concurrent `otl` processes refresh once between them rather than invalidating each other.
+
+`otl auth logout` needs no `OUTLINE_URL`: every server it contacts comes out of the credential file,
+anchored to the origin each credential recorded for itself. It exits non-zero if a server-side step did
+not happen, and — when a retry could still succeed — keeps the credentials rather than leaving you with a
+token that is live on the server and unrevocable from here. `--force` overrides that.
 
 When several credentials exist for a profile, the order is OAuth session, then the credential file's API
 key, then `OUTLINE_API_KEY`. Using the environment variable prints a one-time note about where plaintext

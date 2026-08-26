@@ -56,6 +56,12 @@ so that 用工作区身份安全登录。
 ## Dev Notes
 
 - **先读 `project-context.md`**。本 story 最相关红线：engine 禁止 OAuth 内容（全部落 otl）、除凭证文件外任何位置不得出现凭证、硬编码值提常量。
+- **R3 [29] 修正：issuer 比较两侧都过同一个 URL parser**。R2 用**用户输入的 `OUTLINE_URL` 原文**
+  当预期 issuer，而 endpoint 同源校验用的是 parser 规范化后的 origin——两套基准。
+  于是任何等价但非字节相同的写法（大小写主机名、显式 `:443`、`0177.0.0.1` 这类合法数字形式）
+  在 `otl api` / `auth info` / `set-key` 下都正常，唯独 `auth login` 报「服务器身份不对」——
+  把用户的输入格式问题指控成元数据攻击。现在 `canonical_issuer()` 两侧都跑 `Url::parse`
+  再 `strip_one_slash`。规范化没有变松：不同租户路径、重复斜杠仍然拒绝，有测试钉住。
 - **安全决策 0-fix（R2：TLS 强制覆盖所有命令，不只 login）**：R1 只在 `metadata::discover` 里做检查，
   于是 `otl api` / `auth info` / env key / 已存 session 走 `http://remote-host` 时 bearer 仍然明文上网。
   现在 `auth::instance_origin()`（`open_session` 与 `open_store` 的共同入口）调用 `require_secure`，

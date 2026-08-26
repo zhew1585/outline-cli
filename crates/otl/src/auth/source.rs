@@ -108,9 +108,13 @@ impl CredentialProvider {
     /// The check refuses rather than warns: a warning is printed after the
     /// credential has already gone to the request channel.
     ///
-    /// An environment API key is exempt, and deliberately so: it is
-    /// supplied per invocation by whoever set it, alongside `OUTLINE_URL`,
-    /// so there is no stored binding it could contradict.
+    /// An environment API key needs no stored binding of its own - it is
+    /// supplied per invocation alongside `OUTLINE_URL` - so a profile that
+    /// holds only a leftover client registration does not block it. It is
+    /// NOT exempt from the check as a whole: if the profile also holds a
+    /// stored key or session for another instance, that conflict is
+    /// reported rather than silently resolved by falling through to the
+    /// environment.
     ///
     /// The plaintext-environment warning is emitted here - once per
     /// command run, at the moment the key is actually chosen, rather than

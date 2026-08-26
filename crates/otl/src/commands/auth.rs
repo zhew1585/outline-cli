@@ -96,6 +96,16 @@ pub struct LogoutArgs {
     /// administrator created is never touched.
     #[arg(long)]
     purge: bool,
+
+    /// Discard the local credentials even if the server could not be told.
+    ///
+    /// By default a step that could still succeed later - a revocation the
+    /// instance was too unreachable to accept, say - keeps the credentials
+    /// on disk, because they are the only thing that makes the retry
+    /// possible. This says: I accept that these tokens will stay live on
+    /// the server until they expire.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Arguments for `otl auth info`.
@@ -141,34 +151,45 @@ fn run_login(args: &LoginArgs, mode: OutputMode) -> Result<(), CliError> {
 
 /// `otl auth logout`.
 ///
-/// Exits non-zero when a server-side step the user asked for did not
-/// happen: the local credentials are gone either way, but "the application
-/// is still registered on the server" is not success, and a script needs to
-/// be able to see that so the purge can be retried.
+/// Deliberately does NOT resolve an instance URL: see
+/// `auth::open_store_without_instance`. Exits non-zero when a server-side
+/// step the user asked for did not happen - the local credentials may be
+/// gone, but "the tokens are still live on the server" is not success, and
+/// a script has to be able to see the difference.
 fn run_logout(args: &LogoutArgs, mode: OutputMode) -> Result<(), CliError> {
-    let context = auth::open_store().map_err(auth::map_auth_error)?;
+    let (profile, store) = auth::open_store_without_instance().map_err(auth::map_auth_error)?;
     let report = logout::run(
-        &context.profile,
-        &context.origin,
-        &context.store,
-        logout::Options { purge: args.purge },
+        &profile,
+        &store,
+        logout::Options {
+            purge: args.purge,
+            force: args.force,
+        },
     )
     .map_err(auth::map_auth_error)?;
     for warning in &report.warnings {
         stdio::write_diagnostic_line(&format!("warning: {warning}"));
     }
-    emit(logout_output(&context.profile, &report), mode)?;
+    emit(logout_output(&profile, &report), mode)?;
     if report.remote_cleanup_failed {
         return Err(CliError::new(
             ExitCode::ApiRequest,
-            anyhow!(
-                "signed out locally, but the application could not be removed \
-                 from the server; the credential that manages it was kept so \
-                 `otl auth logout --purge` can be retried"
-            ),
+            anyhow!("{}", logout_failure(&report)),
         ));
     }
     Ok(())
+}
+
+/// The one-line summary of a logout that did not fully succeed.
+fn logout_failure(report: &logout::Report) -> String {
+    if report.kept_for_retry {
+        return "signed out on the server was not possible, so the local \
+                credentials were KEPT to allow a retry; see the warnings above"
+            .to_string();
+    }
+    "signed out locally, but not everything could be done on the server; \
+     see the warnings above"
+        .to_string()
 }
 
 /// `otl auth set-key`.
@@ -385,10 +406,13 @@ fn login_output(profile: &str, outcome: &login::Outcome) -> Output {
 
 /// Human lines plus the machine-readable object for `auth logout`.
 fn logout_output(profile: &str, report: &logout::Report) -> Output {
-    let headline = if report.had_credentials {
-        format!("Signed out of profile {profile}.")
-    } else {
-        format!("Nothing was stored for profile {profile}.")
+    let headline = match (report.had_credentials, report.kept_for_retry) {
+        (false, _) => format!("Nothing was stored for profile {profile}."),
+        (true, true) => format!(
+            "Profile {profile} was NOT signed out: the server could not be \
+             told, so the credentials were kept for a retry."
+        ),
+        (true, false) => format!("Signed out of profile {profile}."),
     };
     Output {
         lines: vec![
@@ -399,6 +423,7 @@ fn logout_output(profile: &str, report: &logout::Report) -> Output {
                 report.registration_deleted
             ),
             format!("credential file removed:      {}", report.file_removed),
+            format!("kept locally for retry:       {}", report.kept_for_retry),
         ],
         value: json!({
             "profile": profile,
@@ -406,6 +431,7 @@ fn logout_output(profile: &str, report: &logout::Report) -> Output {
             "revoked": report.revoked,
             "registration_deleted": report.registration_deleted,
             "credential_file_removed": report.file_removed,
+            "credentials_kept_for_retry": report.kept_for_retry,
             "warnings": report.warnings,
         }),
     }
