@@ -3,6 +3,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::time::Duration;
+
 mod oauth_harness;
 
 use oauth_harness::*;
@@ -454,4 +456,164 @@ async fn force_discards_tokens_that_could_not_be_revoked() {
     assert_eq!(code, Some(3));
     assert!(stored_session_absent(dir.path()));
     drop(server);
+}
+
+// --- R4 [N2]: a concurrent refresh inside the revocation window ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_written_during_logout_is_reported_not_declared_signed_out() {
+    // The reviewer's race, reproduced against the real binary. Revocation
+    // requests go out BEFORE the credential lock is taken - they are slow,
+    // and holding the lock across them would block every other otl - so a
+    // concurrent refresh can land a rotated session in the file while they
+    // are in flight.
+    //
+    // `clear_if_unchanged` correctly refuses to delete that session: it is
+    // not the one this run acted on. What was wrong is what the user was
+    // then told - "Signed out", `revoked: true`, exit 0 - while a fully
+    // valid bearer session sat on disk, unrevoked. That is the same state
+    // this whole round exists to eliminate, reached by a different door.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        // Slow enough that the rewrite below lands mid-flight.
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1500)))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let (code, stdout, stderr) = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(otl::auth::oauth::now_unix() + 3600));
+
+            let child = otl(&path, &base)
+                .args(["auth", "logout"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            // Stand in for a concurrent refresh completing: a rotated
+            // session, written through the same locked transaction a real
+            // refresh uses.
+            std::thread::sleep(Duration::from_millis(700));
+            let store = store(&path);
+            let mut file = store.load().unwrap();
+            if let Some(session) = file.profile_mut("default").oauth.as_mut() {
+                session.access_token = "at-ROTATED".to_string();
+                session.refresh_token = Some("rt-ROTATED".to_string());
+            }
+            store.save(&file).unwrap();
+
+            let output = child.wait_with_output().unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).to_string(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+
+    // The rotated session must still be there - deleting another process's
+    // session was never the right answer.
+    let surviving = store(dir.path())
+        .load()
+        .unwrap()
+        .profile("default")
+        .and_then(|entry| entry.oauth.clone())
+        .expect("the concurrently written session must survive");
+    assert_eq!(surviving.access_token, "at-ROTATED");
+
+    // ...and the user must be told, in every channel.
+    assert_eq!(
+        code,
+        Some(3),
+        "a live unrevoked session was left behind with a success exit.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"revoked\": false"),
+        "revocation was claimed over a session that was never revoked: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"session_survived_concurrent_write\": true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("has NOT been revoked"),
+        "the surviving session was not reported: {stderr}"
+    );
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uncontended_logout_still_reports_plain_success() {
+    // The other side of the same assertion: without a concurrent write,
+    // nothing changes - exit 0 and `revoked: true`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let (code, stdout) = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            seed_session(&path, &base, Some(otl::auth::oauth::now_unix() + 3600));
+            let output = otl(&path, &base).args(["auth", "logout"]).output().unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).to_string(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(code, Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("\"revoked\": true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"session_survived_concurrent_write\": false"),
+        "stdout: {stdout}"
+    );
+    drop(server);
+}
+
+// --- R4 [N3]: never advise retrying something that cannot succeed --------
+
+#[test]
+fn a_permanently_unusable_management_uri_is_not_called_retryable() {
+    // The stored management URI is plaintext, so `require_secure` refuses
+    // it - every time, forever. Telling the user to retry `--purge` was
+    // false advice.
+    let dir = tempfile::tempdir().unwrap();
+    seed_session(dir.path(), "http://legacy.example.invalid", Some(0));
+
+    let output = otl(dir.path(), "http://legacy.example.invalid")
+        .args(["auth", "logout", "--purge"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("can be retried"),
+        "a permanent refusal was advertised as retryable: {stderr}"
+    );
+    assert!(
+        stderr.contains("Retrying will not help") || stderr.contains("retrying will not help"),
+        "the permanence must be stated: {stderr}"
+    );
+    assert!(
+        stderr.contains("otl auth login") || stderr.contains("--force"),
+        "a real remedy must be offered: {stderr}"
+    );
 }

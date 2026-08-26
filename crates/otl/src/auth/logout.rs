@@ -36,14 +36,11 @@
 //! so: "signed out locally, tokens still live on the server" is not
 //! success.
 
-use reqwest::blocking::Client as HttpClient;
-
 use crate::auth::credentials::{
     ClientRegistration, CredentialFile, CredentialStore, OAuthSession, ProfileCredentials,
 };
-use crate::auth::error::OAuthError;
-use crate::auth::oauth::ClientAuth;
-use crate::auth::{dcr, endpoint, oauth, transport, AuthError};
+use crate::auth::logout_remote::{purge_registration, revoke_tokens};
+use crate::auth::{endpoint, AuthError};
 
 /// What `otl auth logout` was asked to do.
 #[derive(Debug, Clone, Copy, Default)]
@@ -77,6 +74,18 @@ pub struct Report {
     pub retry_could_succeed: bool,
     /// Whether local credentials were kept because of the above.
     pub kept_for_retry: bool,
+    /// Whether a credential written by ANOTHER process during this logout
+    /// is still stored - and therefore was never revoked.
+    ///
+    /// The revocation requests go out before the lock is taken (they are
+    /// slow, and holding the credential lock across them would block every
+    /// other `otl`), so a concurrent refresh can land a rotated session in
+    /// the file while they are in flight. `clear_if_unchanged` correctly
+    /// leaves that session alone - it is not the one this run acted on -
+    /// but leaving it alone silently would report "signed out" over a live
+    /// bearer session, which is the exact state this command exists to
+    /// remove.
+    pub survived_concurrent_write: bool,
     /// Problems worth telling the user about, none of which stopped the
     /// local removal.
     pub warnings: Vec<String>,
@@ -123,19 +132,11 @@ fn remove_locally(
     options: Options,
     report: &mut Report,
 ) -> Result<(), AuthError> {
-    if report.retry_could_succeed && !options.force {
-        report.kept_for_retry = true;
-        report.warnings.push(
-            "the credentials were KEPT on this machine so the failed step \
-             can be retried - discarding the only copy of a token that is \
-             still live on the server would make it impossible to revoke. \
-             Run `otl auth logout` again once the instance is reachable, or \
-             `otl auth logout --force` to discard them anyway"
-                .to_string(),
-        );
+    if keep_for_retry(options, report) {
         return Ok(());
     }
     let drop_client = drop_registration(options, entry, report);
+    let mut survivors = Survivors::default();
     store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
         let profile_entry = file.profile_mut(profile);
         clear_if_unchanged(&mut profile_entry.oauth, entry.oauth.as_ref(), same_session);
@@ -151,6 +152,11 @@ fn remove_locally(
                 same_registration,
             );
         }
+        // Read back INSIDE the transaction: anything still here was written
+        // by another process while the revocations were in flight, which
+        // means this run never revoked it.
+        survivors.session = profile_entry.oauth.is_some();
+        survivors.api_key = profile_entry.api_key.is_some();
         if profile_entry.is_empty() {
             // Nothing left for the binding to protect, and a stale one
             // would only confuse the next `auth info`.
@@ -159,7 +165,61 @@ fn remove_locally(
         Ok(())
     })?;
     report.file_removed = !store.path().exists();
+    report_survivors(&survivors, report);
     Ok(())
+}
+
+/// Whether to leave the credentials in place so a failed step can be tried
+/// again, recording why if so.
+///
+/// Discarding the only copy of a token that is still live on the server
+/// makes it permanently unrevocable, so that is never the default.
+fn keep_for_retry(options: Options, report: &mut Report) -> bool {
+    if !report.retry_could_succeed || options.force {
+        return false;
+    }
+    report.kept_for_retry = true;
+    report.warnings.push(
+        "the credentials were KEPT on this machine so the failed step can be \
+         retried - discarding the only copy of a token that is still live on \
+         the server would make it impossible to revoke. Run `otl auth logout` \
+         again once the instance is reachable, or `otl auth logout --force` to \
+         discard them anyway"
+            .to_string(),
+    );
+    true
+}
+
+/// Credentials still stored after the removal transaction.
+#[derive(Debug, Default)]
+struct Survivors {
+    session: bool,
+    api_key: bool,
+}
+
+/// Turn surviving credentials into warnings and a non-zero exit.
+///
+/// Never silently accepted: "signed out" printed over a live bearer session
+/// is exactly the state this command exists to remove, and a concurrent
+/// refresh landing inside the revocation window is just another route to
+/// it.
+fn report_survivors(survivors: &Survivors, report: &mut Report) {
+    if survivors.session {
+        report.survived(
+            "another process wrote a new OAuth session while this logout was \
+             revoking the previous one, so that session is still stored here \
+             and has NOT been revoked. Run `otl auth logout` again to revoke \
+             and remove it"
+                .to_string(),
+        );
+    }
+    if survivors.api_key {
+        report.survived(
+            "another process stored an API key while this logout was running, \
+             so it is still here. Run `otl auth logout` again to remove it"
+                .to_string(),
+        );
+    }
 }
 
 impl Report {
@@ -168,7 +228,7 @@ impl Report {
     /// The command still failed to do what was asked, so the exit code says
     /// so - but keeping the credentials would not help, because no retry
     /// can change the answer.
-    fn unrevocable(&mut self, warning: String) {
+    pub(crate) fn unrevocable(&mut self, warning: String) {
         self.remote_cleanup_failed = true;
         self.warnings.push(warning);
     }
@@ -177,10 +237,31 @@ impl Report {
     ///
     /// Keeps the local credentials by default (see `remove_locally`): they
     /// are the only thing that makes the retry possible.
-    fn retryable(&mut self, warning: String) {
+    pub(crate) fn retryable(&mut self, warning: String) {
         self.remote_cleanup_failed = true;
         self.retry_could_succeed = true;
         self.warnings.push(warning);
+    }
+
+    /// Record a credential that outlived this logout because another
+    /// process wrote it while the revocations were in flight.
+    ///
+    /// Not `retryable`: by the time this is known the removal has already
+    /// happened, so there is nothing to hold back. It still has to reach
+    /// the exit code, because the profile is not signed out.
+    pub(crate) fn survived(&mut self, warning: String) {
+        self.remote_cleanup_failed = true;
+        self.survived_concurrent_write = true;
+        self.warnings.push(warning);
+    }
+
+    /// Whether this profile's stored session is now revoked AND gone.
+    ///
+    /// `revoked` on its own only says what this run managed to revoke; a
+    /// session another process wrote in the meantime is still sitting
+    /// there, unrevoked, and callers must not be told otherwise.
+    pub fn signed_out(&self) -> bool {
+        self.revoked && !self.survived_concurrent_write
     }
 }
 
@@ -276,130 +357,11 @@ fn drop_registration(options: Options, entry: &ProfileCredentials, report: &mut 
 /// Maximum characters kept from a server-supplied client id when printed.
 const MAX_CLIENT_ID_CHARS: usize = 80;
 
-/// Ask the server to revoke the stored tokens.
-///
-/// Anchored to the session's OWN origin - the token endpoint it recorded at
-/// login - not to `OUTLINE_URL`. That is the same anchor `dcr::delete` uses
-/// for a registration, and it is the correct one: what the same-origin
-/// check defends against is a tampered credential file, and the baseline
-/// for that is the credential's self-recorded issuer, not an environment
-/// variable the user can point anywhere.
-///
-/// Both tokens are offered: revoking the refresh token is what actually
-/// ends the session, and revoking the access token closes the remaining
-/// window.
-fn revoke_tokens(
-    http: &HttpClient,
-    session: &OAuthSession,
-    registration: Option<&ClientRegistration>,
-    profile: &str,
-    report: &mut Report,
-) {
-    let endpoint_url = match usable_revocation_endpoint(session, profile) {
-        Ok(Some(url)) => url,
-        // Nothing to retry: this instance cannot revoke, or the endpoint it
-        // recorded may not be used. Say so and let removal proceed - waiting
-        // would never turn into a successful revocation.
-        Ok(None) => return report.unrevocable(NO_REVOCATION_ENDPOINT.to_string()),
-        Err(error) => return report.unrevocable(error.to_string()),
-    };
-    let client = ClientAuth {
-        client_id: &session.client_id,
-        client_secret: registration.and_then(|reg| reg.client_secret.as_deref()),
-    };
-    let mut failures = Vec::new();
-    let mut revoked_any = false;
-    for token in [
-        session.refresh_token.as_deref(),
-        Some(session.access_token.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        match oauth::revoke(http, endpoint_url, client, token) {
-            Ok(()) => revoked_any = true,
-            Err(error) => failures.push(format!("a token could not be revoked ({error})")),
-        }
-    }
-    report.revoked = revoked_any && failures.is_empty();
-    for failure in failures {
-        // The endpoint exists and answered badly: a later attempt can still
-        // work, so this one must not destroy the only copy of the tokens.
-        report.retryable(failure);
-    }
-}
-
-/// Notice printed when the instance offers no way to revoke at all.
-const NO_REVOCATION_ENDPOINT: &str =
-    "this instance advertises no token revocation endpoint, so the \
-     tokens cannot be revoked and stay valid until they expire";
-
-/// The revocation endpoint, if there is a usable one.
-///
-/// `Ok(None)` means the instance never advertised one. `Err` means it
-/// advertised one that may not be used - a plaintext URL, or one that does
-/// not belong to the instance that issued this session.
-fn usable_revocation_endpoint<'a>(
-    session: &'a OAuthSession,
-    profile: &str,
-) -> Result<Option<&'a str>, OAuthError> {
-    let Some(url) = session.revocation_endpoint.as_deref() else {
-        return Ok(None);
-    };
-    transport::require_stored_secure(url, profile, "OAuth revocation endpoint")?;
-    let issuer = session_origin(session);
-    transport::require_same_origin(url, &issuer, profile, "OAuth revocation endpoint")?;
-    Ok(Some(url))
-}
-
-/// The origin that issued this session, from the token endpoint it recorded.
-fn session_origin(session: &OAuthSession) -> String {
-    crate::auth::endpoint::origin_of(&session.token_endpoint)
-}
-
-/// Delete the dynamic client registration from the server.
-fn purge_registration(
-    http: &HttpClient,
-    registration: Option<&ClientRegistration>,
-    report: &mut Report,
-) {
-    let Some(registration) = registration else {
-        return;
-    };
-    if !registration.dynamic {
-        report.warnings.push(
-            "the client id for this profile was created by an administrator, \
-             so --purge left it alone; only otl's own registrations are deleted"
-                .to_string(),
-        );
-        return;
-    }
-    match dcr::delete(http, registration) {
-        Ok(true) => report.registration_deleted = true,
-        // No management credential was ever issued: no retry can change
-        // that, so keeping the local record buys nothing.
-        Ok(false) => report.unrevocable(
-            "the stored registration has no management token, so the \
-             application cannot be deleted from the server; ask an admin to \
-             remove it (Settings -> Applications)"
-                .to_string(),
-        ),
-        // The server refused or was unreachable: a later attempt can still
-        // work, and the management token is what makes it possible.
-        Err(error) => report.retryable(format!(
-            "the application could not be deleted from the server ({error}); \
-             `otl auth logout --purge` can be retried"
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-
-    const ORIGIN: &str = "https://docs.example.com";
 
     fn scratch() -> (tempfile::TempDir, CredentialStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -715,43 +677,6 @@ mod tests {
         let mut current = Some("written-later".to_string());
         clear_if_unchanged(&mut current, None, |a, b| a == b);
         assert_eq!(current.as_deref(), Some("written-later"));
-    }
-
-    #[test]
-    fn a_plaintext_revocation_endpoint_is_refused_at_use_time() {
-        // The endpoint comes off disk and is about to receive both tokens.
-        let mut stored = session();
-        stored.revocation_endpoint = Some("http://docs.example.com/oauth/revoke".to_string());
-        let error = usable_revocation_endpoint(&stored, "default")
-            .expect_err("a plaintext stored endpoint must be refused");
-        let text = error.to_string();
-        assert!(text.contains("revocation endpoint"), "{text}");
-        assert!(text.contains("otl auth login"), "{text}");
-    }
-
-    #[test]
-    fn a_revocation_endpoint_on_another_host_is_refused_at_use_time() {
-        let mut stored = session();
-        stored.revocation_endpoint = Some("https://evil.example.net/oauth/revoke".to_string());
-        let error = usable_revocation_endpoint(&stored, "default")
-            .expect_err("an off-origin stored endpoint must be refused");
-        // Anchored to the SESSION's own issuer, not to any ambient URL.
-        assert!(error.to_string().contains(ORIGIN), "{error}");
-    }
-
-    #[test]
-    fn revocation_is_anchored_to_the_session_not_to_the_environment() {
-        // The R3 finding: anchoring on OUTLINE_URL refused to revoke A's
-        // tokens because the shell pointed at B - while still deleting them
-        // locally. The session records its own issuer; that is the anchor.
-        let stored = OAuthSession {
-            revocation_endpoint: Some(format!("{ORIGIN}/oauth/revoke")),
-            ..session()
-        };
-        assert_eq!(session_origin(&stored), ORIGIN);
-        let usable = usable_revocation_endpoint(&stored, "default")
-            .expect("the session's own endpoint must be usable");
-        assert_eq!(usable, Some(&*format!("{ORIGIN}/oauth/revoke")));
     }
 
     #[test]

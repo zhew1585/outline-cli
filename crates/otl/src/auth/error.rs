@@ -563,6 +563,30 @@ impl OAuthError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Endpoint { status: 404, .. })
     }
+
+    /// Whether retrying this could never succeed.
+    ///
+    /// Two families qualify. A stored endpoint that may not be used -
+    /// plaintext, or belonging to another instance - is refused by a local
+    /// rule that no amount of waiting changes. And a 400/401/403 from an
+    /// OAuth endpoint is the server rejecting the credential itself
+    /// (`invalid_client`, a revoked management token), not a transient
+    /// condition; 429 and 5xx are excluded because those genuinely do clear.
+    ///
+    /// Callers use this to choose their WORDING and whether to keep
+    /// credentials for a retry. Getting it wrong is not dangerous - the
+    /// conservative branch only ever preserves credentials - but telling a
+    /// user to retry something that cannot succeed wastes their time and
+    /// hides the real remedy.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::InsecureTransport { .. }
+            | Self::InsecureStoredEndpoint { .. }
+            | Self::ForeignEndpoint { .. } => true,
+            Self::Endpoint { status, .. } => matches!(status, 400 | 401 | 403),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +610,57 @@ mod tests {
         assert!(!rejected(503).is_grant_rejected());
         assert!(rejected(404).is_not_found());
         assert!(!rejected(400).is_not_found());
+    }
+
+    #[test]
+    fn a_locally_refused_stored_endpoint_is_permanent() {
+        // R4 [N3]: these were classified as retryable, so logout advised
+        // retrying something the same local rule refuses every time.
+        let permanent: Vec<OAuthError> = vec![
+            OAuthError::InsecureTransport {
+                what: "the stored client management URI",
+                detail: "plaintext".to_string(),
+            },
+            OAuthError::InsecureStoredEndpoint {
+                profile: "default".to_string(),
+                what: "OAuth revocation endpoint",
+                detail: "plaintext".to_string(),
+            },
+            OAuthError::ForeignEndpoint {
+                origin: "https://docs.example.com".to_string(),
+                endpoint: "registration_client_uri",
+            },
+        ];
+        for error in permanent {
+            assert!(error.is_permanent(), "{error} was treated as retryable");
+        }
+    }
+
+    #[test]
+    fn a_rejected_credential_is_permanent_but_throttling_is_not() {
+        let endpoint = |status| OAuthError::Endpoint {
+            stage: Stage::Revocation,
+            origin: "https://docs.example.com".to_string(),
+            status,
+            detail: String::new(),
+        };
+        for status in [400, 401, 403] {
+            assert!(endpoint(status).is_permanent(), "HTTP {status}");
+        }
+        // These genuinely clear on their own.
+        for status in [429, 500, 503] {
+            assert!(!endpoint(status).is_permanent(), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_is_never_permanent() {
+        let error = OAuthError::Transport {
+            stage: Stage::Revocation,
+            origin: "https://docs.example.com".to_string(),
+            reason: "connection failed (DNS, refused, or TLS)".to_string(),
+        };
+        assert!(!error.is_permanent());
     }
 
     #[test]

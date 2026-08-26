@@ -26,7 +26,11 @@ pub const CLIENT_NAME: &str = "outline-cli (otl)";
 
 /// Homepage advertised with the registration, so an administrator looking
 /// at the client list can tell what it is.
-pub const CLIENT_URI: &str = "https://github.com/weizhesafeheron/outline-cli";
+///
+/// This is sent to the instance as the RFC 7591 `client_uri` and shown in
+/// Settings -> Applications, so pointing it at the wrong repository is
+/// user-visible and stays visible until the client is deleted.
+pub const CLIENT_URI: &str = "https://github.com/zhew1585/outline-cli";
 
 /// Token endpoint auth method for a public client: none.
 const AUTH_METHOD_NONE: &str = "none";
@@ -150,6 +154,17 @@ mod tests {
             url: "https://docs.example.com/oauth/register",
             secrets: &[],
         }
+    }
+
+    #[test]
+    fn the_advertised_client_uri_names_this_project() {
+        // Sent as RFC 7591 `client_uri` and displayed in the instance's
+        // Settings -> Applications list, so a broken edit here is visible
+        // to every administrator of every instance otl registers with.
+        let uri = reqwest::Url::parse(CLIENT_URI).expect("client_uri must be a valid URL");
+        assert_eq!(uri.scheme(), "https");
+        assert_eq!(uri.host_str(), Some("github.com"));
+        assert_eq!(uri.path(), "/zhew1585/outline-cli");
     }
 
     #[test]

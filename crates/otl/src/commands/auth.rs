@@ -187,6 +187,12 @@ fn logout_failure(report: &logout::Report) -> String {
                 credentials were KEPT to allow a retry; see the warnings above"
             .to_string();
     }
+    if report.survived_concurrent_write {
+        return "a credential written by another process during this logout is \
+                still stored and was never revoked; run `otl auth logout` \
+                again"
+            .to_string();
+    }
     "signed out locally, but not everything could be done on the server; \
      see the warnings above"
         .to_string()
@@ -406,18 +412,26 @@ fn login_output(profile: &str, outcome: &login::Outcome) -> Output {
 
 /// Human lines plus the machine-readable object for `auth logout`.
 fn logout_output(profile: &str, report: &logout::Report) -> Output {
-    let headline = match (report.had_credentials, report.kept_for_retry) {
-        (false, _) => format!("Nothing was stored for profile {profile}."),
-        (true, true) => format!(
+    let headline = if !report.had_credentials {
+        format!("Nothing was stored for profile {profile}.")
+    } else if report.kept_for_retry {
+        format!(
             "Profile {profile} was NOT signed out: the server could not be \
              told, so the credentials were kept for a retry."
-        ),
-        (true, false) => format!("Signed out of profile {profile}."),
+        )
+    } else if report.survived_concurrent_write {
+        format!(
+            "Profile {profile} is NOT signed out: a credential written by \
+             another process during this logout is still stored, and was \
+             never revoked."
+        )
+    } else {
+        format!("Signed out of profile {profile}.")
     };
     Output {
         lines: vec![
             headline,
-            format!("tokens revoked on the server: {}", report.revoked),
+            format!("tokens revoked on the server: {}", report.signed_out()),
             format!(
                 "application deleted:          {}",
                 report.registration_deleted
@@ -428,7 +442,10 @@ fn logout_output(profile: &str, report: &logout::Report) -> Output {
         value: json!({
             "profile": profile,
             "had_credentials": report.had_credentials,
-            "revoked": report.revoked,
+            // The profile-level claim, not just what this run managed to
+            // revoke: a session another process wrote is still live.
+            "revoked": report.signed_out(),
+            "session_survived_concurrent_write": report.survived_concurrent_write,
             "registration_deleted": report.registration_deleted,
             "credential_file_removed": report.file_removed,
             "credentials_kept_for_retry": report.kept_for_retry,

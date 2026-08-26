@@ -126,9 +126,24 @@ struct Function {
 /// first so braces inside them cannot throw the count off, which matters on
 /// these heavily-commented sources.
 ///
-/// Functions are tracked at ANY depth, so methods inside `impl` blocks are
-/// measured too - they are most of the code here, and a scanner that only
-/// saw free functions would report a reassuring nothing.
+/// Functions are tracked at ANY depth, so methods inside `impl` blocks and
+/// trait default bodies are measured too - they are most of the code here,
+/// and the first version of this scanner only saw free functions and
+/// reported a reassuring nothing.
+///
+/// **Known blind spots**, recorded because a guard that fails silently is
+/// worse than no guard:
+///
+/// - **Closures.** A 60-line `|x| { ... }` is not matched, because it has
+///   no `fn` to key off. There are none in `crates/*/src` today.
+/// - **Macro-generated functions.** A body produced by `macro_rules!` is
+///   never seen, since this reads source text rather than expanded output.
+///   There is no `macro_rules!` under `crates/*/src` today either.
+///
+/// Both would need the scanner taught about them - or a real parser - if
+/// either construct arrives. Neither is a current violation; both are ways
+/// this guard could go quiet without anyone noticing, which is exactly the
+/// failure mode it was added to prevent.
 fn functions_in(source: &str) -> Vec<Function> {
     let mut found = Vec::new();
     let mut open: Option<(Function, usize)> = None;

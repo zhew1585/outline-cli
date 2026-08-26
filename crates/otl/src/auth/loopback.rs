@@ -13,7 +13,6 @@
 //! resolve to `::1`, and never `0.0.0.0`, which would expose the
 //! authorization code to the local network.
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -21,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Url;
 
+use crate::auth::callback_request::handle;
 use crate::auth::error::OAuthError;
 
 /// Loopback address the callback listener binds. Literal, never resolved.
@@ -42,24 +42,35 @@ pub const AUTH_TIMEOUT: Duration = Duration::from_secs(240);
 /// How often the listener is polled while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Longest a single connection may take to send its request line.
+/// Total time one connection gets to deliver its whole request line.
 ///
-/// Short on purpose. Concurrency already stops a stalled connection from
-/// delaying the real redirect, so this only bounds how long one worker
-/// thread lingers. A browser that has opened a connection sends its request
-/// line immediately.
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Maximum bytes read from one request line.
-const MAX_REQUEST_LINE_BYTES: u64 = 8 * 1024;
-
-/// Most connections served at once.
+/// A TOTAL budget, not a per-read timeout, and the difference is the whole
+/// point: a socket read timeout only fires when a peer sends NOTHING, so a
+/// peer sending one byte every second keeps every read succeeding and holds
+/// its handler for as long as it likes - about two and a half hours at the
+/// 8 KiB line cap. Budgeting the request line as a whole bounds that at
+/// this value no matter how the bytes are paced.
 ///
-/// A ceiling on threads, not on the login: handlers are short-lived
-/// (bounded by [`READ_TIMEOUT`]), so the cap frees continuously and a peer
-/// cannot hold it. Beyond it a connection is dropped unread, which costs a
-/// browser a retry - unlike queueing it, which would cost the login its
-/// deadline.
+/// A browser that has opened a connection sends its request line in the
+/// same breath, so 2s is enormous for the legitimate case.
+const REQUEST_BUDGET: Duration = Duration::from_secs(2);
+
+/// Total request-line budget for a connection served while at capacity.
+///
+/// Deliberately tiny. On loopback a real callback's bytes are already in
+/// the socket buffer by the time the connection is accepted, so this is
+/// thousands of times more than it needs, while a peer trying to occupy the
+/// accept loop gets almost nothing for each connection it opens.
+const SATURATED_REQUEST_BUDGET: Duration = Duration::from_millis(50);
+
+/// Most connections served on their own thread at once.
+///
+/// A ceiling on THREADS, not on connections: nothing is ever dropped
+/// unread. Beyond this the connection is served inline on the accept loop
+/// with [`SATURATED_REQUEST_BUDGET`] instead, because a dropped connection
+/// may BE the callback - a browser does not retry a top-level navigation
+/// that was accepted and then closed without an answer, and even if it did,
+/// a saturated listener would drop the retry too.
 const MAX_LIVE_HANDLERS: usize = 64;
 
 /// Every redirect URI an administrator must allow when pre-registering an
@@ -76,23 +87,13 @@ pub fn port_of(redirect_uri: &str) -> Option<u16> {
     Url::parse(redirect_uri).ok()?.port()
 }
 
-/// What the browser was redirected with.
-struct Redirect {
-    /// The `code` parameter, when the grant succeeded.
-    code: Option<String>,
-    /// The `state` parameter, echoed back by the server.
-    state: Option<String>,
-    /// The `error` parameter, when the grant was refused.
-    error: Option<String>,
-    /// The `error_description` parameter, when present.
-    description: Option<String>,
-}
-
 /// A bound loopback listener plus the exact redirect URI it answers on.
 #[derive(Debug)]
 pub struct CallbackServer {
     listener: TcpListener,
     redirect_uri: String,
+    /// Connections currently being served on their own thread.
+    live: Arc<AtomicUsize>,
 }
 
 impl CallbackServer {
@@ -141,6 +142,7 @@ impl CallbackServer {
         Ok(Self {
             listener,
             redirect_uri: format!("http://{CALLBACK_HOST}:{}{CALLBACK_PATH}", bound.port()),
+            live: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -167,12 +169,24 @@ impl CallbackServer {
     /// prefetch and keep-alive connections that go quiet.
     ///
     /// Concurrency removes the head-of-line blocking outright: a stalled
-    /// connection now occupies one short-lived thread and nothing else, and
-    /// the real redirect is handled the moment it arrives.
+    /// connection occupies one short-lived thread and nothing else, and the
+    /// real redirect is handled the moment it arrives.
+    ///
+    /// Concurrency alone was not enough, though, and the two gaps are worth
+    /// naming because both reproduced the original symptom by another
+    /// route. A per-READ timeout let a peer drip-feed bytes and hold a
+    /// handler indefinitely, so the thread pool never freed - fixed by
+    /// budgeting the request line as a whole ([`REQUEST_BUDGET`]). And when
+    /// the pool was full, connections were DROPPED unread - and the
+    /// connection over the limit can be the callback - fixed by serving
+    /// those inline instead ([`CallbackServer::serve`]).
+    ///
+    /// What holds now: a flood can delay the callback, bounded by the
+    /// kernel's listen backlog times [`SATURATED_REQUEST_BUDGET`], but it
+    /// cannot make the callback go unread.
     pub fn wait_for_code(&self, state: &str, timeout: Duration) -> Result<String, OAuthError> {
         let deadline = Instant::now() + timeout;
         let (sender, outcomes) = mpsc::channel();
-        let live = Arc::new(AtomicUsize::new(0));
         while Instant::now() < deadline {
             if let Some(outcome) = collect(&outcomes) {
                 return outcome;
@@ -181,7 +195,7 @@ impl CallbackServer {
                 std::thread::sleep(POLL_INTERVAL);
                 continue;
             };
-            self.serve(stream, state, &sender, &live);
+            self.serve(stream, state, &sender);
         }
         // Drain anything a handler produced in the final moments.
         collect(&outcomes).unwrap_or(Err(OAuthError::CallbackTimeout {
@@ -189,31 +203,52 @@ impl CallbackServer {
         }))
     }
 
-    /// Hand one connection to a worker thread.
+    /// Serve one connection, on a worker thread if there is room.
     ///
-    /// Above [`MAX_LIVE_HANDLERS`] the connection is dropped unread rather
-    /// than queued: unbounded thread spawning is its own denial of service,
-    /// and a dropped connection costs a browser a retry while a queued one
-    /// would cost the login its deadline. Handlers are short-lived, so the
-    /// cap frees continuously.
+    /// **Nothing is ever dropped unread.** At capacity - or if a thread
+    /// cannot be spawned - the connection is served INLINE with the much
+    /// smaller [`SATURATED_REQUEST_BUDGET`]. That keeps three properties at
+    /// once: threads stay bounded, the accept loop keeps draining, and a
+    /// callback is always read.
+    ///
+    /// The worst a flood can do is delay the callback by the number of
+    /// connections queued ahead of it times that small budget, bounded in
+    /// turn by the kernel's listen backlog. It cannot make the callback
+    /// disappear, which is what dropping did.
     fn serve(
         &self,
         stream: TcpStream,
         state: &str,
         sender: &mpsc::Sender<Result<String, OAuthError>>,
-        live: &Arc<AtomicUsize>,
     ) {
-        if live.load(Ordering::SeqCst) >= MAX_LIVE_HANDLERS {
+        if self.live.load(Ordering::SeqCst) < MAX_LIVE_HANDLERS
+            && self.spawn(&stream, state, sender)
+        {
             return;
         }
-        live.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = handle(&stream, state, SATURATED_REQUEST_BUDGET) {
+            let _ = sender.send(outcome);
+        }
+    }
+
+    /// Try to hand a connection to a worker thread; `false` if not spawned.
+    fn spawn(
+        &self,
+        stream: &TcpStream,
+        state: &str,
+        sender: &mpsc::Sender<Result<String, OAuthError>>,
+    ) -> bool {
+        let Ok(stream) = stream.try_clone() else {
+            return false;
+        };
+        self.live.fetch_add(1, Ordering::SeqCst);
         let expected = state.to_string();
         let sender = sender.clone();
-        let held = Arc::clone(live);
+        let held = Arc::clone(&self.live);
         let spawned = std::thread::Builder::new()
             .name("otl-oauth-callback".to_string())
             .spawn(move || {
-                if let Some(outcome) = handle(&stream, &expected) {
+                if let Some(outcome) = handle(&stream, &expected, REQUEST_BUDGET) {
                     // A departed receiver just means the login already
                     // finished; there is nothing left to report to.
                     let _ = sender.send(outcome);
@@ -221,19 +256,26 @@ impl CallbackServer {
                 held.fetch_sub(1, Ordering::SeqCst);
             });
         if spawned.is_err() {
-            live.fetch_sub(1, Ordering::SeqCst);
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            return false;
         }
+        true
+    }
+
+    /// How many connections are being served on their own thread.
+    #[cfg(test)]
+    fn live_handlers(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
     }
 
     /// Accept a connection if one is waiting, without blocking.
     fn accept_now(&self) -> Result<Option<TcpStream>, OAuthError> {
         match self.listener.accept() {
             Ok((stream, _)) => {
-                // Blocking for this connection's own thread, bounded by its
-                // own read timeout rather than by the login's deadline.
+                // Blocking from here on; how long is decided per read by
+                // the request-line budget, not by one fixed timeout.
                 let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(REQUEST_BUDGET));
                 Ok(Some(stream))
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -244,151 +286,11 @@ impl CallbackServer {
     }
 }
 
-/// Serve one connection: `Some` when it was the redirect (successfully or
-/// not), `None` when it was anything else and the wait continues.
-fn handle(stream: &TcpStream, expected_state: &str) -> Option<Result<String, OAuthError>> {
-    let Some(target) = read_request_target(stream) else {
-        respond(stream, "400 Bad Request", "Malformed request.");
-        return None;
-    };
-    let Some(redirect) = parse_redirect(&target) else {
-        // A stray request: answer it and keep waiting for the real one.
-        respond(stream, "404 Not Found", "Not the otl callback.");
-        return None;
-    };
-    Some(finish(stream, redirect, expected_state))
-}
-
 /// Take the first outcome a handler has produced, if any.
 fn collect(
     outcomes: &mpsc::Receiver<Result<String, OAuthError>>,
 ) -> Option<Result<String, OAuthError>> {
     outcomes.try_recv().ok()
-}
-
-/// Validate one redirect and turn it into a code or a typed failure.
-fn finish(
-    stream: &TcpStream,
-    redirect: Redirect,
-    expected_state: &str,
-) -> Result<String, OAuthError> {
-    // State first: nothing else in the query may be acted on until the
-    // redirect is known to belong to this login.
-    if redirect.state.as_deref() != Some(expected_state) {
-        respond(
-            stream,
-            "400 Bad Request",
-            "State mismatch: this redirect did not come from the otl login \
-                 that is running. Nothing was exchanged.",
-        );
-        return Err(OAuthError::StateMismatch);
-    }
-    if let Some(code) = redirect.error {
-        respond(
-            stream,
-            "200 OK",
-            "Authorization was not granted. You can close this tab.",
-        );
-        return Err(OAuthError::AuthorizationDenied {
-            code: sanitize_redirect_text(&code),
-            detail: match redirect.description {
-                Some(text) => format!(": {}", sanitize_redirect_text(&text)),
-                None => String::new(),
-            },
-        });
-    }
-    match redirect.code {
-        Some(code) => {
-            respond(
-                stream,
-                "200 OK",
-                "Signed in. You can close this tab and go back to the terminal.",
-            );
-            Ok(code)
-        }
-        None => {
-            respond(stream, "400 Bad Request", "Redirect carried no code.");
-            Err(OAuthError::Callback {
-                reason: "the redirect carried neither a code nor an error".to_string(),
-            })
-        }
-    }
-}
-
-/// Read the request target out of an HTTP request line.
-///
-/// Only `GET` is accepted; the read is capped, so a client that never sends
-/// a newline cannot make the CLI allocate without bound.
-fn read_request_target(stream: &TcpStream) -> Option<String> {
-    let mut reader = BufReader::new(stream.try_clone().ok()?).take(MAX_REQUEST_LINE_BYTES);
-    let mut line = String::new();
-    if reader.read_line(&mut line).ok()? == 0 {
-        return None;
-    }
-    let mut parts = line.split_whitespace();
-    let method = parts.next()?;
-    let target = parts.next()?;
-    (method == "GET").then(|| target.to_string())
-}
-
-/// Parse a redirect target, or `None` if it is not the callback path.
-fn parse_redirect(target: &str) -> Option<Redirect> {
-    // A request target is path-relative; give it a base so a real URL
-    // parser can handle the query, including percent-encoding.
-    let url = Url::parse(&format!("http://{CALLBACK_HOST}{target}")).ok()?;
-    if url.path() != CALLBACK_PATH {
-        return None;
-    }
-    let mut redirect = Redirect {
-        code: None,
-        state: None,
-        error: None,
-        description: None,
-    };
-    for (key, value) in url.query_pairs() {
-        let value = value.into_owned();
-        match key.as_ref() {
-            "code" => redirect.code = Some(value),
-            "state" => redirect.state = Some(value),
-            "error" => redirect.error = Some(value),
-            "error_description" => redirect.description = Some(value),
-            _ => {}
-        }
-    }
-    Some(redirect)
-}
-
-/// Maximum characters kept from redirect-supplied text.
-const MAX_REDIRECT_TEXT_CHARS: usize = 200;
-
-/// Make redirect query text safe to print.
-///
-/// The redirect comes through the user's browser, so its values are
-/// attacker-influenceable text like any other server response: it goes
-/// through the same hygiene pipeline (no secret to redact here, but control
-/// characters, invisible codepoints and length are all handled).
-fn sanitize_redirect_text(text: &str) -> String {
-    engine::sanitize::clean_server_text(text, "", false, MAX_REDIRECT_TEXT_CHARS)
-}
-
-/// Send a minimal HTML response. Best effort: the browser tab is a
-/// courtesy, and a write failure must not lose an authorization code.
-fn respond(stream: &TcpStream, status: &str, message: &str) {
-    let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>otl</title>\
-         <body style=\"font-family:system-ui;margin:3rem\"><p>{message}</p></body>"
-    );
-    let response = format!(
-        "HTTP/1.1 {status}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-store\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let mut stream = stream;
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
 }
 
 #[cfg(test)]
@@ -449,43 +351,150 @@ mod tests {
         assert_eq!(port_of("not a url"), None);
     }
 
-    #[test]
-    fn a_redirect_query_is_parsed_including_percent_encoding() {
-        let redirect = parse_redirect("/callback?code=abc%2Fdef&state=xyz").expect("callback path");
-        assert_eq!(redirect.code.as_deref(), Some("abc/def"));
-        assert_eq!(redirect.state.as_deref(), Some("xyz"));
-        assert!(redirect.error.is_none());
+    /// Wait for the handler count to reach `want`, up to `budget`.
+    ///
+    /// Polled rather than slept: what these tests assert is that the count
+    /// DOES reach a value, and a fixed sleep turns that into an assertion
+    /// about machine speed - which is how timing tests become flaky on a
+    /// loaded CI box.
+    fn await_handlers(server: &CallbackServer, want: usize, budget: Duration) -> usize {
+        let deadline = Instant::now() + budget;
+        loop {
+            let live = server.live_handlers();
+            if live == want || Instant::now() >= deadline {
+                return live;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// A peer that holds a connection open forever, drip-feeding bytes so
+    /// the socket never goes idle but the request line never completes.
+    ///
+    /// This is the shape that matters: a per-READ timeout never fires
+    /// against it, because every read returns data. Only a total budget for
+    /// the whole request line can end it.
+    fn trickle(port: u16, stop: &Arc<std::sync::atomic::AtomicBool>) -> Option<TcpStream> {
+        use std::io::Write as _;
+
+        let stream = TcpStream::connect((CALLBACK_HOST, port)).ok()?;
+        let mut feed = stream.try_clone().ok()?;
+        let stop = Arc::clone(stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if feed.write_all(b"x").is_err() || feed.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+        Some(stream)
+    }
+
+    /// Send a complete, valid callback request and keep the socket alive
+    /// long enough for the answer to be written.
+    fn send_callback(port: u16) {
+        use std::io::Write as _;
+
+        if let Ok(mut stream) = TcpStream::connect((CALLBACK_HOST, port)) {
+            let _ = stream.write_all(
+                b"GET /callback?code=real-code&state=state HTTP/1.1\r\n\
+                  Host: 127.0.0.1\r\n\r\n",
+            );
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(600));
+        }
     }
 
     #[test]
-    fn a_non_callback_path_is_not_treated_as_a_redirect() {
-        assert!(parse_redirect("/favicon.ico").is_none());
-        assert!(parse_redirect("/callback/extra?code=a").is_none());
-        assert!(parse_redirect("/?code=a").is_none());
+    fn a_saturating_flood_of_trickling_peers_cannot_block_the_redirect() {
+        // R4 [N1], the reviewer's attack. Concurrency fixed head-of-line
+        // blocking but the handler cap reintroduced the same consequence:
+        // over the cap a connection was dropped UNREAD, and the real
+        // callback can be the connection over the cap. Combined with a
+        // per-read (rather than total) timeout, a byte-trickling peer held
+        // a slot indefinitely, so the cap never freed.
+        //
+        // More peers than MAX_LIVE_HANDLERS on purpose: the previous test
+        // used 8, which by construction never reached the cap branch at
+        // all, and so could not observe this.
+        use std::sync::atomic::AtomicBool;
+
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let port = port_of(server.redirect_uri()).expect("a bound port");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let held: Vec<TcpStream> = (0..MAX_LIVE_HANDLERS + 16)
+            .filter_map(|_| trickle(port, &stop))
+            .collect();
+        assert!(
+            held.len() >= MAX_LIVE_HANDLERS,
+            "could not saturate the handler cap: only {} peers connected",
+            held.len()
+        );
+
+        std::thread::spawn(move || {
+            // Well after every slot is occupied.
+            std::thread::sleep(Duration::from_millis(900));
+            send_callback(port);
+        });
+
+        let outcome = server.wait_for_code("state", Duration::from_secs(20));
+        stop.store(true, Ordering::Relaxed);
+        drop(held);
+        assert_eq!(
+            outcome.ok().as_deref(),
+            Some("real-code"),
+            "a local process saturated the listener and the real callback \
+             never got served"
+        );
     }
 
     #[test]
-    fn an_error_redirect_is_parsed_as_such() {
-        let redirect =
-            parse_redirect("/callback?error=access_denied&error_description=User+said+no&state=s")
-                .expect("callback path");
-        assert_eq!(redirect.error.as_deref(), Some("access_denied"));
-        assert_eq!(redirect.description.as_deref(), Some("User said no"));
-        assert!(redirect.code.is_none());
-    }
+    fn one_peer_cannot_hold_a_handler_slot_beyond_the_request_budget() {
+        // The other half of [N1]: `READ_TIMEOUT` was a per-read timeout, so
+        // a peer sending one byte every second kept every read succeeding
+        // and held its handler for as long as it liked - about two and a
+        // half hours at the 8 KiB line cap. A request line needs a TOTAL
+        // budget.
+        //
+        // The accept loop has to be RUNNING for this to mean anything: a
+        // first version of this test checked the handler count without ever
+        // calling `wait_for_code`, so nothing was ever accepted and the
+        // assertion passed against the bug it was meant to catch.
+        use std::sync::atomic::AtomicBool;
 
-    #[test]
-    fn redirect_text_is_stripped_of_control_and_invisible_characters() {
-        let cleaned = sanitize_redirect_text("denied\u{1b}[31m\u{200b}by\nadmin");
-        assert!(!cleaned.contains('\u{1b}'), "{cleaned}");
-        assert!(!cleaned.contains('\u{200b}'), "{cleaned}");
-        assert!(!cleaned.contains('\n'), "{cleaned}");
-    }
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let port = port_of(server.redirect_uri()).expect("a bound port");
+        let stop = Arc::new(AtomicBool::new(false));
 
-    #[test]
-    fn redirect_text_is_length_capped() {
-        let cleaned = sanitize_redirect_text(&"x".repeat(1000));
-        assert_eq!(cleaned.chars().count(), MAX_REDIRECT_TEXT_CHARS);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Long enough to outlive the observation below.
+                let _ = server.wait_for_code("state", REQUEST_BUDGET * 4);
+            });
+
+            let held = trickle(port, &stop).expect("local connect");
+            assert_eq!(
+                await_handlers(&server, 1, Duration::from_secs(2)),
+                1,
+                "the trickling peer was never accepted, so this test would \
+                 prove nothing"
+            );
+
+            // The handler must give up on it despite bytes still arriving
+            // every 250ms. Generous budget: what is asserted is that the
+            // slot is released at all, not how fast.
+            assert_eq!(
+                await_handlers(&server, 0, REQUEST_BUDGET * 3),
+                0,
+                "a trickling peer is still holding a handler slot long after \
+                 the request budget elapsed"
+            );
+
+            stop.store(true, Ordering::Relaxed);
+            drop(held);
+        });
     }
 
     #[test]
@@ -526,19 +535,19 @@ mod tests {
             }
         });
 
-        // 8 stalled peers x the 2s read window is 16s of serial reading;
-        // this budget is a fraction of that, so it can only pass if the
-        // redirect is served concurrently.
-        let started = Instant::now();
+        // The proof is arithmetic, not wall-clock: serving these serially
+        // would cost stalled x REQUEST_BUDGET, which must exceed the budget
+        // below - so succeeding at all means the redirect was served
+        // concurrently rather than behind them.
+        let budget = Duration::from_secs(6);
+        assert!(
+            REQUEST_BUDGET * stalled.len() as u32 > budget,
+            "the budget is too generous for this to prove anything"
+        );
         let code = server
-            .wait_for_code("state", Duration::from_secs(6))
+            .wait_for_code("state", budget)
             .expect("a silent peer must not starve the real redirect");
         assert_eq!(code, "real-code");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the redirect waited behind the stalled peers: {:?}",
-            started.elapsed()
-        );
         drop(stalled);
     }
 
@@ -571,9 +580,9 @@ mod tests {
         // Generous, but far below the old flat per-connection timeout: the
         // point is that one silent peer cannot add 10s to the wait.
         assert!(
-            elapsed < READ_TIMEOUT,
-            "a stalled connection extended the wait to {elapsed:?}, past the \
-             {budget:?} budget and up to the {READ_TIMEOUT:?} read timeout"
+            elapsed < budget + REQUEST_BUDGET,
+            "a stalled connection extended the wait to {elapsed:?}, well past \
+             its {budget:?} budget"
         );
     }
 
@@ -674,7 +683,7 @@ mod tests {
             "{error:?}"
         );
         assert!(
-            started.elapsed() < budget + READ_TIMEOUT,
+            started.elapsed() < budget + REQUEST_BUDGET,
             "the wait overran its budget: {:?}",
             started.elapsed()
         );

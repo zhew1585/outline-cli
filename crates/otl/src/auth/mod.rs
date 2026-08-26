@@ -11,20 +11,22 @@
 //! - [`credentials`]: the credential file's contents.
 //! - [`lock`]: the advisory lock that makes token refresh single-flight.
 //! - [`endpoint`]: the one place that speaks HTTP to an OAuth endpoint.
-//! - [`metadata`], [`pkce`], [`loopback`], [`oauth`], [`dcr`]: the pieces of
-//!   the authorization-code flow.
+//! - [`metadata`], [`pkce`], [`loopback`], [`callback_request`], [`oauth`],
+//!   [`dcr`]: the pieces of the authorization-code flow.
 //! - [`transport`]: the TLS rule every OAuth URL has to pass.
 //! - [`selection`]: which credential a profile offers, and whether it may
 //!   be used against the instance in hand.
 //! - [`source`]: the `engine::CredentialSource` the request channel calls.
 //! - [`client_acquisition`]: which OAuth client a login speaks as.
-//! - [`login`], [`logout`], [`report`]: what the `otl auth` subcommands do.
+//! - [`login`], [`logout`], [`logout_remote`], [`report`]: what the
+//!   `otl auth` subcommands do.
 //!
 //! The profile helper here is deliberately minimal (an environment variable
 //! and a default): the full configuration and profile system lives
 //! elsewhere, and this module only needs a name to file credentials under.
 
 pub mod browser;
+pub mod callback_request;
 pub mod client_acquisition;
 pub mod credentials;
 pub mod dcr;
@@ -34,6 +36,7 @@ pub mod file_guard;
 pub mod lock;
 pub mod login;
 pub mod logout;
+pub mod logout_remote;
 pub mod loopback;
 pub mod metadata;
 pub mod oauth;
