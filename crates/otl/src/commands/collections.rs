@@ -17,6 +17,7 @@ use anyhow::anyhow;
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::fields::{self, Column, COMPUTED};
 use crate::render::{self, OutputMode};
@@ -78,21 +79,25 @@ pub struct ListArgs {
 }
 
 /// Run the requested `otl collections` subcommand.
-pub fn run(args: &CollectionsArgs, mode: OutputMode) -> Result<(), CliError> {
+pub fn run(
+    args: &CollectionsArgs,
+    mode: OutputMode,
+    overrides: &Overrides,
+) -> Result<(), CliError> {
     match &args.command {
-        CollectionsCommand::List(args) => list(args, mode),
+        CollectionsCommand::List(args) => list(args, mode, overrides),
     }
 }
 
 /// Run `otl collections list`.
-fn list(cmd: &ListArgs, mode: OutputMode) -> Result<(), CliError> {
-    let session = Session::open()?;
+fn list(cmd: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let session = Session::open(overrides)?;
     let collections = session.call_rows(LIST_OPERATION, &[], cmd.limit)?;
     if mode == OutputMode::Json {
         // Raw server rows: no synthetic count field, so a script never sees
         // a value the API cannot confirm.
         let payload = Value::Array(collections.items.clone());
-        let rendered = render::render(&payload, OutputMode::Json)
+        let rendered = render::render_json(&payload)
             .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
         stdio::write_data_line(&rendered)?;
     } else {

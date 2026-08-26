@@ -23,6 +23,7 @@ mod view;
 
 use clap::{Args, Subcommand};
 
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::render::OutputMode;
 
@@ -54,12 +55,17 @@ enum DocsCommand {
 /// needs: its default output is the document's markdown, so a pipe gets
 /// markdown and JSON has to be asked for explicitly. Every other
 /// subcommand follows the usual dual-state rule, already encoded in `mode`.
-pub fn run(args: &DocsArgs, mode: OutputMode, json_requested: bool) -> Result<(), CliError> {
+pub fn run(
+    args: &DocsArgs,
+    mode: OutputMode,
+    json_requested: bool,
+    overrides: &Overrides,
+) -> Result<(), CliError> {
     match &args.command {
-        DocsCommand::Search(args) => search::run(args, mode),
-        DocsCommand::View(args) => view::run(args, mode, json_requested),
-        DocsCommand::Create(args) => create::run(args, mode),
-        DocsCommand::Update(args) => update::run(args, mode),
-        DocsCommand::Export(args) => export::run(args, mode),
+        DocsCommand::Search(args) => search::run(args, mode, overrides),
+        DocsCommand::View(args) => view::run(args, mode, json_requested, overrides),
+        DocsCommand::Create(args) => create::run(args, mode, overrides),
+        DocsCommand::Update(args) => update::run(args, mode, overrides),
+        DocsCommand::Export(args) => export::run(args, mode, overrides),
     }
 }

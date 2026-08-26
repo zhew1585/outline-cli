@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use clap::Args;
 use std::path::PathBuf;
 
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::render::OutputMode;
 use crate::session::Session;
@@ -39,10 +40,10 @@ pub struct UpdateArgs {
 }
 
 /// Run `otl docs update`.
-pub fn run(cmd: &UpdateArgs, mode: OutputMode) -> Result<(), CliError> {
+pub fn run(cmd: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     let body = content::read(cmd.file.as_deref())?;
     let args = request_args(cmd, body)?;
-    let session = Session::open()?;
+    let session = Session::open(overrides)?;
     let document = session.call_data(OPERATION, &args)?;
     detail::report(&session, &document, mode)
 }

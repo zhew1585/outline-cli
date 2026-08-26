@@ -87,16 +87,27 @@ pub fn write_diagnostic_line(text: &str) {
 /// are layers, not alternatives: this one bounds the damage of forgetting,
 /// that one is precise about a particular value.
 ///
-/// Invisible and re-ordering format characters go too: they are not
-/// controls, but in a diagnostic they can make the text read as something
-/// other than what it says.
+/// Every other hazard [`crate::text::hazard`] knows about goes too. The
+/// match below is exhaustive on purpose: a new category added to that enum
+/// has to be answered here rather than silently falling through to
+/// "forward it".
+///
+/// Note what the answers say about this surface. A diagnostic is prose, so
+/// a removed character needs no visible marker (unlike a table cell, where
+/// `render` substitutes one to keep the width honest). And `Joiner` is
+/// dropped rather than kept, because a diagnostic quotes a NAME - an id, a
+/// path, a title being reported - and two names that render identically
+/// while differing underneath is the problem, not the emoji.
 pub fn scrub_terminal_controls(text: &str) -> String {
+    use crate::text::Hazard;
+
     text.chars()
-        .filter(|c| !crate::text::is_invisible(*c))
-        .map(|c| match c {
-            '\n' => '\n',
-            c if c.is_control() => ' ',
-            c => c,
+        .filter_map(|c| match crate::text::hazard(c) {
+            None => Some(c),
+            // The one hazard that survives, and only this one: see above.
+            Some(Hazard::Control) if c == '\n' => Some(c),
+            Some(Hazard::Control) => Some(' '),
+            Some(Hazard::BidiFormat | Hazard::Invisible | Hazard::Joiner) => None,
         })
         .collect()
 }

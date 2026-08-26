@@ -20,6 +20,7 @@ fn list_op() -> OpSpec {
         summary: Cow::Borrowed("Retrieve a thing"),
         content_type: Cow::Borrowed("application/json"),
         body_mode: BodyMode::KeyValue,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(&[]),
     }
 }

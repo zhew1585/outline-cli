@@ -1,0 +1,78 @@
+# Build provenance for the global release artifacts (Story 4.5).
+#
+# cargo-dist attests only the *local* artifacts - the per-target archives -
+# and only while `github-attestations-phase` is left at its default. Moving
+# the phase to "host" or "announce" would cover the globals, but that same
+# default is what gives `build-local-artifacts` its read-only token, so
+# moving it would hand a writable GITHUB_TOKEN back to the one job that
+# compiles the crate graph. Attesting the globals in a separate job gets
+# both properties instead of trading one for the other.
+#
+# The gap this closes is not hypothetical: README's headline install command
+# pipes `outline-cli-installer.sh` into a shell, and until now that script -
+# unlike the tarballs it downloads - had no attestation a user could check.
+#
+# Registered as a `post-announce-jobs` job. That is the only cargo-dist slot
+# nothing depends on, and the choice is load-bearing rather than cosmetic:
+# attesting is additive, so a failure here must not be able to damage a
+# release that is otherwise fine.
+#
+# `host-jobs` looked like the natural home and is a trap. `announce` really
+# does ignore host-job results (its `if` uses `always()`), but
+# publish-homebrew-formula lists host jobs in `needs` and has no `always()`,
+# so a failed attestation would skip the formula push while announce still
+# published the Release - reconstructing exactly the "Release is public but
+# brew cannot install it" state that `github-release = "announce"` was set
+# to eliminate. dist-workspace.toml carries the full slot-by-slot map, and
+# scripts/check-release-gating.sh asserts that no attestation job sits in
+# the needs of anything on the publishing path.
+#
+# Cost of post-announce: the attestations appear seconds after the Release
+# instead of before it. For a verification aid that is immaterial.
+name: Attest global artifacts
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist-manifest JSON produced by the plan job (unused)"
+        required: false
+        type: string
+
+# Permissions come from the caller job, set via
+# `github-custom-job-permissions` in dist-workspace.toml. Declared here too
+# so a direct call cannot end up with less than attestation needs.
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  attest:
+    name: attest installers and checksums
+    runs-on: ubuntu-latest
+    steps:
+      - name: fetch built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+      - name: drop intermediate manifests
+        # The per-target dist-manifest.json files are build scaffolding that
+        # never reaches a release, matching the Cleanup step dist runs before
+        # creating the release.
+        shell: bash
+        run: rm -f artifacts/*-dist-manifest.json
+      - name: attest
+        # Same action and input shape dist uses for the local artifacts, so
+        # both sets of attestations are produced the same way. The per-target
+        # archives are already attested in build-local-artifacts; this covers
+        # what that step's glob cannot reach.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            artifacts/*-installer.sh
+            artifacts/*.rb
+            artifacts/sha256.sum
+            artifacts/source.tar.gz

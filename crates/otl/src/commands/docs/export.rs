@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::Args;
 
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::export::Names;
 use crate::fields;
@@ -83,7 +84,7 @@ struct Failure {
 }
 
 /// Run `otl docs export`.
-pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
+pub fn run(cmd: &ExportArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     // Local checks first: a bad output directory must not cost a request.
     // The canonical path is what everything below joins onto, so an
     // ancestor symlink is resolved once, up front, and reported.
@@ -91,7 +92,7 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     let root = prepared.root;
     let root_dir = Dir::open(root.clone())
         .map_err(|reason| CliError::usage(anyhow!("{}: {reason}", root.display())))?;
-    let session = Session::open()?;
+    let session = Session::open(overrides)?;
     let args = vec![("collectionId".to_string(), cmd.collection.clone())];
     let documents = session.call_rows(LIST_OPERATION, &args, cmd.limit)?;
     let plan = tree::plan(&documents.items);
@@ -590,7 +591,7 @@ impl<'a> Export<'a> {
                 }))
                 .collect::<Vec<_>>(),
         });
-        let rendered = render::render(&payload, OutputMode::Json)
+        let rendered = render::render_json(&payload)
             .map_err(|error| CliError::failure(anyhow!("failed to render summary: {error}")))?;
         stdio::write_data_line(&rendered)
     }

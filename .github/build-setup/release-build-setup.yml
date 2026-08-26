@@ -1,0 +1,73 @@
+# Extra steps cargo-dist injects into the `build-local-artifacts` job of the
+# generated release workflow (`github-build-setup` in dist-workspace.toml).
+# That job is the matrix one: it runs once per published target triple.
+#
+# The fragment deliberately lives OUTSIDE .github/workflows: GitHub tries to
+# parse every .yml in that directory as a workflow and would report a bare
+# step list as an invalid workflow file. dist resolves the configured path
+# relative to .github/workflows, hence the `../` in the config.
+#
+# ---------------------------------------------------------------------------
+# Why the size gate lives HERE and not in a workflow of its own
+# ---------------------------------------------------------------------------
+# A separate workflow triggered by the same tag runs *in parallel* with the
+# release: it can only turn itself red while the release publishes anyway.
+# Even a custom `plan-jobs` job is not enough, because when it fails the
+# build jobs are *skipped*, and dist's `host` job accepts `skipped` builds
+# (`always() && ... (result == 'skipped' || result == 'success')`).
+#
+# Failing a step inside `build-local-artifacts` makes that job report
+# `failure`, which is neither `skipped` nor `success`, so:
+#
+#   build-local-artifacts (failure)
+#     -> host             skipped   (its `if` requires skipped-or-success)
+#     -> announce         skipped   (its `if` requires host == 'success')
+#     -> GitHub Release   never created (github-release = "announce")
+#
+# That is a real gate on the publishing path, which is what AC2 asks for.
+#
+# It is also nearly free: the step compiles the same package, profile and
+# target that `dist build` compiles moments later in the same job, with the
+# same RUSTFLAGS, so dist reuses this compilation instead of redoing it.
+- name: install musl cross toolchain (Linux release builds)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: bash scripts/install-linux-musl-toolchain.sh
+
+# Belt and braces for the checks that protect the supply chain. The
+# preflight job (release-guards) is the primary gate and blocks `host`
+# properly now, but it does so through the same template machinery it is
+# asserting - so run the dependency-free assertions here too, on the one
+# lever that provably fails the build job. Linux only: these need python3,
+# which is not reliably on PATH under Git Bash on the Windows runner, and
+# one failing matrix leg already fails the job.
+- name: release gating and pinning assertions
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    bash scripts/check-release-gating.sh
+    bash scripts/check-action-pins.sh
+    bash scripts/check-msi-version.sh
+
+- name: binary size budget for the published target
+  shell: bash
+  env:
+    # One triple per matrix entry with dist's default `merge-tasks = false`;
+    # the loop below keeps working if that ever changes.
+    RELEASE_TARGETS: ${{ join(matrix.targets, ',') }}
+  run: |
+    set -euo pipefail
+    if [ -z "${RELEASE_TARGETS}" ]; then
+      echo "::error::no target triples in the build matrix; refusing to skip the size gate"
+      exit 1
+    fi
+    IFS=',' read -r -a targets <<< "${RELEASE_TARGETS}"
+    for target in "${targets[@]}"; do
+      echo "::group::binary size gate (${target})"
+      # dist adds the target itself later; doing it here too is a no-op for
+      # a native target and required for the musl cross build.
+      rustup target add "${target}"
+      BINARY_SIZE_TARGET="${target}" bash scripts/check-binary-size.sh
+      echo "::endgroup::"
+    done

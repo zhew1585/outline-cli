@@ -16,6 +16,7 @@ use clap::Args;
 use serde_json::Value;
 
 use crate::browser;
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::fields;
 use crate::pager;
@@ -42,14 +43,19 @@ pub struct ViewArgs {
 }
 
 /// Run `otl docs view`.
-pub fn run(cmd: &ViewArgs, mode: OutputMode, json_requested: bool) -> Result<(), CliError> {
+pub fn run(
+    cmd: &ViewArgs,
+    mode: OutputMode,
+    json_requested: bool,
+    overrides: &Overrides,
+) -> Result<(), CliError> {
     if cmd.raw && json_requested {
         return Err(CliError::usage(anyhow!(
             "--raw prints the document's markdown and --json prints its \
              metadata as JSON; pass one or the other"
         )));
     }
-    let session = Session::open()?;
+    let session = Session::open(overrides)?;
     let document = session.call_data(OPERATION, &[("id".to_string(), cmd.id.clone())])?;
     if cmd.web {
         return open_in_browser(&session, &document, json_requested);
@@ -84,7 +90,7 @@ fn markdown(document: &Value) -> String {
 
 /// Print the raw document object.
 fn print_json(document: &Value) -> Result<(), CliError> {
-    let rendered = render::render(document, OutputMode::Json)
+    let rendered = render::render_json(document)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
     stdio::write_data_line(&rendered)
 }

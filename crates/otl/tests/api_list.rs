@@ -9,7 +9,12 @@ use serde_json::Value;
 /// `otl` command with Outline env scrubbed for deterministic tests.
 fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env_remove("OUTLINE_URL").env_remove("OUTLINE_API_KEY");
+    cmd.env_remove("OUTLINE_URL")
+        .env_remove("OUTLINE_API_KEY")
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file, so the developer's own
+        // profiles cannot influence the assertions below (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 

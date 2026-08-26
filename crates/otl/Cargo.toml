@@ -7,6 +7,25 @@ description = "Outline CLI (otl): UX layer over the generic engine"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Required by cargo-dist's GitHub backend: installers and the Homebrew
+# formula embed release-artifact URLs derived from this repository, the MSI
+# takes its Manufacturer from `authors`, and the formula its `homepage`.
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "339F52C9-2FA2-4724-B43E-04C01774EB48"
+path-guid = "3E6CF235-552B-4E3C-A786-10EF1CD89BC0"
+license = false
+eula = false
+# `AllowSameVersionUpgrades='yes'` in wix/main.wxs makes the MSI's detect
+# range include its own version, which Windows Installer's ICE61 validation
+# reports ("This product should remove only older versions of itself"). It
+# is a warning, not an error, but silence it so a real linker problem is not
+# lost in the noise. cargo-wix passes these straight to light.exe
+# (cargo-wix 0.3.9, src/create.rs::linker_args).
+linker-args = ["-sice:ICE61"]
 
 [lib]
 name = "otl"
@@ -20,15 +39,24 @@ path = "src/main.rs"
 engine = { path = "../engine" }
 anyhow = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
+directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 terminal_size = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [build-dependencies]
-serde_json = { workspace = true }
+# `preserve_order` so the compiled IR keeps the spec's own property order:
+# it is the schema's statement of which response fields matter most, and the
+# table renderer ranks columns by it. Build-dependency features are not
+# unified with normal dependencies under resolver 2, so the runtime
+# `serde_json` keeps its default (sorted) map and response JSON output is
+# unaffected.
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

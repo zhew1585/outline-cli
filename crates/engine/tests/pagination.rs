@@ -47,6 +47,7 @@ fn op() -> OpSpec {
         summary: Cow::Borrowed("List things"),
         content_type: Cow::Borrowed("application/json"),
         body_mode: BodyMode::KeyValue,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(PARAMS),
     }
 }
@@ -490,6 +491,7 @@ const STRING_OFFSET_PARAMS: &[ParamSpec] = &[
 
 fn string_offset_op() -> OpSpec {
     OpSpec {
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(STRING_OFFSET_PARAMS),
         ..op()
     }

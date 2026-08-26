@@ -78,15 +78,21 @@ pub fn safe_stem(raw: &str) -> String {
 
 /// Map every character that cannot appear in a file name to
 /// [`REPLACEMENT`], and drop the invisible ones entirely.
+///
+/// A file name is a NAME, so every invisible category goes - including
+/// `Joiner`, which other surfaces keep. Two files whose names render
+/// identically while differing underneath is exactly what the
+/// de-duplication below exists to prevent, and an emoji ligature in a file
+/// name is not worth reintroducing it for.
 fn replace_illegal(raw: &str) -> String {
+    use crate::text::Hazard;
+
     raw.chars()
-        .filter(|c| !crate::text::is_invisible(*c))
-        .map(|c| {
-            if c.is_control() || ILLEGAL.contains(&c) {
-                REPLACEMENT
-            } else {
-                c
-            }
+        .filter_map(|c| match crate::text::hazard(c) {
+            Some(Hazard::BidiFormat | Hazard::Invisible | Hazard::Joiner) => None,
+            Some(Hazard::Control) => Some(REPLACEMENT),
+            None if ILLEGAL.contains(&c) => Some(REPLACEMENT),
+            None => Some(c),
         })
         .collect()
 }

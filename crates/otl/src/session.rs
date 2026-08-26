@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use engine::{Client, Fetched, Truncation, TruncationCause, ValidationMode};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, Overrides};
 use crate::errors::map_engine_error;
 use crate::exit::CliError;
 use crate::ops;
@@ -50,9 +50,14 @@ pub struct Session {
 impl Session {
     /// Resolve configuration and build the request channel.
     ///
+    /// `overrides` is the command-line layer, which outranks the
+    /// environment and the config file key by key - the curated commands
+    /// honour `--profile`, `--url` and `--config` exactly as `otl api`
+    /// does, because they resolve configuration the same way.
+    ///
     /// Configuration problems are reported here, before any network I/O.
-    pub fn open() -> Result<Self, CliError> {
-        let config = Config::from_env().map_err(CliError::usage)?;
+    pub fn open(overrides: &Overrides) -> Result<Self, CliError> {
+        let config = Config::load(overrides).map_err(CliError::usage)?;
         let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
         let origin = engine::base_url_origin(&config.base_url).ok_or_else(|| {
             // Unreachable in practice: `Client::new` accepted the URL, so it
@@ -174,9 +179,13 @@ fn is_safe_relative_path(path: &str) -> bool {
         && !ENCODED_SEPARATORS
             .iter()
             .any(|encoded| lowered.contains(encoded))
-        && !path.chars().any(|c| {
-            c.is_control() || c.is_whitespace() || c == '\u{7f}' || crate::text::is_invisible(c)
-        })
+        // Any hazard at all, of any category: a URL path has no use for a
+        // control character, a bidi override, an invisible pad or a joiner,
+        // and this string is both printed to the user and handed to a
+        // browser - the two must agree about what it says.
+        && !path
+            .chars()
+            .any(|c| c.is_whitespace() || crate::text::hazard(c).is_some())
 }
 
 /// Take the `data` payload out of a response envelope.

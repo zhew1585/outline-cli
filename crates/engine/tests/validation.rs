@@ -45,6 +45,7 @@ fn json_op(params: Vec<ParamSpec>) -> OpSpec {
         summary: Cow::Borrowed("Update a thing"),
         content_type: Cow::Borrowed("application/json"),
         body_mode: BodyMode::KeyValue,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Owned(params),
     }
 }
@@ -292,6 +293,7 @@ fn unsupported_op() -> OpSpec {
     OpSpec {
         content_type: Cow::Borrowed("multipart/form-data"),
         body_mode: BodyMode::Unsupported,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(&[]),
         ..test_op()
     }
@@ -335,6 +337,7 @@ fn unsupported_body_type_is_rejected_before_any_network_request() {
 fn union_op() -> OpSpec {
     OpSpec {
         body_mode: BodyMode::RawJsonOnly,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Owned(vec![
             param("documentId", ParamType::String, false),
             param("collectionId", ParamType::String, false),

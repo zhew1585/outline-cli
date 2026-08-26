@@ -17,7 +17,7 @@ use clap::Args;
 use engine::{BodyMode, Client, EngineError, ErrorDetail, Fetched, ValidationMode};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, Overrides};
 use crate::errors::{map_engine_error, map_engine_error_with_hint};
 use crate::exit::CliError;
 use crate::ops;
@@ -97,7 +97,10 @@ enum Payload {
 
 /// Run the `api` subcommand. Configuration and argument validation happen
 /// before any network request.
-pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
+///
+/// `overrides` carries the command-line configuration layer, which outranks
+/// the environment and the user config file key by key.
+pub fn run(cmd: &ApiArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     if cmd.operation == LIST_OPERATION {
         return run_list(cmd);
     }
@@ -116,7 +119,7 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         Payload::Raw(_) => None,
     };
     check_limit_usage(cmd, &payload, pagination.is_some())?;
-    let config = Config::from_env().map_err(CliError::usage)?;
+    let config = Config::load(overrides).map_err(CliError::usage)?;
 
     let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
     let detail = error_detail(cmd);
@@ -139,7 +142,7 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
     if let Some(truncation) = &fetched.truncation {
         session::warn_truncated(truncation);
     }
-    print_response(&fetched.value, mode)
+    print_response(&fetched.value, mode, &op.response_fields)
 }
 
 /// Reject `--limit` where it cannot mean anything, before any request.
@@ -345,9 +348,17 @@ fn parse_key_value_args(raw: &[String]) -> Result<Vec<(String, String)>, CliErro
 
 /// Print the `data` field (or the whole envelope if absent) to stdout in
 /// the resolved output mode (raw JSON, or a table for list-shaped data).
-fn print_response(response: &Value, mode: OutputMode) -> Result<(), CliError> {
+///
+/// `schema` is the operation's compiled response shape, which drives table
+/// column selection; the same `data` convention is applied here and by the
+/// build pipeline that extracted it.
+fn print_response(
+    response: &Value,
+    mode: OutputMode,
+    schema: &[engine::FieldSpec],
+) -> Result<(), CliError> {
     let payload = response.get("data").unwrap_or(response);
-    let rendered = render::render(payload, mode)
+    let rendered = render::render(payload, mode, schema)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
     // Never `println!` on the data path: a consumer that closes the pipe
     // early must not turn into a panic and exit code 101.

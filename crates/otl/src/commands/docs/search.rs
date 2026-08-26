@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use clap::Args;
 use serde_json::Value;
 
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::fields::{self, Column, COMPUTED};
 use crate::render::{self, OutputMode};
@@ -54,8 +55,8 @@ pub struct SearchArgs {
 }
 
 /// Run `otl docs search`.
-pub fn run(cmd: &SearchArgs, mode: OutputMode) -> Result<(), CliError> {
-    let session = Session::open()?;
+pub fn run(cmd: &SearchArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let session = Session::open(overrides)?;
     let mut args = vec![("query".to_string(), cmd.query.clone())];
     if let Some(collection) = &cmd.collection {
         // The vendored spec marks `collectionId` deprecated in favour of
@@ -87,7 +88,7 @@ pub fn run(cmd: &SearchArgs, mode: OutputMode) -> Result<(), CliError> {
 /// Print the raw result rows, exactly as the server sent them.
 fn print_json(hits: &[Value]) -> Result<(), CliError> {
     let payload = Value::Array(hits.to_vec());
-    let rendered = render::render(&payload, OutputMode::Json).map_err(|error| {
+    let rendered = render::render_json(&payload).map_err(|error| {
         CliError::failure(anyhow::anyhow!("failed to render response: {error}"))
     })?;
     stdio::write_data_line(&rendered)

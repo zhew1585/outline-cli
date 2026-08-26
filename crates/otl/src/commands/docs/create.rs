@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use clap::Args;
 use std::path::PathBuf;
 
+use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::render::OutputMode;
 use crate::session::Session;
@@ -46,14 +47,14 @@ pub struct CreateArgs {
 }
 
 /// Run `otl docs create`.
-pub fn run(cmd: &CreateArgs, mode: OutputMode) -> Result<(), CliError> {
+pub fn run(cmd: &CreateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     let Some(body) = content::read(cmd.file.as_deref())? else {
         return Err(CliError::usage(anyhow!(
             "no document body: pipe markdown in (`cat notes.md | otl docs \
              create --title Notes --collection <id>`) or pass --file <path>"
         )));
     };
-    let session = Session::open()?;
+    let session = Session::open(overrides)?;
     let args = request_args(cmd, body.text);
     let document = session.call_data(OPERATION, &args)?;
     detail::report(&session, &document, mode)

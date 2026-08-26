@@ -25,11 +25,21 @@ const MAX_LINES: usize = 800;
 /// a new file cannot join it by accident, and shrinking one of these below
 /// the limit makes this test fail until the entry is removed - so the list
 /// can only get shorter.
-const GRANDFATHERED: &[(&str, &str)] = &[(
-    "crates/engine/tests/pagination.rs",
-    "predates this guard; `crates/engine` is unchanged on this branch, so \
-     splitting it here would be an unrelated change in an unrelated crate",
-)];
+const GRANDFATHERED: &[(&str, &str)] = &[
+    (
+        "crates/engine/tests/pagination.rs",
+        "predates this guard; `crates/engine` is unchanged on this branch, so \
+         splitting it here would be an unrelated change in an unrelated crate",
+    ),
+    (
+        "crates/engine/tests/validation.rs",
+        "arrived over the limit from `develop` (799 -> 802 lines there, and \
+         this guard does not exist on that branch, so nothing told anyone). \
+         Two lines over, in a crate this branch does not touch: recorded so \
+         it is visible and expires by itself, rather than split here as an \
+         unrelated change",
+    ),
+];
 
 #[test]
 fn no_rust_file_is_longer_than_the_limit() {

@@ -33,7 +33,7 @@ const FIELDS: &[Column] = &[
 /// and whether the document is still a draft.
 pub fn report(session: &Session, document: &Value, mode: OutputMode) -> Result<(), CliError> {
     if mode == OutputMode::Json {
-        let rendered = render::render(document, OutputMode::Json)
+        let rendered = render::render_json(document)
             .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
         return stdio::write_data_line(&rendered);
     }
