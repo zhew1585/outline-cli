@@ -47,8 +47,9 @@ Prebuilt archives are attached to every release for these targets:
 | Linux (x86-64) | `x86_64-unknown-linux-musl` | statically linked, no glibc version floor |
 | Windows (x86-64) | `x86_64-pc-windows-msvc` | also shipped as an MSI |
 
-**Verifying a download.** Every release archive carries a GitHub build attestation, so you can check an
-artifact was produced by this repository's release workflow rather than merely that it matches a checksum
+**Verifying a download.** Every release artifact — the per-platform archives, the MSI, and also the shell
+installer, the Homebrew formula and `sha256.sum` — carries a GitHub build attestation, so you can check
+it was produced by this repository's release workflow rather than merely that it matches a checksum
 published alongside it:
 
 ```sh
@@ -200,15 +201,21 @@ comment inside it.)
 
 Two things guard a release, and both are wired so that failing them actually stops one:
 
-- **`release-guards.yml`** runs as cargo-dist's plan-phase job, which every later job depends on. It
+- **`release-guards.yml`** runs alongside the build matrix as one of dist's `local-artifacts-jobs`. It
   verifies the cargo-dist installer against a committed checksum before running it, checks that the
-  generated workflow is in sync, that every action is pinned to a commit SHA, that all six artifacts are
-  planned, that no updater has crept in, that the version can be expressed as an MSI, and that the
-  Homebrew tap and its token actually exist.
+  generated workflow is in sync and has not drifted from dist's WiX template, that every action is pinned
+  to a commit SHA, that all six artifacts are planned, that no updater has crept in, that the version can
+  be expressed as an MSI, and that the Homebrew tap and its token actually exist.
 - **The binary-size budget** runs *inside* dist's own build job (injected via
-  `.github/build-setup/release-build-setup.yml`), once per published target. Failing it fails that job,
-  which skips `host`, which skips `announce` — and the GitHub Release is created in `announce`, so
-  nothing is published. `binary-size.yml` runs the same script on pull requests for early feedback.
+  `.github/build-setup/release-build-setup.yml`), once per published target. `binary-size.yml` runs the
+  same script on pull requests for early feedback.
+
+Both are wired to the only two things that stop a release, which is a narrower set than it looks:
+`host` accepts a *skipped* dependency and only rejects a *failed* one, so a guard that merely gets
+skipped changes nothing. Failing `release-guards` or failing a build job skips `host`, which skips
+`announce` — and the GitHub Release is created in `announce`, so nothing is published.
+`scripts/check-release-gating.sh` asserts that chain against the generated workflow on every run, so a
+cargo-dist upgrade cannot quietly unhook it.
 
 CI runs the matrix on macOS, Linux, and Windows, guards the startup budget, and asserts that no
 YAML/OpenAPI parser ever enters the runtime dependency graph. Contract tests against a real workspace run

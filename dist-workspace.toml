@@ -92,10 +92,42 @@ github-release = "announce"
 # as close to least privilege as the tool allows today.
 github-attestations = true
 
-# Plan-phase gate. Every build, host, publish and announce job transitively
-# needs this, so a failure here means nothing is built and nothing is
-# published. See the workflow for what it checks.
-plan-jobs = ["./release-guards"]
+# Release preflight. Registered as a `local-artifacts-jobs` job, NOT a
+# `plan-jobs` one, and the difference is the whole point.
+#
+# dist's `host` job is guarded by
+#   always() && ... && (needs.X.result == 'skipped' || needs.X.result == 'success')
+# so a *skipped* dependency passes and only a *failure* blocks. A plan job
+# that fails leaves the build jobs skipped, not failed, and `host` then runs
+# anyway - taking `publish-homebrew-formula` (writable tap PAT, third-party
+# Ruby) with it. `host` does list `local-artifacts-jobs` in `needs` and does
+# demand skipped-or-success from each, so a failure here genuinely stops the
+# release. `host-jobs` would NOT work either: `announce` lists them in
+# `needs` but its `if` uses `always()` and never checks their result.
+#
+# It still starts at the same moment - the job only needs `plan`, so it runs
+# alongside the build matrix rather than after it.
+#
+# scripts/check-release-gating.sh asserts this chain against the generated
+# workflow, so a cargo-dist upgrade cannot quietly undo it.
+local-artifacts-jobs = ["./release-guards"]
+
+# Attest the global artifacts (shell installer, Homebrew formula,
+# sha256.sum, source tarball). dist only attests *local* artifacts, and only
+# when `github-attestations-phase` is left at its default - and that same
+# default is what gives build-local-artifacts its read-only token, so the
+# phase cannot be moved to cover the globals without handing the compile job
+# a writable token back. Doing it in a custom host-phase job gets both.
+#
+# A host job runs after every artifact exists and cannot block the release
+# (`announce` never checks its result), which is the right shape for
+# something additive: a failure to attest must not strand a good build.
+host-jobs = ["./attest-global-artifacts"]
+
+# Custom jobs get no special permissions by default; attestation needs
+# these, and nothing else. Inline table on purpose: a `[dist.<table>]`
+# section header here would swallow every key defined after it.
+github-custom-job-permissions = { attest-global-artifacts = { id-token = "write", attestations = "write", contents = "read" } }
 
 # Do not regenerate or diff the WiX definition: crates/otl/wix/main.wxs is
 # hand-maintained because it needs `AllowSameVersionUpgrades='yes'`, which

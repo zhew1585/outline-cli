@@ -97,6 +97,15 @@
           warning and is suppressed via [package.metadata.wix] linker-args
           in the package's Cargo.toml.
 
+          Accepted cost: including the current version in the detect
+          range also removes downgrade protection *within* one core
+          version. Installing 1.2.3-rc.1 over 1.2.3-rc.2 is seen as a
+          same-version upgrade and silently replaces it, rather than
+          raising DowngradeErrorMessage. Across core versions (1.2.2
+          over 1.2.3) the downgrade guard still applies. Prereleases
+          being mutually replaceable is the lesser evil versus stable
+          releases failing to replace the prereleases they follow.
+
           Versions whose prerelease has no numeric part at all (1.2.3-rc)
           make cargo-wix fail outright; scripts/check-msi-version.sh
           catches that at plan time instead of mid-release on Windows.

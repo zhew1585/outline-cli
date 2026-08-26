@@ -34,6 +34,22 @@
   shell: bash
   run: bash scripts/install-linux-musl-toolchain.sh
 
+# Belt and braces for the checks that protect the supply chain. The
+# preflight job (release-guards) is the primary gate and blocks `host`
+# properly now, but it does so through the same template machinery it is
+# asserting - so run the dependency-free assertions here too, on the one
+# lever that provably fails the build job. Linux only: these need python3,
+# which is not reliably on PATH under Git Bash on the Windows runner, and
+# one failing matrix leg already fails the job.
+- name: release gating and pinning assertions
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    bash scripts/check-release-gating.sh
+    bash scripts/check-action-pins.sh
+    bash scripts/check-msi-version.sh
+
 - name: binary size budget for the published target
   shell: bash
   env:

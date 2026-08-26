@@ -3,11 +3,13 @@
 # x86_64-unknown-linux-musl (the statically linked artifact we ship, see
 # dist-workspace.toml `targets`).
 #
-# Single source of truth for that package list: it is called both by the
-# steps cargo-dist injects into its release build job
-# (.github/build-setup/linux-musl.yml) and by the pre-merge musl build in
-# .github/workflows/release-guards.yml, so the release path and the path
-# that proves the release path works can never drift apart.
+# Single source of truth for that package list. Both callers use it:
+#   * .github/build-setup/release-build-setup.yml - the steps cargo-dist
+#     injects into its own `build-local-artifacts` job, i.e. the release
+#     build itself;
+#   * .github/workflows/binary-size.yml - the pre-merge musl build, which is
+#     what proves the release build will work before anyone tags.
+# So the release path and the path that exercises it cannot drift apart.
 #
 # Why a C toolchain is needed at all: the TLS stack is rustls, whose crypto
 # provider is aws-lc-rs -> aws-lc-sys, which compiles C. Building for a

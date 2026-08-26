@@ -9,28 +9,46 @@
 #
 # So the gate is set tighter than the promise:
 #
-#   measured 2026-08, `--profile dist` (= release: opt-level="s", fat LTO,
-#   codegen-units=1, strip="symbols", panic="abort"):
-#       aarch64-apple-darwin      2_567_312 B  (~2.45 MiB)
-#   the other release targets land in the same 2.6-2.8 MB band, with
-#   x86_64-unknown-linux-musl the largest because it statically links libc.
+#   gate:  4 MiB = 4194304 B   (fails the build)
+#   warn:  85% of the gate     (prints a warning, still passes)
 #
-#   gate: 4 MiB = 4194304 B
+# Measurements, `--profile dist` (= release: opt-level="s", fat LTO,
+# codegen-units=1, strip="symbols", panic="abort"), aarch64-apple-darwin,
+# 2026-08:
 #
-# 4 MiB leaves ~40% headroom over the largest observed artifact - enough
-# that ordinary code growth and toolchain churn never flap the build - while
-# still catching the thing this gate exists to catch: a fat new dependency
-# (a YAML parser, a TUI stack, an async runtime) landing in the shipped
-# binary. It is also comfortably under the 5 MB NFR, so passing this gate
-# implies satisfying NFR2.
+#   this branch, which carries release config and no feature code:
+#       2_567_312 B  (~2.45 MiB)   61% of the gate
 #
-# Raising the ceiling is a deliberate decision, not a mechanical fix:
-# update the measurements above together with the constant, and say in the
-# commit message which dependency bought the extra megabyte.
+#   the four feature branches waiting to merge, measured individually as
+#   deltas against the same baseline:
+#       epic2-auth      +317_360 B
+#       epic3-commands  +283_168 B
+#       epic4-config    +232_800 B
+#       epic4-specsync  +116_400 B
+#
+# Those deltas are additive-worst-case, so the merged binary lands around
+# 3.35 MiB on darwin. x86_64-unknown-linux-musl runs roughly 9% larger
+# because it statically links libc, which puts the largest shipped artifact
+# near 3.66 MiB - about 91% of this gate.
+#
+# That is deliberately tight, and it is why the warning band exists: the
+# squeeze becomes visible before it becomes a red build, so the response can
+# be "what grew?" rather than "raise the number". 4 MiB was NOT chosen for
+# comfort - it is the largest value that still leaves the gate meaningful,
+# since the NFR2 promise itself (5 MB ~= 4.77 MiB) is only 14% above the
+# projected merged size. A gate at the promise would police nothing.
+#
+# After the feature branches merge, re-measure all four targets on develop
+# and update the numbers above. If the real figure is materially worse than
+# the projection, the fix is to find the growth - `cargo bloat`, a duplicated
+# dependency, a monomorphisation blowup - not to move the constant. Raising
+# it is a deliberate decision: update the measurements here in the same
+# commit and say which dependency bought the extra megabyte.
 #
 # Usage:
 #   ./scripts/check-binary-size.sh                          # gate at 4 MiB
 #   MAX_BINARY_SIZE_BYTES=3000000 ./scripts/check-binary-size.sh
+#   BINARY_SIZE_WARN_PERCENT=90 ./scripts/check-binary-size.sh
 #   BINARY_SIZE_PROFILE=release ./scripts/check-binary-size.sh
 #   BINARY_SIZE_TARGET=x86_64-unknown-linux-musl ./scripts/check-binary-size.sh
 #   SKIP_BUILD=1 ./scripts/check-binary-size.sh             # measure as-is
@@ -38,6 +56,10 @@ set -euo pipefail
 
 # Gate: maximum size of the shipped binary, in bytes (4 MiB).
 MAX_BYTES="${MAX_BINARY_SIZE_BYTES:-4194304}"
+
+# Warning band: percentage of the gate above which the build still passes
+# but says so loudly.
+WARN_PERCENT="${BINARY_SIZE_WARN_PERCENT:-85}"
 
 # Cargo profile to measure. Default `dist` is the profile cargo-dist builds
 # release artifacts with, i.e. exactly what users download.
@@ -128,6 +150,15 @@ if ((SIZE_BYTES > MAX_BYTES)); then
     echo "error: ${BIN_NAME} is ${SIZE_BYTES} bytes, over the ${MAX_BYTES} byte budget by $((SIZE_BYTES - MAX_BYTES)) bytes" >&2
     echo "hint: inspect what grew with 'cargo bloat --profile ${PROFILE} -p ${PACKAGE}' or 'cargo tree -p ${PACKAGE} -e normal'" >&2
     exit 1
+fi
+
+if ((percent >= WARN_PERCENT)); then
+    # Deliberately not a failure: the point is to surface the squeeze while
+    # there is still room to act on it, instead of presenting a maintainer
+    # with a red build and an obvious-looking constant to raise.
+    warning="${BIN_NAME} is at ${percent}% of its ${MAX_BYTES} byte budget (warn at ${WARN_PERCENT}%); find what grew before the gate turns red"
+    echo "::warning::${warning}"
+    echo "warning: ${warning}" >&2
 fi
 
 echo "binary size gate passed"

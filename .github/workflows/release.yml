@@ -86,17 +86,12 @@ jobs:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
 
-  custom-release-guards:
-    uses: ./.github/workflows/release-guards.yml
-    secrets: inherit
-
   # Build and packages all the platform-specific things
   build-local-artifacts:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-      - custom-release-guards
     if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
@@ -138,6 +133,14 @@ jobs:
       - name: "install musl cross toolchain (Linux release builds)"
         if: "runner.os == 'Linux'"
         run: "bash scripts/install-linux-musl-toolchain.sh"
+        shell: "bash"
+      - name: "release gating and pinning assertions"
+        if: "runner.os == 'Linux'"
+        run: |
+          set -euo pipefail
+          bash scripts/check-release-gating.sh
+          bash scripts/check-action-pins.sh
+          bash scripts/check-msi-version.sh
         shell: "bash"
       - name: "binary size budget for the published target"
         run: |
@@ -200,11 +203,21 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  custom-release-guards:
+    needs:
+      - plan
+    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
+    uses: ./.github/workflows/release-guards.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
       - plan
       - build-local-artifacts
+      - custom-release-guards
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -251,9 +264,10 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+      - custom-release-guards
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-release-guards.result == 'skipped' || needs.custom-release-guards.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -292,10 +306,25 @@ jobs:
           name: artifacts-dist-manifest
           path: dist-manifest.json
 
+  custom-attest-global-artifacts:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    uses: ./.github/workflows/attest-global-artifacts.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
+
   publish-homebrew-formula:
     needs:
       - plan
       - host
+      - custom-attest-global-artifacts
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -344,6 +373,7 @@ jobs:
       - plan
       - host
       - publish-homebrew-formula
+      - custom-attest-global-artifacts
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!

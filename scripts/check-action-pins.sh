@@ -14,8 +14,14 @@
 # Local reusable workflows (`uses: ./.github/workflows/x.yml`) are this
 # repository's own code at the same commit and are exempt.
 #
+# Scans the whole `.github` tree, both `.yml` and `.yaml` (GitHub accepts
+# either), so composite actions under `.github/actions/` and the build-setup
+# fragment that dist splices into the release workflow are covered too - a
+# floating tag added to that fragment would otherwise only become visible
+# after someone remembered to re-run `dist generate`.
+#
 # Usage:
-#   ./scripts/check-action-pins.sh                 # all workflows
+#   ./scripts/check-action-pins.sh                 # everything under .github
 #   ./scripts/check-action-pins.sh path/to/wf.yml  # specific files
 set -euo pipefail
 
@@ -27,7 +33,7 @@ else
     FILES=()
     while IFS= read -r file; do
         FILES+=("${file}")
-    done < <(find "${REPO_ROOT}/.github/workflows" -type f -name '*.yml' | sort)
+    done < <(find "${REPO_ROOT}/.github" -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
 fi
 
 if [[ ${#FILES[@]} -eq 0 ]]; then

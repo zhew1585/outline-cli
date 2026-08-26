@@ -1,13 +1,24 @@
 # Release preflight (Story 4.5).
 #
-# Registered as a cargo-dist `plan-jobs` custom job, so on a release tag it
-# runs as `custom-release-guards` and every build, host, publish and
-# announce job transitively needs it: if it fails, nothing is built and no
-# GitHub Release is created. It also runs on its own for pull requests and
-# branch pushes, which is where these problems should normally be caught.
+# Registered as a cargo-dist `local-artifacts-jobs` custom job, so on a
+# release tag it runs as `custom-release-guards` alongside the build matrix.
+# That registration is deliberate and load-bearing: dist's `host` job lists
+# `local-artifacts-jobs` in `needs` and requires skipped-or-success from
+# each, so a failure here skips `host`, which skips
+# `publish-homebrew-formula` (no `always()`) and `announce` (which requires
+# host success) - and with `github-release = "announce"` the GitHub Release
+# is created in `announce`, so nothing is published.
 #
-# It does NOT gate binary size - a check that must fail *the build job* to
-# block a release, see .github/build-setup/release-build-setup.yml.
+# It must NOT be a `plan-jobs` job. A failing plan job leaves the build jobs
+# *skipped*, and `host` is guarded by
+# `always() && ... (result == 'skipped' || result == 'success')` - skipped
+# passes. `host-jobs` does not work either: `announce` lists them in `needs`
+# but its `if` uses `always()` and never checks their result.
+# scripts/check-release-gating.sh asserts this chain so it cannot regress
+# silently.
+#
+# The binary-size budget is not here: it must fail *the build job* itself,
+# see .github/build-setup/release-build-setup.yml.
 #
 # Everything here is either impossible to check from the generated files
 # alone, or a property of them that `dist generate --check` does not cover.
@@ -21,8 +32,16 @@
 name: Release guards
 
 on:
-  # Called by the generated release workflow as a plan-phase gate.
+  # Called by the generated release workflow as a release gate. dist passes
+  # the plan manifest to `local-artifacts-jobs` jobs, so the input has to be
+  # declared even though nothing here reads it - GitHub rejects a call with
+  # an undeclared input.
   workflow_call:
+    inputs:
+      plan:
+        description: "dist-manifest JSON produced by the plan job (unused)"
+        required: false
+        type: string
   push:
     branches: [main, develop]
   pull_request:
@@ -71,6 +90,20 @@ jobs:
         # carries a hand-applied AllowSameVersionUpgrades; its invariants
         # are asserted separately below.)
         run: dist generate --check
+
+      - name: the release gates can actually stop a release
+        # Asserts the needs/if chain in the generated workflow: that a
+        # failure of this job blocks `host`, that a build-job failure does
+        # too, that the compile job still has a read-only token, and that
+        # the Release is created in `announce`. All of that is template
+        # behaviour `dist generate --check` would happily accept changing.
+        run: bash scripts/check-release-gating.sh
+
+      - name: WiX definition has not drifted from dist's template
+        # main.wxs is excluded from `dist generate --check` (allow-dirty), so
+        # regenerate it without that exclusion and allow only the one delta
+        # we applied on purpose.
+        run: bash scripts/check-wxs-drift.sh
 
       - name: no updater artifact (NFR4, no phone home)
         shell: bash
@@ -129,26 +162,19 @@ jobs:
           # halfway through a real release:
           #   1. a prerelease version cargo-wix cannot map onto the MSI's
           #      fourth version field (hard error on the Windows runner);
-          #   2. main.wxs losing the hand-applied upgrade settings, which
-          #      `dist generate --check` no longer covers because MSI
-          #      generation is allow-dirty.
+          # (main.wxs itself is covered by check-wxs-drift.sh above.)
           set -euo pipefail
           bash scripts/check-msi-version.sh
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             bash scripts/check-msi-version.sh "${GITHUB_REF_NAME}"
           fi
-          wxs=crates/otl/wix/main.wxs
-          for required in \
-            "AllowSameVersionUpgrades='yes'" \
-            "UpgradeCode='339F52C9-2FA2-4724-B43E-04C01774EB48'"; do
-            if ! grep -qF "${required}" "${wxs}"; then
-              echo "::error file=${wxs}::missing required setting ${required}"
-              exit 1
-            fi
-            echo "ok: ${wxs} has ${required}"
-          done
 
       - name: homebrew tap is reachable
+        # Never on a pull request. The step is advisory-only outside a tag,
+        # so a PR run would gain nothing while moving a PAT that can write to
+        # the tap into an environment any branch author controls. Same
+        # trust-from-the-ref rule ci.yml uses for its contract job.
+        if: github.event_name != 'pull_request'
         shell: bash
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
