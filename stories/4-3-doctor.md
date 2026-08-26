@@ -246,6 +246,27 @@ N3 是审查者点名要求的那条:它证明「文件过宽必须 0 请求」�
 - `check-all.sh` 抓到一个我自己漏掉的 clippy `doc_lazy_continuation`(新 doc 注释里一行以 `-` 开头
   被当成列表项)。这正是那个脚本存在的理由:我在加完注释后只跑了 `cargo test`。
 
+### 真实 Linux 验证(Docker)与两个**非本 story**的发现
+
+`--lib` 全量 423 个单测(含 doctor 28 + `auth::report` 3)、`doctor_e2e` 17、`doctor_golden` 2、
+`credential_hygiene` 17、`credential_paths` 4、`no_phone_home` 10、`limits` / `source_hygiene` /
+`portability` / `readme_exit_codes` —— 在 `rust:1.98-slim` 上**全绿**。两个 0777 目录测试与 0644 文件测试
+(本轮最需要真机验证的三条)都在真实 Linux 上跑过。
+
+过程中撞到两个与本 story 无关、但会影响别人的问题,已定位到根因,**未擅自修改别人的文件**:
+
+1. **以 root 跑 Docker 会假失败一条既有测试。** `auth::secret_file::tests::
+   a_write_into_an_unwritable_directory_reports_failure` 在容器里以 root 运行时失败——root 无视目录权限位,
+   于是「往 0500 目录写入必须失败」这个前提不成立。加 `--user "$(id -u):$(id -g)"` 后立刻通过(423/0)。
+   `check-all.sh --linux` 目前是 root 跑的。
+2. **把 target 目录放在 macOS bind mount 上,会让既有的 `startup_guard` 约 50% 概率 ETXTBSY 失败。**
+   `help_/version_works_with_no_spec_file_reachable` 报 `Text file busy (os error 26)`:
+   `isolated_otl()` 把二进制 `fs::copy` 到临时目录后立刻 exec,而源在 virtiofs 上时 close 返回后写回可能仍在飞,
+   Linux 对「仍被打开写」的文件 exec 就是 ETXTBSY。**已用对照实验确认**:target 放容器内 (`/tmp/lt2`) 连跑两次全绿,
+   放 bind mount (`-v .../target/linux:/linux-target`,即 `check-all.sh --linux` 的写法) 连跑两次有一次红。
+   本机 macOS 从不复现。也就是说这不是 Linux CI 的问题,而是那条新 gate 的挂载方式的问题;
+   最小修法是 copy 之后 `sync_all()` 再 exec,或对 ETXTBSY 重试一次。
+
 ### Completion Notes
 
 - 新增 51 个测试（28 单测 + 17 端到端 + 2 golden + 3 auth::report 单测 + 1 speccompile）。
