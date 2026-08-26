@@ -12,8 +12,10 @@
 # It must NOT be a `plan-jobs` job. A failing plan job leaves the build jobs
 # *skipped*, and `host` is guarded by
 # `always() && ... (result == 'skipped' || result == 'success')` - skipped
-# passes. `host-jobs` does not work either: `announce` lists them in `needs`
-# but its `if` uses `always()` and never checks their result.
+# passes. `host-jobs` is wrong in a different way: `announce` ignores their
+# result, so they cannot stop a Release, but `publish-homebrew-formula` does
+# list them in `needs` without an `always()`, so they *can* skip the formula
+# push - the worst of both. dist-workspace.toml carries the full slot map.
 # scripts/check-release-gating.sh asserts this chain so it cannot regress
 # silently.
 #

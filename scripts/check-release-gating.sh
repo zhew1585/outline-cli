@@ -23,6 +23,15 @@
 # no GitHub Release, because `github-release = "announce"` puts the
 # `gh release create` step in `announce`.
 #
+# The mirror image matters just as much: jobs that exist to *add* something
+# (attestations) must not be able to block anything, or a transient failure
+# turns a good build into a broken release. That is not obvious from the
+# config - `host-jobs` reads like a safe slot but sits in
+# publish-homebrew-formula's `needs`, so a failed attestation would skip the
+# formula push while `announce` still published the Release. So this script
+# also asserts that nothing on the publishing path depends on an attestation
+# job, whichever slot it is registered in.
+#
 # It also asserts the build job's reduced token, which is a side effect of
 # `github-attestations-phase` rather than a switch of its own, and two
 # config settings that scripts/check-binary-size.sh assumes.
@@ -150,6 +159,59 @@ require(
     "uses: ./.github/workflows/release-guards.yml" in guard,
     "the preflight job calls the release-guards workflow",
 )
+
+# 6. Additive jobs must not gate anything. An attestation job that a
+#    publishing job `needs` can skip that job, and a skipped publish reads
+#    as success to `announce` - which is how a Release gets published with
+#    no Homebrew formula pushed. Assert the dependency direction instead of
+#    reasoning about which cargo-dist slot is safe.
+ATTEST_PATTERN = re.compile(r"attest", re.IGNORECASE)
+attest_jobs = [name for name in sections if ATTEST_PATTERN.search(name)]
+require(bool(attest_jobs), "an attestation job is registered")
+
+def needs_of(body: str) -> list:
+    """The job names listed under this job's `needs:` block."""
+    collected = []
+    inside = False
+    for line in body.splitlines():
+        if line.strip() == "needs:":
+            inside = True
+            continue
+        if inside:
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                collected.append(stripped[2:].strip())
+                continue
+            if stripped == "":
+                continue
+            break
+    return collected
+
+
+publishing_path = [
+    name
+    for name in sections
+    if name in ("host", "announce") or name.startswith("publish-")
+]
+require(
+    any(name.startswith("publish-") for name in publishing_path),
+    "at least one publish job was found to check (guards against a silent no-op)",
+)
+for name in publishing_path:
+    blockers = sorted(set(needs_of(sections[name])) & set(attest_jobs))
+    require(
+        not blockers,
+        f"`{name}` does not depend on attestation job(s) "
+        f"{blockers or '[]'} (a failed attestation must not skip publishing)",
+    )
+
+# And positively: the attestation job must run after the release, which is
+# what `post-announce-jobs` buys.
+for name in attest_jobs:
+    require(
+        "announce" in needs_of(sections[name]),
+        f"`{name}` runs after `announce` (post-announce slot)",
+    )
 
 # 6. Two config settings scripts/check-binary-size.sh assumes when it
 #    reproduces dist's RUSTFLAGS and build command. Enabling either makes

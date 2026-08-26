@@ -117,12 +117,30 @@ local-artifacts-jobs = ["./release-guards"]
 # when `github-attestations-phase` is left at its default - and that same
 # default is what gives build-local-artifacts its read-only token, so the
 # phase cannot be moved to cover the globals without handing the compile job
-# a writable token back. Doing it in a custom host-phase job gets both.
+# a writable token back. A custom job gets both properties.
 #
-# A host job runs after every artifact exists and cannot block the release
-# (`announce` never checks its result), which is the right shape for
-# something additive: a failure to attest must not strand a good build.
-host-jobs = ["./attest-global-artifacts"]
+# `post-announce-jobs` is the ONLY slot where a custom job cannot interfere
+# with publishing, which matters because attesting is additive: failing to
+# attest must never turn a good build into a broken release. Complete map of
+# what consumes each slot in cargo-dist 0.32.0 (grepped across
+# templates/ci/github/ *including the partials* - checking only
+# release.yml.j2 is how this was got wrong once):
+#
+#   plan-jobs             build-local `needs`            -> skip, host tolerates
+#   local-artifacts-jobs  host `needs` AND `if`          -> BLOCKS host
+#   global-artifacts-jobs host `needs` AND `if`          -> BLOCKS host
+#   host-jobs             announce `needs`,              -> BLOCKS publish
+#                         publish_homebrew/npm `needs`      (no `always()`)
+#   user-publish-jobs     announce `needs` AND `if`      -> BLOCKS announce
+#   post-announce-jobs    nothing needs it               -> blocks nothing
+#
+# host-jobs specifically would recreate the half-published state that
+# `github-release = "announce"` exists to prevent: a failed attestation
+# skips publish-homebrew-formula, and announce's `if` treats a skipped
+# publish as success, so the Release goes public with no formula in the tap.
+# scripts/check-release-gating.sh now asserts no attestation job can block
+# publishing, whichever slot it is moved to.
+post-announce-jobs = ["./attest-global-artifacts"]
 
 # Custom jobs get no special permissions by default; attestation needs
 # these, and nothing else. Inline table on purpose: a `[dist.<table>]`

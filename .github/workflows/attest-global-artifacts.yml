@@ -12,12 +12,23 @@
 # pipes `outline-cli-installer.sh` into a shell, and until now that script -
 # unlike the tarballs it downloads - had no attestation a user could check.
 #
-# Registered as a `host-jobs` job, which runs after every artifact exists.
-# Its result is deliberately not a release gate: `announce` lists host jobs
-# in `needs` but its `if` uses `always()` and never checks them, so a
-# failure to attest cannot strand an otherwise good build. That asymmetry is
-# correct for something additive - see scripts/check-release-gating.sh for
-# the gates that must block.
+# Registered as a `post-announce-jobs` job. That is the only cargo-dist slot
+# nothing depends on, and the choice is load-bearing rather than cosmetic:
+# attesting is additive, so a failure here must not be able to damage a
+# release that is otherwise fine.
+#
+# `host-jobs` looked like the natural home and is a trap. `announce` really
+# does ignore host-job results (its `if` uses `always()`), but
+# publish-homebrew-formula lists host jobs in `needs` and has no `always()`,
+# so a failed attestation would skip the formula push while announce still
+# published the Release - reconstructing exactly the "Release is public but
+# brew cannot install it" state that `github-release = "announce"` was set
+# to eliminate. dist-workspace.toml carries the full slot-by-slot map, and
+# scripts/check-release-gating.sh asserts that no attestation job sits in
+# the needs of anything on the publishing path.
+#
+# Cost of post-announce: the attestations appear seconds after the Release
+# instead of before it. For a verification aid that is immaterial.
 name: Attest global artifacts
 
 on:

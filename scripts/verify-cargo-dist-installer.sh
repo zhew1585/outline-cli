@@ -20,12 +20,19 @@
 # v0.32.0 match upstream's published sha256.sum byte for byte). Pinning the
 # script's own hash therefore also pins the binary it installs.
 #
-# What it does NOT do: this runs as a `plan-jobs` custom job, and dist's own
-# `plan` job runs in parallel, so a swapped installer may already have
-# executed in that one job by the time this fails. What it does guarantee is
-# that nothing gets *published*: every build, host, publish and announce job
-# transitively needs this job, so a checksum mismatch means no artifacts and
-# no GitHub Release. Detection for `plan`, prevention for the release.
+# What it does NOT do: it cannot stop the installer from running. This check
+# lives in the release-guards job, and dist's own jobs each download and pipe
+# the installer independently - `plan`, every `build-local-artifacts` leg
+# (`irm ... .ps1 | iex` on Windows), and `build-global-artifacts` - so by the
+# time a mismatch is reported a swapped installer may already have executed
+# elsewhere, and nothing re-verifies the copy each job fetched. That is a
+# TOCTOU gap, and it is upstream's to close.
+#
+# What it does guarantee is that a mismatch stops the *release*: release-guards
+# is registered as a `local-artifacts-jobs` job, which `host` lists in `needs`
+# and requires skipped-or-success from, so a failure skips `host`, which skips
+# publish and announce, which is where the GitHub Release is created.
+# Detection for the execution, prevention for the publication.
 #
 # Usage:
 #   ./scripts/verify-cargo-dist-installer.sh          # version from config
