@@ -151,16 +151,25 @@ fn compile_against_otl(source: &str) -> Option<String> {
         })
         .max_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())?;
 
+    // `--emit=metadata`: the question is whether this TYPE-CHECKS, and a
+    // privacy violation is a compile error, so linking answers nothing.
+    // Emitting a binary made the probe depend on the link environment and it
+    // failed on Windows (`LNK1181: cannot open input file
+    // 'windows.0.52.0.lib'` - windows-sys import libraries sit behind a
+    // native search path a hand-built rustc call does not reproduce),
+    // leaving the harness to report itself broken: inconclusive, not a
+    // verdict.
     let result = std::process::Command::new(rustc)
         .arg(&src)
         .arg("--edition=2021")
         .arg("--crate-type=bin")
+        .arg("--emit=metadata")
         .arg("--extern")
         .arg(format!("otl={}", otl_rlib.display()))
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
-        .arg("-o")
-        .arg(dir.path().join("probe"))
+        .arg("--out-dir")
+        .arg(dir.path())
         .output()
         .unwrap();
     if result.status.success() {
@@ -428,14 +437,17 @@ fn combinations(candidates: &[Vec<String>]) -> Vec<Vec<String>> {
 fn compile_with(dir: &TempDir, externs: &[String]) -> Option<String> {
     let mut command =
         std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()));
+    // Metadata only, so both probes ask the compiler the same question. An
+    // rlib never reaches the linker, so this one was not broken on Windows.
     command
         .arg(dir.path().join("lib.rs"))
         .arg("--crate-type=lib")
         .arg("--edition=2021")
+        .arg("--emit=metadata")
         .arg("-L")
         .arg(format!("dependency={}", deps_dir().display()))
-        .arg("-o")
-        .arg(dir.path().join("probe.rlib"));
+        .arg("--out-dir")
+        .arg(dir.path());
     for spec in externs {
         command.arg("--extern").arg(spec);
     }
