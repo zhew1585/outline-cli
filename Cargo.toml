@@ -42,6 +42,12 @@ unicode-segmentation = "1.12"
 spec-compile = { path = "crates/speccompile" }
 
 # dev / test
+# Heap profiler used by tests/memory_bounds.rs. The bounds this story
+# claims are about ALLOCATION, and prose arithmetic about allocation has
+# been wrong twice; this makes them assertions instead. Its allocator is
+# safe to use from our side (the `unsafe impl GlobalAlloc` lives in dhat),
+# and it never enters the shipped binary.
+dhat = "0.3"
 wiremock = "0.6"
 assert_cmd = "2.0"
 predicates = "3.1"

@@ -32,12 +32,14 @@
 
 #![forbid(unsafe_code)]
 
+mod document;
 mod schema;
 mod text;
 
 use serde_json::Value;
 use thiserror::Error;
 
+pub use document::MAX_PARSED_BYTES;
 pub use schema::MAX_SCHEMA_DEPTH;
 pub use text::{
     is_display_safe, MAX_CONTENT_TYPE_BYTES, MAX_ENUM_VALUES, MAX_ENUM_VALUE_BYTES,
@@ -234,24 +236,27 @@ const TOO_MANY_ENUM_VALUES: &str = "it declares more enumerated values than the 
 
 /// Compile a JSON OpenAPI document.
 ///
-/// The input is treated as untrusted; see the crate docs.
+/// The input is treated as untrusted throughout, starting with the parse:
+/// only the parts this compiler reads are materialized, and they are
+/// charged against a budget as they are built (see [`document`]). There is
+/// deliberately no entry point that takes an already-parsed
+/// `serde_json::Value` - that would be a way to skip the one limit that
+/// bounds memory before any other limit exists.
 pub fn compile_json(raw: &str, options: &CompileOptions) -> Result<CompiledSpec, CompileError> {
-    let document: Value = serde_json::from_str(raw).map_err(|error| CompileError::NotJson {
-        reason: error.to_string(),
-    })?;
+    let document = document::parse(raw, MAX_PARSED_BYTES)?;
     compile(&document, options)
 }
 
-/// Compile an already-parsed JSON OpenAPI document.
-pub fn compile(document: &Value, options: &CompileOptions) -> Result<CompiledSpec, CompileError> {
-    let paths = document
-        .get("paths")
-        .and_then(Value::as_object)
-        .ok_or(CompileError::NoPaths)?;
+/// Compile a parsed document.
+fn compile(
+    document: &document::Document,
+    options: &CompileOptions,
+) -> Result<CompiledSpec, CompileError> {
+    let paths = document.paths.as_object().ok_or(CompileError::NoPaths)?;
     let mut ops: Vec<CompiledOp> = paths
         .iter()
         .filter_map(|(path, item)| item.get("post").map(|post| (path, post)))
-        .map(|(path, post)| compile_op(path, post, document, options))
+        .map(|(path, post)| compile_op(path, post, &document.components, options))
         .collect::<Result<_, _>>()?;
     if ops.is_empty() {
         return Err(CompileError::NoOperations);
@@ -274,13 +279,13 @@ pub fn compile(document: &Value, options: &CompileOptions) -> Result<CompiledSpe
 fn compile_op(
     path: &str,
     post: &Value,
-    document: &Value,
+    components: &Value,
     options: &CompileOptions,
 ) -> Result<CompiledOp, CompileError> {
     let name = path.trim_start_matches('/').to_string();
     let (content_type, schema) = request_body(post, &name)?;
     let (params, root_union) = match schema {
-        Some(schema) => schema::extract_params(schema, document)?,
+        Some(schema) => schema::extract_params(schema, components)?,
         None => (Vec::new(), false),
     };
     let body_mode = body_kind(&content_type, root_union);

@@ -365,9 +365,12 @@ fn read_capped(file: &Path) -> Result<Option<Vec<u8>>, CacheError> {
     if !opened.is_file() || !super::openfile::is_same_file(&expected, &opened) {
         return Err(not_regular());
     }
-    let mut raw = Vec::new();
-    // One byte over the limit, so hitting it is detectable rather than
+    // Reserved from the size just stat'd, capped at the limit: without it
+    // `read_to_end` grows by doubling and peaks at roughly three times the
+    // file. One byte over, so hitting the limit is detectable rather than
     // silently truncating.
+    let reserve = expected.len().min(MAX_CACHE_FILE_BYTES as u64) as usize + 1;
+    let mut raw = Vec::with_capacity(reserve);
     let read = handle
         .take(MAX_CACHE_FILE_BYTES as u64 + 1)
         .read_to_end(&mut raw)

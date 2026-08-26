@@ -14,9 +14,9 @@ use crate::{CompileError, CompiledParam, ScalarKind};
 
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
-/// JSON pointer to the component-schema map itself (no name appended, so
-/// no escaping question arises for this part).
-const COMPONENT_SCHEMAS_POINTER: &str = "/components/schemas";
+/// Key of the schema map within `components` (no name appended, so no
+/// pointer-escaping question arises for this part).
+const COMPONENT_SCHEMAS_KEY: &str = "schemas";
 /// Maximum `$ref`/`allOf` expansion depth (guards reference cycles).
 pub const MAX_SCHEMA_DEPTH: usize = 8;
 
@@ -26,10 +26,10 @@ pub const MAX_SCHEMA_DEPTH: usize = 8;
 /// body cannot be assembled from flat `key=value` pairs.
 pub(crate) fn extract_params(
     schema: &Value,
-    document: &Value,
+    components: &Value,
 ) -> Result<(Vec<CompiledParam>, bool), CompileError> {
     let mut walk = Walk {
-        document,
+        components,
         params: Vec::new(),
         seen: HashSet::new(),
         required: HashSet::new(),
@@ -60,7 +60,7 @@ pub(crate) fn extract_params(
 /// in that count - a small download could pin a core for minutes.
 /// `params` stays a `Vec` so the output keeps the parser's key order.
 struct Walk<'a> {
-    document: &'a Value,
+    components: &'a Value,
     params: Vec<CompiledParam>,
     seen: HashSet<String>,
     required: HashSet<String>,
@@ -78,7 +78,7 @@ impl Walk<'_> {
             self.root_union = true;
         }
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            let resolved = resolve_ref(reference, self.document)?;
+            let resolved = resolve_ref(reference, self.components)?;
             return self.collect(resolved, depth + 1);
         }
         if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
@@ -133,7 +133,7 @@ impl Walk<'_> {
             return Ok(ScalarKind::Json);
         }
         if let Some(reference) = prop.get("$ref").and_then(Value::as_str) {
-            let resolved = resolve_ref(reference, self.document)?;
+            let resolved = resolve_ref(reference, self.components)?;
             return self.param_type(resolved, depth + 1);
         }
         if let Some(branches) = prop.get("allOf").and_then(Value::as_array) {
@@ -178,7 +178,7 @@ impl Walk<'_> {
         check_depth(depth)?;
         merge_facets(schema, facets);
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            let resolved = resolve_ref(reference, self.document)?;
+            let resolved = resolve_ref(reference, self.components)?;
             self.collect_facets(resolved, depth + 1, facets)?;
         }
         if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
@@ -244,7 +244,7 @@ fn check_depth(depth: usize) -> Result<(), CompileError> {
 /// contains either character. Unescaping is done by hand and the map is
 /// indexed directly, which also keeps `/` inside a name from being read as
 /// pointer structure.
-fn resolve_ref<'a>(reference: &str, document: &'a Value) -> Result<&'a Value, CompileError> {
+fn resolve_ref<'a>(reference: &str, components: &'a Value) -> Result<&'a Value, CompileError> {
     let unsupported = || CompileError::UnsupportedRef {
         reference: reference.to_string(),
     };
@@ -252,8 +252,8 @@ fn resolve_ref<'a>(reference: &str, document: &'a Value) -> Result<&'a Value, Co
         .strip_prefix(COMPONENTS_SCHEMAS_REF)
         .ok_or_else(unsupported)?;
     let name = unescape_token(token).ok_or_else(unsupported)?;
-    document
-        .pointer(COMPONENT_SCHEMAS_POINTER)
+    components
+        .get(COMPONENT_SCHEMAS_KEY)
         .and_then(|schemas| schemas.get(&name))
         .ok_or_else(|| CompileError::UnresolvedRef {
             reference: reference.to_string(),

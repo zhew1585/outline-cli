@@ -751,13 +751,20 @@ fn an_operation_packed_with_enum_containers_is_refused() {
     write_body(&file, MAGIC, FORMAT_VERSION, &framed);
 
     // ...so it is refused by the framing, before a byte of it is decoded
-    // and long before anything could be allocated for those containers.
+    // and long before anything could be allocated for those containers -
+    // and the message says WHICH operation and why, the same way the write
+    // path does, rather than "a record is too big".
     let error = cache::load_at(&file).expect_err("must be refused");
     assert!(!error.is_stale(), "{error}");
-    let text = error.to_string();
+    let text = format!("{error} {}", error.remedy());
+    assert!(text.contains("operation #0"), "does not say which: {text}");
     assert!(
-        text.contains("record declares") || text.contains("byte limit"),
-        "not refused by the framing: {text}"
+        text.contains(&cache::MAX_OP_RECORD_BYTES.to_string()),
+        "does not say the limit: {text}"
+    );
+    assert!(
+        text.contains("parameters or enumerated values"),
+        "generic remedy on a per-operation limit: {text}"
     );
 }
 

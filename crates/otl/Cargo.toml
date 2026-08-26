@@ -42,6 +42,7 @@ unicode-segmentation = { workspace = true }
 spec-compile = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
 # Cache tests build a cache file byte by byte to pin its layout.
 bincode = { workspace = true }
 sha2 = { workspace = true }

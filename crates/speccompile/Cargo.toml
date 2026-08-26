@@ -15,6 +15,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+# The document parser is hand-written (a seed threading an allocation
+# budget), so serde's traits are needed directly - not the derive macros.
+serde = { workspace = true, default-features = false }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

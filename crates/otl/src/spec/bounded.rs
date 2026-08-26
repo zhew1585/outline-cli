@@ -34,30 +34,30 @@
 //!
 //! # The resulting bound
 //!
-//! For a cache file of at most [`super::cache::MAX_CACHE_FILE_BYTES`]
-//! (1 MiB), decoding a hostile file can occupy:
+//! Deliberately NOT stated as a number here. Twice this module carried an
+//! arithmetic bound in prose, and twice an independent measurement showed
+//! it too low - once by a factor of six, once by a whole missing term. A
+//! wrong bound is worse than none: it stops the next reader from checking.
 //!
-//! - the file contents in memory: at most that limit, 1 MiB;
-//! - the operations accepted so far: at most [`MAX_DECODED_BYTES`], 4 MiB,
-//!   charged with [`CONTAINER_SLACK`] so a container is counted at the
-//!   capacity it can reach, not the length it reports;
-//! - the record being decoded: under 2 MiB. A record holds at most
-//!   [`MAX_OP_RECORD_BYTES`] (32 KiB) of bytes, so its satisfiable
-//!   containers come to at most about 786 KiB (each byte can become one
-//!   24-byte `Cow`), and a container whose declared length is a lie
-//!   reserves at most serde's own cap (1 MiB) before running out of record
-//!   and failing.
+//! What is stated instead is what ENFORCES the bound, each with its own
+//! constant, so a reader can find the check rather than trust a sum:
 //!
-//! Total: under about 8 MiB, transient, and then the file is discarded.
+//! - the file never exceeds [`super::cache::MAX_CACHE_FILE_BYTES`] and is
+//!   read into a buffer reserved from its stat'd size (no doubling);
+//! - the table's own `Vec` is charged against the budget BEFORE it is
+//!   reserved, and its length cannot exceed [`MAX_CACHED_OPS`] nor what
+//!   the remaining bytes could encode;
+//! - the accepted operations are charged as they arrive, against
+//!   [`MAX_DECODED_BYTES`], with containers charged at their worst-case
+//!   capacity ([`CONTAINER_SLACK`]);
+//! - the record being decoded is confined to [`MAX_OP_RECORD_BYTES`] and
+//!   decoded with a byte budget of its own, so a container that lies about
+//!   its length has only a record's worth of bytes to lie with.
 //!
-//! This bound is stated because the previous one was WRONG. Charging
-//! containers by length missed that `Vec` grows by doubling: a container
-//! just past serde's reservation cap (43,690 `Cow<str>`s, about 43 KiB of
-//! input) jumps to 87,380 slots, 2 MiB of heap, and two dozen of those fit
-//! in a one-megabyte body - about 47 MiB, from a file that passed every
-//! check until the budget was consulted. Framing is what removes the
-//! construction; [`CONTAINER_SLACK`] is what stops the accounting from
-//! lying about the rest.
+//! The actual peaks are MEASURED, with a heap profiler, in
+//! `crates/otl/tests/memory_bounds.rs` - including the worst record shape
+//! and a cache declaring the maximum number of operations. That test is
+//! the bound; this list is how it is achieved.
 //!
 //! Both directions use the same rules: [`encode_table`] refuses to write
 //! anything [`decode_table`] would refuse to read.
@@ -125,9 +125,9 @@ pub enum TableError {
     TooManyOperations { count: usize, limit: usize },
     /// One operation's encoded record exceeds [`MAX_OP_RECORD_BYTES`].
     OperationTooLarge {
-        /// Position in the table (0-based). Always available, and the only
-        /// identifier a cache being DECODED has: its name is inside the
-        /// record that was just refused.
+        /// Position in the table (0-based). Always available, and the
+        /// only identifier a cache being DECODED has: the name is inside
+        /// the record that was just refused.
         index: usize,
         /// The operation's name, when it is known (encoding a table the
         /// caller already validated). Safe to print: it has been through
@@ -205,14 +205,26 @@ impl TableError {
     }
 }
 
-/// Bincode configuration for one record: fixed, and limited to the record
-/// it is decoding.
-fn record_config(limit_bytes: usize) -> impl bincode::config::Config {
-    // The generic parameter has to be a constant, so the two record sizes
-    // are expressed as the same maximum; the slice handed to the decoder is
-    // what actually bounds each one.
-    let _ = limit_bytes;
-    bincode::config::standard().with_limit::<MAX_OP_RECORD_BYTES>()
+/// How much bincode's own byte budget may exceed a record's size cap.
+///
+/// The budget counts consumed bytes PLUS the claims the decoder makes for
+/// containers, so it has to be larger than the record itself or a
+/// legitimate record at the cap would be refused: a real 32,008-byte
+/// operation with 4000 parameters fails at a 32 KiB budget and decodes at
+/// four times that. Any multiple works for a legitimate record; what
+/// matters is that the budget stays a small multiple of the record, so a
+/// forged container length is still refused before it can reserve.
+const RECORD_BUDGET_FACTOR: usize = 4;
+
+/// Bincode configuration for an operation record.
+fn op_record_config() -> impl bincode::config::Config {
+    bincode::config::standard().with_limit::<{ MAX_OP_RECORD_BYTES * RECORD_BUDGET_FACTOR }>()
+}
+
+/// Bincode configuration for the provenance record, which is far smaller
+/// and gets a budget to match rather than sharing the operation one.
+fn meta_record_config() -> impl bincode::config::Config {
+    bincode::config::standard().with_limit::<{ MAX_META_RECORD_BYTES * RECORD_BUDGET_FACTOR }>()
 }
 
 /// Frame a table into the body of a cache file.
@@ -222,7 +234,7 @@ fn record_config(limit_bytes: usize) -> impl bincode::config::Config {
 pub(super) fn encode_table(meta: &CacheMeta, ops: &[OpSpec]) -> Result<Vec<u8>, TableError> {
     check_table(ops)?;
     let mut body = Vec::new();
-    let meta_record = encode_record(meta)?;
+    let meta_record = encode_record(meta, meta_record_config())?;
     if meta_record.len() > MAX_META_RECORD_BYTES {
         return Err(TableError::Framing(format!(
             "the provenance record encodes to {} bytes, over its {MAX_META_RECORD_BYTES} \
@@ -233,7 +245,7 @@ pub(super) fn encode_table(meta: &CacheMeta, ops: &[OpSpec]) -> Result<Vec<u8>, 
     push_record(&mut body, &meta_record);
     push_len(&mut body, ops.len());
     for (index, op) in ops.iter().enumerate() {
-        let record = encode_record(op)?;
+        let record = encode_record(op, op_record_config())?;
         // Classified as what it is - one operation carrying more than the
         // format holds - so the remedy can point at that operation's
         // parameters instead of at the document's size.
@@ -259,9 +271,11 @@ pub(super) fn check_table(ops: &[OpSpec]) -> Result<(), TableError> {
             limit: MAX_CACHED_OPS,
         });
     }
-    let footprint = ops
-        .iter()
-        .fold(0usize, |total, op| total.saturating_add(footprint_of(op)));
+    // Same accounting as the decoder, the table's own Vec included.
+    let footprint = ops.iter().fold(
+        ops.len().saturating_mul(size_of::<OpSpec>()),
+        |total, op| total.saturating_add(footprint_of(op)),
+    );
     if footprint > MAX_DECODED_BYTES {
         return Err(TableError::TooMuchMemory {
             footprint,
@@ -276,7 +290,7 @@ pub(super) fn check_table(ops: &[OpSpec]) -> Result<(), TableError> {
 pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), TableError> {
     let mut cursor = 0usize;
     let meta_record = take_record(body, &mut cursor, MAX_META_RECORD_BYTES)?;
-    let meta: CacheMeta = decode_record(meta_record)?;
+    let meta: CacheMeta = decode_record(meta_record, meta_record_config())?;
 
     let count = take_len(body, &mut cursor)?;
     if count > MAX_CACHED_OPS {
@@ -296,11 +310,21 @@ pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Tabl
         )));
     }
 
+    // The table's own Vec is charged BEFORE it is reserved: 8192 slots of
+    // `OpSpec` is a megabyte, allocated before a single record is decoded,
+    // and it used to be invisible to the budget that exists to bound
+    // exactly this.
+    let mut footprint = count.saturating_mul(size_of::<OpSpec>());
+    if footprint > MAX_DECODED_BYTES {
+        return Err(TableError::TooMuchMemory {
+            footprint,
+            limit: MAX_DECODED_BYTES,
+        });
+    }
     let mut ops: Vec<OpSpec> = Vec::with_capacity(count);
-    let mut footprint = 0usize;
-    for _ in 0..count {
-        let record = take_record(body, &mut cursor, MAX_OP_RECORD_BYTES)?;
-        let op: OpSpec = decode_record(record)?;
+    for index in 0..count {
+        let record = take_op_record(body, &mut cursor, index)?;
+        let op: OpSpec = decode_record(record, op_record_config())?;
         footprint = footprint.saturating_add(footprint_of(&op));
         if footprint > MAX_DECODED_BYTES {
             return Err(TableError::TooMuchMemory {
@@ -327,10 +351,7 @@ pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Tabl
 fn footprint_of(op: &OpSpec) -> usize {
     let text = op.name.len() + op.path.len() + op.summary.len() + op.content_type.len();
     let params: usize = op.params.iter().map(footprint_of_param).sum();
-    size_of::<OpSpec>()
-        + text
-        + CONTAINER_SLACK * (op.params.len() * size_of::<ParamSpec>())
-        + params
+    text + CONTAINER_SLACK * (op.params.len() * size_of::<ParamSpec>()) + params
 }
 
 fn footprint_of_param(param: &ParamSpec) -> usize {
@@ -346,16 +367,21 @@ fn footprint_of_param(param: &ParamSpec) -> usize {
 /// Size is NOT checked here: the caller knows which record this is and can
 /// say so ("operation #7 is too large" rather than "a record is too
 /// large"), which decides what the user is told to do about it.
-fn encode_record<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, TableError> {
-    bincode::serde::encode_to_vec(value, record_config(MAX_OP_RECORD_BYTES))
+fn encode_record<T: serde::Serialize>(
+    value: &T,
+    config: impl bincode::config::Config,
+) -> Result<Vec<u8>, TableError> {
+    bincode::serde::encode_to_vec(value, config)
         .map_err(|error| TableError::Decode(error.to_string()))
 }
 
 /// Decode one record from exactly its own bytes.
-fn decode_record<T: serde::de::DeserializeOwned>(record: &[u8]) -> Result<T, TableError> {
-    let (value, consumed) =
-        bincode::serde::decode_from_slice::<T, _>(record, record_config(record.len()))
-            .map_err(|error| TableError::Decode(error.to_string()))?;
+fn decode_record<T: serde::de::DeserializeOwned>(
+    record: &[u8],
+    config: impl bincode::config::Config,
+) -> Result<T, TableError> {
+    let (value, consumed) = bincode::serde::decode_from_slice::<T, _>(record, config)
+        .map_err(|error| TableError::Decode(error.to_string()))?;
     if consumed != record.len() {
         return Err(TableError::Framing(format!(
             "a record carries {} unexpected trailing bytes",
@@ -388,6 +414,33 @@ fn take_len(body: &[u8], cursor: &mut usize) -> Result<usize, TableError> {
     field.copy_from_slice(bytes);
     *cursor = end;
     Ok(u32::from_le_bytes(field) as usize)
+}
+
+/// Read one operation record, reporting an over-long one as what it is.
+///
+/// The generic [`take_record`] would call it a framing problem, which is
+/// true but useless: "operation #7 is bigger than the format holds" tells
+/// the reader which operation to look at, and its remedy is about
+/// parameters rather than about rebuilding the cache. (The name lives
+/// inside the record that was just refused, so the position is all a
+/// DECODER can offer - the encoder, which has the table in hand, reports
+/// the name.)
+fn take_op_record<'a>(
+    body: &'a [u8],
+    cursor: &mut usize,
+    index: usize,
+) -> Result<&'a [u8], TableError> {
+    let mut probe = *cursor;
+    let declared = take_len(body, &mut probe)?;
+    if declared > MAX_OP_RECORD_BYTES {
+        return Err(TableError::OperationTooLarge {
+            index,
+            name: None,
+            bytes: declared,
+            limit: MAX_OP_RECORD_BYTES,
+        });
+    }
+    take_record(body, cursor, MAX_OP_RECORD_BYTES)
 }
 
 /// Read a length-prefixed record, advancing the cursor.
