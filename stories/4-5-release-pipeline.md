@@ -22,7 +22,7 @@ so that 上手零门槛 —— 打一个 tag 就自动产出三平台的 brew ta
 
 - [x] Task 1: cargo-dist 配置就位 (AC: 1)
   - [x] 用 dist 0.32.0 `dist init` 生成 `dist-workspace.toml`（新式 `[dist]` 表，不落 `[workspace.metadata.dist]`）
-  - [x] `installers = ["shell", "homebrew", "msi"]`；`tap = "weizhesafeheron/homebrew-tap"` + `publish-jobs = ["homebrew"]`
+  - [x] `installers = ["shell", "homebrew", "msi"]`；`tap = "zhew1585/homebrew-tap"` + `publish-jobs = ["homebrew"]`
   - [x] `targets` 收敛为四个：aarch64/x86_64-apple-darwin、x86_64-unknown-linux-musl（静态）、x86_64-pc-windows-msvc
   - [x] `install-updater = false`、`pr-run-mode = "skip"`（NFR4 + tag-only 发布）
   - [x] 根 Cargo.toml 追加 `[profile.dist]`（纯 `inherits = "release"`，见 Dev Notes 体积说明）与 `[workspace.package]` 的 authors/homepage
@@ -172,7 +172,7 @@ claude-opus-5[1m] (Claude Code agent), 2026-08-26
 - **只能在 CI / 其他平台验证的部分**（本地一律未声称通过）：
   1. `x86_64-unknown-linux-musl` 的实际构建。本机是 macOS 且没有 musl 交叉工具链，Docker daemon 未运行（不主动替用户启动 Docker Desktop）。风险集中在 aws-lc-sys 的 C 编译；缓解手段有两层：`binary-size.yml` 每次 push/PR 都构建 musl（第一次 CI 运行就会暴露，而不是留到打 tag），且发布路径上的体积门禁也在 musl 构建 job 里跑同一条命令。
   2. MSI 的实际产出（wix 只在 Windows 跑）。已验证的是 `main.wxs` 能生成、`dist plan` 把 `.msi` 列入产物清单。
-  3. homebrew tap 推送。需要仓库外的两个前提：`weizhesafeheron/homebrew-tap` 仓库存在，以及 `HOMEBREW_TAP_TOKEN` secret。缺任一都会在 publish 步骤失败，但 `.rb` 仍会作为 Release 产物附上。formula 内容已本地生成并肉眼核对（三个 URL 指向正确 triple）。
+  3. homebrew tap 推送。需要仓库外的两个前提，**两个目前都还不存在**（2026-08）：`zhew1585/homebrew-tap` 仓库待创建，`HOMEBREW_TAP_TOKEN` secret 待配置。当前接线下的后果是**快速失败、什么都不发**：release-guards preflight 在 tag 上把 tap 不可达判为 fatal → host 被 skip → 无产物、无 Release。（这条早前写的「缺任一会在 publish 步骤失败，但 `.rb` 仍会作为 Release 产物附上」在 R2 把 Release 创建挪到 `announce` 之后就不再成立了——现在没有任何路径能在 formula 未推送的情况下产出 Release。）formula 内容已本地生成并肉眼核对（homepage 与三个 tar.xz URL 全部指向 `zhew1585`）。
   4. `x86_64-apple-darwin` 交叉构建（本机 arm64，未装该 target）。
 - 本地实跑通过的部分：`dist plan`、`dist generate --check`、`dist build --artifacts=global`（source.tar.gz / installer.sh / outline-cli.rb / sha256.sum 全部产出）、`dist build --artifacts=local --target=aarch64-apple-darwin`（tar.xz + 校验和产出）。
 - 故意留下的缺口：
