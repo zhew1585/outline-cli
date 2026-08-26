@@ -12,24 +12,25 @@
 #   gate:  4 MiB = 4194304 B   (fails the build)
 #   warn:  85% of the gate     (prints a warning, still passes)
 #
-# Measurements, `--profile dist` (= release: opt-level="s", fat LTO,
-# codegen-units=1, strip="symbols", panic="abort"), aarch64-apple-darwin,
+# Measurements, aarch64-apple-darwin, `--profile dist` (= release:
+# opt-level="s", fat LTO, codegen-units=1, strip="symbols", panic="abort"),
 # 2026-08:
 #
 #   this branch, which carries release config and no feature code:
 #       2_567_312 B  (~2.45 MiB)   61% of the gate
+#   develop, now that the config/completions track has landed:
+#       2_800_112 B  (~2.67 MiB)   66% of the gate
 #
-#   the four feature branches waiting to merge, measured individually as
-#   deltas against the same baseline:
+#   still to merge, measured individually as deltas against the 2_567_312 B
+#   baseline:
 #       epic2-auth      +317_360 B
 #       epic3-commands  +283_168 B
-#       epic4-config    +232_800 B
 #       epic4-specsync  +116_400 B
 #
-# Those deltas are additive-worst-case, so the merged binary lands around
-# 3.35 MiB on darwin. x86_64-unknown-linux-musl runs roughly 9% larger
-# because it statically links libc, which puts the largest shipped artifact
-# near 3.66 MiB - about 91% of this gate.
+# Additive worst case therefore lands near 3.35 MiB on darwin (~84% of the
+# gate). x86_64-unknown-linux-musl runs roughly 9% larger because it
+# statically links libc, putting the largest shipped artifact near 3.66 MiB -
+# about 91% of this gate, i.e. inside the warning band below.
 #
 # That is deliberately tight, and it is why the warning band exists: the
 # squeeze becomes visible before it becomes a red build, so the response can
