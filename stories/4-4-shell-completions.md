@@ -99,7 +99,9 @@ so that 不背命令。
 
 | R3-7 | MINOR | 已修：R2 那个 rustdoc 测试只校验「被支持的 shell 被提到」，追加一句 “powershell and elvish operation names complete” 仍会通过（循环里对谓词为 false 的分支没有 else 断言）。现在按**句子**双向校验：任何正面声称补全操作名的句子都不得点到未覆盖的 shell；另加一个「守卫的守卫」测试，用审查者给的那句原文验证检查本身会命中 |
 
-R2/R3 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
+| R4-4 | MINOR | 已修：R3 的检查只挡住了「给未支持 shell 加正面声明」，挡不住反向漂移——把文档改成 “bash, zsh, fish do not complete operation names” 时，正向断言仍因子串匹配通过，该句又被 `not complete` 当成否认句跳过。现在按句子分类做**对称**两条规则：正面声明不得点到未覆盖 shell，否认句不得点到已覆盖 shell，且必须存在一句正面声明点齐全部已覆盖 shell。`is_denial` 特意不以 “only” 为据（“complete in bash, zsh, fish only” 是正面声明）。guard-the-guard 现在两个方向各一个样本，并已做变异验证：两种漂移分别触发 `rustdoc claims powershell...` 与 `rustdoc denies that bash...` |
+
+R2/R3/R4 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
 进一步验证」——生成期过滤不依赖 build.rs 的编译期拒绝，是独立的第二道，specsync 合并后可直接复验该接缝。
 
 ### 故意留下的缺口

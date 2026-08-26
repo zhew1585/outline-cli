@@ -394,61 +394,95 @@ fn a_shell_that_claims_operation_names_actually_carries_them() {
 
 #[test]
 fn the_public_module_documentation_matches_the_delivered_coverage() {
-    // R2 finding 5 / R3 finding 7: help, README and the script headers were
-    // narrowed, but the module rustdoc still claimed every operation name
-    // completes everywhere - and the first version of this test only checked
-    // that the SUPPORTED shells were mentioned, so appending "powershell and
-    // elvish operation names complete" would still have passed. Both
-    // directions are now checked, by sentence.
+    // R2-5 / R3-7 / R4-4. Each round the check was too weak in a new
+    // direction, so it is now stated as two symmetric rules over SENTENCES,
+    // both driven by the same predicate the generator uses:
+    //
+    //   1. some positive claim names exactly the covered shells;
+    //   2. no positive claim names an uncovered shell, and no denial names a
+    //      covered one.
+    //
+    // Substring searches were what let the previous versions pass: "bash,
+    // zsh, fish" appears just as happily in "bash, zsh, fish do not complete
+    // operation names".
     let doc = module_doc();
     assert!(!doc.is_empty(), "no module documentation found");
 
-    // 1. The covered shells are named, exactly as the predicate says.
-    let covered = shell_names(true).join(", ");
-    assert!(
-        doc.contains(&covered),
-        "rustdoc does not name the covered shells ({covered}): {doc}"
-    );
+    let covered = shell_names(true);
+    let uncovered = shell_names(false);
+    let mut positive_naming_all_covered = false;
 
-    // 2. No sentence that positively claims operation-name completion may
-    //    name a shell that does not deliver it.
     for sentence in doc.split(['.', ';']) {
-        let claims = sentence.contains("OPERATION")
-            || (sentence.contains("operation") && sentence.contains("complete"));
-        let denies = sentence.contains("NOT")
-            || sentence.contains("not complete")
-            || sentence.contains("no candidates")
-            || sentence.contains("only");
-        if !claims || denies {
+        if !mentions_operation_completion(sentence) {
             continue;
         }
-        for uncovered in shell_names(false) {
+        if is_denial(sentence) {
+            for shell in &covered {
+                assert!(
+                    !sentence.contains(shell),
+                    "rustdoc denies that {shell} completes operation names: {sentence:?}"
+                );
+            }
+            continue;
+        }
+        for shell in &uncovered {
             assert!(
-                !sentence.contains(uncovered),
-                "rustdoc claims {uncovered} completes operation names: {sentence:?}"
+                !sentence.contains(shell),
+                "rustdoc claims {shell} completes operation names: {sentence:?}"
             );
         }
+        if covered.iter().all(|shell| sentence.contains(shell)) {
+            positive_naming_all_covered = true;
+        }
     }
+    assert!(
+        positive_naming_all_covered,
+        "no sentence positively states that {covered:?} complete operation names: {doc}"
+    );
 }
 
 #[test]
-fn the_coverage_test_would_catch_an_over_claiming_sentence() {
-    // Guards the guard: the check above must reject the exact sentence the
-    // review used to show the previous version was vacuous.
-    let over_claiming = "powershell and elvish operation names complete";
-    let denies = over_claiming.contains("NOT")
-        || over_claiming.contains("not complete")
-        || over_claiming.contains("no candidates")
-        || over_claiming.contains("only");
-    assert!(!denies, "the sentence would be skipped as a denial");
-    let claims = over_claiming.contains("operation") && over_claiming.contains("complete");
-    assert!(claims, "the sentence would not be seen as a claim");
-    for uncovered in shell_names(false) {
-        assert!(
-            over_claiming.contains(uncovered),
-            "{uncovered} is not named by the sample sentence"
-        );
-    }
+fn the_coverage_check_catches_drift_in_both_directions() {
+    // Guards the guard, with one sample per direction: the over-claim the R3
+    // review supplied, and the denial the R4 review supplied. Each is run
+    // through the same classification the check above uses.
+    let over_claim = "powershell and elvish operation names complete";
+    assert!(mentions_operation_completion(over_claim));
+    assert!(!is_denial(over_claim), "would be skipped as a denial");
+    assert!(
+        shell_names(false).iter().any(|s| over_claim.contains(s)),
+        "the over-claim sample names no uncovered shell"
+    );
+
+    let denial = "bash, zsh, fish do not complete operation names";
+    assert!(mentions_operation_completion(denial));
+    assert!(is_denial(denial), "a denial must be classified as one");
+    assert!(
+        shell_names(true).iter().all(|s| denial.contains(s)),
+        "the denial sample does not name the covered shells"
+    );
+}
+
+/// Whether a sentence is about completing operation names at all.
+fn mentions_operation_completion(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.contains("operation") && (lower.contains("complete") || lower.contains("candidate"))
+}
+
+/// Whether such a sentence denies rather than asserts that completion.
+///
+/// Deliberately not keyed on "only": "complete in bash, zsh, fish only" is a
+/// POSITIVE claim about those three (and silence about the rest), which is
+/// exactly the sentence the documentation is supposed to contain. A denial
+/// has to negate the completion itself.
+fn is_denial(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.contains("not complete")
+        || lower.contains("not completed")
+        || lower.contains("no candidates")
+        || lower.contains("do not")
+        || lower.contains("does not")
+        || lower.contains("cannot")
 }
 
 /// The module-level `//!` documentation of the completions module.

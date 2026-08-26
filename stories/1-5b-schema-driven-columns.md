@@ -105,6 +105,7 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
 | 6 | MAJOR | 已修：schema 只提供排名，出现哪些列由响应字段集决定；不再把 `nullable=false` 当作「必然存在」；`required` 明确不入 IR（全 spec 皆空，纯死重量）；四个新测试钉住稀疏响应行为 |
 | R2-4 | MAJOR | 已修：过滤条件由「key 存在」改为「有内容」——`null`、缺失、空白字符串都不算内容，`false` / `0` 算。原实现下 `[{"id":"1","a":null,"b":null,"c":null,"d":"useful"}]` 会渲染三个全空列并把 `d` 挤掉 |
 | R3-6 | MAJOR | 已修：`has_content` 判的是**原始字符串**，而单元格经 `sanitize_cell` 后可能完全不可见——`"\u{1b}"` 会变成空格，`"\u{200b}"` 保留但宽度 0，多个这类字段能占满四列。现在判据是「渲染后是否占据终端列」（`renders_visibly`：grapheme 既可打印又宽度 >0）。另外审查者指出我的 invariant 测试用 `split_whitespace().nth(i)` 对齐列不可靠（空的中间列会让后面的值左移），已改为**独立重实现**的 payload 级判据，完全不解析对齐后的表格 |
+| R4-2 | MAJOR | 已修：R3 只把内容判据加在 schema 候选路径上，`from_schema` 为空时转入的 `select_data_columns` 仍只排容器、不查内容——而「schema 一个候选都没有」恰恰意味着所有排名字段都是空的，于是 fallback 又按名字优先级选中同一批空字段，把真正有内容的挤出四列。现在两条路径共用同一个 `has_content`，并新增「两条路径都不得出现全空列」的统一不变量测试 |
 | — | 验证 | 审查者独立确认 resolver-2 的 build-dep feature 隔离成立（`.fingerprint` 里 runtime `["default","std"]` 与 build-script `[...,"preserve_order",...]` 两套 artifact 并存） |
 
 ### 故意留下的缺口

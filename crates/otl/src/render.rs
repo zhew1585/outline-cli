@@ -260,7 +260,12 @@ fn is_plain_label(field: &FieldSpec) -> bool {
 /// - ordering is by fixed priority and then by key name, so it depends on
 ///   neither row order nor JSON object iteration order;
 /// - a key whose value is a container in any row is dropped entirely, so a
-///   column is never half-rendered.
+///   column is never half-rendered;
+/// - a key with no visible content in any row is dropped, by the same
+///   [`has_content`] test the schema path uses. Both paths need it: this one
+///   is reached whenever the schema contributes nothing, which is exactly
+///   when every schema-ranked field was blank, and picking four more blank
+///   columns here would push out the one field that does have something.
 fn select_data_columns<'a>(rows: &[&'a Map<String, Value>]) -> Vec<&'a str> {
     let mut candidates: Vec<&str> = Vec::new();
     for row in rows {
@@ -277,6 +282,7 @@ fn select_data_columns<'a>(rows: &[&'a Map<String, Value>]) -> Vec<&'a str> {
                 .filter_map(|row| row.get(*key))
                 .all(|value| !value.is_object() && !value.is_array())
         })
+        .filter(|key| rows.iter().any(|row| has_content(row.get(*key))))
         .collect();
     columns.sort_by(|left, right| {
         key_priority(left)

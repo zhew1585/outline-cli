@@ -841,3 +841,57 @@ fn a_payload_whose_schema_fields_are_all_null_falls_back_to_the_data() {
     );
     assert!(rendered.contains("extra"), "{rendered}");
 }
+
+#[test]
+fn the_data_driven_fallback_also_requires_content() {
+    // R4 finding 2: the content filter was only on the schema path. When the
+    // schema contributes nothing - which is exactly when every ranked field
+    // was blank - the fallback re-selected those same blank fields by name
+    // priority and pushed the one field with data past the column cap.
+    let schema = document_schema();
+    let payload = json!([{
+        "id": null,
+        "title": "",
+        "updatedAt": null,
+        "createdAt": "\u{200b}",
+        "extra": "visible"
+    }]);
+    let header = header_of(&payload, &schema);
+    assert_eq!(header, vec!["extra"], "blank fields took the columns");
+    let rendered = render(&payload, OutputMode::Table, &schema).unwrap();
+    assert!(rendered.contains("visible"), "{rendered}");
+}
+
+#[test]
+fn the_fallback_drops_blank_columns_with_no_schema_at_all() {
+    // The same rule with no schema in play: a raw `--body` response whose
+    // high-priority fields are empty must not crowd out the useful one.
+    let payload = json!([
+        { "id": null, "title": "", "name": "\u{1b}", "updatedAt": null, "zeta": "visible" },
+        { "id": null, "title": "  ", "name": "\u{200b}", "updatedAt": null, "zeta": "also" }
+    ]);
+    let header = header_of(&payload, NO_SCHEMA);
+    assert_eq!(header, vec!["zeta"], "blank fields took the columns");
+}
+
+#[test]
+fn no_selected_column_is_blank_on_either_path() {
+    // One invariant, both selectors: with a schema, without a schema, and in
+    // the case where the schema contributes nothing and the fallback runs.
+    let schema = document_schema();
+    for payload in [
+        json!([{ "id": null, "title": "", "createdAt": "\u{200b}", "extra": "visible" }]),
+        json!([{ "id": "d1", "title": "\u{1b}", "urlId": "u" }]),
+        json!([{ "alpha": "", "beta": null, "gamma": "g" }]),
+        json!([{ "id": "d1", "title": "T", "createdAt": "c", "updatedAt": "u" }]),
+    ] {
+        for columns in [header_of(&payload, &schema), header_of(&payload, NO_SCHEMA)] {
+            for column in columns {
+                assert!(
+                    visible_in_payload(&payload, &column),
+                    "column {column} is blank in every row of {payload}"
+                );
+            }
+        }
+    }
+}

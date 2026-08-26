@@ -183,10 +183,25 @@ pub fn release_token(source: &impl TokenSource, s: &Settings) -> Result<String, 
 }
 ```
 
-`BindingChecked` 只有一个私有字段，所以**模块外根本调不到 `fetch`**——不是靠约定，是靠类型系统。
-Epic 2 的凭证文件 TokenSource 接进来时自动继承这道检查，无需知道它存在。测试
-`the_binding_gate_applies_to_every_token_source` 用一个「对任何 settings 都吐出秘密」的假实现证明：
-即使 source 本身毫无防线，gate 仍然拒绝，且秘密不出现在错误里。
+`BindingChecked` 只有一个私有字段，所以**模块外根本调不到 `fetch`**。
+
+**R4 补完：不可伪造的令牌 + 可伪造的输入 = 不成立。** R4 指出我只锁了一半——令牌造不出来，但签发令牌
+所依据的 `Settings` 是公开结构体，外部可以直接构造 `url_source: UrlSource::Flag` 骗过闸门；更直接的是
+`EnvLayer` 的 `api_key` / `profile_api_keys` 本身就是公开字段，压根不用过闸门就能读到秘密。审查者说得
+对，我的集成测试自己的 `settings_for` helper 就是这条路径的现成证明。现在三处一起锁：
+
+1. `Settings` 字段私有 + 无公开构造函数 → 只能由 `resolve_settings` 产出（读取走 accessor）；
+2. `EnvLayer` 的秘密字段私有且**不提供 accessor** → 秘密只能经 `release_token` 取得（非秘密部分给
+   `profile()` / `url()` / `config_path()` 与 `with_*` 构造器）；
+3. `BindingChecked` 私有字段 → `fetch` 只能由 `release_token` 调用。
+
+三者缺一，闸门就是装饰。测试用**编译失败**验证（不是运行时断言——伪造路径根本没有能触达的运行时值）：
+`the_gates_inputs_cannot_be_forged_from_outside_the_crate` 把 4 段攻击代码用 `rustc` 编译到真实
+rlib 上，要求全部因私有性失败，同时先编译一段「合法用法」确保探针本身没坏。已做变异验证：把
+`api_key` 改回 `pub` 会立刻得到 `SAFE RUST CAN STILL read the global API key straight off EnvLayer`。
+
+另有 `the_binding_gate_applies_to_every_token_source`（假 source 也被拦）与
+`the_gate_still_governs_an_honestly_resolved_flag_redirect`（真 `--url` 仍放行，逃生门没被误伤）。
 
 **三项确认（裁决要求）**：
 - AC2 同项三层优先级：`the_url_key_itself_resolves_flag_over_env_over_file`——同一个 URL 键上依次断言
@@ -259,6 +274,16 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 | R3-9 | MINOR | 已修：profile 无 URL 的错误不再建议 `set OUTLINE_URL`（那会撞上绑定检查），改为建议加 `url =` 或 `--url` |
 
 R3 已 VERIFIED：R2-6（Windows/POSIX 双规则参数化执行）、R2-7（64 字符上限在派生处生效）。
+
+### R4 复核处置（2026-08-26）
+
+| # | 级别 | 处置 |
+|---|------|------|
+| 裁决落地 | PARTIAL | 规范选择被确认正确；「结构性不可绕过」不成立的部分已补完（见上：Settings / EnvLayer / BindingChecked 三处同时私有化，编译失败测试 + 变异验证） |
+| R4-1 | BLOCKER | 已修，如上 |
+| R4-3 | MINOR | 已修：非法 URL 不再误报「跨实例冲突」。分三种情况——**解析结果**无法确定 origin（发不出去，交给请求通道给出精确的 invalid base URL）、**profile 声明的 url** 无法解析（绑定根本建立不了，新增 `InvalidProfileUrl` 指向 profile 自己的配置）、两者都能解析则比规范化 origin。原注释与实际控制流相反，已一并改正 |
+
+R4 已 VERIFIED（不再改动）：AC2 同项三层优先级、跨 origin 零请求、R3-2/3/4/5/8/9。
 
 R2 已 VERIFIED：R1-3（TOML 文本只用于分类）、R1-4（两层白名单）、R1-7（控制字符清理，并额外确认 bidi
 经 Rust Debug 转义后无法改变终端方向状态）。

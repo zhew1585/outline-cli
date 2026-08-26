@@ -123,6 +123,11 @@ credential that has been sent cannot be recalled. Origins are compared normalize
 host casing or a default port is never a false conflict. Without a profile there is nothing to bind and
 `OUTLINE_URL` behaves exactly as before.
 
+The gate is enforced by the type system rather than by convention: the resolved settings it reads have no
+public constructor, the credential cannot be read around it, and the token proving the check ran cannot
+be built outside the module that runs it. A credential source added later inherits all of that without
+opting in.
+
 The config file holds no secrets, by construction: an `api_key` or `token` key — at the top level or in a
 profile — is a hard error pointing at `credentials.toml`, and any other unrecognized key (including a
 deeper table holding one) is rejected as an unknown key. A missing config file is not an error — the
