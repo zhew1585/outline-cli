@@ -533,16 +533,32 @@ fn string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
 /// exit 2 means "fix something locally". See `docs/exit-codes.md`.
 pub fn map_auth_error(error: AuthError) -> CliError {
     match error {
+        // The engine's own mapper, because it composes the hint text as well
+        // as choosing the class; the class it chooses is the one
+        // [`exit_code_of`] reports for the same error.
         AuthError::Engine(inner) => map_engine_error(inner),
-        AuthError::OAuth(inner) => {
-            let code = oauth_exit_code(&inner);
-            CliError::new(code, inner)
+        // Every other class is Display-transparent, so the wrapped error and
+        // the wrapper render identically and the code comes from the one
+        // table below.
+        other => CliError::new(exit_code_of(&other), other),
+    }
+}
+
+/// The exit code an authentication failure produces, without consuming it.
+///
+/// The borrowing half of [`map_auth_error`], for `otl doctor`: a report has
+/// to state the code a failure WOULD have produced while keeping the error
+/// to print. Deliberately not a second table - each arm delegates to the
+/// same classifier `map_auth_error` uses, so the two cannot drift.
+pub fn exit_code_of(error: &AuthError) -> ExitCode {
+    match error {
+        AuthError::Engine(inner) => crate::errors::engine_exit_code(inner),
+        AuthError::OAuth(inner) => oauth_exit_code(inner),
+        // Every store or config failure is something the user fixes on their
+        // own machine: a permission bit, a path, a stale lock, a variable.
+        AuthError::Store(_) | AuthError::Config(_) | AuthError::NoCredentials { .. } => {
+            ExitCode::Usage
         }
-        // Every store failure is something the user fixes on their own
-        // machine: a permission bit, a path, a stale lock.
-        AuthError::Store(inner) => CliError::new(ExitCode::Usage, inner),
-        AuthError::Config(inner) => CliError::new(ExitCode::Usage, inner),
-        AuthError::NoCredentials { .. } => CliError::new(ExitCode::Usage, error),
     }
 }
 

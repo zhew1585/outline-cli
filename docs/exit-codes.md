@@ -89,3 +89,26 @@ Notes:
   - **If a credential written by another process survived** — a concurrent refresh landing a rotated session inside the revocation window — it is reported and the exit code is 9. That session was never revoked, so `revoked` is `false` and the command does not claim to have signed out. Deleting another process's session is never the answer; run `otl auth logout` again to revoke and remove it.
 - `otl auth logout` never requires `OUTLINE_URL`, and never applies the transport rule to it. Everything it contacts comes out of the credential file, anchored to the origin each credential recorded for itself. That is deliberate: cleanup has to work precisely when the configuration is missing, wrong, or predates a rule, and the alternative is a user deleting the file by hand and orphaning a DCR registration for good.
 - A client registration stranded on the server (created, then neither saveable nor deletable) exits **1**: it is neither a local configuration problem nor retryable, and only an administrator can clear it.
+- `otl doctor` introduces **no exit code of its own**, and that is the point: it answers "is this
+  environment usable?", so it exits with the code the first blocking finding *would have produced in any
+  other command*. 0 means nothing is blocking. 2 is something to fix locally (an unusable config file, a
+  credential file whose permissions are too wide, no credential configured, an instance URL that is
+  missing, plaintext or unusable). 4 means the instance rejected the credential. 3, 5, 6, 7 and 8 are
+  whatever the instance answered, or failed to answer, to the one probe `doctor` sends (`auth.info`
+  through the ordinary request channel). Four rules go with that:
+  - **First, not worst.** The checks run in dependency order - config file, instance URL, credential
+    file, chosen credential, reachability, local spec, online spec - and the FIRST blocking one decides
+    the code. An earlier problem is both the cause of what follows and the thing to fix first: reporting
+    the numerically highest code instead would point a user at a network failure that is really a missing
+    `OUTLINE_URL`.
+  - **A warning is never blocking.** A spec cache that had to be discarded, a local table behind the
+    online one, an unreachable spec host, a plaintext key in the environment: all are reported, none
+    changes the exit code, because none of them stops `otl` from working. In particular a spec host is a
+    third party the CLI consults only when asked, so its 404 or its firewall must never make `otl doctor`
+    call a working environment broken.
+  - **The report is always printed**, before the code is decided and whatever the code turns out to be.
+    A `--json` consumer gets the same object on every run; a blocking finding is additionally summarized
+    on stderr, naming the check it came from.
+  - **`doctor` classifies nothing itself.** Every blocking code comes from the same mapper the failing
+    command uses (`auth::exit_code_of`, the borrowing half of `map_auth_error`), so a diagnosis cannot
+    disagree with the command it is diagnosing.

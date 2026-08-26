@@ -145,6 +145,15 @@ pub struct CompiledOp {
     /// source schema declares them. Empty when the document describes no
     /// response shape.
     pub response_fields: Vec<CompiledField>,
+    /// Whether the document marks the operation `deprecated`.
+    ///
+    /// Read here and deliberately NOT carried into the runtime IR: the IR is
+    /// a dispatch table, a deprecation bit would change its schema version
+    /// (invalidating every user's cache), and the one consumer that needs
+    /// the flag - `otl doctor`, comparing the online API against the local
+    /// table - compiles the fetched document itself and can read it from
+    /// there. A deprecated operation still dispatches exactly as before.
+    pub deprecated: bool,
 }
 
 /// A whole compiled document: operations sorted by name.
@@ -360,6 +369,7 @@ fn compile_op(
         body_mode,
         params,
         response_fields,
+        deprecated: is_deprecated(post),
         name,
     };
     rules::check_identifiers(&op, options)?;
@@ -424,6 +434,16 @@ fn extract_summary(post: &Value) -> String {
     text::sanitize_display(first_line)
 }
 
+/// Whether the document marks this operation `deprecated`.
+///
+/// Strictly the JSON boolean `true`: OpenAPI defines the field as a
+/// boolean, and treating any truthy-looking value (`"false"`, `0`, `{}`) as
+/// deprecation would let a document deprecate an operation by accident. A
+/// missing field means "not deprecated", which is the OpenAPI default.
+fn is_deprecated(post: &Value) -> bool {
+    post.get("deprecated") == Some(&Value::Bool(true))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -463,6 +483,30 @@ mod tests {
         assert_eq!(op.params[1].name, "count");
         assert_eq!(op.params[1].ty, ScalarKind::Integer);
         assert!(!op.params[1].required);
+    }
+
+    /// The `deprecated` flag is read per operation, strictly as the JSON
+    /// boolean `true`. `otl doctor` reports it, so a document must not be
+    /// able to deprecate an operation with a truthy-looking value.
+    #[test]
+    fn reads_the_deprecated_flag_of_an_operation() {
+        let raw = doc(r#"{"/things.old":{"post":{"deprecated":true}},
+                "/things.new":{"post":{}},
+                "/things.stringy":{"post":{"deprecated":"true"}},
+                "/things.zero":{"post":{"deprecated":0}}}"#);
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let flag = |name: &str| {
+            compiled
+                .ops
+                .iter()
+                .find(|op| op.name == name)
+                .expect("operation is compiled")
+                .deprecated
+        };
+        assert!(flag("things.old"));
+        assert!(!flag("things.new"));
+        assert!(!flag("things.stringy"), "a string is not the boolean true");
+        assert!(!flag("things.zero"), "a number is not the boolean true");
     }
 
     #[test]

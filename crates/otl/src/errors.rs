@@ -68,6 +68,16 @@ pub fn map_engine_error_with_hint(error: EngineError, hint: Option<&str>) -> Cli
     CliError::new(code, anyhow::Error::new(error).context(message))
 }
 
+/// The exit code an engine error produces, without consuming it.
+///
+/// For `otl doctor`, which reports the code a failure WOULD have produced
+/// and keeps the error to print. It reads the same [`classify`] table
+/// [`map_engine_error`] does, so a report cannot disagree with the command
+/// it describes.
+pub fn engine_exit_code(error: &EngineError) -> ExitCode {
+    classify(error).0
+}
+
 /// Pick the exit code and compose the top-level message for an engine error.
 fn classify(error: &EngineError) -> (ExitCode, String) {
     match error {
