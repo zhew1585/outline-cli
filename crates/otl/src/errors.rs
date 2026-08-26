@@ -10,6 +10,7 @@
 //! construction (see `engine::error`). Never interpolate raw URLs,
 //! tokens, or unsanitized server text here.
 
+use engine::fetch::FetchError;
 use engine::EngineError;
 
 use crate::config::ENV_API_KEY;
@@ -29,6 +30,22 @@ const RATE_LIMIT_HINT: &str =
 /// Hint appended to network/transport failures.
 const NETWORK_RETRY_HINT: &str =
     "Check your network connection and the OUTLINE_URL host, then retry.";
+/// Hints for the spec-source domain. None of them mention the API key or
+/// the instance URL: neither is involved in fetching a spec.
+const FETCH_NETWORK_HINT: &str =
+    "Check your network connection and that the spec source above is reachable, then retry. \
+     `otl` keeps working on the spec built into the binary meanwhile.";
+const FETCH_AUTH_HINT: &str =
+    "The spec source requires authentication. `otl spec sync` fetches the document \
+     anonymously and never sends your API key to a spec host; point --url at a \
+     publicly readable copy, or pass --spec with a local file.";
+const FETCH_NOT_FOUND_HINT: &str =
+    "Check the --url value, or pass --spec with a local copy of the document.";
+const FETCH_SERVER_HINT: &str =
+    "The spec source failed to serve the document; it may help to retry later.";
+/// Hint appended when spec-fetch rate-limit retries are exhausted.
+const FETCH_RATE_LIMIT_HINT: &str =
+    "Wait for the spec source's rate limit to reset and run `otl spec sync` again.";
 
 /// Map an engine error to a `CliError` with a documented exit code
 /// (see `docs/exit-codes.md`) and a polished stderr message.
@@ -98,6 +115,52 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
             (ExitCode::Failure, error.to_string())
         }
     }
+}
+
+/// Map a document-fetch error to a `CliError`.
+///
+/// A separate function from [`map_engine_error`] on purpose, and not a
+/// delegation to it: the two describe different servers. The Outline
+/// instance is reached with the user's API key, so its 401 means "your key
+/// is wrong" and its DNS failure means "check `OUTLINE_URL`". A spec host
+/// is reached anonymously and has nothing to do with either, so every hint
+/// here talks about the spec SOURCE. Exit codes keep their documented
+/// meaning (a 404 is still "not found", an exhausted 429 is still 8) - it
+/// is the wording, and only the wording, that differs.
+pub fn map_fetch_error(error: FetchError) -> CliError {
+    let (code, message) = classify_fetch(&error);
+    CliError::new(code, anyhow::Error::new(error).context(message))
+}
+
+/// Pick the exit code and message for a document-fetch error.
+fn classify_fetch(error: &FetchError) -> (ExitCode, String) {
+    match error {
+        // Nothing was sent: the URL never passed local checks.
+        FetchError::InvalidUrl { .. } => (ExitCode::Usage, error.to_string()),
+        FetchError::ClientBuild(_) => (ExitCode::Failure, error.to_string()),
+        FetchError::Transport { .. } => {
+            (ExitCode::Network, format!("{error}.\n{FETCH_NETWORK_HINT}"))
+        }
+        FetchError::Status { status, .. } => classify_fetch_status(*status, error),
+        FetchError::RateLimited { .. } => (
+            ExitCode::RateLimited,
+            format!("{error}.\n{FETCH_RATE_LIMIT_HINT}"),
+        ),
+        FetchError::Unusable { .. } => (ExitCode::Failure, error.to_string()),
+    }
+}
+
+/// Class of a non-success status from a document host.
+fn classify_fetch_status(status: u16, error: &FetchError) -> (ExitCode, String) {
+    let (exit, hint) = match status {
+        401 | 403 => (ExitCode::Auth, Some(FETCH_AUTH_HINT)),
+        404 => (ExitCode::NotFound, Some(FETCH_NOT_FOUND_HINT)),
+        400..=499 => (ExitCode::ApiRequest, None),
+        500..=599 => (ExitCode::Server, Some(FETCH_SERVER_HINT)),
+        _ => (ExitCode::Failure, None),
+    };
+    let suffix = hint.map(|hint| format!("\n{hint}")).unwrap_or_default();
+    (exit, format!("{error}{suffix}"))
 }
 
 /// Map an API error envelope (status + code + message) to its class.

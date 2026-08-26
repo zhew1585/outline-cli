@@ -9,11 +9,16 @@ use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::{no_cache_dir, CACHE_DIR_ENV};
+
 /// `otl` command with Outline env scrubbed for deterministic tests.
 fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
     cmd.env_remove("OUTLINE_URL")
         .env_remove("OUTLINE_API_KEY")
+        // Dispatch must come from the built-in spec, not a synced one.
+        .env(CACHE_DIR_ENV, no_cache_dir())
         .env_remove("OUTLINE_PROFILE")
         // Empty value = read no user config file, so the developer's own
         // profiles cannot influence the assertions below (Story 4.1).
@@ -390,6 +395,9 @@ async fn closed_stdout_pipe_exits_quietly_without_panicking() {
         use std::process::{Command, Stdio};
 
         let mut child = Command::new(assert_cmd::cargo::cargo_bin("otl"))
+            .env_remove("OUTLINE_URL")
+            .env_remove("OUTLINE_API_KEY")
+            .env(CACHE_DIR_ENV, no_cache_dir())
             .env_remove("OUTLINE_PROFILE")
             .env("OUTLINE_CONFIG", "")
             .env("OUTLINE_URL", uri)

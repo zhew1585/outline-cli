@@ -14,5 +14,6 @@ pub mod pager;
 pub mod paging;
 pub mod render;
 pub mod session;
+pub mod spec;
 pub mod stdio;
 pub mod text;

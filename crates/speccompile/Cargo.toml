@@ -1,0 +1,41 @@
+# Shared OpenAPI -> IR compiler, used from two places:
+#   - `crates/otl/build.rs` at build time (renders the static IR table)
+#   - `otl spec sync` at run time (compiles a freshly fetched spec)
+# It is deliberately a separate crate rather than a module of `engine`: a
+# build script may only use build-dependencies, and pulling `engine` (and
+# with it reqwest/rustls) into the host build would cost far more than it
+# saves. Kept service-agnostic like `engine`: no vendor-specific content.
+[package]
+name = "spec-compile"
+version = "0.1.0"
+description = "Compile an OpenAPI document into the versioned RPC IR"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# The document parser is hand-written (a seed threading an allocation
+# budget), so it needs serde's traits directly. It does not use the derive
+# macros, but it takes the workspace feature set as it is: overriding
+# `default-features` here is ignored (the workspace entry does not set it)
+# and cargo warns about that on every build.
+serde = { workspace = true }
+# `preserve_order` so a compiled table keeps the document's own property
+# order: it is the schema's statement of which response fields matter most,
+# and the table renderer ranks columns by it. This crate parses for BOTH the
+# build script and `spec sync`, so the feature cannot differ between them -
+# a synced table and the built-in one would order fields differently, column
+# ranking would depend on where the spec came from, and `spec_parity` would
+# fail.
+#
+# Consequence, deliberate and pinned by `crates/otl/tests/json_key_order.rs`:
+# unlike the old build-only arrangement, this DOES unify into the runtime, so
+# `--json` prints response keys in the order the server sent them instead of
+# sorted. `otl api` output is explicitly unstable, and the server's own order
+# is the more faithful of the two.
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
