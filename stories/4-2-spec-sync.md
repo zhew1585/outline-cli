@@ -187,6 +187,28 @@ persist、HashSet 化无语义回归、consumed 检查、函数长度）未再�
 | [10] MINOR 共享的「保证不存在」目录 | 目录名含 pid + 计数器 + 纳秒，返回前断言不存在 |
 | [11] MINOR `--spec` 打开竞态 | 打开动作放到看门狗线程 + `recv_timeout`，「打开阻塞」变成明确错误而非永久挂起（`O_NONBLOCK` 需要 libc 且平台常量不同，为一次调用不值得）。看门狗本身有单测 |
 
+### Review R3 处置（4 VERIFIED / 5 PARTIAL + 3 MAJOR + 6 MINOR，全部修复）
+
+**最重要的一条：R2 我给的「峰值约 26 MB」被算术核对证伪，是我算错了。** `footprint_of` 按 `len × 24` 计费，
+漏掉 Vec 翻倍扩容：刚越过 serde cautious 上限（43,690 个 `Cow<str>`，约 43 KiB 输入）的容器一次涨到 87,380 槽
+= 2 MiB，一个 1 MiB body 能塞约 24 个 → **约 47 MiB**，全在预算被查之前。
+
+| # | 处置 |
+|---|------|
+| [1] MAJOR 内层容器放大 ~47 MiB | 不是调数字而是**换结构**：表改为逐记录分帧（`meta_len \| meta \| op_count \| [op_len \| op]*`），每条记录 ≤ 32 KiB 且从自己的切片单独解码。内层容器再怎么声明也只有一条记录的字节可用，构造本身不存在了。容量计费加 2× slack。新界（写进代码注释）：文件 1 MiB + 已接受 4 MiB + 正在解的记录 <2 MiB ≈ **8 MiB 以内**。实测最大真实记录 391 字节（documents.search），余量 83 倍 |
+| [2] MAJOR store/load 仍不对称 | store 现在跑 load 侧全部规则（含 decoded-footprint）；新增 store→load 组合测试（8 万短参数名那类形状） |
+| [3] MAJOR 缓存加载 TOCTOU | 打开走看门狗（换成 FIFO 只会超时报错并回退，不会永久阻塞）；句柄按 **(dev, ino)** 与预检查结果比对，换成另一个普通文件也会被认出。两处 open 合并到 `spec/openfile.rs`——运行时唯一的 open 站点 |
+| [4] MINOR 守卫可绕（send/公开面） | 通道文件内禁用 `.execute(`/`blocking::get(` 等其他发送 API（否则 `.send()` 计数不变）；公开面扫描加 `pub use`/`pub async fn`，并**双向**校验（改名不会让清单静默失效） |
+| [5] MINOR hyper/rustls 无法区分直接依赖 | 锁文件允许（reqwest 带入），但**任何 member manifest 里直接声明**即失败；同时区分「依赖键」与「feature 字符串」（`"rustls"` 作为 reqwest 的 feature 是正确用法） |
+| [6] MINOR 文件读取按整文件放行 | 改为**按调用站点**（文件 + 该行必须含的上下文），并把 `.open(` 也纳入模式（覆盖 `File::options()`/别名）。已用报告原样的绕过（拆分路径 + `fs::read` 塞进已登记文件）验证会被抓住 |
+| [7] MINOR watchdog 线程泄漏 | 单测结尾打开 FIFO 写端放行工作线程，不再留阻塞线程；限制（超时后线程会阻塞到进程退出、真正的修法需要 `O_NONBLOCK` 与 libc）写进模块注释 |
+| [8] MINOR 容量上界是死上界 | 分帧后按**实际剩余字节**判定：`count > remaining / MIN_FRAMED_OP_BYTES` 直接判为撒谎，短 body 声明 8192 个 operation 不再预留 |
+| [9] MINOR 错误分类与措辞 | 三类资源错误各自独立（operation 数 / 单条记录大小 / 解码后内存），各带实际值 + 上限 + 对症的 remedy，单条超限还会**点名是哪个 operation**；`--spec` 的文档类错误按「谁选的文档」判退出码（本地 2 / 远程 1） |
+
+守卫的注释也按要求改写：它们是**源码文本的回归守卫，不是证明**。字符串扫描不解析 Rust，绕过总是存在；它们保证的是
+「本仓库实际使用的形态不能被悄悄新增」——新的 send 点、fetch 模块的新公开项、任何 manifest/lock 里的第二个 HTTP 栈、
+新的文件打开站点，都会在这里失败，而修改它们本身就是这些测试代替的那次评审。
+
 审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
 
 ### Completion Notes List

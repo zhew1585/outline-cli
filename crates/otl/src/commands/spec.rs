@@ -120,7 +120,7 @@ fn run_sync(args: &SyncArgs, mode: OutputMode) -> Result<(), CliError> {
 
     let ops = compile(&document, source)?;
     let meta = cache::CacheMeta::new(hash.clone(), label);
-    let path = cache::store(&ops, &meta).map_err(cache_write_error)?;
+    let path = cache::store(&ops, &meta).map_err(|error| store_error(error, source))?;
     emit(&sync_report(&ops, &before, &meta, &path), mode)
 }
 
@@ -288,7 +288,30 @@ fn compile_error(reason: &str, source: Source) -> CliError {
 /// command did not do what it said, and no fallback applies.
 fn cache_write_error(error: cache::CacheError) -> CliError {
     let remedy = error.remedy();
-    CliError::failure(anyhow!("{error}; {remedy}"))
+    CliError::failure(anyhow!("{error}.\n{remedy}"))
+}
+
+/// A failed store during `spec sync`.
+///
+/// Two of these are really verdicts on the DOCUMENT rather than on the
+/// filesystem - it declares more than the cache format can hold - so they
+/// are classified like any other unusable document: the user's own file is
+/// a usage error, a fetched one is the source's fault. Everything else is
+/// a plain failure to write.
+fn store_error(error: cache::CacheError, source: Source) -> CliError {
+    let about_the_document = matches!(
+        error,
+        cache::CacheError::TooLarge { .. } | cache::CacheError::Unsupportable(_)
+    );
+    if !about_the_document {
+        return cache_write_error(error);
+    }
+    let remedy = error.remedy();
+    let message = anyhow!("the OpenAPI document cannot be used: {error}.\n{remedy}");
+    match source {
+        Source::Local => CliError::usage(message),
+        Source::Remote => CliError::failure(message),
+    }
 }
 
 /// One command result, in both output states.

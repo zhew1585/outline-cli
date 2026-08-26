@@ -125,10 +125,17 @@ pub enum TableError {
     TooManyOperations { count: usize, limit: usize },
     /// One operation's encoded record exceeds [`MAX_OP_RECORD_BYTES`].
     OperationTooLarge {
-        /// Position in the table (0-based), for a document with no usable
-        /// name to report yet.
+        /// Position in the table (0-based). Always available, and the only
+        /// identifier a cache being DECODED has: its name is inside the
+        /// record that was just refused.
         index: usize,
+        /// The operation's name, when it is known (encoding a table the
+        /// caller already validated). Safe to print: it has been through
+        /// the text rules.
+        name: Option<String>,
+        /// Bytes the record came to.
         bytes: usize,
+        /// The limit it exceeded.
         limit: usize,
     },
     /// The table decodes to more memory than [`MAX_DECODED_BYTES`].
@@ -146,13 +153,20 @@ impl TableError {
             ),
             Self::OperationTooLarge {
                 index,
+                name,
                 bytes,
                 limit,
-            } => format!(
-                "operation #{index} encodes to {bytes} bytes, more than the {limit} \
-                 the cache format allows for one operation (too many parameters or \
-                 enumerated values)"
-            ),
+            } => {
+                let which = match name {
+                    Some(name) => format!("operation {name:?}"),
+                    None => format!("operation #{index}"),
+                };
+                format!(
+                    "{which} encodes to {bytes} bytes, more than the {limit} the cache \
+                     format allows for one operation (too many parameters or \
+                     enumerated values)"
+                )
+            }
             Self::TooMuchMemory { footprint, limit } => format!(
                 "its operations would occupy about {footprint} bytes in memory, more \
                  than the {limit} the cache format allows"
@@ -208,14 +222,25 @@ fn record_config(limit_bytes: usize) -> impl bincode::config::Config {
 pub(super) fn encode_table(meta: &CacheMeta, ops: &[OpSpec]) -> Result<Vec<u8>, TableError> {
     check_table(ops)?;
     let mut body = Vec::new();
-    let meta_record = encode_record(meta, MAX_META_RECORD_BYTES)?;
+    let meta_record = encode_record(meta)?;
+    if meta_record.len() > MAX_META_RECORD_BYTES {
+        return Err(TableError::Framing(format!(
+            "the provenance record encodes to {} bytes, over its {MAX_META_RECORD_BYTES} \
+             byte limit",
+            meta_record.len()
+        )));
+    }
     push_record(&mut body, &meta_record);
     push_len(&mut body, ops.len());
     for (index, op) in ops.iter().enumerate() {
-        let record = encode_record(op, MAX_OP_RECORD_BYTES)?;
+        let record = encode_record(op)?;
+        // Classified as what it is - one operation carrying more than the
+        // format holds - so the remedy can point at that operation's
+        // parameters instead of at the document's size.
         if record.len() > MAX_OP_RECORD_BYTES {
             return Err(TableError::OperationTooLarge {
                 index,
+                name: Some(op.name.to_string()),
                 bytes: record.len(),
                 limit: MAX_OP_RECORD_BYTES,
             });
@@ -316,17 +341,14 @@ fn footprint_of_param(param: &ParamSpec) -> usize {
         + CONTAINER_SLACK * (param.enum_values.len() * size_of::<std::borrow::Cow<'static, str>>())
 }
 
-/// Encode one record, refusing a value that does not fit its own limit.
-fn encode_record<T: serde::Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, TableError> {
-    let encoded = bincode::serde::encode_to_vec(value, record_config(limit))
-        .map_err(|error| TableError::Decode(error.to_string()))?;
-    if encoded.len() > limit {
-        return Err(TableError::Framing(format!(
-            "a record encodes to {} bytes, over its {limit} byte limit",
-            encoded.len()
-        )));
-    }
-    Ok(encoded)
+/// Encode one record.
+///
+/// Size is NOT checked here: the caller knows which record this is and can
+/// say so ("operation #7 is too large" rather than "a record is too
+/// large"), which decides what the user is told to do about it.
+fn encode_record<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, TableError> {
+    bincode::serde::encode_to_vec(value, record_config(MAX_OP_RECORD_BYTES))
+        .map_err(|error| TableError::Decode(error.to_string()))
 }
 
 /// Decode one record from exactly its own bytes.

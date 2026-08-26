@@ -906,6 +906,59 @@ fn storing_metadata_from_another_build_is_refused() {
     }
 }
 
+/// Each resource limit has to say WHICH limit was hit, with the actual
+/// number, and point somewhere useful. "Too big" with the wrong cause
+/// sends the user looking in the wrong place.
+#[test]
+fn each_resource_limit_reports_its_own_cause_and_remedy() {
+    let (_dir, file) = temp_cache();
+
+    // Too many operations: names the count and the ceiling.
+    let many: Vec<OpSpec> = (0..cache::MAX_CACHED_OPS + 1)
+        .map(|index| {
+            let name = format!("t{index}.i");
+            op(&name, &format!("/api/{name}"))
+        })
+        .collect();
+    let error = cache::store_at(&file, &many, &meta()).expect_err("must be refused");
+    let text = format!("{error} {}", error.remedy());
+    assert!(text.contains(&many.len().to_string()), "{text}");
+    assert!(text.contains(&cache::MAX_CACHED_OPS.to_string()), "{text}");
+    assert!(text.contains("operations you need"), "no remedy: {text}");
+
+    // One operation too large: names THAT operation, and its remedy talks
+    // about parameters rather than about the document's size.
+    let mut fat = op("things.big", "/api/things.big");
+    fat.params = (0..4000)
+        .map(|index| ParamSpec {
+            name: format!("parameter{index}").into(),
+            ty: ParamType::String,
+            required: false,
+            nullable: false,
+            enum_values: Vec::new().into(),
+            format: String::new().into(),
+            minimum: None,
+            maximum: None,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let error = cache::store_at(&file, &[fat], &meta()).expect_err("must be refused");
+    let text = format!("{error} {}", error.remedy());
+    assert!(text.contains("things.big"), "does not say which: {text}");
+    assert!(
+        text.contains(&cache::MAX_OP_RECORD_BYTES.to_string()),
+        "{text}"
+    );
+    assert!(text.contains("parameters"), "wrong remedy: {text}");
+    assert!(
+        !text.contains("far fewer operations"),
+        "blames the operation count for a parameter problem: {text}"
+    );
+
+    // Nothing was written for either.
+    assert!(!file.exists());
+}
+
 #[test]
 fn spec_hash_is_stable_and_content_addressed() {
     let one = cache::spec_hash("{\"a\":1}");
