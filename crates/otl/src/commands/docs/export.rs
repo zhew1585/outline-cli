@@ -141,7 +141,7 @@ struct Export<'a> {
     /// write: if the destination already IS a file this run wrote, the two
     /// names are one directory entry on this filesystem, and overwriting
     /// would lose a document that was reported as exported.
-    written_ids: HashSet<(u64, u64)>,
+    written_ids: HashSet<dir::FileId>,
     /// Why the enumeration stopped short in a way the caller did not ask
     /// for, if it did.
     truncated: Option<engine::Truncation>,

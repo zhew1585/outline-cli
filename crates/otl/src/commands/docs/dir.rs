@@ -17,6 +17,22 @@ use std::path::{Path, PathBuf};
 /// `None` means "not available on this platform", never "different":
 /// callers must treat an absent identity as no information rather than as a
 /// mismatch, and must not report a guarantee they could not check.
+///
+/// `(dev, ino)` identifies a file only for as long as that inode cannot be
+/// reused. Linux hands an inode number back as soon as the inode is free -
+/// measured on ext4, a directory deleted and recreated at the same path came
+/// back as the same `ino=418806` - so a pin that only remembers the number
+/// would accept the replacement as the original. macOS/APFS allocates a
+/// fresh one, which is why this looked sound until the Linux leg of CI
+/// disagreed.
+///
+/// What makes the number trustworthy is holding the file OPEN: see
+/// [`Dir::open`]. A live descriptor keeps the inode allocated, so nothing
+/// else can be given that number while the pin exists.
+///
+/// Change time is deliberately NOT part of this. It moves whenever the inode
+/// changes - including every write - so an identity carrying it would say
+/// "replaced" about a file this process had merely finished writing.
 pub type FileId = (u64, u64);
 
 /// The identity of whatever `path` names right now.
@@ -32,6 +48,26 @@ pub(super) fn identity(path: &Path) -> Option<FileId> {
 /// process is holding, which is what makes it usable as proof later.
 pub(super) fn identity_of_handle(file: &std::fs::File) -> Option<FileId> {
     identity_of(&file.metadata().ok()?)
+}
+
+/// Open a directory so its inode stays allocated while we hold the handle.
+///
+/// Unix opens a directory with a plain read; Windows needs a backup-semantics
+/// flag that the standard library does not expose, so there the pin keeps no
+/// handle - which is consistent, because Windows exposes no identity to pin
+/// either (see [`identity_of`]).
+#[cfg(unix)]
+fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(not(unix))]
+fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    let _ = path;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening a directory handle needs an API the standard library does not expose here",
+    ))
 }
 
 /// Pull the identity out of metadata, where the platform has one.
@@ -79,7 +115,25 @@ pub enum Durability {
 pub struct Dir {
     path: PathBuf,
     /// Identity at open time, when the platform exposes one.
-    id: Option<(u64, u64)>,
+    id: Option<FileId>,
+    /// The open directory, kept alive for as long as the pin is.
+    ///
+    /// This is what makes [`FileId`] mean something: while this descriptor
+    /// exists the inode stays allocated, so the number in `id` cannot be
+    /// handed to anything else. Drop it and a filesystem that recycles inode
+    /// numbers - Linux does, immediately - can give a recreated directory
+    /// the same one, and the pin would accept it.
+    ///
+    /// `Arc` because `Dir` is cloned per child directory and every clone must
+    /// keep the same inode pinned.
+    ///
+    /// Never read, on any platform, and that is the point: the value is here
+    /// for the descriptor's lifetime, not for anything it can tell us. The
+    /// identity was taken from it at open time and lives in `id`. Deleting
+    /// this field would compile, pass every test on macOS, and quietly
+    /// return the pin to trusting a number the kernel is free to reissue.
+    #[allow(dead_code)]
+    held: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl Dir {
@@ -90,8 +144,14 @@ impl Dir {
         if !metadata.file_type().is_dir() {
             return Err("the export directory is not a directory".to_string());
         }
-        let id = identity(&path);
-        Ok(Self { path, id })
+        // Opened before the identity is read, so the number recorded belongs
+        // to an inode this process is already holding.
+        let held = open_directory(&path).ok().map(std::sync::Arc::new);
+        let id = held
+            .as_deref()
+            .and_then(identity_of_handle)
+            .or_else(|| identity(&path));
+        Ok(Self { path, id, held })
     }
 
     /// The directory's path.
@@ -200,7 +260,8 @@ mod tests {
 
     #[test]
     fn a_recreated_directory_no_longer_verifies() {
-        // Same path, different inode: the pin is what notices.
+        // Same path, and on Linux quite possibly the SAME inode - the pin
+        // notices because change time moved, not because the number did.
         let outer = tempfile::tempdir().unwrap();
         let path = outer.path().join("dir");
         std::fs::create_dir(&path).unwrap();
@@ -212,6 +273,41 @@ mod tests {
             let error = target.verify().unwrap_err();
             assert!(error.contains("replaced"), "{error}");
         }
+    }
+
+    /// Why [`Dir`] keeps the directory open, asserted rather than described.
+    ///
+    /// A pin that only remembered `(dev, ino)` would be defeated by inode
+    /// reuse: on Linux this exact sequence returns the same inode number when
+    /// nothing holds the old one. Holding it is what makes the number unique
+    /// again, so the observable is that a directory recreated at the pinned
+    /// path does NOT get the pinned identity - and it must hold while the
+    /// pin is alive, which is why `pinned` is still in scope at the assert.
+    ///
+    /// Drop `held` from `Dir` and this fails on Linux while still passing on
+    /// macOS, which is the asymmetry that let the gap ship in the first place.
+    #[test]
+    #[cfg(unix)]
+    fn a_pinned_directory_keeps_its_inode_from_being_reused() {
+        let outer = tempfile::tempdir().unwrap();
+        let path = outer.path().join("dir");
+        std::fs::create_dir(&path).unwrap();
+
+        let pinned = Dir::open(path.clone()).unwrap();
+        let pinned_id = pinned.id.expect("unix exposes an identity");
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let replacement = identity(&path).expect("unix exposes an identity");
+
+        assert_ne!(
+            pinned_id, replacement,
+            "the replacement was given the pinned inode, so the pin cannot \
+             tell them apart - the open handle is what has to prevent this"
+        );
+        // The pin must outlive the comparison, or the inode is free again and
+        // the assertion above proves nothing.
+        assert!(pinned.verify().is_err());
     }
 
     #[test]

@@ -320,14 +320,24 @@ fn bash_and_zsh_scripts_pass_their_own_syntax_check() {
             eprintln!("skipping: {program} not installed");
             continue;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("otl.{shell}"));
-        std::fs::write(&path, script_for(shell)).unwrap();
-        let output = std::process::Command::new(program)
+        // Fed on stdin, not as a path. `bash` exists on GitHub's Windows
+        // runners (Git Bash), so the probe above does not skip there - but a
+        // native path handed to it is not one it can open, and it exits
+        // non-zero with an empty message, which reads exactly like a syntax
+        // error in the generated script. `-n` reads the script from stdin
+        // when given no file, so there is no path to translate and the check
+        // means the same thing on every platform that has the shell.
+        let script = script_for(shell);
+        let mut child = std::process::Command::new(program)
             .args(&args)
-            .arg(&path)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "{shell} script fails {program} -n: {}",

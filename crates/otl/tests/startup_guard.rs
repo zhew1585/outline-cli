@@ -69,15 +69,48 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Copy the built `otl` binary into a fresh empty temp dir outside the repo;
-/// returns (dir, copied binary path).
+/// Place the built `otl` binary in a fresh empty temp dir outside the repo;
+/// returns (dir, binary path).
+///
+/// Linked rather than copied, and the reason is a real failure this suite hit
+/// on Linux. These tests run in parallel, and a copy holds a write
+/// descriptor on its destination while it runs. `Command::spawn` forks, and
+/// the child inherits every descriptor open at that moment - `O_CLOEXEC`
+/// closes them at exec, not at fork - so one test's in-flight copy could
+/// still be held open by a sibling's forked child when the copying test
+/// reached its own exec. The kernel refuses to exec a file anyone has open
+/// for writing: `ETXTBSY`. Measured 1-in-4 with four parallel copy-then-exec
+/// pairs; macOS does not enforce this, which is why only the Linux leg of CI
+/// saw it.
+///
+/// `hard_link` opens nothing, so the window does not exist. It is also
+/// closer to the intent: what these tests need is the binary reachable from
+/// a directory with no spec file beside it, not a second copy of its bytes.
+/// A link cannot cross filesystems, so the copy path stays as a fallback -
+/// and because that path can still lose the race, it retries.
 fn isolated_otl(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("otl-startup-guard-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let built = assert_cmd::cargo::cargo_bin("otl");
-    let copied = dir.join(built.file_name().unwrap());
-    std::fs::copy(&built, &copied).unwrap();
-    (dir, copied)
+    let placed = dir.join(built.file_name().unwrap());
+    let _ = std::fs::remove_file(&placed);
+
+    if std::fs::hard_link(&built, &placed).is_ok() {
+        return (dir, placed);
+    }
+
+    // Different filesystem: copy, and give a lost race a moment to clear.
+    for attempt in 0..10 {
+        match std::fs::copy(&built, &placed) {
+            Ok(_) => return (dir, placed),
+            Err(error) if attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _ = error;
+            }
+            Err(error) => panic!("could not place otl in {}: {error}", dir.display()),
+        }
+    }
+    unreachable!("the loop returns or panics")
 }
 
 /// Command for the isolated binary, running from its temp dir with Outline

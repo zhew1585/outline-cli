@@ -130,9 +130,16 @@ impl TempFile {
         };
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
-        // Close before linking or renaming: Windows will not rename a file
-        // that is still open.
-        self.file = None;
+        // Windows will not rename a file that is still open, so the handle
+        // has to go there. On Unix it deliberately stays: a live descriptor
+        // keeps this inode allocated, and that is the only thing stopping
+        // Linux from handing its number straight to a file someone swaps in
+        // at the same path - which `remove` would then delete as if it were
+        // ours. Renaming and unlinking an open file are both fine on Unix.
+        #[cfg(not(unix))]
+        {
+            self.file = None;
+        }
         Ok(())
     }
 
@@ -149,11 +156,20 @@ impl TempFile {
     /// so the removal proceeds there.
     fn remove(&mut self) -> std::io::Result<()> {
         self.keep = true;
+        // Decided BEFORE the handle is dropped. Closing first would free our
+        // inode, and on Linux the very next file created at that name can be
+        // given the same number - so a comparison made after closing could
+        // call someone else's file ours.
+        let is_ours = match (self.id, identity(&self.path)) {
+            (Some(mine), Some(current)) => mine == current,
+            (Some(_), None) => false,
+            _ => true,
+        };
         self.file = None;
-        match (self.id, identity(&self.path)) {
-            (Some(mine), Some(current)) if mine != current => Ok(()),
-            (Some(_), None) => Ok(()),
-            _ => std::fs::remove_file(&self.path),
+        if is_ours {
+            std::fs::remove_file(&self.path)
+        } else {
+            Ok(())
         }
     }
 }

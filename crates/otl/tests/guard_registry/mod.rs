@@ -212,11 +212,17 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
     // Opening the directory itself is how it is fsynced (a write is not
     // durable until the directory entry is), and `read_dir` is how it tells
     // its own leftovers from content the user put there.
+    //
+    // Two occurrences, both the user's own output directory and neither the
+    // vendored spec: `flush_directory` opens it to fsync it, and
+    // `open_directory` holds it open for the lifetime of the pin so the
+    // inode cannot be freed and its number reused under us - which is what
+    // makes the `(dev, ino)` pin mean anything on Linux.
     Exception {
         file: "crates/otl/src/commands/docs/dir.rs",
         pattern: "File::open",
         context: "std::fs::File::open(path)",
-        count: 1,
+        count: 2,
     },
     Exception {
         file: "crates/otl/src/commands/docs/outdir.rs",
