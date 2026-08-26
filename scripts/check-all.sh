@@ -64,10 +64,25 @@ if [ "$WITH_LINUX" = 1 ]; then
   # container's own filesystem is small enough that a debug build of the
   # whole workspace fills it and the link step fails with ENOSPC, which
   # reads like a build error and is not one.
-  mkdir -p target/linux
+  #
+  # --user matters for correctness, not tidiness. Containers run as root by
+  # default, and root has CAP_DAC_OVERRIDE: it ignores permission bits. Any
+  # test that asserts a permission is ENFORCED therefore gets the wrong
+  # answer - `a_write_into_an_unwritable_directory_reports_failure` writes
+  # into a 0500 directory and expects a failure, and as root the write
+  # succeeds, so the test fails here while being correct everywhere else.
+  # Running as the invoking user is what makes this gate agree with CI.
+  #
+  # CARGO_HOME has to move with it: the image's is root-owned, so a non-root
+  # cargo cannot write the registry index into it and the build dies before
+  # any test runs.
+  mkdir -p target/linux target/linux-cargo
   run "linux cargo test" docker run --rm \
-    -v "$PWD":/w -v "$PWD/target/linux":/linux-target -w /w \
-    -e CARGO_TARGET_DIR=/linux-target rust:1.98-slim \
+    --user "$(id -u):$(id -g)" \
+    -v "$PWD":/w -v "$PWD/target/linux":/linux-target \
+    -v "$PWD/target/linux-cargo":/linux-cargo -w /w \
+    -e CARGO_TARGET_DIR=/linux-target -e CARGO_HOME=/linux-cargo \
+    rust:1.98-slim \
     cargo test --workspace
 fi
 

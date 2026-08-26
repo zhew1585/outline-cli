@@ -99,10 +99,14 @@ fn isolated_otl(tag: &str) -> (PathBuf, PathBuf) {
         return (dir, placed);
     }
 
-    // Different filesystem: copy, and give a lost race a moment to clear.
+    // Different filesystem, so the link could not be made: copy instead,
+    // and give a lost race a moment to clear.
     for attempt in 0..10 {
         match std::fs::copy(&built, &placed) {
-            Ok(_) => return (dir, placed),
+            Ok(_) => {
+                flush_to_disk(&placed);
+                return (dir, placed);
+            }
             Err(error) if attempt < 9 => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 let _ = error;
@@ -111,6 +115,31 @@ fn isolated_otl(tag: &str) -> (PathBuf, PathBuf) {
         }
     }
     unreachable!("the loop returns or panics")
+}
+
+/// Wait for a just-copied binary to actually be on disk before it is exec'd.
+///
+/// `fs::copy` returning does not mean the write has landed: on a filesystem
+/// that acknowledges a close before writeback finishes - a bind-mounted
+/// host directory under virtiofs is the case that sent us here, which is
+/// exactly the layout `scripts/check-all.sh --linux` uses - the kernel can
+/// still hold the file open for writing when we exec it, and exec answers
+/// `ETXTBSY` (`Text file busy`). Measured on that layout: 1 of 2 startup
+/// tests failed per run, roughly half the runs. With the target directory
+/// inside the container instead, 2 of 2 passed. It never reproduces on
+/// native macOS, so this is a flake nobody would see locally.
+///
+/// The descriptor is opened READ-ONLY on purpose. `fsync` flushes the
+/// inode's dirty pages whichever way the descriptor was opened, and opening
+/// for writing would reintroduce the very thing the `hard_link` above
+/// exists to avoid: a sibling test's `Command::spawn` forks, inherits the
+/// write descriptor, and holds this binary busy for as long as that child
+/// lives.
+fn flush_to_disk(path: &Path) {
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|error| panic!("could not reopen {} to flush: {error}", path.display()));
+    file.sync_all()
+        .unwrap_or_else(|error| panic!("could not flush {}: {error}", path.display()));
 }
 
 /// Command for the isolated binary, running from its temp dir with Outline
