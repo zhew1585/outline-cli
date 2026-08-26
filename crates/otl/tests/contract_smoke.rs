@@ -36,6 +36,8 @@ fn documents_search_succeeds_against_real_workspace() {
         .unwrap()
         .env("OUTLINE_URL", &url)
         .env("OUTLINE_API_KEY", &key)
+        .env_remove("OUTLINE_PROFILE")
+        .env("OUTLINE_CONFIG", "")
         .args(["api", "documents.search", "query=contract-smoke"])
         .output()
         .unwrap();

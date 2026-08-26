@@ -10,3 +10,4 @@ pub mod ops;
 pub mod paging;
 pub mod render;
 pub mod stdio;
+pub mod text;

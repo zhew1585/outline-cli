@@ -62,7 +62,10 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.current_dir(dir)
         .env_remove("OUTLINE_URL")
-        .env_remove("OUTLINE_API_KEY");
+        .env_remove("OUTLINE_API_KEY")
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 

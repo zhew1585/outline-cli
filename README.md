@@ -9,8 +9,8 @@ single-digit milliseconds.
 
 > **Status: work in progress.** The engine (Epic 1) is complete: authentication with an API key, the
 > generic `otl api` escape hatch, schema validation, dual-state output, auto-pagination, and rate-limit
-> backoff. OAuth login, the six polished day-to-day commands, and multi-workspace profiles are next.
-> Command surfaces may still change before 1.0.
+> backoff. Multi-workspace profiles and shell completions are in place too. OAuth login and the six
+> polished day-to-day commands are next. Command surfaces may still change before 1.0.
 
 ## Install
 
@@ -56,8 +56,20 @@ implemented exactly once. There is one `.send()` call in the whole crate.
 **No runtime spec parsing.** `build.rs` compiles the vendored spec into a static IR table. The binary
 contains neither the spec file nor its path, which a test asserts against the built artifact.
 
+**Server text is never printed verbatim — on the human-readable paths.** Document titles, operation
+summaries, profile names and paths all reach a terminal, and control characters are only the obvious half
+of the problem: an unterminated `U+202E` reverses the visual order of everything after it, and zero-width
+characters hide inside a value. One classification (`otl::text`) covers control, bidi, invisible and
+joiner characters, and each surface decides what to do with each category: a diagnostic replaces all of
+them with a visible marker, a table cell turns controls into spaces, marks what has scope, drops what is
+invisible, and keeps the zero-width joiner that emoji ligatures and Persian spelling depend on. `--json`
+is a deliberate exemption — it is the payload, and its contract is to round-trip what the server sent, so
+it is emitted unchanged.
+
 **Output is two-state.** Data goes to stdout, diagnostics to stderr, always. On a terminal you get a
-table with columns picked from the data and widths measured in grapheme clusters; piped or with
+table whose columns come from the operation's response schema — one generic policy over the schema's own
+facets (identity, writable label, timestamps), so the same operation always renders the same columns and
+no endpoint has rendering code of its own — with widths measured in grapheme clusters; piped or with
 `--json`, you get raw JSON for `jq`. A reader that closes the pipe early (`otl ... | head -1`) is normal
 completion, not a crash.
 
@@ -67,6 +79,94 @@ ceiling, an exhausted offset space — produces an explicit stderr warning, and 
 
 **Exit codes are a public API.** See [docs/exit-codes.md](docs/exit-codes.md). Published codes never
 change meaning.
+
+## Configuration and profiles
+
+Configuration comes from three layers, resolved **flag > environment > user config file, key by key** —
+an `OUTLINE_URL` in the environment does not discard the rest of the selected profile:
+
+```toml
+# config.toml in your config directory (~/.config/outline-cli on Linux,
+# ~/Library/Application Support/outline-cli on macOS,
+# %APPDATA%\outline-cli\config on Windows). `otl --config FILE` overrides it.
+default_profile = "work"
+
+[profiles.work]
+url = "https://outline.example.com"
+auth = "api-key"                      # "oauth" arrives with `otl auth login`
+
+[profiles.personal]
+url = "https://notes.example.net"
+```
+
+```sh
+otl --profile personal api documents.list     # or: OUTLINE_PROFILE=personal
+otl --url https://other.example.com api auth.info
+OUTLINE_CONFIG= otl api auth.info             # empty value: ignore the config file entirely
+```
+
+**Credentials are scoped to their instance.** A profile names a server, so its key is read from that
+profile's own variable and from nowhere else:
+
+```sh
+export OUTLINE_API_KEY=...                    # used only when no profile is in effect
+export OUTLINE_API_KEY_WORK=...               # used by --profile work
+export OUTLINE_API_KEY_PERSONAL=...           # used by --profile personal
+```
+
+The name is `OUTLINE_API_KEY_` plus the profile name upper-cased, with anything other than an ASCII
+letter or digit becoming `_` (`self-hosted` → `OUTLINE_API_KEY_SELF_HOSTED`). A profile never falls back
+to the global `OUTLINE_API_KEY`: falling back would send the key that happens to be exported to whichever
+instance the selected profile points at, which is one workspace's credential going to another
+workspace's server. When a profile is missing its key, `otl` says which variable to set and exits 2
+without making a request.
+
+The same rule applies to the *other* half of a request, without bending the precedence model.
+Resolution is always flag > env > file, for the base URL as for every other key. What changes is that
+the credential is only handed to the request channel once it is bound to the origin that request will
+use: with a profile in effect, `otl` releases the key when the base URL came from the profile's own
+`url` or from `--url` (stated in the same command, so the redirect is deliberate), and refuses when it
+came from `OUTLINE_URL` and names a different instance — or when the profile declares no `url` at all,
+leaving nothing to bind to. An ambient variable left over from an earlier shell session must not be able
+to point a profile's credential at a server the profile never named, and a warning would not help: a
+credential that has been sent cannot be recalled. Origins are compared normalized, so a trailing slash,
+host casing or a default port is never a false conflict. Without a profile there is nothing to bind and
+`OUTLINE_URL` behaves exactly as before.
+
+The gate is enforced by the type system rather than by convention, and that turns out to be a question of
+module layout rather than of the `pub` keyword — a private field in Rust is visible to the declaring
+module *and every descendant of it*. So the three pieces of state live in separate leaf modules, none an
+ancestor of another: resolved settings can only be produced by the resolver, the credential can only be
+read by the source that the gate calls, and the token proving the check ran can only be minted by the
+gate. A credential source added later inherits all of it without opting in.
+
+The config file holds no secrets, by construction: an `api_key` or `token` key — at the top level or in a
+profile — is a hard error pointing at `credentials.toml`, and any other unrecognized key (including a
+deeper table holding one) is rejected as an unknown key. A missing config file is not an error — the
+environment-only path works on a fresh machine — but a file named explicitly with
+`--config`/`OUTLINE_CONFIG` must exist, and an unknown key, an unknown profile, or malformed TOML fails
+with exit code 2 before any request. Parse diagnostics are built from a line number, a description `otl`
+owns, and the schema itself — never from the TOML parser's own text, which quotes the offending value —
+so a secret wrongly placed in the file is never echoed back.
+
+## Shell completions
+
+```sh
+otl completions zsh > ~/.zfunc/_otl          # bash, zsh, fish, powershell, elvish
+```
+
+For zsh this file must keep its `#compdef otl` first line — `compinit` reads only that line when it scans
+`$fpath` — so the coverage comment below is placed after it rather than above.
+
+Candidates are generated from the same command tree the binary parses with, so subcommands and flags can
+never drift from the build; `otl api` operation names come from the compiled IR table. bash, zsh and fish
+complete operation names; powershell and elvish get subcommands and flags only, because their upstream
+generators emit no candidates for positional arguments. Every generated script states its own coverage in
+a header comment, so an installed file never over-claims.
+
+Completion scripts are executable code, so candidate text is constrained rather than trusted: an
+operation name must be a plain `resource.method` token (ASCII letters, digits, `.`, `_`, `-`) or it is
+not written at all, and the build fails outright if the vendored spec ever contains one that is not.
 
 ## Credential handling
 
