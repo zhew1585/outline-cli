@@ -10,6 +10,9 @@
 
 use assert_cmd::Command;
 
+mod common;
+use common::{no_cache_dir, CACHE_DIR_ENV};
+
 /// Read contract-test credentials from the environment, or `None` to skip.
 fn contract_credentials() -> Option<(String, String)> {
     let url = std::env::var("OUTLINE_TEST_URL").ok()?;
@@ -41,6 +44,9 @@ fn documents_search_succeeds_against_real_workspace() {
         .unwrap()
         .env("OUTLINE_URL", &url)
         .env("OUTLINE_API_KEY", &key)
+        // A contract test checks the VENDORED spec against the live API;
+        // a synced cache on the runner would test something else.
+        .env(CACHE_DIR_ENV, no_cache_dir())
         .env_remove("OUTLINE_PROFILE")
         .env("OUTLINE_CONFIG", "")
         .env("OUTLINE_CONFIG_DIR", config_dir.path())

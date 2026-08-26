@@ -196,18 +196,39 @@ Notes worth knowing:
   display: control sequences are replaced (a document body must not be able to set your clipboard or
   forge a hyperlink), and `$PAGER` takes over when the content does not fit on one screen, counting
   wrapped rows rather than lines.
+## Keeping the spec current
+
+The spec is vendored into the binary, so a fresh install needs no network for anything but your own
+requests. When upstream adds an endpoint you need before the next release:
+
+```sh
+otl spec sync                          # fetch upstream, compile once, cache the IR
+otl spec sync --spec ./spec3.json      # or compile a local document (development override)
+otl api list                           # the new operations are here immediately
+otl spec reset                         # go back to the spec built into this binary
+```
+
+Nothing checks for spec updates on its own: `otl` never contacts the network unless a command you ran
+requires it.
+
 ## Design
 
 **Two crates.** `engine` is a generic OpenAPI RPC client with no knowledge of Outline whatsoever — the
 Outline conventions (the `/api` path prefix, the `data`/`pagination` envelope) live entirely in the `otl`
 layer and reach the engine as data. The boundary is enforced in review, not just by convention.
 
-**One request channel.** Every HTTP request goes through a single private `send()`: local validation,
+**One request channel.** Every API request goes through a single private `send()`: local validation,
 rate-limit backoff, global throttling, pagination, error mapping, and credential redaction are each
-implemented exactly once. There is one `.send()` call in the whole crate.
+implemented exactly once. `otl spec sync` adds the one other outbound call in the codebase — a plain
+unauthenticated GET of a public document, deliberately kept apart from the channel that carries your
+token — and a test confines both to their modules.
 
 **No runtime spec parsing.** `build.rs` compiles the vendored spec into a static IR table. The binary
-contains neither the spec file nor its path, which a test asserts against the built artifact.
+contains neither the spec file nor its path, which a test asserts against the built artifact. The single
+exception is `otl spec sync`, which parses a document once on the command you typed and stores the
+compiled IR as a binary cache; every other command only deserializes it, so `otl --help` stays a few
+milliseconds. A cache that is damaged or was written by another version is discarded with a warning and
+the built-in spec takes over — it can never make the CLI unusable.
 
 **Server text is never printed verbatim — on the human-readable paths.** Document titles, operation
 summaries, profile names and paths all reach a terminal, and control characters are only the obvious half
@@ -242,7 +263,9 @@ guarantee: breaking changes may land in a minor release until `1.0`.
 **Covered by semver** — a breaking change here requires a major version:
 
 - The **curated commands** (`otl docs search`, `otl docs get`, …): their names, their flags, and the
-  shape of their output, both the human-readable rendering and `--json`.
+  shape of their output, both the human-readable rendering and `--json`. "Shape" means which fields
+  exist and with what types — not the order object keys are serialized in, which JSON itself leaves
+  unordered. `--json` round-trips what the server sent, key order included.
 - The **exit-code table** below. Published codes never change meaning; new error classes get new codes.
 - Environment variables (`OUTLINE_URL`, `OUTLINE_API_KEY`, …) and the location and key names of the
   config and credential files.

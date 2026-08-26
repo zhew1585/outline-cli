@@ -237,6 +237,31 @@ fn huge_retry_after_header_is_capped_by_the_policy() {
 }
 
 #[test]
+fn a_delta_seconds_header_beyond_u64_is_capped_not_shortened() {
+    // `18446744073709551616` is u64::MAX + 1: a well-formed delta-seconds
+    // value that does not fit the integer type. Answering "wait forever"
+    // with the SHORTEST wait the policy has would be the exact opposite of
+    // what the server asked, so it clamps to max_wait like any other
+    // oversized value.
+    let policy = fast_policy();
+    for header in [
+        "18446744073709551616",
+        "99999999999999999999999999999999",
+        " 18446744073709551616 ",
+    ] {
+        assert_eq!(
+            policy.retry_wait(Some(header), 0),
+            policy.max_wait,
+            "{header:?} was not capped"
+        );
+    }
+    // Still a fallback for anything that is not a delta-seconds value.
+    assert!(policy.retry_wait(Some("12a"), 0) < policy.max_wait);
+    assert!(policy.retry_wait(Some("-1"), 0) < policy.max_wait);
+    assert!(policy.retry_wait(Some(""), 0) < policy.max_wait);
+}
+
+#[test]
 fn token_bucket_paces_after_burst() {
     use engine::TokenBucket;
 

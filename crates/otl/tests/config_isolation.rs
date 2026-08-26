@@ -22,6 +22,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tempfile::TempDir;
 
@@ -314,23 +315,117 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 /// Compile the copied tree; returns the compiler's stderr on failure.
 fn compile_config_tree(dir: &TempDir) -> Option<String> {
-    let deps = Path::new(env!("CARGO_BIN_EXE_otl"))
+    compile_with(dir, resolved_externs())
+}
+
+/// The `--extern` arguments that make the copied tree compile.
+///
+/// `target/debug/deps` can hold SEVERAL rlibs for one crate name: a
+/// dependency built for the host (for a build script) and the same
+/// dependency built for the target both live there, and nothing in the file
+/// name tells them apart. "Newest wins" is therefore a lottery that any
+/// change in build order can flip - which is exactly what happened when the
+/// spec compiler became a build dependency, and it made this harness fail
+/// with a confusing "the config tree did not compile".
+///
+/// So the choice is VALIDATED rather than guessed: candidates are tried
+/// newest-first and the winner is the combination that compiles an
+/// unmodified copy of the tree. A wrong pick cannot quietly weaken the
+/// probes below - it cannot be picked at all.
+fn resolved_externs() -> &'static [String] {
+    static RESOLVED: OnceLock<Vec<String>> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let candidates: Vec<Vec<String>> = DEPENDENCIES
+            .iter()
+            .map(|(name, prefix)| {
+                rlib_candidates(prefix)
+                    .into_iter()
+                    .map(|path| format!("{name}={}", path.display()))
+                    .collect()
+            })
+            .collect();
+        for (attempt, combination) in combinations(&candidates).into_iter().enumerate() {
+            let probe = config_tree_copy();
+            if compile_with(&probe, &combination).is_none() {
+                return combination;
+            }
+            assert!(
+                attempt + 1 < MAX_EXTERN_ATTEMPTS,
+                "no combination of dependency rlibs in target/debug/deps \
+                 compiles the config tree after {MAX_EXTERN_ATTEMPTS} \
+                 attempts; run `cargo build --tests` and try again"
+            );
+        }
+        panic!("no dependency rlibs found in target/debug/deps");
+    })
+}
+
+/// Dependencies the copied tree needs, as (crate name, rlib prefix).
+const DEPENDENCIES: &[(&str, &str)] = &[
+    ("engine", "libengine-"),
+    ("serde", "libserde-"),
+    ("toml", "libtoml-"),
+    ("directories", "libdirectories-"),
+];
+
+/// Cap on how many rlib combinations are tried before giving up, so a
+/// deps directory full of stale artifacts fails fast instead of grinding.
+const MAX_EXTERN_ATTEMPTS: usize = 16;
+
+fn deps_dir() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_otl"))
         .parent()
         .unwrap()
-        .join("deps");
-    let newest = |prefix: &str| -> PathBuf {
-        std::fs::read_dir(&deps)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".rlib"))
-            })
-            .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
-            .unwrap_or_else(|| panic!("no {prefix}*.rlib in {}", deps.display()))
-    };
+        .join("deps")
+}
+
+/// Every rlib matching `prefix`, newest first.
+fn rlib_candidates(prefix: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(deps_dir())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".rlib"))
+        })
+        .collect();
+    found.sort_by_key(|path| {
+        std::cmp::Reverse(
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        )
+    });
+    assert!(
+        !found.is_empty(),
+        "no {prefix}*.rlib in {}",
+        deps_dir().display()
+    );
+    found
+}
+
+/// Combinations of one candidate per dependency, newest-first, capped.
+fn combinations(candidates: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![Vec::new()];
+    for choices in candidates {
+        let mut next = Vec::new();
+        for prefix in &out {
+            for choice in choices {
+                let mut extended = prefix.clone();
+                extended.push(choice.clone());
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    out.truncate(MAX_EXTERN_ATTEMPTS);
+    out
+}
+
+/// Compile the copied tree against one specific set of dependencies.
+fn compile_with(dir: &TempDir, externs: &[String]) -> Option<String> {
     let mut command =
         std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()));
     command
@@ -338,18 +433,11 @@ fn compile_config_tree(dir: &TempDir) -> Option<String> {
         .arg("--crate-type=lib")
         .arg("--edition=2021")
         .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
+        .arg(format!("dependency={}", deps_dir().display()))
         .arg("-o")
         .arg(dir.path().join("probe.rlib"));
-    for (name, prefix) in [
-        ("engine", "libengine-"),
-        ("serde", "libserde-"),
-        ("toml", "libtoml-"),
-        ("directories", "libdirectories-"),
-    ] {
-        command
-            .arg("--extern")
-            .arg(format!("{name}={}", newest(prefix).display()));
+    for spec in externs {
+        command.arg("--extern").arg(spec);
     }
     let output = command.output().unwrap();
     (!output.status.success()).then(|| String::from_utf8_lossy(&output.stderr).to_string())

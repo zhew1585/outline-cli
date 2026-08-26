@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/otl"]
+members = ["crates/engine", "crates/otl", "crates/speccompile"]
 
 [workspace.package]
 edition = "2021"
@@ -44,12 +44,17 @@ toml = { version = "1", default-features = false, features = [
     "display",
     "serde",
 ] }
-# Cross-platform config-directory resolution. Never assume Unix paths.
+# Cross-platform config and cache directory resolution. Never assume Unix
+# paths.
 directories = "6"
 # OAuth (otl only; the engine stays service-agnostic).
 base64 = "0.22"
-sha2 = "0.11"
 getrandom = "0.4"
+# Spec/payload hashing for the IR cache key and integrity check, and the
+# PKCE S256 challenge. ONE version for both: two majors of a hash crate in
+# one binary is duplicated code generation for no benefit, and the older of
+# the two is the one already in the lockfile.
+sha2 = "0.10"
 # Advisory file locks (credential-file transactions, refresh single-flight).
 # Pure Rust, no libc, so it needs no `unsafe` on our side; `std::fs::File::lock`
 # would raise the workspace MSRV from 1.85 to 1.89, which is not this epic's
@@ -64,6 +69,9 @@ rpassword = "7"
 # path without a TOCTOU window, and without `unsafe` on our side. Already in
 # the dependency graph via fs4 and tempfile.
 rustix = { version = "1.1", features = ["fs", "process"] }
+# On-disk IR cache written by `spec sync`. bincode 2.x with the `serde`
+# feature; 3.0.0 on crates.io is an empty placeholder release.
+bincode = { version = "2.0", features = ["serde"] }
 # Terminal column width of a string is not its char count (CJK is 2
 # columns wide, combining marks 0); table alignment depends on this.
 unicode-width = "0.2"
@@ -79,7 +87,16 @@ unicode-normalization = "0.1"
 # which both crates forbid.
 terminal_size = "0.4"
 
+# Shared OpenAPI -> IR compiler (build script and `spec sync` both use it).
+spec-compile = { path = "crates/speccompile" }
+
 # dev / test
+# Heap profiler used by tests/memory_bounds.rs. The bounds this story
+# claims are about ALLOCATION, and prose arithmetic about allocation has
+# been wrong twice; this makes them assertions instead. Its allocator is
+# safe to use from our side (the `unsafe impl GlobalAlloc` lives in dhat),
+# and it never enters the shipped binary.
+dhat = "0.3"
 wiremock = "0.6"
 assert_cmd = "2.0"
 predicates = "3.1"

@@ -21,18 +21,22 @@
 #   develop, after the config/completions, release and curated-command
 #   tracks landed:
 #       3_099_728 B  (~2.95 MiB)   73% of the gate
+#   develop, after the spec-sync track landed on top of those:
+#       3_215_728 B  (~3.06 MiB)   76% of the gate
 #   develop + epic2-auth (the last track), measured after the merge:
-#       3_315_648 B  (~3.16 MiB)   79% of the gate
+#       3_431_584 B  (~3.27 MiB)   81% of the gate
 #
-# The auth track cost +215_920 B once merged, against the +317_360 B its own
+# The auth track cost +215_856 B once merged, against the +317_360 B its own
 # branch measured in isolation: most of what it adds (reqwest with the form
 # feature, base64, sha2) was already linked by the tracks that landed first,
 # and the merge also removed a duplicated browser-opener module and folded
-# the CLI's character-hazard table into the engine's.
+# the CLI's character-hazard table into the engine's. It also dropped a
+# second major of sha2: the spec cache asked for 0.10 and PKCE for 0.11, and
+# one hash crate compiled twice is duplicated code generation for nothing.
 #
 # NOT measured here: x86_64-unknown-linux-musl statically links libc and ran
 # roughly 9% larger on the pre-merge branches, which projects the largest
-# shipped artifact near 3.62 MiB - about 86% of this gate, i.e. inside the
+# shipped artifact near 3.57 MiB - about 89% of this gate, i.e. inside the
 # warning band below. That is a projection from a ratio, not a measurement;
 # the release workflow measures every target per artifact and will print the
 # real figure.

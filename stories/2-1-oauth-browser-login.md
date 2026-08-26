@@ -241,11 +241,13 @@ without_any_of_its_content`（逐种措辞验证连 4 字符片段都不泄漏�
 
 - `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo test --workspace` 全过。
-- `scripts/check-binary-size.sh`：develop 3_099_728 B（73%），合并后 3_315_648 B（79%），
-  低于 85% 告警带。分支单独测出的 +317_360 B 落到合并后只剩 +215_920 B，因为
-  reqwest/base64/sha2 已被先落地的 track 链接进去，且本次删掉了重复的 browser 模块、
-  把危险字符表折进 engine。**常量未动**；`scripts/check-binary-size.sh` 里的实测数字按脚本
-  自己的要求更新了，musl 那一行明确标注为「按比例推算，非实测」。
+- `scripts/check-binary-size.sh`：develop（含 spec-sync）3_215_728 B（76%），
+  合并后 3_431_584 B（81%），低于 85% 告警带。分支单独测出的 +317_360 B 落到合并后
+  只剩 +215_856 B，因为 reqwest/base64/sha2 已被先落地的 track 链接进去，本次又删掉了
+  重复的 browser 模块、把危险字符表折进 engine、并把 sha2 从两个大版本收敛到一个
+  （spec 缓存要 0.10、PKCE 要 0.11，同一个哈希库编译两遍毫无收益）。
+  **常量未动**；脚本里的实测数字按它自己的要求更新了，musl 那一行明确标注为
+  「按比例推算（+9%）→ ~3.57 MiB / 89%，非实测」。
 - `config_isolation.rs` 的 `a_module_added_inside_config_cannot_forge_the_gates_state`
   在**干净的 target 目录**下通过（`config/credentials.rs` 不需要新增 `--extern`）。
   在本 worktree 累积了多轮不同 feature 组合的 target 目录里会失败，原因是探针用 mtime
@@ -271,6 +273,42 @@ without_any_of_its_content`（逐种措辞验证连 4 字符片段都不泄漏�
 都失败，只是失败原因从「拒绝」变成「DNS 错误」。这正是前几轮被点名三次的「断言对被测行为
 不敏感」。改成**两个都活着的 mock server**（凭证由 A 签发、命令指向 B），断言 B 一个请求都
 没收到，回退后立刻变红。
+
+### 10. 第二次 develop 合并（spec-sync track）
+
+第一次合并时 `MERGE_HEAD` 指向 Epic 3 的提交；合并期间 develop 又前进了 30 个提交
+（epic4-specsync：`spec-compile` crate、`otl spec sync/reset`、磁盘 IR 缓存、
+plain-document fetch 通道）。所以本 track 做了第二次合并，接缝如下：
+
+- **sha2 版本冲突**：spec 缓存声明 0.10，Epic 2 的 PKCE 声明 0.11。统一到 0.10
+  （已在 lockfile 里），`crates/otl/Cargo.toml` 里 `sha2` 与 `thiserror` 各自的重复条目
+  合并成一条并说明两个调用方。
+- **`no_phone_home.rs`（specsync 新增的门禁）把 OAuth 通道判为违规**。这条门禁把 HTTP
+  限制在 engine 的两条通道内，而 OAuth 的 token/注册/撤销端点是**第三条**、也是文档化的
+  例外（develop 自己有一个提交叫「register the third HTTP channel exception」，但注册的是
+  fetch 通道）。改法不是加宽豁免了事：
+  - 模块文档新增「The third channel」一节，写清为什么这三类请求不能走 engine 的认证通道
+    （不带 bearer、form-encoded、不在 OpenAPI 里、其中一类的目的就是去取那个凭证）；
+  - `.send()` 白名单只加 `auth/endpoint.rs` 一个文件，并把它计入
+    `each_channel_has_exactly_one_send`（实测整个 otl crate 只有 1 处 `.send()`）——
+    这条才是真正的约束，`reqwest` 白名单能放宽到 11 个 auth 模块正是因为它们只能「提到」
+    而不能「发送」；
+  - 顺手补上门禁漏掉的 `TcpListener` 规则（原表只有 `std::net`/`TcpStream`/`UdpSocket`）。
+    回环回调监听器是**入站**的，不产生请求也不触达远端，所以它不是这条规则要拦的东西，
+    但仍然只允许出现在实现那一条流程的两个模块里。
+- **`startup_guard.rs`（specsync 新增）要求逐调用点登记文件打开**。凭证文件的 11 个打开点
+  全部登记，每条都写明为什么不能用普通方式打开（`O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` +
+  对拿到的 fd 做 fstat、`create_new` + 0600 交给 `open(2)` 本身、只为 fsync 而打开目录）。
+  登记后该文件涨到 830 行超限，按责任拆成 `tests/guard_registry/mod.rs`（登记数据）与
+  `startup_guard.rs`（检查本身）。
+  另外 `portability.rs` 会把数据里出现的 `std::os::unix::...` 字符串当成未加 `cfg` 的
+  平台代码，所以那条登记改用 `OpenOptionsExt` 作为 context——它本来就该是「区分调用点的
+  片段」而不是整行。
+- **exit-code 表求并集**：spec-sync 给 1/2/5/6/7 增加了原因，Epic 2 给 2/3/4 增加了原因，
+  逐行合并后用 `UPDATE_README_EXIT_CODES=1` 重新生成 README 的派生块。
+- **api_* 测试的隔离助手合并**：develop 加了 `CACHE_DIR_ENV`/`no_cache_dir()`（防止本机
+  跑过 `otl spec sync` 影响断言），本 track 加了 `OUTLINE_CONFIG_DIR`（防止读到真实凭证
+  文件）。四个 suite 里各自复制一份的隔离块统一到 `common::isolate`。
 
 ## Dev Agent Record
 

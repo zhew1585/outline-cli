@@ -10,30 +10,17 @@ use serde_json::json;
 use wiremock::matchers::{body_json, body_string, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::isolate;
+
 /// Nothing listens here; validation must fail before any network attempt.
 const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 
 /// `otl` with valid-looking config pointing at a closed port.
-/// A configuration directory that deliberately does not exist, so these
-/// tests never read - or write - the developer's real credential file, and
-/// so credential resolution depends on the environment alone.
-const NO_CREDENTIALS_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/no-credentials");
-
-/// Point a command at an empty credential store AND an absent user config
-/// file, and silence the one-time plaintext-key notice.
 ///
-/// Three separate things have to be neutralised or the developer's own
-/// machine leaks into the assertions: the credential file
-/// (`OUTLINE_CONFIG_DIR` at a path that does not exist), the user config
-/// file and its profiles (`OUTLINE_CONFIG` empty means "read none"), and a
-/// selected profile (`OUTLINE_PROFILE`).
-fn isolate(cmd: &mut Command) -> &mut Command {
-    cmd.env("OUTLINE_CONFIG_DIR", NO_CREDENTIALS_DIR)
-        .env("OUTLINE_CONFIG", "")
-        .env("OUTLINE_NO_KEY_WARNING", "1")
-        .env_remove("OUTLINE_PROFILE")
-}
-
+/// `common::isolate` shuts off the credential file, the user config file, the
+/// selected profile, the plaintext-key notice and the spec cache - validation
+/// is asserted against the facets of the spec compiled into the binary.
 fn otl_offline() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
     isolate(&mut cmd)
