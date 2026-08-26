@@ -3,14 +3,61 @@
 //! Not a test target of its own (it lives in a subdirectory), so each test
 //! file includes it with `mod common;`.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+
+pub mod cache;
+pub mod export;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use assert_cmd::Command;
+
 /// Environment variable that relocates the spec cache.
 pub const CACHE_DIR_ENV: &str = "OTL_CACHE_DIR";
+
+/// An `otl` command with every environment variable the CLI reads scrubbed,
+/// so a test never depends on the developer's shell.
+///
+/// "Every" is meant literally, and it is the whole value of this helper: a
+/// variable that is missed here does not make a test fail, it makes it
+/// depend on the machine. Three kinds of state have to be shut off:
+///
+/// - credentials and instance (`OUTLINE_URL`, `OUTLINE_API_KEY`);
+/// - the user config file and profile selection (`OUTLINE_CONFIG` empty
+///   means "read no file at all", Story 4.1);
+/// - the synced spec cache, which decides which operations exist at all
+///   (Story 4.2) - pointed at a directory that cannot contain one;
+/// - and the output environment (`PAGER`, `BROWSER`).
+pub fn otl() -> Command {
+    let mut cmd = Command::cargo_bin("otl").unwrap();
+    cmd.env_remove("OUTLINE_URL")
+        .env_remove("OUTLINE_API_KEY")
+        .env_remove("OUTLINE_PROFILE")
+        .env("OUTLINE_CONFIG", "")
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("PAGER")
+        .env_remove("BROWSER");
+    cmd
+}
+
+/// [`otl`] pointed at a mock server with a test API key.
+pub fn otl_at(uri: &str) -> Command {
+    let mut cmd = otl();
+    cmd.env("OUTLINE_URL", uri)
+        .env("OUTLINE_API_KEY", "test-key");
+    cmd
+}
+
+/// Run a blocking closure off the async test runtime.
+pub async fn blocking<F, T>(work: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.unwrap()
+}
 
 /// A cache directory guaranteed to hold no synced spec.
 ///

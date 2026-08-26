@@ -89,7 +89,7 @@ pub struct Settings {
     profile_source: ProfileSource,
     /// The selected profile's own `url`, when it declared one.
     ///
-    /// Kept so that [`release_token`] can compare origins without needing
+    /// Kept so that [`super::release::release_token`] can compare origins without needing
     /// the config file again.
     profile_url: Option<String>,
     /// How to authenticate to it.

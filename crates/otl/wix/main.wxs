@@ -210,7 +210,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/weizhesafeheron/outline-cli'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/zhew1585/outline-cli'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>

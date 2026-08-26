@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
+use otl::commands::collections::{self, CollectionsArgs};
 use otl::commands::completions::{self, CompletionsArgs};
+use otl::commands::docs::{self, DocsArgs};
 use otl::commands::spec::{self, SpecArgs};
 use otl::config::Overrides;
 use otl::exit::ExitCode;
@@ -55,6 +57,10 @@ impl Cli {
 enum Command {
     /// Call any API operation by name (output format unstable).
     Api(ApiArgs),
+    /// Work with documents: search, view, create, update, export.
+    Docs(DocsArgs),
+    /// Work with collections.
+    Collections(CollectionsArgs),
     /// Manage the OpenAPI spec this CLI dispatches from.
     Spec(SpecArgs),
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
@@ -67,6 +73,8 @@ fn main() -> std::process::ExitCode {
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
         Command::Api(args) => api::run(args, mode, &cli.overrides()),
+        Command::Docs(args) => docs::run(args, mode, cli.json, &cli.overrides()),
+        Command::Collections(args) => collections::run(args, mode, &cli.overrides()),
         Command::Spec(args) => spec::run(args, mode),
         Command::Completions(args) => completions::run(args, Cli::command()),
     };

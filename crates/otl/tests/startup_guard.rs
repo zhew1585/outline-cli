@@ -180,17 +180,25 @@ const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
 ];
 
 /// A reviewed exception: `pattern` is tolerated in `file`, but ONLY on
-/// lines that also contain `context`.
+/// lines that also contain `context`, and only `count` times.
 ///
-/// The context is what keeps an exception from becoming a hole. A
-/// file-wide exemption would let a later `fs::read_to_string("spec3.json")`
-/// into the same file unnoticed - the very thing this guard exists to
-/// prevent - so each entry pins the one construct that was reviewed, and
-/// every OTHER occurrence in that file is still a violation.
+/// The two halves catch different things, and both came from a real miss:
+///
+/// - the CONTEXT keeps an exception from becoming a file-wide hole. A
+///   file-wide exemption would let a later `fs::read_to_string("spec3.json")`
+///   into the same file unnoticed - the very thing this guard exists to
+///   prevent.
+/// - the COUNT catches a second occurrence that happens to match the same
+///   context anyway. Removing one fails too, so a stale exception cannot
+///   linger while appearing to constrain something.
+///
+/// The release-binary assertions above remain the hard proof that no spec is
+/// embedded or opened at runtime; this scan is the early warning.
 struct Exception {
     file: &'static str,
     pattern: &'static str,
     context: &'static str,
+    count: usize,
 }
 
 /// Reviewed exceptions. Add one only with a comment saying why, and keep
@@ -205,6 +213,7 @@ const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
         file: "crates/otl/src/spec/mod.rs",
         pattern: SPEC_FILE_NAME,
         context: "https://raw.githubusercontent.com/outline/openapi",
+        count: 1,
     },
     // Story 4.2: the name of the `--spec <PATH>` flag of `otl spec sync`,
     // which compiles a document the USER points at (the documented
@@ -214,96 +223,50 @@ const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
         file: "crates/otl/src/commands/spec.rs",
         pattern: "\"spec\"",
         context: "#[arg(long = ",
+        count: 1,
     },
-];
-
-/// Ways to get at a file's contents. Every one of them must appear only
-/// at a registered call site ([`FILE_READ_ALLOWLIST`]).
-///
-/// This is the rule that makes the literal-string rules above hard to
-/// dodge. A path can always be assembled out of pieces
-/// (`["spec/spec3", ".json"].concat()`), so no amount of substring
-/// matching on path literals is conclusive - but a read still has to go
-/// through one of these, `.open(` included, which covers the aliases
-/// (`File::options()`, a renamed `OpenOptions`) that name-based matching
-/// would miss.
-///
-/// What this does NOT do: recognise a read performed by a subprocess, a
-/// dependency, or an API added to std after this list was written. It is a
-/// registry of the ways this codebase opens files, and it makes adding an
-/// unregistered one fail - which is the review it stands in for, not a
-/// proof.
-const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
-    ("read_to_string", "reading a file by name"),
-    ("File::open", "opening a file by name"),
-    ("File::options", "opening a file by name"),
-    ("OpenOptions", "opening a file by name"),
-    (".open(", "opening a file, whatever the type is called"),
-    ("fs::read", "reading a file by name"),
-    // `read_to_end`/`read` on an already-open handle are deliberately NOT
-    // here: they are how a response body is read, and getting a FILE handle
-    // to use them on requires one of the patterns above.
-    ("read_dir", "enumerating a directory to find a file"),
-    ("include_str!", "embedding a file at compile time"),
-    ("include_bytes!", "embedding a file at compile time"),
-];
-
-/// The registered file-opening call sites, as (file, pattern, line
-/// context).
-///
-/// Per CALL SITE, not per file: a second read added to one of these files
-/// fails the guard, because its line will not match the registered
-/// context. Each entry names what it opens and why that is not the
-/// vendored spec.
-const FILE_READ_ALLOWLIST: &[Exception] = &[
-    // The `--body @file.json` request body, named by the user (Story 1.3).
+    // Story 3.6: `otl docs export` refuses to write into a directory that
+    // already has contents unless `--overwrite` is given, and has to tell
+    // leftovers of its own from content the user put there - both of which
+    // mean enumerating the user-supplied output directory. Nothing to do
+    // with the vendored spec.
     Exception {
-        file: "crates/otl/src/commands/api.rs",
-        pattern: "File::open",
-        context: "let file = File::open(path)",
+        file: "commands/docs/outdir.rs",
+        pattern: "read_dir",
+        context: "let entries = std::fs::read_dir(dir)",
+        count: 1,
+    },
+    // One `#[cfg(test)]` helper that lists a temporary directory the test
+    // just created, so the write tests can assert exactly which entries a
+    // write left behind - which is how "no temporary file survived" is
+    // checked.
+    Exception {
+        file: "commands/docs/target.rs",
+        pattern: "read_dir",
+        context: "let mut found: Vec<String> = std::fs::read_dir(dir)",
+        count: 1,
+    },
+    // Golden-file assertions inside `#[cfg(test)]` modules: the curated
+    // commands' human-readable output is compared byte-for-byte against
+    // `tests/golden/*.txt`. Test fixtures, compiled only into the test
+    // harness, never into the shipped binary.
+    Exception {
+        file: "commands/collections.rs",
+        pattern: "include_str!",
+        context: "tests/golden/collections_list_table.txt",
+        count: 1,
     },
     Exception {
-        file: "crates/otl/src/commands/api.rs",
-        pattern: "read_to_string",
-        context: ".read_to_string(&mut raw)",
-    },
-    // The `--spec <PATH>` document, likewise named by the user.
-    Exception {
-        file: "crates/otl/src/commands/spec.rs",
-        pattern: "read_to_string",
-        context: ".read_to_string(&mut raw)",
-    },
-    // The one place the runtime opens a path: a watchdogged open used by
-    // both the `--spec` path and the cache.
-    Exception {
-        file: "crates/otl/src/spec/openfile.rs",
-        pattern: "File::open",
-        context: "sender.send(File::open(owned))",
-    },
-    // The user config file (Story 4.1), at a path that comes from
-    // `OUTLINE_CONFIG` or from `directories` - never from the build, so it
-    // cannot reach the vendored spec.
-    Exception {
-        file: "crates/otl/src/config/file.rs",
-        pattern: "File::open",
-        context: "let file = File::open(path)",
+        file: "commands/docs/detail.rs",
+        pattern: "include_str!",
+        context: "tests/golden/docs_detail_pairs.txt",
+        count: 1,
     },
     Exception {
-        file: "crates/otl/src/config/file.rs",
-        pattern: "read_to_string",
-        context: ".read_to_string(&mut raw)",
-    },
-    // Test-only, in that module's own tests: opening the write end of a
-    // FIFO so the blocked worker thread finishes.
-    Exception {
-        file: "crates/otl/src/spec/openfile.rs",
-        pattern: "OpenOptions",
-        context: "let _writer",
-    },
-    Exception {
-        file: "crates/otl/src/spec/openfile.rs",
-        pattern: ".open(",
-        context: "let _writer",
+        file: "commands/docs/search.rs",
+        pattern: "include_str!",
+        context: "tests/golden/docs_search_table.txt",
+        count: 1,
     },
 ];
 
@@ -338,39 +301,241 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Ways to get at a file's contents. Every one of them must appear only
+/// at a registered call site ([`FILE_READ_ALLOWLIST`]).
+///
+/// This is the rule that makes the literal-string rules above hard to
+/// dodge. A path can always be assembled out of pieces
+/// (`["spec/spec3", ".json"].concat()`), so no amount of substring matching
+/// on path literals is conclusive - but a read still has to go through one
+/// of these, `.open(` included, which covers the aliases
+/// (`File::options()`, a renamed `OpenOptions`) that name-based matching
+/// would miss.
+///
+/// What this does NOT do: recognise a read performed by a subprocess, a
+/// dependency, or an API added to std after this list was written. It is a
+/// registry of the ways this codebase opens files, and it makes adding an
+/// unregistered one fail - which is the review it stands in for, not a
+/// proof.
+const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
+    ("read_to_string", "reading a file by name"),
+    ("File::open", "opening a file by name"),
+    ("File::options", "opening a file by name"),
+    ("OpenOptions", "opening a file by name"),
+    (".open(", "opening a file, whatever the type is called"),
+    ("fs::read", "reading a file by name"),
+    // `read_to_end`/`read` on an already-open handle are deliberately NOT
+    // here: they are how a response body is read, and getting a FILE handle
+    // to use them on requires one of the patterns above.
+];
+
+/// The registered file-opening call sites.
+///
+/// Per CALL SITE, not per file: a second read added to one of these files
+/// fails the guard, because its line will not match the registered context
+/// and its count will not match either.
+const FILE_READ_ALLOWLIST: &[Exception] = &[
+    // The `--body @file.json` request body, named by the user (Story 1.3).
+    Exception {
+        file: "crates/otl/src/commands/api.rs",
+        pattern: "File::open",
+        context: "let file = File::open(path)",
+        count: 1,
+    },
+    Exception {
+        file: "crates/otl/src/commands/api.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut raw)",
+        count: 1,
+    },
+    // The `--spec <PATH>` document, likewise named by the user.
+    Exception {
+        file: "crates/otl/src/commands/spec.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut raw)",
+        count: 1,
+    },
+    // The one place the runtime opens a path: a watchdogged open used by
+    // both the `--spec` path and the cache.
+    Exception {
+        file: "crates/otl/src/spec/openfile.rs",
+        pattern: "File::open",
+        context: "sender.send(File::open(owned))",
+        count: 1,
+    },
+    // Story 3.6: `otl docs export` writes into a user-named directory.
+    // Opening the directory itself is how it is fsynced (a write is not
+    // durable until the directory entry is), and `read_dir` is how it tells
+    // its own leftovers from content the user put there.
+    Exception {
+        file: "crates/otl/src/commands/docs/dir.rs",
+        pattern: "File::open",
+        context: "std::fs::File::open(path)",
+        count: 1,
+    },
+    Exception {
+        file: "crates/otl/src/commands/docs/outdir.rs",
+        pattern: "fs::read",
+        context: "let entries = std::fs::read_dir(dir)",
+        count: 1,
+    },
+    // The exported file itself, created in the user's output directory.
+    Exception {
+        file: "crates/otl/src/commands/docs/target.rs",
+        pattern: "OpenOptions",
+        context: "let file = std::fs::OpenOptions::new()",
+        count: 1,
+    },
+    Exception {
+        file: "crates/otl/src/commands/docs/target.rs",
+        pattern: ".open(",
+        context: ".open(&path)?",
+        count: 1,
+    },
+    // Story 3.3: `otl docs create --file <PATH>`, the document body, named
+    // by the user on the command line.
+    Exception {
+        file: "crates/otl/src/commands/docs/content.rs",
+        pattern: "File::open",
+        context: "let file = File::open(path).map_err(io_error)?",
+        count: 1,
+    },
+    Exception {
+        file: "crates/otl/src/commands/docs/content.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut text)",
+        count: 1,
+    },
+    // The user config file (Story 4.1), at a path that comes from
+    // `OUTLINE_CONFIG` or from `directories` - never from the build, so it
+    // cannot reach the vendored spec.
+    Exception {
+        file: "crates/otl/src/config/file.rs",
+        pattern: "File::open",
+        context: "let file = File::open(path)",
+        count: 1,
+    },
+    Exception {
+        file: "crates/otl/src/config/file.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut raw)",
+        count: 1,
+    },
+];
+
+/// The source with every `#[cfg(test)]` module removed.
+///
+/// Brace-counted from the module's opening `{`, so a nested block cannot
+/// end the module early. Anything this misses is scanned, not skipped: a
+/// module it fails to recognise stays in, which is the safe direction.
+fn strip_test_modules(source: &str) -> String {
+    let mut kept = String::with_capacity(source.len());
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() != "#[cfg(test)]" {
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        }
+        // Only a MODULE is skipped; a `#[cfg(test)]` on anything else stays.
+        match lines.peek() {
+            Some(next) if next.trim_start().starts_with("mod ") => {}
+            _ => {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            }
+        }
+        let mut depth = 0usize;
+        let mut opened = false;
+        for body in lines.by_ref() {
+            depth += body.matches('{').count();
+            depth -= body.matches('}').count().min(depth);
+            if body.contains('{') {
+                opened = true;
+            }
+            if opened && depth == 0 {
+                break;
+            }
+        }
+    }
+    kept
+}
+
 /// Normalized, workspace-relative form of a source path.
 fn relative(file: &Path) -> String {
     file.to_string_lossy().replace('\\', "/")
 }
 
-/// Every line of `source` that contains `pattern` and is NOT covered by a
-/// reviewed exception for this file.
-fn unexcused_lines<'a>(file: &Path, source: &'a str, pattern: &str) -> Vec<&'a str> {
+/// The exceptions registered for one (file, pattern).
+fn exceptions_for<'a>(
+    allowlist: &'a [Exception],
+    file: &Path,
+    pattern: &str,
+) -> Vec<&'a Exception> {
     let path = relative(file);
-    let exceptions: Vec<&Exception> = SOURCE_SCAN_ALLOWLIST
+    allowlist
         .iter()
         .filter(|entry| entry.pattern == pattern && path.ends_with(entry.file))
-        .collect();
-    source
-        .lines()
-        .filter(|line| line.contains(pattern))
-        .filter(|line| !exceptions.iter().any(|entry| line.contains(entry.context)))
         .collect()
 }
 
-/// Code lines containing `pattern` that no registered call site covers.
-fn unexcused_read_lines<'a>(file: &Path, source: &'a str, pattern: &str) -> Vec<&'a str> {
-    let path = relative(file);
-    let sites: Vec<&Exception> = FILE_READ_ALLOWLIST
-        .iter()
-        .filter(|entry| entry.pattern == pattern && path.ends_with(entry.file))
-        .collect();
-    source
+/// Judge one file against one forbidden pattern, checking BOTH halves of
+/// every exception: each occurrence must sit on a reviewed line, and the
+/// number of occurrences must be the number that was reviewed.
+///
+/// `skip_comments` is true for the file-reading family only: a comment
+/// cannot open a file, and those modules have to be able to explain
+/// themselves. The spec-path patterns deliberately do scan comments,
+/// because there a mention is worth reviewing.
+///
+/// `#[cfg(test)]` modules are excluded from the file-reading family for the
+/// same reason: that family asks "what can the RUNTIME open?", and a test
+/// module is not part of the shipped binary - it is compiled only into the
+/// test harness, which the release-binary assertions above cover. Including
+/// them meant registering every temp-file read a write test makes, which is
+/// churn that teaches a reader nothing. The spec-path family still scans
+/// them, because naming the vendored spec in a test is worth a look.
+fn scan(
+    allowlist: &[Exception],
+    file: &Path,
+    source: &str,
+    pattern: &str,
+    reason: &str,
+    skip_comments: bool,
+) -> Vec<String> {
+    let production = if skip_comments {
+        strip_test_modules(source)
+    } else {
+        source.to_string()
+    };
+    let lines: Vec<&str> = production
         .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| !(skip_comments && line.trim_start().starts_with("//")))
         .filter(|line| line.contains(pattern))
-        .filter(|line| !sites.iter().any(|entry| line.contains(entry.context)))
-        .collect()
+        .collect();
+    let registered = exceptions_for(allowlist, file, pattern);
+    let mut violations = Vec::new();
+    for line in &lines {
+        if !registered.iter().any(|entry| line.contains(entry.context)) {
+            violations.push(format!(
+                "  {}: {pattern} - {reason}\n    at: {}",
+                file.display(),
+                line.trim()
+            ));
+        }
+    }
+    let found: usize = lines.iter().map(|line| line.matches(pattern).count()).sum();
+    let allowed: usize = registered.iter().map(|entry| entry.count).sum();
+    if violations.is_empty() && found != allowed {
+        violations.push(format!(
+            "  {}: {pattern} appears {found} time(s), but {allowed} reviewed \
+             occurrence(s) are allowlisted - review the new one and update \
+             its count in the allowlist",
+            file.display()
+        ));
+    }
+    violations
 }
 
 #[test]
@@ -379,26 +544,24 @@ fn runtime_sources_never_reach_for_the_spec() {
     for file in runtime_source_files() {
         let source = std::fs::read_to_string(&file).unwrap();
         for (pattern, reason) in FORBIDDEN_SOURCE_PATTERNS {
-            for line in unexcused_lines(&file, &source, pattern) {
-                violations.push(format!(
-                    "  {}: {pattern} - {reason}\n    at: {}",
-                    file.display(),
-                    line.trim()
-                ));
-            }
+            violations.extend(scan(
+                SOURCE_SCAN_ALLOWLIST,
+                &file,
+                &source,
+                pattern,
+                reason,
+                false,
+            ));
         }
         for (pattern, reason) in FORBIDDEN_FILE_READS {
-            // Comment lines are skipped for THIS family only: a comment
-            // cannot open a file, and these modules have to be able to
-            // explain themselves. The spec-path patterns above deliberately
-            // do scan comments, because there a mention is worth reviewing.
-            for line in unexcused_read_lines(&file, &source, pattern) {
-                violations.push(format!(
-                    "  {}: {pattern} - {reason}\n    at: {}",
-                    file.display(),
-                    line.trim()
-                ));
-            }
+            violations.extend(scan(
+                FILE_READ_ALLOWLIST,
+                &file,
+                &source,
+                pattern,
+                reason,
+                true,
+            ));
         }
     }
     assert!(
@@ -498,4 +661,72 @@ fn api_unknown_op_rejected_by_ir_with_no_spec_file_reachable() {
         .stderr(predicate::str::contains("unknown API operation"))
         .stderr(predicate::str::contains("nonexistent.op"));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Negative test for the source scan itself: an allowlist entry must be a
+/// review of specific call sites, not a blanket exemption for a file.
+///
+/// Both halves are exercised, because they fail differently. Without the
+/// COUNT, a second `read_dir` added to an allowlisted file - including one
+/// enumerating the vendored spec directory - slips through on the strength
+/// of the first one's exception. Without the CONTEXT, any `read_dir` in that
+/// file passes as long as the total happens to match.
+#[test]
+fn the_allowlist_does_not_exempt_a_whole_file() {
+    let allowlisted = Path::new("crates/otl/src/commands/docs/outdir.rs");
+    let pattern = "read_dir";
+    let reason = "test reason";
+    let scan_file = |source: &str| {
+        scan(
+            SOURCE_SCAN_ALLOWLIST,
+            allowlisted,
+            source,
+            pattern,
+            reason,
+            false,
+        )
+    };
+    assert_eq!(
+        exceptions_for(SOURCE_SCAN_ALLOWLIST, allowlisted, pattern).len(),
+        1,
+        "the fixture no longer matches the allowlist"
+    );
+
+    // Exactly the reviewed occurrence, on the reviewed line: clean.
+    assert!(scan_file("    let entries = std::fs::read_dir(dir).map_err(|e| e)?;").is_empty());
+
+    // One more occurrence than was reviewed: a violation naming both counts.
+    let extra = "let entries = std::fs::read_dir(dir);\nlet x = std::fs::read_dir(spec_dir);";
+    let violations = scan_file(extra);
+    assert!(
+        !violations.is_empty(),
+        "an unreviewed occurrence must be reported"
+    );
+    let joined = violations.join("\n");
+    assert!(joined.contains("read_dir"), "{joined}");
+
+    // Fewer than reviewed: also a violation, so a stale exception cannot
+    // linger after the code it covered is gone.
+    assert!(!scan_file("nothing here").is_empty());
+
+    // The reviewed COUNT but a different line: the context catches it.
+    let wrong_line = "let sneaky = std::fs::read_dir(spec_dir);";
+    let violations = scan_file(wrong_line);
+    assert!(
+        violations.iter().any(|text| text.contains("sneaky")),
+        "an occurrence on an unreviewed line must be reported: {violations:?}"
+    );
+
+    // A file with no exception at all is reported on the first occurrence.
+    let other = Path::new("crates/otl/src/session.rs");
+    assert!(exceptions_for(SOURCE_SCAN_ALLOWLIST, other, pattern).is_empty());
+    assert!(!scan(
+        SOURCE_SCAN_ALLOWLIST,
+        other,
+        "std::fs::read_dir(x)",
+        pattern,
+        reason,
+        false
+    )
+    .is_empty());
 }

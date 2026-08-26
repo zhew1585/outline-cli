@@ -243,6 +243,26 @@ R5 确认了 R4 的核心修法（367 MB → 实测 29.2 MB、IgnoredAny 零分�
 
 审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
 
+### 第二次合并（develop 含 Epic 3 的六个精选命令）
+
+第一次合并的合并点早于 Epic 3 落地，所以又合了一次。枢纽文件多为并集，两处需要判断：
+
+1. **`tests/common/mod.rs`（add/add 冲突）**：Epic 3 的 `otl()` helper 自称「scrub 掉 CLI 会读的每一个环境变量」，
+   实际漏了 `OUTLINE_PROFILE`、`OUTLINE_CONFIG` 与 `OTL_CACHE_DIR`——也就是说他们的 curated 测试会依赖开发机上的
+   profile 与 synced 缓存。合并后**两侧隔离都保留**，并把那句「每一个」变成真的：三个都补上，注释按类别说明
+   （凭证/实例、配置与 profile、spec 缓存、输出环境）。
+2. **`tests/startup_guard.rs`**：两侧各自发明了一半机制——我的是「该行必须含登记的上下文」，Epic 3 的是
+   「出现次数必须精确等于登记数」。两者抓的是不同东西（同一行上加第二处 vs 换一行写），所以**合并成一个
+   `Exception { file, pattern, context, count }`**，两个条件都要满足。另外把文件读取那一族的扫描范围限定为
+   **非 `#[cfg(test)]` 代码**：那一族问的是「运行时能打开什么」，而测试模块不进二进制；否则要为 export 测试里
+   每个临时文件读取登记一条，纯噪音。Epic 3 的六个生产站点（export 写文件/fsync 目录/`docs create --file`）
+   照实登记，测试站点相应删除。
+3. Epic 3 还带来了 `tests/limits.rs`（800 行文件上限的自动守卫），它抓到我的 `spec_cache.rs`（1050 行）。
+   按它自己的要求「按职责拆而不是按行数拆」：拆成 `spec_cache.rs`（缓存能用：往返、原子写、权限）与
+   `spec_cache_rejects.rs`（缓存会拒：损坏、过期、敌意内容、资源上限），fixture 提到 `tests/common/cache.rs`。
+4. `docs/exit-codes.md` 与 README 取并集（Epic 3 的退出码 9 + 我的 fetch 错误类；`readme_exit_codes` 派生块
+   无需重生成，因为我只扩了 Examples 列、没加新码）。
+
 ### 合并集成记录（已完成，`git merge develop` 于本分支）
 
 develop 前移了两条 track：Epic 4a（config/profile、补全、schema 驱动列，含 IR schema 5）与发布管道
@@ -272,6 +292,30 @@ develop 前移了两条 track：Epic 4a（config/profile、补全、schema 驱�
 
 合并后实测余量：最大记录 761 B / 32 KiB（43 倍）、单 op 最多 25 个响应字段 / 256（10 倍）、
 整表 34 KB / 1 MiB（30 倍）、dist 二进制 2.79 MiB / 4 MiB（69%）。
+
+### 行为变更登记：`--json` 的键顺序（含 semver 受保护面）
+
+**变更**：`--json` 输出的对象键从「排序」变为「服务器给的顺序」。影响 `otl api`（明示不稳定）**以及六个
+curated 命令**（`--json` shape 受 semver 保护）。
+
+**为什么不可避免**：spec 解析在共用的 `spec-compile` 里，构建期与运行期必须用同一套 `preserve_order`——否则
+synced 表与内置表的字段顺序不同，schema 驱动的列排序会取决于 spec 从哪来，`spec_parity` 直接失败。而
+resolver 2 只在「同一构建种类」内统一 feature，该 crate 同时是 build-dependency 与普通依赖，所以 feature
+必然进入运行时。
+
+**为什么允许（三条，逐条成立）**：
+1. JSON 对象按规范（RFC 8259）是**无序**成员集合，"shape"（有哪些字段、什么类型）不覆盖序列化顺序；
+   依赖键顺序的消费者依赖的是 JSON 没有承诺的东西。
+2. README 对 `--json` 的契约原文是「round-trips what the server sent」——保留服务器顺序**更**符合这条契约，
+   之前的排序行为才是破坏 round-trip 的那个。
+3. 版本仍是 0.x，README 明写 1.0 前的 minor 可含破坏性变更。
+
+**登记方式**（不让它只活在审查记录里）：
+- `crates/otl/tests/json_key_order.rs` 对**两个面**各有一条断言：`otl api documents.info` 与
+  `otl docs search --json`（curated）。头注写明上面三条理由。
+- README 的 semver 段把「shape」的含义写清：字段与类型受保护，键顺序不受保护，且 `--json` round-trip
+  服务器输出（含键顺序）。
+- `crates/speccompile/Cargo.toml` 的 feature 注释写明这个后果与它为何不能只留在构建期。
 
 ### Completion Notes List### Completion Notes List
 

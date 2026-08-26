@@ -34,12 +34,23 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "homebrew", "msi"]
 # Homebrew tap the generated formula is pushed to by the `homebrew` publish
-# job. Prerequisites, both outside this repository:
-#   1. the tap repo `weizhesafeheron/homebrew-tap` must exist;
-#   2. a `HOMEBREW_TAP_TOKEN` repository secret with `contents: write` on it.
-# Without them the release still succeeds up to the publish step and the
-# .rb formula is still attached to the GitHub Release as an artifact.
-tap = "weizhesafeheron/homebrew-tap"
+# job. Two prerequisites live outside this repository and NEITHER EXISTS YET
+# (2026-08):
+#   1. the tap repo `zhew1585/homebrew-tap` has to be created;
+#   2. a `HOMEBREW_TAP_TOKEN` repository secret needs `contents: write` on it.
+#
+# Until both are in place a version tag fails fast and publishes nothing: the
+# release-guards preflight resolves this value to `zhew1585/homebrew-tap`,
+# asks the GitHub API whether the configured token can see it, and treats a
+# negative answer as fatal on a tag. That failure skips `host`, so no
+# artifacts are uploaded and no Release is created.
+#
+# (An earlier version of this comment claimed the release would "still
+# succeed up to the publish step" with the .rb attached. That stopped being
+# true when `github-release = "announce"` moved Release creation behind a
+# successful publish - there is no longer any path that produces a Release
+# without the formula having been pushed.)
+tap = "zhew1585/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
 # NFR3 - three first-class platforms. Linux ships musl so the binary is

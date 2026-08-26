@@ -21,18 +21,18 @@ contract the release pipeline implements, and they start working with the first 
 **Homebrew** (macOS and Linux):
 
 ```sh
-brew install weizhesafeheron/tap/outline-cli
+brew install zhew1585/tap/outline-cli
 ```
 
 **Shell installer** (macOS and Linux; installs into `$CARGO_HOME/bin`):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/weizhesafeheron/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
+  https://github.com/zhew1585/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
 ```
 
 **Windows**: download `outline-cli-x86_64-pc-windows-msvc.msi` from the
-[latest release](https://github.com/weizhesafeheron/outline-cli/releases/latest) and run it. The MSI adds
+[latest release](https://github.com/zhew1585/outline-cli/releases/latest) and run it. The MSI adds
 `otl` to `PATH` and uninstalls through Settings → Apps like any other Windows program. It is **not
 code-signed** — SmartScreen will warn on first run, and "More info → Run anyway" is the way past it.
 Signing needs a purchased certificate; until there is one, verify the download with the attestation
@@ -53,7 +53,7 @@ it was produced by this repository's release workflow rather than merely that it
 published alongside it:
 
 ```sh
-gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo weizhesafeheron/outline-cli
+gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo zhew1585/outline-cli
 ```
 
 **`otl` never checks for updates.** No telemetry, no update ping, no background spec fetch — the binary
@@ -63,7 +63,7 @@ re-run the shell installer, or install the newer MSI.
 **From source** (Rust stable, `rust-version` 1.85):
 
 ```sh
-git clone https://github.com/weizhesafeheron/outline-cli
+git clone https://github.com/zhew1585/outline-cli
 cd outline-cli
 cargo build --release
 # binary at target/release/otl
@@ -88,6 +88,62 @@ otl api documents.list limit=25 template=false   # native JSON number and boolea
 otl api documents.info id=not-a-uuid             # exits 2, no request sent
 otl api shares.create --body @share.json         # oneOf/anyOf bodies go through --body verbatim
 ```
+
+## Everyday commands
+
+Six polished commands cover the day-to-day work. Unlike `otl api`, their flags and output are a stable
+(semver) contract.
+
+```sh
+otl collections list                          # name / id / document count, every page fetched
+otl docs search deploy                        # title / collection / updated / matching snippet
+otl docs search deploy --json | jq '.[].document.id'
+
+otl docs view <doc-id>                        # markdown; $PAGER on a terminal, plain in a pipe
+otl docs view <doc-id> --raw                  # never paged
+otl docs view <doc-id> --web                  # prints the URL and opens a browser
+
+cat notes.md | otl docs create --title Notes --collection <collection-id>
+otl docs create --title Notes --collection <collection-id> --file notes.md   # equivalent
+otl docs update <doc-id> --title "New title"
+cat revised.md | otl docs update <doc-id>
+
+otl docs export --collection <collection-id> --out ./backup
+```
+
+Notes worth knowing:
+
+- **`docs view` is markdown-first.** A pipe gets the document body, not JSON — the body *is* the data
+  here. Ask for `--json` explicitly to get the document object. Every other command follows the usual
+  rule (JSON whenever stdout is not a terminal).
+- **`docs create` publishes** when you give it a `--collection` or `--parent`, because a draft is
+  invisible to everyone else; `--draft` opts out. Without a destination Outline cannot publish at all,
+  and the command says so.
+- **A blank body means "no body".** `otl docs update <id> --title X` from a script (where stdin is
+  `/dev/null`) can never be read as "replace the body with nothing". Clearing a body is possible, but
+  only by spelling it out: `otl api documents.update id=<id> text=`.
+- **`docs export`** rebuilds the document hierarchy as directories, sanitizes every file name (path
+  traversal, Windows device names, case- and normalization-insensitive collisions, length limits),
+  refuses a non-empty output directory unless `--overwrite` is given, and keeps going when one
+  document fails — the failures are summarized at the end and the exit code is 9 (partial failure).
+  Each file is written to a temporary file, flushed, and only then given its real name, so an
+  interrupted export never leaves a half-written or empty document and a failed `--overwrite` never
+  destroys the previous backup. `--json` reports `"complete"`, `"durable"` (`true`/`false`/`null` —
+  `null` where the platform cannot flush a directory, so test with
+  `complete == true && durable != false` rather than `if (durable)`) and `"stray"` alongside the
+  exported paths.
+- **Pagination never truncates silently, and never lies about it either.** `--limit N` caps the total
+  rows, warns on stderr and exits 0 — you asked for it. But when the CLI's own page cap stops a fetch
+  before the server ran out of rows, the result is incomplete through no choice of yours, so
+  `docs search`, `collections list` and `docs export` all exit **9**. `docs export --json` also reports
+  `"complete": false`, because an output directory cannot show what was never fetched.
+- **`docs view` on a terminal is a display, in a pipe it is data.** Piped or `--raw` output is the
+  document byte-for-byte — not even a trailing newline is added. On a terminal the text is prepared for
+  display: control sequences are replaced (a document body must not be able to set your clipboard or
+  forge a hyperlink), and `$PAGER` takes over when the content does not fit on one screen, counting
+  wrapped rows rather than lines.
+
+## Keeping the spec current
 
 The spec is vendored into the binary, so a fresh install needs no network for anything but your own
 requests. When upstream adds an endpoint you need before the next release:
@@ -154,7 +210,9 @@ guarantee: breaking changes may land in a minor release until `1.0`.
 **Covered by semver** — a breaking change here requires a major version:
 
 - The **curated commands** (`otl docs search`, `otl docs get`, …): their names, their flags, and the
-  shape of their output, both the human-readable rendering and `--json`.
+  shape of their output, both the human-readable rendering and `--json`. "Shape" means which fields
+  exist and with what types — not the order object keys are serialized in, which JSON itself leaves
+  unordered. `--json` round-trips what the server sent, key order included.
 - The **exit-code table** below. Published codes never change meaning; new error classes get new codes.
 - Environment variables (`OUTLINE_URL`, `OUTLINE_API_KEY`, …) and the location and key names of the
   config and credential files.
@@ -190,6 +248,7 @@ checked against it by `cargo test`, so the two cannot drift.
 | 6 | Server error |
 | 7 | Network error |
 | 8 | Rate limited |
+| 9 | Partial failure |
 
 <!-- END GENERATED EXIT CODES -->
 

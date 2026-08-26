@@ -97,6 +97,99 @@ pub fn render(
     }
 }
 
+/// Render a payload as JSON, with no schema involved.
+///
+/// [`render`] takes the operation's response schema because it may pick
+/// table columns from it; in JSON mode it never looks. Callers that only
+/// ever emit JSON - the curated commands printing raw server rows, or a
+/// summary they built themselves - say so with this instead of handing
+/// `render` an empty schema that reads like an oversight.
+pub fn render_json(payload: &Value) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(payload)
+}
+
+/// Render a table with caller-chosen columns.
+///
+/// The curated commands (`otl docs search`, `otl collections list`, ...)
+/// pick their own columns instead of letting [`select_columns`] guess, but
+/// share this layout, cell sanitizing and truncation with the generic
+/// renderer - there is deliberately no per-command table code.
+///
+/// `rows` must be rectangular with respect to `headers`; shorter rows are
+/// padded with empty cells and extra cells are dropped, so a mismatch
+/// cannot panic on an index.
+pub fn render_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return EMPTY_LIST_PLACEHOLDER.to_string();
+    }
+    let header: Vec<String> = headers.iter().map(|name| sanitize_cell(name)).collect();
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            (0..header.len())
+                .map(|index| {
+                    row.get(index)
+                        .map(|cell| sanitize_cell(cell))
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    layout_table(&header, &body)
+}
+
+/// Render label/value pairs as an aligned two-column block.
+///
+/// Used by the curated commands that report ONE object (`otl docs create`,
+/// `otl docs update`) rather than a list. Values are scrubbed of control
+/// characters, like every other piece of server text that reaches a
+/// terminal, but deliberately NOT truncated: a document URL is the point of
+/// the output, and a 40-column cell would cut it in half.
+pub fn render_pairs(pairs: &[(&str, String)]) -> String {
+    let labels: Vec<String> = pairs
+        .iter()
+        .map(|(label, _)| scrub_control_chars(label))
+        .collect();
+    let Some(width) = labels.iter().map(|label| display_width(label)).max() else {
+        return String::new();
+    };
+    pairs
+        .iter()
+        .zip(labels.iter())
+        .map(|((_, value), label)| {
+            format!(
+                "{}{COLUMN_GAP}{}",
+                pad_to_width(label, width),
+                scrub_control_chars(value)
+            )
+            .trim_end()
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace control characters (ANSI escapes, newlines, tabs) with spaces.
+///
+/// The length-bounding half of [`sanitize_cell`] is deliberately absent:
+/// this is for values that must stay whole (see [`render_pairs`]).
+fn scrub_control_chars(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// The terminal column width of `text`, summed over grapheme clusters.
+///
+/// Public because layout decisions outside this module need the same
+/// measure - notably [`crate::pager`], which has to know how many terminal
+/// rows a line will wrap onto. Character counts are wrong for CJK (two
+/// columns each), combining marks (zero) and emoji ligatures (one cluster
+/// of width two whose codepoints sum to more).
+pub fn display_columns(text: &str) -> usize {
+    display_width(text)
+}
+
 /// Render a list of objects as a table, or `None` when the payload does
 /// not have that shape.
 fn try_render_table(payload: &Value, schema: &[FieldSpec]) -> Option<String> {
