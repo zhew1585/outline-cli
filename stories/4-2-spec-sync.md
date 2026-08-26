@@ -226,6 +226,21 @@ R4 换成能真跑门禁的审查者，结论有两条对我不利且都成立�
 | [9] MINOR File List 漏登记 | 补 `engine/src/retry.rs`、`engine/tests/rate_limit.rs`，并补齐本轮新增文件 |
 | 守卫摘要过度声称 | 摘要改为继承被摘要测试的限制：只保证**具名**的 HTTP/TLS crate 会被抓，而不是「任何 HTTP 依赖」 |
 
+### Review R5 处置（R3 四条 PARTIAL 全部 VERIFIED；新增 2 MAJOR + 4 MINOR，全部修复）
+
+R5 确认了 R4 的核心修法（367 MB → 实测 29.2 MB、IgnoredAny 零分配经源码+实测双重确认、provenance 多跳正确、
+无绕过入口），并判定可合并。但它指出**「可执行断言」这块招牌自己没兑现**——这条批评成立且尖锐：
+
+| # | 处置 |
+|---|------|
+| [1] MAJOR fixture 与注释不一致、最坏形状未测 | 注释说「两层容器都撒谎」，代码却让外层诚实声明 4000 → 只测到 1.46 MiB。现在**外层也撒谎**，实测 **2.03 MiB**（与审查者独立探针一致）；并新增**组合场景**「8192-op 表 + 首条最坏记录」实测 **3.19 MiB**（同样吻合）——这是加载器真正的最坏情形，此前没有任何测试构造过它。阈值按实测重设（4 MiB / 6 MiB） |
+| 同上：`bounded.rs` 那句错的散文 | 「一条记录不会放大超过约 1 MB」删掉，换成**机制**：bincode 的 serde 桥只按消耗字节计限额、从不 `claim_container_read`，而 serde 的 `Vec` 独立按自己的 1 MiB cap 预留——**每层嵌套各一次**，`OpSpec` 有两层。分帧能把它压成小常数，但不能消掉（那需要接管每个嵌套类型的解码）。数字一律指向 memory_bounds 测试 |
+| [2] MAJOR 测量窗口不含输入缓冲 | 文档改为**在 profiler 窗口内从文件读**。实测因此从 0.00/8.00/2.25 变为 **16.00/24.00/2.60 MiB**——之前少报的正是最大的一项。头注改为明确说明窗口含什么（输入缓冲 + 解析/加载）、不含什么（进程基线约 13 MB），并附命令级 RSS 实测：vendored **6.9 MB**、ignored-key **29.2 MB**、预算接受的最坏形状 **46.1 MB**。另新增「预算会接受的最坏文档」（16 MiB 长字符串）场景，实测 32.08 MiB |
+| [3] MINOR 重校验失败时记错主机 | 先剥 userinfo 再校验（带凭证的 Location 现在也能正确点名应答主机，凭证不入记录也从不发送）；真正无法确定时记**空**（调用方渲染为 unknown），**绝不回退到没有应答过的主机**。新增双 server + 带凭证 Location 的测试 |
+| [4] MINOR 依赖检测器仍漏两种写法 | 补上 quoted key（`"hyper" = "1"`、`"hyper".workspace = true`）与**改名依赖**（`h = { package = "hyper" }`——键名什么都不说，`package` 才是真的）。自测扩到 13 命中 + 8 不误报，并逐个在真实 manifest 里植入验证 |
+| [5] MINOR 过大文档被报成「JSON 不合法」 | 新增独立错误变体：给出输入大小、上限、停下前已计费的量，全部「可读 + 精确」双写（`24.0 MiB (25165824 bytes)`），与缓存侧三条限额的措辞标准一致 |
+| [6] MINOR serde `default-features` 被忽略 | 删掉该无效项（每次构建都告警），注释改为与 workspace 实际 feature 集一致 |
+
 审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
 
 ### Completion Notes List
