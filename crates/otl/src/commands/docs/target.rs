@@ -70,159 +70,10 @@
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::path::{Path, PathBuf};
 
+use super::dir::{identity, identity_of_handle, Dir, FileId};
+
 /// Prefix of the temporary file each document is written through.
 const TEMP_PREFIX: &str = ".otl-export-";
-
-/// The filesystem identity of a file or directory.
-///
-/// `None` means "not available on this platform", never "different":
-/// callers must treat an absent identity as no information rather than as a
-/// mismatch, and must not report a guarantee they could not check.
-pub type FileId = (u64, u64);
-
-/// The identity of whatever `path` names right now.
-fn identity(path: &Path) -> Option<FileId> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    identity_of(&metadata)
-}
-
-/// The identity of an OPEN file, taken from its handle.
-///
-/// No path is consulted, so this cannot be redirected by anything happening
-/// to the directory in the meantime. It is the identity of the file this
-/// process is holding, which is what makes it usable as proof later.
-fn identity_of_handle(file: &std::fs::File) -> Option<FileId> {
-    identity_of(&file.metadata().ok()?)
-}
-
-/// Pull the identity out of metadata, where the platform has one.
-fn identity_of(metadata: &std::fs::Metadata) -> Option<FileId> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        Some((metadata.dev(), metadata.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows exposes a file index only through an unstable std API.
-        let _ = metadata;
-        None
-    }
-}
-
-/// Whether a directory's entries were actually flushed to disk.
-///
-/// A separate value rather than a bare `Ok` so that "flushed" and "could not
-/// be flushed on this platform" cannot be confused for each other by a
-/// caller reporting durability to a backup script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Durability {
-    /// The directory's entries were fsynced.
-    Flushed,
-    /// This platform offers no way to flush a directory through the
-    /// standard library, so nothing can be claimed about whether the names
-    /// written survive a crash.
-    ///
-    /// Only constructed off Unix; the allow keeps the Unix build from
-    /// warning about a variant that is real on another target rather than
-    /// tempting someone to delete it.
-    #[cfg_attr(unix, allow(dead_code))]
-    Unconfirmed,
-}
-
-/// A directory of the output tree, pinned to the entry it named when it was
-/// opened.
-#[derive(Debug, Clone)]
-pub struct Dir {
-    path: PathBuf,
-    /// Identity at open time, when the platform exposes one.
-    id: Option<(u64, u64)>,
-}
-
-impl Dir {
-    /// Pin an existing real directory.
-    pub fn open(path: PathBuf) -> Result<Self, String> {
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("cannot inspect the directory: {}", error.kind()))?;
-        if !metadata.file_type().is_dir() {
-            return Err("the export directory is not a directory".to_string());
-        }
-        let id = identity(&path);
-        Ok(Self { path, id })
-    }
-
-    /// The directory's path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Re-check that this path still names the directory that was pinned.
-    ///
-    /// Called before every write and again when the directory is flushed,
-    /// so that the LAST document written into a directory is covered too -
-    /// without the check at flush time, a swap performed after the final
-    /// write would never be looked at.
-    pub fn verify(&self) -> Result<(), String> {
-        let metadata = std::fs::symlink_metadata(&self.path)
-            .map_err(|error| format!("the target directory is gone: {}", error.kind()))?;
-        if !metadata.file_type().is_dir() {
-            return Err("the target directory was replaced by a file or symlink".to_string());
-        }
-        match (self.id, identity(&self.path)) {
-            (Some(pinned), Some(current)) if pinned != current => {
-                Err("the target directory was replaced since the export started".to_string())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Create (or accept) a subdirectory and pin it.
-    ///
-    /// `create_dir` is used rather than `create_dir_all` so nothing is ever
-    /// created *through* a link, an existing entry is accepted only when it
-    /// is a real directory, and the resolved path must still be inside
-    /// `root`.
-    pub fn child(&self, root: &Path, name: &str) -> Result<Self, String> {
-        self.verify()?;
-        let path = self.path.join(name);
-        match std::fs::create_dir(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-                    format!("cannot inspect the target directory: {}", error.kind())
-                })?;
-                if !metadata.file_type().is_dir() {
-                    return Err(
-                        "a symlink or file already occupies the target directory".to_string()
-                    );
-                }
-            }
-            Err(error) => return Err(format!("cannot create the directory: {}", error.kind())),
-        }
-        let resolved = std::fs::canonicalize(&path)
-            .map_err(|error| format!("cannot resolve the directory: {}", error.kind()))?;
-        if !resolved.starts_with(root) {
-            return Err("the directory resolves outside the export directory".to_string());
-        }
-        Self::open(path)
-    }
-
-    /// Flush this directory's entries to disk, re-verifying it first.
-    ///
-    /// `sync_all` on a file only promises that its CONTENT survives a
-    /// crash; the directory entry that gives it a name is separate
-    /// metadata. Without this, a power loss right after a successful export
-    /// can leave the backup missing files whose data was already durable.
-    ///
-    /// Returns [`Durability::Unconfirmed`] on platforms that cannot flush a
-    /// directory, so the caller reports the gap rather than silently
-    /// treating it as a success. The verification happens everywhere.
-    pub fn sync(&self) -> Result<Durability, String> {
-        self.verify()?;
-        flush_directory(&self.path)
-    }
-}
 
 /// A temporary file that removes itself unless it is explicitly kept.
 ///
@@ -389,25 +240,44 @@ pub fn write_atomically(
         .map_err(|error| format!("cannot write the file: {}", error.kind()))?;
     let id = temp.id;
 
-    if overwrite {
-        // Replace semantics, and the only step that touches the
-        // destination: it either becomes the new file or stays as it was.
-        std::fs::rename(&temp.path, &dest)
-            .map_err(|error| format!("cannot place the file: {}", error.kind()))?;
-        // Renamed away: there is no temporary file left to remove, and the
-        // guard must not try (the name may since belong to someone else).
-        temp.keep = true;
-        return Ok(Written {
-            path: dest,
-            id,
-            stray: None,
-        });
-    }
+    let stray = if overwrite {
+        replace(&mut temp, &dest)?
+    } else {
+        link_exclusively(&mut temp, &dest)?
+    };
+    Ok(Written {
+        path: dest,
+        id,
+        stray,
+    })
+}
 
-    // No-replace semantics: the link fails if anything already answers to
-    // that name, including a name the filesystem considers equivalent to
-    // one already written.
-    match std::fs::hard_link(&temp.path, &dest) {
+/// Give the temporary file its real name, replacing whatever is there.
+///
+/// The rename is the only step that touches the destination: it either
+/// becomes the new file or stays exactly as it was, and it replaces a
+/// symlink at that name rather than following it.
+fn replace(temp: &mut TempFile, dest: &Path) -> Result<Option<PathBuf>, String> {
+    std::fs::rename(&temp.path, dest)
+        .map_err(|error| format!("cannot place the file: {}", error.kind()))?;
+    // Renamed away: there is no temporary file left to remove, and the
+    // guard must not try (the name may since belong to someone else).
+    temp.keep = true;
+    Ok(None)
+}
+
+/// Give the temporary file its real name, failing if the name is taken.
+///
+/// The link fails if anything already answers to that name, including a
+/// name the filesystem considers equivalent to one already written - which
+/// is what makes this the collision check as well as the no-clobber
+/// guarantee.
+///
+/// Returns the temporary path when it could not be unlinked afterwards: the
+/// document is published either way, but that leftover name is a second
+/// link to it, so the output tree would be holding a hidden full copy.
+fn link_exclusively(temp: &mut TempFile, dest: &Path) -> Result<Option<PathBuf>, String> {
+    match std::fs::hard_link(&temp.path, dest) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(
@@ -416,16 +286,7 @@ pub fn write_atomically(
         }
         Err(error) => return Err(format!("cannot place the file: {}", error.kind())),
     }
-    // The document is published; the temporary name is now a second link to
-    // it. Failing to drop that link is not a failure of the export, but it
-    // does leave a full copy of the document in the output tree under a
-    // hidden name - so it is reported rather than swallowed.
-    let stray = temp.remove().err().map(|_| temp.path.clone());
-    Ok(Written {
-        path: dest,
-        id,
-        stray,
-    })
+    Ok(temp.remove().err().map(|_| temp.path.clone()))
 }
 
 /// Confirm that `dest` names the file that was just written.
@@ -466,32 +327,6 @@ pub fn confirm_landing(root: &Path, dest: &Path, written: Option<FileId>) -> Res
 const REDIRECTED: &str = "the file was not written where it should have been: a directory in \
      the path was replaced while the export was running";
 
-/// Flush one directory's entries to disk.
-///
-/// Used for the output directory itself and for the ancestors that had to
-/// be created to reach it - the name of a directory lives in its PARENT, so
-/// flushing only the directory that holds the documents would leave the
-/// directory holding that directory unflushed.
-pub fn flush_directory(path: &Path) -> Result<Durability, String> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(path)
-            .and_then(|dir| dir.sync_all())
-            .map(|()| Durability::Flushed)
-            .map_err(|error| format!("cannot flush the directory: {}", error.kind()))
-    }
-    #[cfg(not(unix))]
-    {
-        // No way to obtain a directory handle through the standard library,
-        // so nothing can be flushed and nothing may be claimed. Reported
-        // rather than returned as a success: a Windows branch that pretends
-        // to have done the work is exactly the failure mode this project
-        // forbids.
-        let _ = path;
-        Ok(Durability::Unconfirmed)
-    }
-}
-
 /// The filesystem identity of a file that already exists at `path`.
 ///
 /// Used to notice that two documents are about to land on ONE directory
@@ -513,9 +348,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::commands::docs::dir::identity;
 
     fn names() -> TempNames {
         TempNames::new()
+    }
+
+    /// Every entry of a directory, sorted, as plain names.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        found.sort();
+        found
     }
 
     #[test]
@@ -527,16 +373,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&written.path).unwrap(), "body\n");
         assert!(written.stray.is_none(), "a temporary file survived");
         assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
-    }
-
-    /// Every entry of a directory, sorted, as plain names.
-    fn entries(dir: &Path) -> Vec<String> {
-        let mut found: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        found.sort();
-        found
     }
 
     #[test]
@@ -760,47 +596,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_replaced_directory_is_reported_rather_than_written_into() {
-        let outer = tempfile::tempdir().unwrap();
-        let path = outer.path().join("dir");
-        std::fs::create_dir(&path).unwrap();
-        let target = Dir::open(path.clone()).unwrap();
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-
-        let result = write_atomically(&target, "a.md", "md", &mut names(), "x", false);
-        if cfg!(unix) {
-            let error = result.unwrap_err();
-            assert!(error.contains("replaced"), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_directory_replaced_by_a_file_is_reported() {
-        let outer = tempfile::tempdir().unwrap();
-        let path = outer.path().join("dir");
-        std::fs::create_dir(&path).unwrap();
-        let target = Dir::open(path.clone()).unwrap();
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::write(&path, "not a directory").unwrap();
-        let error = target.verify().unwrap_err();
-        assert!(error.contains("replaced"), "{error}");
-    }
-
-    #[test]
-    fn syncing_verifies_the_directory_too() {
-        // Without this, a directory swapped after the LAST write into it
-        // would never be looked at again.
-        let outer = tempfile::tempdir().unwrap();
-        let path = outer.path().join("dir");
-        std::fs::create_dir(&path).unwrap();
-        let target = Dir::open(path.clone()).unwrap();
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::write(&path, "swapped").unwrap();
-        assert!(target.sync().is_err(), "sync accepted a swapped directory");
-    }
-
     #[cfg(unix)]
     #[test]
     fn landing_is_confirmed_by_identity_not_by_the_path() {
@@ -862,49 +657,18 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_file_as_a_directory_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file");
-        std::fs::write(&path, "x").unwrap();
-        assert!(Dir::open(path).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_child_directory_that_resolves_outside_the_root_is_refused() {
-        use std::os::unix::fs::symlink;
-
+    fn a_replaced_directory_is_reported_rather_than_written_into() {
         let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let outside = outer.path().join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        symlink(&outside, root.join("escape")).unwrap();
+        let path = outer.path().join("dir");
+        std::fs::create_dir(&path).unwrap();
+        let target = Dir::open(path.clone()).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
 
-        let target = Dir::open(root.clone()).unwrap();
-        let error = target.child(&root, "escape").unwrap_err();
-        assert!(
-            error.contains("symlink") || error.contains("outside"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_child_directory_inside_the_root_is_accepted_and_reusable() {
-        let outer = tempfile::tempdir().unwrap();
-        let root = outer.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let canonical = std::fs::canonicalize(&root).unwrap();
-        let target = Dir::open(canonical.clone()).unwrap();
-        let child = target.child(&canonical, "sub").unwrap();
-        assert!(child.path().ends_with("sub"));
-        assert!(target.child(&canonical, "sub").is_ok());
-    }
-
-    #[test]
-    fn syncing_a_directory_succeeds_or_is_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = Dir::open(dir.path().to_path_buf()).unwrap();
-        target.sync().expect("syncing the output directory");
+        let result = write_atomically(&target, "a.md", "md", &mut names(), "x", false);
+        if cfg!(unix) {
+            let error = result.unwrap_err();
+            assert!(error.contains("replaced"), "{error}");
+        }
     }
 }

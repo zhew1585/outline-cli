@@ -12,6 +12,7 @@
 mod content;
 mod create;
 mod detail;
+mod dir;
 mod export;
 mod search;
 mod target;

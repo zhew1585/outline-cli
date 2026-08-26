@@ -23,7 +23,8 @@ use crate::session::Session;
 use crate::stdio;
 use crate::text;
 
-use super::target::{self, Dir, Durability, TempNames};
+use super::dir::{self, Dir, Durability};
+use super::target::{self, TempNames};
 use super::tree::{self, Plan};
 
 /// Operation that enumerates a collection's documents (auto-paginated).
@@ -87,26 +88,7 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     } else if !plan.is_empty() {
         stdio::write_diagnostic_line(&format!("exporting {} document(s)...", plan.len()));
     }
-    let mut export = Export {
-        session: &session,
-        overwrite: cmd.overwrite,
-        root: &root,
-        written: Vec::new(),
-        failures: Vec::new(),
-        flattened: false,
-        temp_names: TempNames::new(),
-        written_ids: HashSet::new(),
-        undurable: Vec::new(),
-        stray: Vec::new(),
-        durability_unconfirmed: false,
-        // Only truncation the caller did NOT ask for makes the export
-        // incomplete. `--limit N` stopping at N documents is the requested
-        // outcome and stays exit 0 - the same boundary the other curated
-        // list commands honour, and the one registered in
-        // docs/exit-codes.md.
-        truncated: documents.incomplete().copied(),
-        limited: documents.truncation.is_some() && documents.incomplete().is_none(),
-    };
+    let mut export = Export::new(&session, cmd, &root, &documents);
     // A row the listing could not identify is a document the server said
     // exists and this run never fetched. It has to land in the accounting
     // like any other missing document.
@@ -120,7 +102,7 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     // holds the documents would leave the name itself unflushed, and a
     // crash could take the whole export with it.
     for parent in &prepared.new_entries {
-        let outcome = target::flush_directory(parent);
+        let outcome = dir::flush_directory(parent);
         export.record_durability(parent, outcome);
     }
     export.finish(mode)
@@ -167,7 +149,36 @@ struct Export<'a> {
     undurable: Vec<String>,
 }
 
-impl Export<'_> {
+impl<'a> Export<'a> {
+    /// Start an export run.
+    fn new(
+        session: &'a Session,
+        cmd: &ExportArgs,
+        root: &'a Path,
+        documents: &crate::session::Rows,
+    ) -> Self {
+        Self {
+            session,
+            overwrite: cmd.overwrite,
+            root,
+            written: Vec::new(),
+            failures: Vec::new(),
+            flattened: false,
+            temp_names: TempNames::new(),
+            written_ids: HashSet::new(),
+            undurable: Vec::new(),
+            stray: Vec::new(),
+            durability_unconfirmed: false,
+            // Only truncation the caller did NOT ask for makes the export
+            // incomplete. `--limit N` stopping at N documents is the
+            // requested outcome and stays exit 0 - the same boundary the
+            // other curated list commands honour, and the one registered
+            // in docs/exit-codes.md.
+            truncated: documents.incomplete().copied(),
+            limited: documents.truncation.is_some() && documents.incomplete().is_none(),
+        }
+    }
+
     /// Write every node of one directory level, recursing into children.
     ///
     /// `names` is the claimed-name set of `dir`: uniqueness is per
@@ -326,17 +337,7 @@ impl Export<'_> {
         if let Err(reason) = target::confirm_landing(self.root, &written.path, written.id) {
             return self.fail(id, reason);
         }
-        if let Some(stray) = &written.stray {
-            // A full copy of the document under a hidden name. Not a failed
-            // export - the document is where it belongs - but the output
-            // tree is not what was promised, so it does not stay quiet.
-            stdio::write_diagnostic_line(&format!(
-                "warning: could not remove the temporary file {}; it is a \
-                 complete copy of this document and should be deleted",
-                stray.display()
-            ));
-            self.stray.push(stray.display().to_string());
-        }
+        self.record_stray(written.stray.as_deref());
         if let Some(identity) = written
             .id
             .or_else(|| target::existing_identity(&written.path))
@@ -344,6 +345,25 @@ impl Export<'_> {
             self.written_ids.insert(identity);
         }
         self.record(&written.path);
+    }
+
+    /// Report a temporary file that outlived a successful publish.
+    ///
+    /// Not a failed export - the document is exactly where it belongs - but
+    /// the leftover name is a second link to it, so the output tree holds a
+    /// hidden full copy of the document. Worth saying out loud and worth
+    /// putting in the JSON, without turning a correct export into a failed
+    /// one.
+    fn record_stray(&mut self, stray: Option<&Path>) {
+        let Some(stray) = stray else {
+            return;
+        };
+        stdio::write_diagnostic_line(&format!(
+            "warning: could not remove the temporary file {}; it is a \
+             complete copy of this document and should be deleted",
+            stray.display()
+        ));
+        self.stray.push(stray.display().to_string());
     }
 
     /// The markdown for one document, with a title heading.
@@ -435,6 +455,37 @@ impl Export<'_> {
                  \"durable\": null)",
             );
         }
+        let reasons = self.shortfalls();
+        if reasons.is_empty() {
+            return Ok(());
+        }
+        Err(CliError::partial(anyhow!("{}", reasons.join("\n"))))
+    }
+
+    /// The durability verdict, as a JSON tri-state.
+    ///
+    /// `None` becomes `null`: this platform cannot flush a directory, so
+    /// neither `true` nor `false` would be a statement anything checked.
+    fn durable(&self) -> Option<bool> {
+        if !self.undurable.is_empty() {
+            return Some(false);
+        }
+        if self.durability_unconfirmed {
+            return None;
+        }
+        Some(true)
+    }
+
+    /// Whether the export delivered everything it was asked for, durably.
+    fn is_complete(&self) -> bool {
+        self.failures.is_empty() && self.truncated.is_none() && self.undurable.is_empty()
+    }
+
+    /// Every way this run fell short of what it promised, in words.
+    ///
+    /// Empty means the export delivered everything it was asked for, and
+    /// durably.
+    fn shortfalls(&self) -> Vec<String> {
         let mut reasons: Vec<String> = Vec::new();
         if !self.undurable.is_empty() {
             reasons.push(format!(
@@ -462,29 +513,7 @@ impl Export<'_> {
         if !self.failures.is_empty() {
             reasons.push(self.failure_summary());
         }
-        if reasons.is_empty() {
-            return Ok(());
-        }
-        Err(CliError::partial(anyhow!("{}", reasons.join("\n"))))
-    }
-
-    /// The durability verdict, as a JSON tri-state.
-    ///
-    /// `None` becomes `null`: this platform cannot flush a directory, so
-    /// neither `true` nor `false` would be a statement anything checked.
-    fn durable(&self) -> Option<bool> {
-        if !self.undurable.is_empty() {
-            return Some(false);
-        }
-        if self.durability_unconfirmed {
-            return None;
-        }
-        Some(true)
-    }
-
-    /// Whether the export delivered everything it was asked for, durably.
-    fn is_complete(&self) -> bool {
-        self.failures.is_empty() && self.truncated.is_none() && self.undurable.is_empty()
+        reasons
     }
 
     /// The written paths, one per line (the scriptable form of the result).

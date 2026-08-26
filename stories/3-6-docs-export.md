@@ -98,6 +98,8 @@ so that 内容可进 git 或离线阅读。
   1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
   2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
      递归深度因此被 `MAX_DEPTH` 硬性封顶。
+- **文件系统层拆成两个模块**：`dir.rs`（`Dir` 目录钉住、身份、`flush_directory`、`Durability`）
+  与 `target.rs`（temp 写入、落地、`confirm_landing`）。R4 修完后单文件超过 800 行上限，按职责切开。
 - **占位法是错的**（R3 finding 2）：R2 用「先 `create_new` 占名、再 rename 覆盖占位」拿到了互斥，
   但代价是目标路径在那个窗口里是一个**零字节的正式文件**。并发读者会读到空文档；
   更糟的是进程在窗口内被 SIGKILL 或断电，那个空 `Document.md` 会永久留下，
