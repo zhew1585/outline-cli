@@ -60,6 +60,20 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# These checks are implemented in Python to stay readable; keep the
+# dependency explicit and fail with a message that says what is missing
+# rather than a bare "command not found" from three lines down. Every
+# runner this is wired into (ubuntu-*, macos-*) ships python3; a slim
+# container image may not.
+require_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "error: python3 is required by $(basename "${BASH_SOURCE[1]}") but is not on PATH" >&2
+        echo "hint: this gate fails closed on purpose - install python3 rather than skipping it" >&2
+        exit 1
+    fi
+}
+require_python3
+
 python3 - "${REPO_ROOT}" <<'PYEOF'
 import re
 import sys
@@ -286,7 +300,25 @@ for name in attest_jobs:
         f"`{name}` runs after `announce` (post-announce slot)",
     )
 
-# 6. Two config settings scripts/check-binary-size.sh assumes when it
+# 6. Every published target must have a measured regression budget. The size
+#    gate deliberately refuses to invent one, so a target added to
+#    dist-workspace.toml without a budget would silently fall back to the
+#    NFR2 ceiling alone - a much weaker check than the one it is supposed to
+#    have. Assert coverage here so adding a triple forces measuring it.
+size_script = (root / "scripts/check-binary-size.sh").read_text(encoding="utf-8")
+budgeted = set(re.findall(r"^\s+([a-z0-9_]+-[a-z0-9_-]+)\)\s+echo\s+\d+\s+;;", size_script, re.MULTILINE))
+configured = slot_entries("targets")
+require(
+    bool(configured),
+    "the target list was parsed from dist-workspace.toml (empty would make the next check vacuous)",
+)
+missing_budget = sorted(set(configured) - budgeted)
+require(
+    not missing_budget,
+    f"every published target has a size budget; missing {missing_budget or '[]'}",
+)
+
+# 7. Two config settings scripts/check-binary-size.sh assumes when it
 #    reproduces dist's RUSTFLAGS and build command. Enabling either makes
 #    the measured binary differ from the shipped one.
 require(
