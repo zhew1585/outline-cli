@@ -1,6 +1,6 @@
 # Story 4.3: doctor
 
-Status: review
+Status: done
 
 ## Story
 
@@ -342,6 +342,25 @@ R1 的 6 条与最初的 17 条在本轮改动后**全部重跑**,仍全红(M7/N
    放 bind mount (`-v .../target/linux:/linux-target`,即 `check-all.sh --linux` 的写法) 连跑两次有一次红。
    本机 macOS 从不复现。也就是说这不是 Linux CI 的问题,而是那条新 gate 的挂载方式的问题;
    最小修法是 copy 之后 `sync_all()` 再 exec,或对 ETXTBSY 重试一次。
+
+### 合并与 CI 实测结论
+
+合并进 `develop`(`git merge --no-ff`,`4341592`)并推送。**CI 的实际结论**(不是本机推断):
+
+- 推送**没有触发**任何 workflow run(`head_sha` 查询 total_count = 0),前一个提交 `2a6de21`
+  也只拿到两个 `startup_failure` 且 CI 根本没跑——而两次之间 `.github/` 一字未改,
+  所以「workflow file issue」那句是通用文案,不是真因。用 `workflow_dispatch` 手动触发后一切正常。
+- 第一次跑到这段代码的 CI 在 **windows-latest 变红**,而且**不是 doctor**:
+  `startup_guard.rs::flush_to_disk`(来自 `2a6de21`)在 Windows 上让四个
+  `*_with_no_spec_file_reachable` 全挂,`could not flush …otl.exe: Access is denied. (os error 5)`。
+  `sync_all` 就是 `FlushFileBuffers`,它要写权限,而那个函数**有意**用只读描述符。
+  Windows 上还必然走到:runner 的 workspace 在 `D:`、temp 在 `C:`,`hard_link` 跨卷失败,copy 兜底是常态。
+  已按平台分叉修掉(`c85106d`):`ETXTBSY` 是 POSIX 语义,Windows 既不需要等也不能这样问。
+  它之所以带着这个缺陷进 develop,正是因为它自己那次推送没有产生 CI run。
+- 修完后 `c85106d` 三个 workflow **全绿**:CI(macOS / ubuntu / windows 三平台 + 启动门禁 +
+  运行时 YAML 守卫;contract tests 按设计因缺 secret 跳过)、Release guards、Binary size 三个 target——
+  aarch64-apple-darwin 3,464,368 B(预算 92%、NFR2 69%)、x86_64-pc-windows-msvc 3,791,360 B(92% / 75%)、
+  x86_64-unknown-linux-musl 4,551,792 B(92% / 91%)。musl 在新的 per-target 预算下是绿的。
 
 ### Completion Notes
 

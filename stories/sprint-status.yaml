@@ -75,10 +75,10 @@ development_status:
   3-5-collections-list: done
   3-6-docs-export: done
   epic-3-retrospective: optional
-  epic-4: in-progress
+  epic-4: done
   4-1-config-and-profiles: done
   4-2-spec-sync: done
-  4-3-doctor: review
+  4-3-doctor: done
   4-4-shell-completions: done
   4-5-release-pipeline: done
   epic-4-retrospective: optional
