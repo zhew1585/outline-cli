@@ -96,7 +96,7 @@ impl Settings {
 }
 
 impl fmt::Debug for Settings {
-    /// Manual impl: same base-URL redaction rule as [`Config`].
+    /// Manual impl: same base-URL redaction rule as `super::Config`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Settings")
             .field("profile", &redacted_name(self.profile.as_deref()))

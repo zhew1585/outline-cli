@@ -39,7 +39,7 @@ pub struct BindingChecked(());
 /// Where the secret comes from.
 ///
 /// The single interface point between profile resolution and credential
-/// storage: v1 ships [`EnvApiKey`], and the Epic 2 credential file becomes a
+/// storage: v1 ships `secret::EnvApiKey`, and the Epic 2 credential file becomes a
 /// second implementation without any change above this line.
 pub trait TokenSource {
     /// The bearer token for `settings`, or a readable configuration error.
