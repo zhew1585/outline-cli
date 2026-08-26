@@ -72,11 +72,13 @@ const ACCEPT_TYPES: &str = "application/json, text/plain, */*";
 pub struct FetchedDocument {
     /// The body, UNTRUSTED: only its size and encoding have been checked.
     pub text: String,
-    /// Origin (`scheme://host[:port]`) that answered, after any redirects.
+    /// Origin (`scheme://host[:port]`) that answered, after any redirects,
+    /// or empty when it could not be determined.
     ///
     /// Not the origin that was asked: a redirect can move the answer to
     /// another host, and a record of "where this came from" that names the
-    /// wrong one is worse than no record.
+    /// wrong one is worse than no record - which is also why the unknown
+    /// case is EMPTY rather than a fallback to the requested origin.
     pub origin: String,
 }
 
@@ -218,14 +220,19 @@ impl DocumentFetch {
             // origin that was ASKED, which is the one the user typed and
             // can act on; a successful document is labelled with the one
             // that served it, which is the one the caller has to record.
-            let answered = answering_origin(&response).unwrap_or_else(|| asked.clone());
+            //
+            // When that cannot be determined the label is EMPTY, never the
+            // requested origin: a caller recording provenance would then
+            // name a host that did not serve the document, which is a
+            // quiet lie. "Unknown" is worse to read and better to trust.
+            let answered = answering_origin(&response).unwrap_or_default();
             if !status.is_success() {
                 return Err(FetchError::Status {
                     origin: asked,
                     status: status.as_u16(),
                 });
             }
-            let text = self.read_text(response, &answered)?;
+            let text = self.read_text(response, &asked)?;
             return Ok(FetchedDocument {
                 text,
                 origin: answered,
@@ -345,15 +352,25 @@ pub fn fetch_document(
         .get_text(url)
 }
 
-/// The origin that answered, taken from the response's final URL and put
-/// through the same shape rules as the requested one.
+/// The origin that answered, taken from the response's final URL.
 ///
-/// `None` when the final URL is not one this channel would have accepted
-/// (it cannot normally be: redirects to other schemes are not followed),
-/// in which case the caller falls back to the requested origin rather than
-/// recording something unvalidated.
+/// Userinfo is stripped before the URL is checked, rather than making the
+/// check fail: a `Location` header may carry credentials (they are never
+/// SENT - this channel sends none - but they do appear in the final URL),
+/// and refusing to name the host because of them would leave provenance
+/// unknown for a redirect that worked perfectly well.
+///
+/// `None` only when the final URL is not something this channel would have
+/// fetched at all. The caller must not substitute the requested origin for
+/// it: that would name a host that did not serve the document.
 fn answering_origin(response: &reqwest::blocking::Response) -> Option<String> {
-    validate_document_url(response.url().as_str())
+    let mut url = response.url().clone();
+    // Both setters fail only for URLs that cannot have userinfo (`file:`,
+    // `data:`), which are not URLs this channel follows; a failure just
+    // leaves the URL as it was, and the check below rejects it.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    validate_document_url(url.as_str())
         .ok()
         .map(|url| url.origin().ascii_serialization())
 }

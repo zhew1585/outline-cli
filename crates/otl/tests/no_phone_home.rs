@@ -239,20 +239,65 @@ const FORBIDDEN_CRATES: &[&str] = &[
 const INDIRECT_ONLY_CRATES: &[&str] = &["hyper", "rustls", "h2", "tokio-rustls"];
 
 /// Whether one manifest line declares `crate_name` as a dependency, in
-/// either of TOML's two forms.
+/// any of the forms TOML allows.
+///
+/// Four shapes, all real declarations:
+///
+/// ```toml
+/// hyper = "1"                      # inline
+/// "hyper" = "1"                    # inline, quoted key (also 'hyper')
+/// [dependencies.hyper]             # table (also [target."...".dependencies.hyper])
+/// h = { package = "hyper", ... }   # renamed - the KEY says nothing
+/// ```
+///
+/// The renamed form is why this cannot just look at keys: `package = "..."`
+/// is what actually pulls the crate in, whatever the key is called. A
+/// feature string inside an array (`"rustls"` in reqwest's own feature
+/// list) is none of these and must keep passing - choosing the TLS backend
+/// that way is the point.
 fn is_dependency_declaration(line: &str, crate_name: &str) -> bool {
-    let inline = line.contains('=')
-        && [" ", "=", "."]
-            .iter()
-            .any(|separator| line.starts_with(&format!("{crate_name}{separator}")));
+    // Comments are not declarations. The caller filters them too; doing it
+    // here as well means this function is correct on its own, which is
+    // what its unit test then actually establishes.
+    if line.trim_start().starts_with('#') {
+        return false;
+    }
+    // Quotes are stripped wherever they appear in the key: `"hyper"` and
+    // `"hyper".workspace` are both this crate, and a crate name can never
+    // contain a quote itself.
+    let key: String = line
+        .split('=')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !matches!(character, '"' | '\''))
+        .collect();
+    let key = key.trim();
+    let inline =
+        line.contains('=') && (key == crate_name || key.starts_with(&format!("{crate_name}.")));
     let table = line.starts_with('[')
         && line.ends_with(']')
         && line
             .trim_matches(['[', ']'])
             .rsplit('.')
             .next()
-            .is_some_and(|last| last == crate_name);
-    inline || table
+            .is_some_and(|last| last.trim_matches(['"', '\'']) == crate_name);
+    // `package = "hyper"` renames the crate; the key is then irrelevant.
+    let renamed = ["package = ", "package=", "package =\""]
+        .iter()
+        .any(|prefix| match line.split_once(prefix) {
+            Some((_, rest)) => {
+                rest.trim_start()
+                    .trim_start_matches(['"', '\''])
+                    .starts_with(&format!("{crate_name}\""))
+                    || rest
+                        .trim_start()
+                        .trim_start_matches(['"', '\''])
+                        .starts_with(&format!("{crate_name}'"))
+            }
+            None => false,
+        });
+    inline || table || renamed
 }
 
 /// No new dependency may bring a second HTTP stack or TLS client in
@@ -352,14 +397,22 @@ const NAMED_REQWEST_SENDS: &[&str] = &["blocking::get(", "reqwest::get("];
 /// against manifests that happen to be clean - which is how the table form
 /// slipped through before.
 #[test]
-fn the_dependency_detector_knows_both_toml_forms() {
+fn the_dependency_detector_knows_every_toml_form() {
     for declaration in [
         "hyper = \"1\"",
         "hyper=\"1\"",
         "hyper.workspace = true",
+        "\"hyper\" = \"1\"",
+        "'hyper' = \"1\"",
+        "\"hyper\".workspace = true",
         "[dependencies.hyper]",
         "[dev-dependencies.hyper]",
         "[target.\"cfg(unix)\".dependencies.hyper]",
+        "[dependencies.\"hyper\"]",
+        // Renamed: the key says nothing, `package` says everything.
+        "h = { package = \"hyper\", version = \"1\" }",
+        "anything = { version = \"1\", package = \"hyper\" }",
+        "package = \"hyper\"",
     ] {
         assert!(
             is_dependency_declaration(declaration.trim(), "hyper"),
@@ -373,6 +426,8 @@ fn the_dependency_detector_knows_both_toml_forms() {
         "hyperlocal = \"1\"", // a different crate
         "[dependencies.hyperlocal]",
         "reqwest = { features = [\"hyper\"] }",
+        "h = { package = \"hyperlocal\" }", // a different crate, renamed
+        "# package = \"hyper\"",
     ] {
         assert!(
             !is_dependency_declaration(innocent.trim(), "hyper"),

@@ -342,6 +342,58 @@ async fn the_reported_origin_is_the_host_that_answered() {
     );
 }
 
+/// A `Location` carrying credentials still identifies its host. The
+/// credentials are never sent (this channel sends none), and refusing to
+/// name the host because of them used to make the fetch report the
+/// REDIRECTOR as the source - a quiet lie about where a document came
+/// from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_with_credentials_still_names_the_answering_host() {
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/final.json"))
+        // Asserting the credentials are NOT forwarded, while we are here.
+        .and(|request: &wiremock::Request| !request.headers.contains_key("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&target)
+        .await;
+
+    let host = target.uri().replace("http://", "");
+    let redirector = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spec.json"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("http://bob:s3cr3t@{host}/final.json").as_str(),
+        ))
+        .mount(&redirector)
+        .await;
+
+    let fetched = fetch_with(
+        format!("{}/spec.json", redirector.uri()),
+        MAX_DOCUMENT_BYTES,
+        fast_policy(),
+        test_throttle(),
+    )
+    .await
+    .expect("follows the redirect");
+
+    assert!(
+        target.uri().starts_with(&fetched.origin),
+        "origin {:?} is not the answering host ({})",
+        fetched.origin,
+        target.uri()
+    );
+    assert!(
+        !redirector.uri().starts_with(&fetched.origin),
+        "origin {:?} names the redirector",
+        fetched.origin
+    );
+    // And the credentials from the Location header are not in the record.
+    assert!(!fetched.origin.contains("bob"), "{:?}", fetched.origin);
+    assert!(!fetched.origin.contains("s3cr3t"), "{:?}", fetched.origin);
+}
+
 /// Without a redirect the two are the same host, and that is what is
 /// reported.
 #[tokio::test(flavor = "multi_thread")]
