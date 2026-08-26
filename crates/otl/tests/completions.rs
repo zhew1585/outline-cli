@@ -351,7 +351,18 @@ fn each_script_states_its_own_coverage() {
         (Shell::Elvish, "elvish"),
     ] {
         let script = script_for(name);
-        let header = script.lines().take(2).collect::<Vec<_>>().join(" ");
+        // Located, not assumed to be first: zsh's `#compdef` tag owns line 1,
+        // so the notice sits just below it there.
+        let start = script
+            .lines()
+            .position(|line| line.starts_with("# otl completion script for"))
+            .unwrap_or_else(|| panic!("{name}: no coverage notice found"));
+        let header = script
+            .lines()
+            .skip(start)
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(header.starts_with('#'), "{name}: no header comment");
         let claims_operations = header.contains("operation names (from");
         assert_eq!(
@@ -472,6 +483,44 @@ fn the_coverage_check_catches_drift_in_every_direction() {
             .any(|c| affirms_completion(c) && shell_names(false).iter().any(|s| c.contains(s))),
         "the mixed sample's affirmative clause is not detected"
     );
+
+    // R6: every other way of joining the two halves. ` - ` matters most,
+    // being this module's own house style for joining clauses.
+    for joiner in [
+        " and ",
+        ": ",
+        " - ",
+        " though ",
+        " although ",
+        " yet ",
+        "; ",
+        ", but ",
+    ] {
+        let drifted = format!("powershell does not complete operation names{joiner}elvish does");
+        assert!(
+            clauses(&drifted)
+                .into_iter()
+                .any(|clause| affirms_completion(clause)
+                    && shell_names(false).iter().any(|s| clause.contains(s))),
+            "a clause joined by {joiner:?} hides its affirmation"
+        );
+    }
+
+    // A denial that never says "not": the other direction.
+    for phrasing in [
+        "bash never completes operation names",
+        "zsh lacks operation name completion",
+        "fish operation name completion is unavailable",
+    ] {
+        assert!(
+            is_denial(phrasing),
+            "{phrasing:?} is not recognised as a denial"
+        );
+        assert!(
+            shell_names(true).iter().any(|s| phrasing.contains(s)),
+            "the sample does not name a covered shell"
+        );
+    }
 }
 
 /// Split documentation into clauses, not just sentences.
@@ -480,10 +529,27 @@ fn the_coverage_check_catches_drift_in_every_direction() {
 /// complete them, but Y does"), so anything classified as a whole sentence
 /// hides half of what it says.
 fn clauses(doc: &str) -> Vec<&str> {
-    doc.split(['.', ';', ','])
-        .flat_map(|part| part.split(" but ").flat_map(|p| p.split(" while ")))
-        .flat_map(|part| part.split(" whereas ").flat_map(|p| p.split(" however ")))
-        .collect()
+    const CONJUNCTIONS: &[&str] = &[
+        " but ",
+        " while ",
+        " whereas ",
+        " however ",
+        " and ",
+        " though ",
+        " although ",
+        " yet ",
+        " - ",
+        " \u{2013} ",
+        " \u{2014} ",
+    ];
+    let mut parts: Vec<&str> = doc.split(['.', ';', ',', ':']).collect();
+    for conjunction in CONJUNCTIONS {
+        parts = parts
+            .into_iter()
+            .flat_map(|part| part.split(conjunction))
+            .collect();
+    }
+    parts
 }
 
 /// Whether a clause is about completing operation names at all.
@@ -519,12 +585,27 @@ fn affirms_completion(text: &str) -> bool {
 /// exactly the sentence the documentation is supposed to contain.
 fn is_denial(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("not complete")
-        || lower.contains("not completed")
-        || lower.contains("no candidates")
-        || lower.contains("do not")
-        || lower.contains("does not")
-        || lower.contains("cannot")
+    [
+        // Negated verbs.
+        "not complete",
+        "not completed",
+        "do not",
+        "does not",
+        "cannot",
+        "no candidates",
+        // Denials that never say "not" at all - the second direction the
+        // review found, where a false denial about a supported shell was
+        // being read as an affirmation.
+        "never",
+        "lacks",
+        "unavailable",
+        "unsupported",
+        "without",
+        "excluded",
+        "omitted",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// The module-level `//!` documentation of the completions module.
@@ -553,4 +634,127 @@ fn shell_names(with_operations: bool) -> Vec<&'static str> {
     })
     .map(|(_, name)| name)
     .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Script SHAPE, not just script content (R6 finding 1).
+//
+// Five rounds of substring assertions could not see that the coverage notice
+// pushed zsh's `#compdef` tag off line 1, which is the one line zsh's
+// `compinit` reads when it scans `$fpath`. The documented install
+// (`otl completions zsh > ~/.zfunc/_otl`) therefore produced a file zsh
+// silently declined to register.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_zsh_script_starts_with_the_compdef_tag() {
+    let script = script_for("zsh");
+    let first = script.lines().next().unwrap_or_default();
+    assert_eq!(
+        first, "#compdef otl",
+        "zsh reads only the first line of a file in $fpath when looking for \
+         the #compdef tag; anything above it makes the completion invisible \
+         to compinit"
+    );
+    // The coverage notice must still be there, just not first.
+    assert!(
+        script.contains("# otl completion script for zsh."),
+        "the coverage notice was lost: {script}"
+    );
+}
+
+#[test]
+fn every_script_keeps_its_shell_required_first_line() {
+    // Stated per shell so a future notice cannot quietly take the slot again.
+    for (shell, required_prefix) in [
+        ("zsh", Some("#compdef")),
+        ("bash", None),
+        ("fish", None),
+        ("powershell", None),
+        ("elvish", None),
+    ] {
+        let script = script_for(shell);
+        let first = script.lines().next().unwrap_or_default();
+        match required_prefix {
+            Some(prefix) => assert!(
+                first.starts_with(prefix),
+                "{shell}: first line must start with {prefix:?}, got {first:?}"
+            ),
+            // The others carry the notice first; assert that too, so the
+            // notice cannot silently disappear from them either.
+            None => assert!(
+                first.starts_with('#'),
+                "{shell}: expected the coverage notice first, got {first:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn zsh_registers_the_generated_completion() {
+    // The end-to-end check the substring tests could not make: install the
+    // script exactly as the README says and ask zsh whether it registered.
+    let Ok(zsh) = which_shell("zsh") else {
+        eprintln!("skipping: zsh not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fpath = dir.path().join("zfunc");
+    std::fs::create_dir(&fpath).unwrap();
+    std::fs::write(fpath.join("_otl"), script_for("zsh")).unwrap();
+
+    let script = format!(
+        "fpath=({} $fpath); autoload -Uz compinit; compinit -u -d {}; \
+         print -r -- ${{_comps[otl]:-NOT-REGISTERED}}",
+        fpath.display(),
+        dir.path().join("zcompdump").display()
+    );
+    let output = std::process::Command::new(zsh)
+        .arg("-f")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("_otl"),
+        "zsh did not register the completion: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Locate a shell on PATH, or report that it is absent.
+fn which_shell(name: &str) -> Result<std::path::PathBuf, ()> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name}"))
+        .output()
+        .map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        Err(())
+    } else {
+        Ok(std::path::PathBuf::from(path))
+    }
+}
+
+#[test]
+fn candidate_descriptions_carry_no_bidi_or_invisible_characters() {
+    // R6 finding 9: descriptions filtered `is_control()` only, so a summary
+    // carrying U+202E would reorder the fish completion menu for the same
+    // reason an ESC byte would recolour it.
+    let script = script_for("fish");
+    for ch in [
+        '\u{202e}', '\u{202a}', '\u{2066}', '\u{2069}', '\u{200f}', '\u{200e}', '\u{61c}',
+        '\u{200b}', '\u{feff}', '\u{00ad}', '\u{2060}',
+    ] {
+        assert!(
+            !script.contains(ch),
+            "U+{:04X} reached the fish script",
+            ch as u32
+        );
+    }
 }

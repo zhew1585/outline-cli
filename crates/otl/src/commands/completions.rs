@@ -68,6 +68,8 @@ const MAX_DESCRIPTION_CHARS: usize = 120;
 /// Comment marker for the coverage notice. `#` starts a line comment in
 /// bash, zsh, fish, elvish and powershell alike.
 const COMMENT: &str = "#";
+/// The tag zsh's `compinit` looks for, on the first line and nowhere else.
+const ZSH_COMPDEF_TAG: &str = "#compdef";
 
 /// Arguments for `otl completions`.
 #[derive(Debug, Args)]
@@ -96,13 +98,51 @@ pub fn run(cmd: &CompletionsArgs, root: Command) -> Result<(), CliError> {
             "the generated completion script is not valid UTF-8"
         ))
     })?;
-    let mut script = coverage_notice(cmd.shell, &name);
-    script.push_str(&generated);
+    let mut script = with_coverage_notice(cmd.shell, &name, &generated);
     if cmd.shell == Shell::Fish {
         let rules = fish_operation_rules(&generated, &name);
         script.push_str(&rules);
     }
     stdio::write_data(&script)
+}
+
+/// Add the coverage notice without displacing a line the shell requires
+/// first.
+///
+/// zsh's `compinit` scans `$fpath` and reads only the FIRST line of each
+/// `_*` file, looking for the `#compdef` tag `clap_complete` emits there.
+/// A comment above it is not a comment as far as zsh is concerned - it is
+/// the absence of a tag, and the completion is silently never registered,
+/// which is exactly what the documented `otl completions zsh > ~/.zfunc/_otl`
+/// install produced. The notice therefore goes after that line, and
+/// `the_zsh_script_starts_with_the_compdef_tag` pins the ordering.
+///
+/// No other supported shell reserves its first line, so they keep the notice
+/// at the top where it is most visible.
+fn with_coverage_notice(shell: Shell, name: &str, generated: &str) -> String {
+    let notice = coverage_notice(shell, name);
+    let Some(reserved) = reserved_first_line(shell, generated) else {
+        return format!("{notice}{generated}");
+    };
+    let rest = &generated[reserved.len()..];
+    format!(
+        "{reserved}\n{notice}{}",
+        rest.strip_prefix('\n').unwrap_or(rest)
+    )
+}
+
+/// The line this shell requires to come first, if it has one and the
+/// generator actually emitted it.
+///
+/// Returns `None` when the expectation does not hold, so an upstream change
+/// degrades to the old layout rather than corrupting the script by splitting
+/// it at the wrong place.
+fn reserved_first_line(shell: Shell, generated: &str) -> Option<&str> {
+    if shell != Shell::Zsh {
+        return None;
+    }
+    let first = generated.lines().next()?;
+    first.starts_with(ZSH_COMPDEF_TAG).then_some(first)
 }
 
 /// Header comment stating what this shell's script does and does not
@@ -192,14 +232,15 @@ fn fish_operation_rules(script: &str, name: &str) -> String {
 
 /// Escape a description for a fish single-quoted string.
 ///
-/// Backslash and quote are escaped as fish requires, and control characters
-/// are dropped: a summary comes from the spec, and an ESC byte surviving into
-/// a completion description would be an escape sequence the terminal renders
-/// when the candidate is displayed. The length is capped for the same reason
-/// a table cell is.
+/// Backslash and quote are escaped as fish requires, and every character
+/// [`crate::text::hazard`] flags is dropped: a summary comes from the spec,
+/// and an ESC byte surviving into a completion description would be an escape
+/// sequence the terminal renders when the candidate is displayed - as would a
+/// bidi override, for exactly the same reason. The length is capped as a table
+/// cell's is.
 fn fish_escape(text: &str) -> String {
     text.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| crate::text::hazard(*c).is_none())
         .take(MAX_DESCRIPTION_CHARS)
         .flat_map(|c| match c {
             '\\' => vec!['\\', '\\'],
