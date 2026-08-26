@@ -29,6 +29,14 @@ const FALLBACK_STEM: &str = "untitled";
 const MAX_STEM_BYTES: usize = 96;
 /// Highest de-duplication suffix tried before giving up.
 const MAX_DEDUP_ATTEMPTS: u32 = 10_000;
+/// Case-folding passes applied before accepting the result as stable.
+///
+/// Two is enough for every mapping in Unicode today (`ẞ` needs two); the
+/// extra passes are headroom, and the loop stops as soon as nothing
+/// changes.
+const MAX_FOLD_PASSES: usize = 4;
+/// Growth factor a single folding pass may not exceed.
+const MAX_FOLD_GROWTH: usize = 4;
 
 /// Characters that are illegal in a Windows file name, plus the two path
 /// separators. `:` is included for macOS as well, where it is a separator
@@ -41,16 +49,6 @@ const RESERVED: &[&str] = &[
     "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
     "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     "clock$", "conin$", "conout$",
-];
-
-/// Invisible characters that can reorder or hide the rest of a name.
-///
-/// They are not `char::is_control`, but a right-to-left override in a file
-/// name makes `report-<RLO>fdp.md` look like `report-md.pdf`. Names are
-/// security-relevant output, so these are dropped.
-const INVISIBLE: &[char] = &[
-    '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}',
-    '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
 ];
 
 /// Sanitize one arbitrary string into a single safe path component.
@@ -82,7 +80,7 @@ pub fn safe_stem(raw: &str) -> String {
 /// [`REPLACEMENT`], and drop the invisible ones entirely.
 fn replace_illegal(raw: &str) -> String {
     raw.chars()
-        .filter(|c| !INVISIBLE.contains(c))
+        .filter(|c| !crate::text::is_invisible(*c))
         .map(|c| {
             if c.is_control() || ILLEGAL.contains(&c) {
                 REPLACEMENT
@@ -235,9 +233,9 @@ impl Names {
 ///   lowercase, so `to_lowercase` leaves it distinct from `σ` even though a
 ///   case-insensitive filesystem treats the two names as one entry.
 ///   Uppercasing first collapses both to `Σ`, and lowercasing that gives
-///   one key - the standard way to get a caseless comparison without
-///   carrying a full case-folding table, and strictly more aggressive than
-///   lowercasing alone.
+///   one key - a caseless comparison without carrying a full case-folding
+///   table. Applied to a FIXPOINT rather than once, because a single round
+///   trip is not stable for every character (see the loop below).
 /// - **normalization**, via NFC: `é` written as one codepoint (U+00E9) and
 ///   as `e` + a combining acute (U+0065 U+0301) are DIFFERENT byte strings
 ///   but the same directory entry on a macOS volume.
@@ -266,7 +264,26 @@ impl Names {
 fn collision_key(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 
-    name.to_uppercase().to_lowercase().nfc().collect()
+    let mut folded = name.to_string();
+    // ONE round trip is not a fixpoint, and the gap is reachable: capital
+    // sharp S `ẞ` uppercases to itself and lowercases to `ß`, while `ß`
+    // uppercases to `SS` and lowercases to `ss`. A single pass therefore
+    // gives `ß` and `ss` - two keys for one case-folding equivalence class,
+    // which is under-folding, the direction that loses documents. Iterating
+    // to a fixpoint closes it: `ẞ` -> `ß` -> `ss`.
+    for _ in 0..MAX_FOLD_PASSES {
+        let next: String = folded.to_uppercase().to_lowercase();
+        if next == folded {
+            break;
+        }
+        // Case mappings can expand (one character to three); a bound keeps
+        // a pathological input from growing the key without limit.
+        if next.len() > folded.len().saturating_mul(MAX_FOLD_GROWTH) + MAX_FOLD_GROWTH {
+            break;
+        }
+        folded = next;
+    }
+    folded.nfc().collect()
 }
 
 /// `base` with a `-N` de-duplication suffix, keeping the byte cap.
@@ -465,6 +482,42 @@ mod tests {
         let mut names = Names::new();
         assert_eq!(names.claim("\u{c9}clair"), "\u{c9}clair"); // NFC É
         assert_eq!(names.claim("e\u{301}clair"), "e\u{301}clair-2"); // NFD é
+    }
+
+    #[test]
+    fn case_folding_catches_capital_sharp_s() {
+        // `ẞ` uppercases to itself and lowercases to `ß`; `ß` uppercases to
+        // `SS`. One round trip therefore stops at `ß` for the first and
+        // reaches `ss` for the second - two keys for one case-folding
+        // class, and a silent overwrite on a filesystem that folds them.
+        for spelling in ["\u{1e9e}", "\u{df}", "SS", "ss", "Ss"] {
+            assert_eq!(
+                collision_key(spelling),
+                collision_key("ss"),
+                "{spelling:?} folded to a different key"
+            );
+        }
+        let mut names = Names::new();
+        assert_eq!(names.claim("Stra\u{1e9e}e"), "Stra\u{1e9e}e");
+        assert_eq!(names.claim("Stra\u{df}e"), "Stra\u{df}e-2");
+        assert_eq!(names.claim("STRASSE"), "STRASSE-3");
+    }
+
+    #[test]
+    fn the_case_fold_is_a_fixpoint() {
+        // Folding an already-folded key must not change it again, or the
+        // key would depend on how many times it happened to be applied.
+        for name in [
+            "\u{1e9e}",
+            "\u{df}",
+            "\u{3c2}",
+            "Deploy",
+            "\u{4e2d}\u{6587}",
+            "\u{130}",
+        ] {
+            let once = collision_key(name);
+            assert_eq!(collision_key(&once), once, "{name:?} is not stable");
+        }
     }
 
     #[test]

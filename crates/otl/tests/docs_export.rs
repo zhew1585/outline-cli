@@ -1001,3 +1001,166 @@ async fn a_duplicate_row_is_not_counted_as_a_failure() {
     assert_eq!(parsed["complete"], json!(true));
     assert_eq!(tree(&out), BTreeSet::from(["Alpha.md".to_string()]));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_title_on_an_unusable_row_cannot_rewrite_the_terminal() {
+    // The failure summary names an unusable row by its title, and a title
+    // is written by anyone who can edit the document. Untouched, it could
+    // set the clipboard with OSC 52 or use a newline to forge an extra
+    // failure entry in the summary it appears in.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                { "title": "evil\u{1b}]52;c;cGF5bG9hZA==\u{7}\nfake-id: forged failure" },
+            ],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains('\u{1b}'), "ESC reached stderr: {stderr:?}");
+    assert!(!stderr.contains('\u{7}'), "BEL reached stderr: {stderr:?}");
+    // The forged text is still shown - it is the real title - but folded
+    // onto the one line that belongs to this row, so it cannot pose as a
+    // second failure entry.
+    let forged_lines = stderr
+        .lines()
+        .filter(|line| line.trim_start().starts_with("fake-id:"))
+        .count();
+    assert_eq!(forged_lines, 0, "a title forged a failure line: {stderr:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collection_of_only_unusable_rows_does_not_claim_to_be_empty() {
+    // Two contradictory diagnostics used to appear together: "this
+    // collection has no documents to export" and a list of documents that
+    // could not be exported.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "title": "Unidentified" }],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("no documents to export"),
+        "claimed the collection was empty while reporting a failure: {stderr}"
+    );
+    assert!(stderr.contains("listing row 1"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_export_reports_itself_as_durable() {
+    // The `durable` field exists so an automated backup can tell "written"
+    // from "written and flushed". On the happy path it must be true, or the
+    // field would be noise.
+    let server = server_with(vec![row("a", "Alpha", None), row("b", "Beta", Some("a"))]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["durable"], json!(true));
+    assert_eq!(parsed["complete"], json!(true));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_can_never_leave_an_empty_document_file() {
+    // The property the placeholder broke: at no point does the destination
+    // exist without its full content. Approximated here by watching the
+    // directory while the export runs - every time `Alpha.md` is visible,
+    // it must already be complete.
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let watched = out.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher_stop = std::sync::Arc::clone(&stop);
+    let watcher = std::thread::spawn(move || {
+        let mut empty_sightings = 0_usize;
+        while !watcher_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(content) = std::fs::read(watched.join("Alpha.md")) {
+                if content.is_empty() {
+                    empty_sightings += 1;
+                }
+            }
+        }
+        empty_sightings
+    });
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "export",
+                "--collection",
+                COLLECTION,
+                "--overwrite",
+                "--out",
+            ])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let empty_sightings = watcher.join().unwrap();
+
+    assert_eq!(
+        empty_sightings, 0,
+        "the destination existed with no content at some point"
+    );
+    assert!(std::fs::read_to_string(out.join("Alpha.md"))
+        .unwrap()
+        .contains("body of a"));
+}

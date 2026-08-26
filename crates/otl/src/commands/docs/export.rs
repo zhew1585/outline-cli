@@ -22,7 +22,7 @@ use crate::render::{self, OutputMode};
 use crate::session::Session;
 use crate::stdio;
 
-use super::target::{self, Dir, TempName};
+use super::target::{self, Dir, TempNames};
 use super::tree::{self, Plan};
 
 /// Operation that enumerates a collection's documents (auto-paginated).
@@ -75,9 +75,9 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     let args = vec![("collectionId".to_string(), cmd.collection.clone())];
     let documents = session.call_rows(LIST_OPERATION, &args, cmd.limit)?;
     let plan = tree::plan(&documents.items);
-    if plan.is_empty() {
+    if plan.is_empty() && plan.unusable().is_empty() {
         stdio::write_diagnostic_line("notice: this collection has no documents to export");
-    } else {
+    } else if !plan.is_empty() {
         stdio::write_diagnostic_line(&format!("exporting {} document(s)...", plan.len()));
     }
     let mut export = Export {
@@ -87,8 +87,9 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
         written: Vec::new(),
         failures: Vec::new(),
         flattened: false,
-        temp_counter: 0,
+        temp_names: TempNames::new(),
         written_ids: HashSet::new(),
+        undurable: Vec::new(),
         // Only truncation the caller did NOT ask for makes the export
         // incomplete. `--limit N` stopping at N documents is the requested
         // outcome and stays exit 0 - the same boundary the other curated
@@ -104,13 +105,7 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
         export.fail(&unusable.label(), unusable.reason.to_string());
     }
     export.write_level(&root_dir, &plan, &plan.roots, 0, &mut Names::new());
-    if let Err(reason) = root_dir.sync() {
-        stdio::write_diagnostic_line(&format!(
-            "warning: could not flush {} to disk ({reason}); the files are \
-             written but a crash could lose the most recent directory entries",
-            root.display()
-        ));
-    }
+    export.flush(&root_dir);
     export.finish(mode)
 }
 
@@ -123,8 +118,9 @@ struct Export<'a> {
     failures: Vec<Failure>,
     /// Whether the depth-cap warning has already been printed.
     flattened: bool,
-    /// Counter making each temporary file name unique within this run.
-    temp_counter: u64,
+    /// Unpredictable names for the temporary files documents are written
+    /// through.
+    temp_names: TempNames,
     /// Filesystem identity of every file this run has written.
     ///
     /// The de-duplication in [`Names`] folds Unicode case and
@@ -139,6 +135,13 @@ struct Export<'a> {
     truncated: Option<engine::Truncation>,
     /// Whether `--limit` is what stopped the enumeration.
     limited: bool,
+    /// Directories whose entries could not be flushed to disk.
+    ///
+    /// The files are written and readable; what is unknown is whether they
+    /// survive a crash. A backup that cannot confirm durability must not
+    /// report itself as a clean success, so this reaches the exit code and
+    /// the JSON summary rather than only stderr.
+    undurable: Vec<String>,
 }
 
 impl Export<'_> {
@@ -212,11 +215,21 @@ impl Export<'_> {
         let own = child_names.claim_exact(stem);
         self.write_document(&child_dir, plan, node, &own);
         self.write_level(&child_dir, plan, children, depth + 1, &mut child_names);
-        if let Err(reason) = child_dir.sync() {
+        self.flush(&child_dir);
+    }
+
+    /// Flush one directory, recording a failure to do so.
+    ///
+    /// Also the last time this directory is verified, which is what covers
+    /// a swap performed after the final write into it.
+    fn flush(&mut self, dir: &Dir) {
+        if let Err(reason) = dir.sync() {
             stdio::write_diagnostic_line(&format!(
-                "warning: could not flush {} to disk ({reason})",
-                child_dir.path().display()
+                "warning: could not flush {} to disk: {reason}",
+                dir.path().display()
             ));
+            self.undurable
+                .push(format!("{}: {reason}", dir.path().display()));
         }
     }
 
@@ -247,20 +260,29 @@ impl Export<'_> {
                 return;
             }
         }
-        self.temp_counter += 1;
-        let temp = TempName {
-            counter: self.temp_counter,
+        let written = target::write_atomically(
+            dir,
+            &file_name,
+            EXTENSION,
+            &mut self.temp_names,
+            &markdown,
+            self.overwrite,
+        );
+        let path = match written {
+            Ok(path) => path,
+            Err(reason) => return self.fail(id, reason),
         };
-        match target::write_atomically(dir, &file_name, EXTENSION, &temp, &markdown, self.overwrite)
-        {
-            Ok(path) => {
-                if let Some(id) = target::existing_identity(path.as_path()) {
-                    self.written_ids.insert(id);
-                }
-                self.record(&path);
-            }
-            Err(reason) => self.fail(id, reason),
+        // Where did it actually land? Re-resolved rather than trusted: a
+        // directory swapped between the check above and the write would
+        // otherwise be reported as a successful export of a path this run
+        // never wrote to.
+        if let Err(reason) = target::landed_inside(self.root, &path) {
+            return self.fail(id, reason);
         }
+        if let Some(identity) = target::existing_identity(&path) {
+            self.written_ids.insert(identity);
+        }
+        self.record(&path);
     }
 
     /// The markdown for one document, with a title heading.
@@ -323,12 +345,14 @@ impl Export<'_> {
 
     /// Print the result and pick the exit status.
     ///
-    /// Exit 9 (partial failure) covers BOTH ways an export can come out
-    /// short: individual documents that could not be written, and an
-    /// enumeration that never listed every document in the first place. The
-    /// second one is the more dangerous of the two, because the output
+    /// Exit 9 (partial failure) covers every way an export can come out
+    /// short of what it promised: individual documents that could not be
+    /// written, an enumeration that never listed every document in the
+    /// first place, and directories whose entries could not be flushed to
+    /// disk. The last two are the dangerous ones, because the output
     /// directory looks perfectly healthy - nothing in it says that
-    /// documents 10,001 and beyond were never requested.
+    /// documents 10,001 and beyond were never requested, or that the names
+    /// of the files in it may not survive a power loss.
     fn finish(self, mode: OutputMode) -> Result<(), CliError> {
         match mode {
             OutputMode::Json => self.print_json()?,
@@ -340,6 +364,20 @@ impl Export<'_> {
             self.root.display()
         ));
         let mut reasons: Vec<String> = Vec::new();
+        if !self.undurable.is_empty() {
+            reasons.push(format!(
+                "{} director{} could not be flushed to disk, so the files \
+                 written there are readable now but are not known to survive \
+                 a crash:\n  {}",
+                self.undurable.len(),
+                if self.undurable.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                self.undurable.join("\n  ")
+            ));
+        }
         if let Some(truncation) = &self.truncated {
             reasons.push(format!(
                 "the collection listing stopped after {} document(s) before \
@@ -356,6 +394,11 @@ impl Export<'_> {
             return Ok(());
         }
         Err(CliError::partial(anyhow!("{}", reasons.join("\n"))))
+    }
+
+    /// Whether the export delivered everything it was asked for, durably.
+    fn is_complete(&self) -> bool {
+        self.failures.is_empty() && self.truncated.is_none() && self.undurable.is_empty()
     }
 
     /// The written paths, one per line (the scriptable form of the result).
@@ -378,12 +421,17 @@ impl Export<'_> {
     /// - `limit_reached`: `--limit` stopped the listing. Not a failure - it
     ///   is what was requested - but a script asking "is this the whole
     ///   collection?" needs `complete && !limit_reached`.
+    /// - `durable`: every directory written was flushed to disk. False
+    ///   means the files are there and readable, but a crash could still
+    ///   lose them - which is exactly the kind of thing an automated backup
+    ///   has to be able to notice rather than read about on stderr.
     fn print_json(&self) -> Result<(), CliError> {
         let payload = serde_json::json!({
             "out": self.root.display().to_string(),
-            "complete": self.failures.is_empty() && self.truncated.is_none(),
+            "complete": self.is_complete(),
             "enumeration_truncated": self.truncated.is_some(),
             "limit_reached": self.limited,
+            "durable": self.undurable.is_empty(),
             "exported": self.written,
             "failed": self
                 .failures

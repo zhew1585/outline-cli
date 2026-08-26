@@ -15,3 +15,4 @@ pub mod paging;
 pub mod render;
 pub mod session;
 pub mod stdio;
+pub mod text;

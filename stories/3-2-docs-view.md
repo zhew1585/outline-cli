@@ -36,6 +36,8 @@ so that 终端内完成阅读。
   - [x] URL 始终作为独立 argv 末位参数传入，不经 shell
   - [x] `Session::absolute_url`：只接受"纯 root-relative 路径"（无 scheme/authority/`..`/空白/控制符/`\`/`:`），否则拒绝
   - [x] R1 修复：额外拒绝百分号编码的分隔符/点段（`%2e` `%2f` `%5c`）与不可见/双向格式字符
+  - [x] R3 修复：不可见字符表改为完整 Unicode `Cf` 类别（`crate::text`），
+        手写清单曾漏掉 U+061C、U+06DD、U+070F、U+0600–0605、U+13430 整块等 26+ 个字符
 - [x] Task 3: 命令实现 (AC: 1, 2, 3)
   - [x] `commands/docs/view.rs`：`documents.info id=<id>`
   - [x] 默认输出 markdown（管道也是 markdown，不是 JSON）；`--json` 才是对象

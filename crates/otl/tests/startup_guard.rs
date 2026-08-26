@@ -159,6 +159,11 @@ const SOURCE_SCAN_ALLOWLIST: &[(&str, &str, usize)] = &[
     // contents unless `--overwrite` is given, which means enumerating the
     // user-supplied output directory. One call site: `is_empty_dir`.
     ("commands/docs/export.rs", "read_dir", 1),
+    // One `#[cfg(test)]` helper that lists a temporary directory, so the
+    // write tests can assert exactly which entries a write left behind -
+    // which is how "no temporary file survived" is checked. Test-only, and
+    // the directory it reads is one the test just created.
+    ("commands/docs/target.rs", "read_dir", 1),
     // Golden-file assertions inside `#[cfg(test)]` modules: the curated
     // commands' human-readable output is compared byte-for-byte against
     // `tests/golden/*.txt`. The embedded files are test fixtures, compiled

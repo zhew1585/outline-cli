@@ -249,8 +249,11 @@ fn count_nodes(structure: &Value) -> Option<NodeCount> {
             return None;
         }
         nodes += 1;
-        if let Some(children) = node.get("children").and_then(Value::as_array) {
-            stack.extend(children.iter());
+        if let Some(children) = node.get("children") {
+            // A `children` field that is not a list of nodes means the
+            // subtree cannot be walked. Treating it as a leaf would report
+            // an exact count that silently omits everything under it.
+            stack.extend(children.as_array()?.iter());
         }
     }
     Some(NodeCount {
@@ -285,6 +288,14 @@ mod tests {
     }
 
     #[test]
+    fn a_node_without_a_children_field_is_a_leaf() {
+        // Absent is different from malformed: a leaf legitimately has no
+        // `children` key at all.
+        let structure = json!([{ "id": "a" }, { "id": "b", "children": [] }]);
+        assert_eq!(count_nodes(&structure).map(|count| count.nodes), Some(2));
+    }
+
+    #[test]
     fn an_empty_array_is_a_genuine_zero() {
         let count = count_nodes(&json!([])).expect("an empty array is countable");
         assert_eq!(count.nodes, 0);
@@ -304,6 +315,12 @@ mod tests {
             json!([null]),
             json!(["not a node"]),
             json!([{ "id": "a", "children": [null] }]),
+            // A `children` field of the wrong type: the subtree under it
+            // cannot be walked, so no exact count can be claimed.
+            json!([{ "id": "a", "children": { "id": "b" } }]),
+            json!([{ "id": "a", "children": "b" }]),
+            json!([{ "id": "a", "children": 3 }]),
+            json!([{ "id": "a", "children": [{ "id": "b", "children": {} }] }]),
         ] {
             assert_eq!(
                 count_nodes(&payload),

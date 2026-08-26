@@ -60,11 +60,19 @@ impl Unusable {
     /// There is no document id to print - that is the whole problem - so
     /// the position in the listing stands in for one, with the title when
     /// the row had one.
+    ///
+    /// The title is SERVER text written by whoever can edit the document,
+    /// and this string goes to stderr as a plain line. It therefore goes
+    /// through [`crate::text::quote`] first, like every other piece of
+    /// server text that reaches a terminal: untouched, a title could set
+    /// the clipboard with `ESC ] 52`, or contain a newline and forge an
+    /// extra failure entry in the summary.
     pub fn label(&self) -> String {
-        if self.title.is_empty() {
+        let title = crate::text::quote(&self.title);
+        if title.is_empty() {
             return format!("listing row {}", self.position);
         }
-        format!("listing row {} ({})", self.position, self.title)
+        format!("listing row {} ({title})", self.position)
     }
 }
 

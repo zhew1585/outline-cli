@@ -37,13 +37,19 @@ so that 内容可进 git 或离线阅读。
   - [x] 每篇正文前置 `# <title>`（文件名已被安全化，标题靠这行保真），已以 `# ` 开头则不重复加
   - [x] 目录深度上限 8 层，更深的**用队列**（不是递归）平铺到该层并警告一次
   - [x] 写盘原子化：同目录 temp（`create_new`）→ `write_all` → `fsync` → `rename`；失败清理 temp
-  - [x] R2 修复：无 `--overwrite` 时先用 `create_new` **占位**目标名（内核保证互斥），再 temp→rename 覆盖占位；
-        失败连占位一起删。「目标不存在」不再是 check-then-rename
+  - [x] R3 重做：**不再占位**。temp 写完 fsync 后，无 `--overwrite` 用 `hard_link`（**不替换**语义）落地、
+        再删 temp；有 `--overwrite` 用 `rename`（替换语义）。目标处永远只有「完整文档」或「什么都没有」
+  - [x] R3 修复：temp 名由 OS 播种的 `RandomState` 生成（不再是 pid+counter），且清理只删
+        `create_new` **确实由本次创建**的那个文件（`TempFile` 的 Drop），不再按路径删别人的文件
   - [x] R2 修复：目录写完后 `fsync` 目录项（Unix），rename 的持久性不再只依赖文件内容 fsync
+  - [x] R3 修复：目录 fsync 失败进入退出码与 `--json`（`durable:false` + exit 9），不再只警告
   - [x] 不跟随符号链接：子目录 `create_dir` + `symlink_metadata` 校验 + canonicalize 后必须仍在 root 内；
         文件只经 `create_new` + `rename` 落地（`rename` 替换链接而非跟随），无 check-then-open 竞态
   - [x] R2 修复：目录被**钉住**（`Dir` 记录 open 时的 (dev, ino)），每次写入前 `verify()` 复核；
         目录被换成链接或另一个目录会报错而非静默接收导出
+  - [x] R3 修复：`Dir::sync()` 也 verify（覆盖「最后一篇写完之后才替换」），
+        且每篇写完用 `landed_inside` 重新 canonicalize 目标、要求仍在 root 内——
+        逃逸出去的写入会被**报告为失败**，不会以 exit 0 + 列出外部路径收场
   - [x] `documents.info` 无 `text` 字段（或为 null）→ 记为失败，不写只有标题的文件；空字符串照常导出
   - [x] `--out` 非空目录在**任何请求之前**拒绝（退出码 2），`--overwrite` 才允许覆盖
 - [x] Task 4: 部分失败 (AC: 2)
@@ -54,6 +60,8 @@ so that 内容可进 git 或离线阅读。
         （用 `Rows::incomplete()` 而不是 `truncation.is_some()`）
   - [x] R2 修复：枚举里**无可用 id 的行**计入 Failure（`Plan::unusable`），
         不再「丢掉 + 只警告 + complete:true」；重复 id 仍只警告（文档本身没丢）
+  - [x] R3 修复：`Unusable::label` 的服务端标题经 `text::quote` 清洗（控制符→空格、换行折平、
+        Cf 格式字符丢弃、长度封顶）才进 stderr；且「全是 unusable 行」不再同时喊「没有文档」和「导出失败」
   - [x] 枚举本身失败 → 沿用其自身退出码（3-7），不写任何文件，不报 9
   - [x] stdout：Table 模式逐行输出相对路径；JSON 模式输出 `{out, exported[], failed[]}`
 - [x] Task 5: 测试 (AC: 1, 2)
@@ -81,6 +89,16 @@ so that 内容可进 git 或离线阅读。
   1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
   2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
      递归深度因此被 `MAX_DEPTH` 硬性封顶。
+- **占位法是错的**（R3 finding 2）：R2 用「先 `create_new` 占名、再 rename 覆盖占位」拿到了互斥，
+  但代价是目标路径在那个窗口里是一个**零字节的正式文件**。并发读者会读到空文档；
+  更糟的是进程在窗口内被 SIGKILL 或断电，那个空 `Document.md` 会永久留下，
+  而下一次无 `--overwrite` 的导出又会因「目标已存在」而拒绝——一次崩溃变成需要人工清理的持久故障。
+  现在：temp 写完 fsync 后用 `hard_link`（**不替换**语义，重名即失败）落地，再删 temp。
+  互斥仍是内核给的，而目标处从不出现半成品。`--overwrite` 仍用 `rename`（替换语义）。
+- **清理只能删自己创建的东西**（R3 finding 3）：旧代码按路径 cleanup，
+  于是 temp 的 `create_new` 因「已存在」失败时，紧接着的 `remove_file` 把**别人那个文件删了**。
+  现在 `TempFile` 只在 `create_new` 成功后才存在，Drop 删的就是它自己创建的那个；
+  temp 名也从可预测的 `pid+counter` 换成 OS 播种的随机名（否则可被预先占据）。
 - **写盘为什么必须原子**（R1 finding 3）：旧实现 `--overwrite` 先 `truncate(true)` 再写，
   一旦 `write_all`/`flush` 中途失败（磁盘满、配额），**上一次有效备份已经被清空了**，
   而命令只报一个 exit 9。改为「同目录 temp → fsync → rename」后：目标文件只被 `rename` 整体替换，
@@ -97,7 +115,10 @@ so that 内容可进 git 或离线阅读。
   `--out` 的**末级**不得是符号链接（退出 2）。
 - **Unicode 去重键**（R1 finding 4 + R2 finding 5）：NFC 的 `é`（U+00E9）与 NFD 的 `e`+U+0301 是不同字节串，
   但在 macOS 卷上是**同一个目录项**；希腊 final sigma `ς` 与 `σ` 在大小写不敏感卷上同理。
-  `to_lowercase()` 挡不住后者（`ς` 本来就是小写），所以键是「先 uppercase 再 lowercase，再 NFC」——
+  `to_lowercase()` 挡不住后者（`ς` 本来就是小写），所以键是「uppercase→lowercase **迭代到不动点**，再 NFC」——
+  一次往返不是不动点：`ẞ` uppercase 是自己、lowercase 得 `ß`，而 `ß` uppercase 得 `SS`、lowercase 得 `ss`，
+  单次会给出 `ß` 与 `ss` 两个键（R3 finding 5，属于**欠**折叠，正是会丢文档的方向）；
+  迭代后 `ẞ`→`ß`→`ss` 收敛，三种写法同键。
   不带完整 case-folding 表拿到 caseless 比较的标准做法，比单纯 lowercase 更激进。
   两个方向的误差被权衡过并写进代码注释：**折多了**只是让某个名字白拿一个 `-2` 后缀（外观代价），
   **折少了**是两篇文档抢一个目录项、丢一篇（数据代价）。因此故意偏向折多。
@@ -120,10 +141,19 @@ so that 内容可进 git 或离线阅读。
   不在本 story 范围。
 - **不写 manifest**：没有 id → 路径的映射文件，因此二次导出后无法按 id 定位旧文件。
   v2 的 pull/push 才需要这个。
+- **Windows 的别名保护从 story 提升成了运行时行为**（R3 finding 5）：
+  默认（无 `--overwrite`）路径用 `hard_link` 落地，**不替换**语义在所有平台上都会因重名而失败——
+  文件系统认为两个名字等价时，第二次 link 直接报错，不再依赖 (dev, ino)。
+  `--overwrite` 模式下仍只有 Unix 有身份预检查。
 - **(dev, ino) 兜底与目录钉住只在 Unix**：Windows 的 file index 只有 std 的 unstable API 能拿到
   （`MetadataExt::file_index`，`windows_by_handle` feature）。NTFS 大小写不敏感但不做 normalization folding，
   而本键的 uppercase 往返正好覆盖 NTFS 的 uppercase 折叠，所以 Windows 上的残余风险很小；
   但**它确实没有兜底**，这一点在此明记。`create_new` + `rename` 的保证是跨平台的，承重部分在那里。
+- **逃逸必须至少被报告**（R3 finding 4）：R2 声称「替换会被报告」，那半句不成立——
+  `verify()` 之后到落地之间被替换、且最后一篇文档之后不再 verify 时，
+  写入可以成功落到 root 外而命令仍 exit 0 并把外部路径列为已导出。两处补上：
+  `Dir::sync()` 也 verify（覆盖最后一篇），以及每篇写完后 `landed_inside` 重新解析目标路径。
+  后者是**事后检测**（字节已经在别处了），但它堵住了「以成功姿态汇报一个自己没写的路径」。
 - **路径式写入无法对抗「导出过程中被重命名目录」的攻击者**（R2 finding 4）：
   resolved path 检查完再使用，中间那个窗口要用 `openat` 系目录句柄才能关掉，std 不提供，
   而本项目禁止 `unsafe`。两点约束损失：这种攻击者本来就对被写入的目录树有写权限（他能直接改导出结果）；

@@ -140,40 +140,6 @@ impl Session {
     }
 }
 
-/// Ranges of invisible or text-reordering formatting characters.
-///
-/// These are not `char::is_control`, but a right-to-left override inside a
-/// URL makes the link printed on stdout read as a different address than the
-/// one the browser will open - which defeats the point of printing it.
-///
-/// Given as RANGES covering the Unicode `Cf` (format) category rather than a
-/// hand-picked list, because a hand-picked list is exactly the kind of thing
-/// that goes stale: an earlier version of this check named U+202E and
-/// U+2066..U+2069 and quietly let U+061C (ARABIC LETTER MARK) and the
-/// deprecated U+206A..U+206F through. A URL path has no legitimate use for
-/// any of them.
-const INVISIBLE_RANGES: &[(char, char)] = &[
-    ('\u{00ad}', '\u{00ad}'),   // SOFT HYPHEN
-    ('\u{061c}', '\u{061c}'),   // ARABIC LETTER MARK
-    ('\u{180e}', '\u{180e}'),   // MONGOLIAN VOWEL SEPARATOR
-    ('\u{200b}', '\u{200f}'),   // zero width space .. RIGHT-TO-LEFT MARK
-    ('\u{202a}', '\u{202e}'),   // embedding and override controls
-    ('\u{2060}', '\u{2064}'),   // word joiner .. invisible plus
-    ('\u{2066}', '\u{206f}'),   // isolates and the deprecated format controls
-    ('\u{feff}', '\u{feff}'),   // ZERO WIDTH NO-BREAK SPACE (BOM)
-    ('\u{fff9}', '\u{fffb}'),   // interlinear annotation controls
-    ('\u{1d173}', '\u{1d17a}'), // musical format controls
-    ('\u{e0001}', '\u{e0001}'), // LANGUAGE TAG (deprecated)
-    ('\u{e0020}', '\u{e007f}'), // tag characters
-];
-
-/// Whether `c` is one of the invisible or reordering formatting characters.
-fn is_invisible(c: char) -> bool {
-    INVISIBLE_RANGES
-        .iter()
-        .any(|(first, last)| c >= *first && c <= *last)
-}
-
 /// Percent-encodings that a URL parser turns back into a path separator or
 /// a dot segment. Compared case-insensitively.
 const ENCODED_SEPARATORS: &[&str] = &["%2e", "%2f", "%5c"];
@@ -194,7 +160,10 @@ const ENCODED_SEPARATORS: &[&str] = &["%2e", "%2f", "%5c"];
 ///   one validated. Outline's own `url` values are plain slugs, so there is
 ///   nothing legitimate to lose here.
 /// - **invisible and bidirectional formatting characters**: they survive
-///   into stdout and make the printed link read as a different path.
+///   into stdout and make the printed link read as a different path. The
+///   set is the whole Unicode `Cf` category (see [`crate::text`]), not a
+///   hand-picked list - a hand-picked one here had already let U+061C and
+///   U+206A..U+206F through.
 fn is_safe_relative_path(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
     path.starts_with('/')
@@ -205,9 +174,9 @@ fn is_safe_relative_path(path: &str) -> bool {
         && !ENCODED_SEPARATORS
             .iter()
             .any(|encoded| lowered.contains(encoded))
-        && !path
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || c == '\u{7f}' || is_invisible(c))
+        && !path.chars().any(|c| {
+            c.is_control() || c.is_whitespace() || c == '\u{7f}' || crate::text::is_invisible(c)
+        })
 }
 
 /// Take the `data` payload out of a response envelope.
@@ -386,22 +355,19 @@ mod tests {
     }
 
     #[test]
-    fn the_invisible_ranges_are_well_formed_and_ordered() {
-        // A typo'd range (last < first) would silently match nothing.
-        let mut previous: Option<char> = None;
-        for (first, last) in INVISIBLE_RANGES {
-            assert!(first <= last, "reversed range {first:?}..{last:?}");
-            if let Some(previous) = previous {
-                assert!(previous < *first, "unordered range at {first:?}");
-            }
-            previous = Some(*last);
+    fn the_rejection_set_is_the_whole_format_category() {
+        // Previously a hand-picked list; these are the ones it missed.
+        for path in [
+            "/doc/a\u{0600}b",  // ARABIC NUMBER SIGN
+            "/doc/a\u{06dd}b",  // ARABIC END OF AYAH
+            "/doc/a\u{070f}b",  // SYRIAC ABBREVIATION MARK
+            "/doc/a\u{0890}b",  // ARABIC POUND MARK ABOVE
+            "/doc/a\u{110bd}b", // KAITHI NUMBER SIGN
+            "/doc/a\u{13430}b", // Egyptian hieroglyph format control
+            "/doc/a\u{1bca0}b", // SHORTHAND FORMAT LETTER OVERLAP
+        ] {
+            assert!(!is_safe_relative_path(path), "accepted {path:?}");
         }
-        // Spot-check both ends of a multi-codepoint range.
-        assert!(is_invisible('\u{200b}'));
-        assert!(is_invisible('\u{200f}'));
-        assert!(!is_invisible('\u{2010}'));
-        assert!(!is_invisible('a'));
-        assert!(!is_invisible('\u{4e2d}'));
     }
 
     #[test]

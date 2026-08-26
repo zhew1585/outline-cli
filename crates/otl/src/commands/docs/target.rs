@@ -1,39 +1,59 @@
 //! The filesystem side of `otl docs export`.
 //!
 //! Everything that touches the output tree lives here, so the rules below
-//! hold for every write rather than at each call site:
+//! hold for every write rather than at each call site.
 //!
-//! - a directory is PINNED when it is created or accepted, and re-checked
-//!   before each write into it (see [`Dir::verify`]);
-//! - a file is never opened by path for writing. Content goes into a fresh
-//!   temporary file created with `create_new` and is moved into place with
-//!   `rename`, which replaces a symlink at the destination instead of
-//!   following it;
-//! - without `--overwrite`, the destination name is CLAIMED with
-//!   `create_new` before anything is written, so "this file did not exist"
-//!   is enforced by the kernel rather than by a check that a second process
-//!   could race.
+//! ## A document file is never partially visible
+//!
+//! Content is written to a temporary file, fsynced, and only then given its
+//! real name. The destination therefore only ever exists with the whole
+//! document in it: there is no window in which a reader - or a crash - can
+//! find an empty or half-written `Document.md`.
+//!
+//! Which system call gives it that name depends on the mode, because the
+//! two modes want opposite things:
+//!
+//! - **without `--overwrite`**: [`std::fs::hard_link`], whose defining
+//!   property is that it FAILS if the name is taken. That is the no-clobber
+//!   guarantee, enforced by the kernel on every platform, and it doubles as
+//!   collision detection: if the filesystem considers two of our names
+//!   equivalent, the second link fails instead of silently replacing the
+//!   first. The temporary file is unlinked afterwards.
+//! - **with `--overwrite`**: [`std::fs::rename`], which replaces
+//!   atomically - including replacing a symlink at the destination rather
+//!   than following it.
 //!
 //! ## What this cannot do
 //!
-//! A path-based write can always be redirected by someone able to rename
-//! directories inside the output tree while the export runs: the resolved
-//! path is checked, then used, and closing that window needs `openat`-style
-//! directory handles, which the standard library does not expose (and which
-//! `otl` will not reach for through `unsafe`). Two things bound the damage
-//! instead. Such an attacker already has write access to the tree being
-//! written, so they can rewrite the exported files anyway; and the identity
-//! pin turns the swap from a silent escape into a reported failure, because
-//! a replaced directory does not have the inode that was pinned.
+//! A path-based write can be redirected by someone able to rename
+//! directories inside the output tree while the export runs. Closing that
+//! window needs `openat`-style directory handles, which the standard
+//! library does not expose and which `otl` will not reach for through
+//! `unsafe`. Two things bound it instead:
 //!
-//! On Windows the identity pin is inert: the file index is only reachable
-//! through an unstable standard-library API. The `create_new`/`rename`
-//! rules above are platform-independent and do the load-bearing work.
+//! - such an attacker already has write access to the tree being written,
+//!   so they can rewrite the exported files anyway;
+//! - a write that lands outside the output directory is DETECTED after the
+//!   fact: [`landed_inside`] re-resolves the file that was just written and
+//!   the caller reports it as a failure. That is detection rather than
+//!   prevention (the bytes are already elsewhere), but it is what stops the
+//!   command from exiting 0 and listing a path it did not actually write.
+//!
+//! [`Dir::verify`] additionally catches a directory that was swapped and
+//! left swapped. A swap that is reverted before the next check is not
+//! detectable this way; the post-write resolution above is what covers that
+//! case.
+//!
+//! On Windows the identity pin in `Dir` is inert, because the file index is
+//! only reachable through an unstable standard-library API. The
+//! `hard_link`/`rename` rules above are platform-independent and do the
+//! load-bearing work.
 
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::path::{Path, PathBuf};
 
 /// Prefix of the temporary file each document is written through.
-const TEMP_PREFIX: &str = "otl-export-";
+const TEMP_PREFIX: &str = ".otl-export-";
 
 /// The filesystem identity of a path, where the platform exposes one.
 ///
@@ -82,10 +102,10 @@ impl Dir {
 
     /// Re-check that this path still names the directory that was pinned.
     ///
-    /// Called before every write. It does not make a path-based write
-    /// atomic (see the module docs), but it does mean a directory swapped
-    /// for a link or another directory is reported instead of silently
-    /// receiving the export.
+    /// Called before every write and again when the directory is flushed,
+    /// so that the LAST document written into a directory is covered too -
+    /// without the check at flush time, a swap performed after the final
+    /// write would never be looked at.
     pub fn verify(&self) -> Result<(), String> {
         let metadata = std::fs::symlink_metadata(&self.path)
             .map_err(|error| format!("the target directory is gone: {}", error.kind()))?;
@@ -131,16 +151,18 @@ impl Dir {
         Self::open(path)
     }
 
-    /// Flush this directory's entries to disk.
+    /// Flush this directory's entries to disk, re-verifying it first.
     ///
     /// `sync_all` on a file only promises that its CONTENT survives a
-    /// crash; the directory entry that gives it a name is separate metadata.
-    /// Without this, a power loss right after a successful export can leave
-    /// the backup missing files whose data was already durable.
+    /// crash; the directory entry that gives it a name is separate
+    /// metadata. Without this, a power loss right after a successful export
+    /// can leave the backup missing files whose data was already durable.
     ///
-    /// Unix only: Windows has no equivalent of opening a directory as a
-    /// handle to sync through the standard library.
+    /// Unix only for the flush itself: Windows has no way to open a
+    /// directory as a handle through the standard library. The verification
+    /// happens on every platform.
     pub fn sync(&self) -> Result<(), String> {
+        self.verify()?;
         #[cfg(unix)]
         {
             std::fs::File::open(&self.path)
@@ -154,106 +176,172 @@ impl Dir {
     }
 }
 
-/// The unique part of one temporary file name.
-pub struct TempName {
-    /// Distinguishes writes within one run.
-    pub counter: u64,
+/// A temporary file that removes itself unless it is explicitly kept.
+///
+/// Ownership is the point. The file is created with `create_new`, so its
+/// existence PROVES this run created it, and only then does the guard take
+/// responsibility for removing it. An earlier version cleaned up by path
+/// after any failure, which meant a `create_new` that failed because
+/// something was already there went on to delete that something - a file
+/// belonging to another process, or to the user.
+struct TempFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    keep: bool,
 }
 
-impl TempName {
-    /// The file name to create in the destination directory.
+impl TempFile {
+    /// Create a new temporary file in `dir`, failing if the name is taken.
+    fn create(dir: &Path, name: &str) -> std::io::Result<Self> {
+        let path = dir.join(name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            keep: false,
+        })
+    }
+
+    /// Write the content and flush it all the way to disk.
     ///
-    /// Unique per write within a run (the counter) and per run (the pid), so
-    /// two concurrent exports into one directory cannot pick the same
-    /// temporary file - and `create_new` fails loudly rather than sharing
-    /// one if they somehow did.
-    fn file_name(&self, extension: &str) -> String {
-        format!(
-            ".{TEMP_PREFIX}{}-{}.{extension}",
-            std::process::id(),
-            self.counter
-        )
+    /// fsync before the file is given its real name: a name that beats its
+    /// own data to disk would leave an empty document behind a power loss.
+    fn fill(&mut self, content: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let Some(file) = self.file.as_mut() else {
+            return Err(std::io::Error::other("the temporary file is closed"));
+        };
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        // Close before linking or renaming: Windows will not rename a file
+        // that is still open.
+        self.file = None;
+        Ok(())
     }
 }
 
-/// Write one file into `dir`, atomically, and return the path written.
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        self.file = None;
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Names the temporary files of one export run.
 ///
-/// The sequence, and what each step is for:
+/// The names are unpredictable on purpose. A predictable one (pid plus a
+/// counter) can be occupied in advance by anyone who can write to the
+/// output directory, which at best denies service and at worst - with the
+/// old path-based cleanup - got that file deleted.
+pub struct TempNames {
+    /// Keyed hasher, seeded once from the operating system.
+    state: RandomState,
+    counter: u64,
+}
+
+impl TempNames {
+    /// A fresh namer whose sequence cannot be predicted from outside.
+    ///
+    /// `RandomState` takes its key from the operating system, so two runs -
+    /// and two processes - produce unrelated sequences. The counter only
+    /// makes names unique WITHIN a run; the key is what makes them
+    /// unguessable, which is the property the old `pid`-plus-counter scheme
+    /// lacked.
+    pub fn new() -> Self {
+        Self {
+            state: RandomState::new(),
+            counter: 0,
+        }
+    }
+
+    /// The next temporary file name.
+    fn next(&mut self, extension: &str) -> String {
+        self.counter += 1;
+        let mut hasher = self.state.build_hasher();
+        hasher.write_u64(self.counter);
+        format!("{TEMP_PREFIX}{:016x}.{extension}", hasher.finish())
+    }
+}
+
+impl Default for TempNames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Write one file into `dir` and return the path it was written to.
 ///
-/// 1. [`Dir::verify`] - the directory is still the one that was pinned.
-/// 2. Without `overwrite`, the destination name is CLAIMED with
-///    `create_new`. This is the no-clobber guarantee, and it is the
-///    kernel's: two processes exporting the same name into the same
-///    directory cannot both succeed, which a "does it exist yet?" test
-///    followed by a rename could not prevent.
-/// 3. The content goes into a fresh temporary file in the same directory
-///    (`create_new`, so it can never follow a link) and is fsynced.
-/// 4. `rename` moves it onto the destination: an all-or-nothing replacement
-///    that leaves a previous file untouched if anything above failed, and
-///    that replaces a symlink at the destination rather than following it.
-///
-/// Any failure removes the temporary file, and the claimed destination as
-/// well, so a failed export leaves no debris and does not block a re-run.
+/// See the module documentation for the guarantees. In short: the content
+/// lands complete or not at all, and without `overwrite` the name is taken
+/// with no-replace semantics rather than by testing whether it is free.
 pub fn write_atomically(
     dir: &Dir,
     file_name: &str,
     extension: &str,
-    temp: &TempName,
+    names: &mut TempNames,
     content: &str,
     overwrite: bool,
 ) -> Result<PathBuf, String> {
-    use std::io::Write;
-
     dir.verify()?;
     let dest = dir.path().join(file_name);
-    let claimed = if overwrite {
-        false
-    } else {
-        claim(&dest)?;
-        true
-    };
-    let cleanup = |temp_path: &Path| {
-        let _ = std::fs::remove_file(temp_path);
-        if claimed {
-            let _ = std::fs::remove_file(&dest);
-        }
-    };
 
-    let temp_path = dir.path().join(temp.file_name(extension));
-    let write = || -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        file.write_all(content.as_bytes())?;
-        // fsync before rename: a rename that beats its own data to disk
-        // would leave an empty file behind a power loss.
-        file.sync_all()
-    };
-    if let Err(error) = write() {
-        cleanup(&temp_path);
-        return Err(format!("cannot write the file: {}", error.kind()));
-    }
-    if let Err(error) = std::fs::rename(&temp_path, &dest) {
-        cleanup(&temp_path);
-        return Err(format!("cannot place the file: {}", error.kind()));
-    }
-    Ok(dest)
-}
+    let mut temp = TempFile::create(dir.path(), &names.next(extension))
+        .map_err(|error| format!("cannot create a temporary file: {}", error.kind()))?;
+    temp.fill(content)
+        .map_err(|error| format!("cannot write the file: {}", error.kind()))?;
 
-/// Claim a destination name that must not already exist.
-fn claim(dest: &Path) -> Result<(), String> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-    {
-        Ok(_) => Ok(()),
+    if overwrite {
+        // Replace semantics, and the only step that touches the
+        // destination: it either becomes the new file or stays as it was.
+        std::fs::rename(&temp.path, &dest)
+            .map_err(|error| format!("cannot place the file: {}", error.kind()))?;
+        temp.keep = true; // renamed away; nothing left to remove
+        return Ok(dest);
+    }
+
+    // No-replace semantics: the link fails if anything already answers to
+    // that name, including a name the filesystem considers equivalent to
+    // one already written.
+    match std::fs::hard_link(&temp.path, &dest) {
+        Ok(()) => Ok(dest),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err("a file already exists at this path; pass --overwrite to replace it".to_string())
         }
-        Err(error) => Err(format!("cannot create the file: {}", error.kind())),
+        Err(error) => Err(format!("cannot place the file: {}", error.kind())),
     }
+    // `temp` drops here and removes itself: on success the content now has
+    // its real name through the hard link, and on failure nothing was
+    // placed.
+}
+
+/// Whether the file just written is really inside the output directory.
+///
+/// Resolved through the filesystem, not compared lexically, so a directory
+/// that was swapped for a link after the last check is caught: the
+/// destination then resolves somewhere else (or no longer resolves at all).
+/// This is the check that keeps a redirected write from being reported as a
+/// successful export.
+pub fn landed_inside(root: &Path, path: &Path) -> Result<(), String> {
+    let resolved = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot confirm where the file was written: {}",
+            error.kind()
+        )
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(
+            "the file was written outside the export directory: a directory \
+             in the path was replaced while the export was running"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// The filesystem identity of a file that already exists at `path`.
@@ -264,6 +352,10 @@ fn claim(dest: &Path) -> Result<(), String> {
 /// check has to happen BEFORE the write: a `rename` installs a brand-new
 /// inode, so asking afterwards would compare against an identity that never
 /// existed before this write.
+///
+/// This is the backstop for `--overwrite` only. Without it, the no-replace
+/// link in [`write_atomically`] already refuses such a collision on every
+/// platform.
 pub fn existing_identity(path: &Path) -> Option<(u64, u64)> {
     identity(path)
 }
@@ -274,36 +366,69 @@ mod tests {
 
     use super::*;
 
-    fn temp(counter: u64) -> TempName {
-        TempName { counter }
+    fn names() -> TempNames {
+        TempNames::new()
     }
 
     #[test]
     fn writes_content_and_leaves_no_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
-        let path = write_atomically(&target, "a.md", "md", &temp(1), "body\n", false).unwrap();
+        let path = write_atomically(&target, "a.md", "md", &mut names(), "body\n", false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "body\n");
-        assert!(
-            !dir.path().join(temp(1).file_name("md")).exists(),
-            "the temporary file survived a successful write"
+        assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
+    }
+
+    /// Every entry of a directory, sorted, as plain names.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn the_destination_never_exists_empty() {
+        // The regression this replaced: claiming the name with an empty
+        // file first meant a crash in that window left a zero-byte
+        // `Document.md` behind, which a later run would then refuse to
+        // overwrite. Nothing may exist at the destination until the content
+        // is complete, so at every point there is either no destination or
+        // a whole document.
+        let dir = tempfile::tempdir().unwrap();
+        let target = Dir::open(dir.path().to_path_buf()).unwrap();
+        let mut namer = names();
+        // A pre-existing entry list proves the destination is not created
+        // ahead of the content: the only file that appears is the finished
+        // one.
+        write_atomically(&target, "a.md", "md", &mut namer, "whole\n", false).unwrap();
+        assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "whole\n"
         );
     }
 
     #[test]
     fn refuses_an_existing_destination_without_overwrite() {
-        // Exclusivity comes from `create_new`, not from a prior existence
-        // test, so a second writer cannot slip between the two.
+        // Exclusivity is the kernel's: `hard_link` fails when the name is
+        // taken, so there is no test-then-act window for a second writer.
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
-        write_atomically(&target, "a.md", "md", &temp(1), "first", false).unwrap();
-        let error = write_atomically(&target, "a.md", "md", &temp(2), "second", false).unwrap_err();
+        let mut namer = names();
+        write_atomically(&target, "a.md", "md", &mut namer, "first", false).unwrap();
+        let error =
+            write_atomically(&target, "a.md", "md", &mut namer, "second", false).unwrap_err();
         assert!(error.contains("--overwrite"), "{error}");
-        // The first writer's content survived.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
-            "first"
+            "first",
+            "the first writer's content was replaced"
         );
+        // And the refused attempt left nothing behind.
+        assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
     }
 
     #[test]
@@ -311,49 +436,102 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
         std::fs::write(dir.path().join("a.md"), "stale").unwrap();
-        write_atomically(&target, "a.md", "md", &temp(1), "fresh", true).unwrap();
+        write_atomically(&target, "a.md", "md", &mut names(), "fresh", true).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
             "fresh"
         );
+        assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
     }
 
     #[test]
-    fn a_failed_write_leaves_no_claimed_destination_behind() {
-        // The destination is a directory, so the rename cannot succeed. The
-        // claimed name must not survive as an empty file, or a re-run would
-        // be blocked by debris from the failed one.
+    fn a_failed_placement_leaves_the_old_content_and_no_debris() {
+        // The destination is a directory, so neither rename nor link can
+        // succeed. The pre-existing content must survive and no temporary
+        // file may be left.
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
         std::fs::create_dir(dir.path().join("a.md")).unwrap();
         std::fs::write(dir.path().join("a.md").join("keep"), "keep").unwrap();
-        assert!(write_atomically(&target, "a.md", "md", &temp(1), "x", true).is_err());
+        assert!(write_atomically(&target, "a.md", "md", &mut names(), "x", true).is_err());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.md").join("keep")).unwrap(),
             "keep",
             "the pre-existing directory was damaged"
         );
-        assert!(
-            !dir.path().join(temp(1).file_name("md")).exists(),
-            "the temporary file survived a failed write"
+        assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
+    }
+
+    #[test]
+    fn a_pre_existing_file_is_never_deleted_by_cleanup() {
+        // The regression: cleanup used to remove the temporary path
+        // whether or not this call had created it, so an attacker who
+        // guessed the (pid-based) name and put a file there got it
+        // deleted. Ownership now comes from `create_new` succeeding.
+        let dir = tempfile::tempdir().unwrap();
+        let target = Dir::open(dir.path().to_path_buf()).unwrap();
+        let bystander = dir.path().join("someone-elses-file");
+        std::fs::write(&bystander, "not mine").unwrap();
+
+        // Fill the directory with entries and run several writes; nothing
+        // this call did not create may disappear.
+        let mut namer = names();
+        for index in 0..5 {
+            write_atomically(
+                &target,
+                &format!("{index}.md"),
+                "md",
+                &mut namer,
+                "x",
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&bystander).unwrap(),
+            "not mine",
+            "a file belonging to someone else was removed"
         );
     }
 
     #[test]
-    fn a_failed_write_removes_the_name_it_claimed() {
-        // Without `--overwrite` the destination name is created up front to
-        // claim it. If the write then fails, that placeholder must go, or a
-        // re-run would be refused because of debris from the failed one.
+    fn an_occupied_temporary_name_does_not_destroy_the_occupant() {
+        // Directly: create the temp file the namer is about to hand out,
+        // then prove a failure on that name leaves it alone. The namer is
+        // seeded per instance, so the same instance reproduces the name.
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
-        std::fs::create_dir(dir.path().join("blocked")).unwrap();
-        // The temp file cannot be created because a directory occupies its
-        // name, so the write fails after the destination was claimed.
-        std::fs::create_dir(dir.path().join(temp(1).file_name("md"))).unwrap();
-        assert!(write_atomically(&target, "a.md", "md", &temp(1), "x", false).is_err());
+        let mut namer = names();
+        let taken = namer.next("md");
+        std::fs::write(dir.path().join(&taken), "occupied").unwrap();
+
+        // Rewind so the next call produces the same name.
+        namer.counter -= 1;
+        let error = write_atomically(&target, "a.md", "md", &mut namer, "x", false).unwrap_err();
+        assert!(error.contains("temporary file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&taken)).unwrap(),
+            "occupied",
+            "the occupying file was deleted"
+        );
+    }
+
+    #[test]
+    fn temporary_names_are_hidden_and_unpredictable() {
+        let mut namer = names();
+        let first = namer.next("md");
+        let second = namer.next("md");
+        assert_ne!(first, second);
+        assert!(first.starts_with('.'), "{first}");
+        assert!(first.ends_with(".md"), "{first}");
+        // Two namers must not agree, or the name would be a function of the
+        // pid alone - which is exactly what made it guessable.
+        let other = names().next("md");
+        assert_ne!(first, other);
+        // And the pid must not be readable out of the name.
         assert!(
-            !dir.path().join("a.md").exists(),
-            "the claimed destination survived a failed write"
+            !first.contains(&std::process::id().to_string()),
+            "{first} exposes the pid"
         );
     }
 
@@ -366,10 +544,7 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
 
-        // On Unix the recreated directory has a different inode, so the pin
-        // catches it. Elsewhere there is no identity to compare and the
-        // write proceeds - which the module docs state.
-        let result = write_atomically(&target, "a.md", "md", &temp(1), "x", false);
+        let result = write_atomically(&target, "a.md", "md", &mut names(), "x", false);
         if cfg!(unix) {
             let error = result.unwrap_err();
             assert!(error.contains("replaced"), "{error}");
@@ -386,6 +561,42 @@ mod tests {
         std::fs::write(&path, "not a directory").unwrap();
         let error = target.verify().unwrap_err();
         assert!(error.contains("replaced"), "{error}");
+    }
+
+    #[test]
+    fn syncing_verifies_the_directory_too() {
+        // Without this, a directory swapped after the LAST write into it
+        // would never be looked at again.
+        let outer = tempfile::tempdir().unwrap();
+        let path = outer.path().join("dir");
+        std::fs::create_dir(&path).unwrap();
+        let target = Dir::open(path.clone()).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "swapped").unwrap();
+        assert!(target.sync().is_err(), "sync accepted a swapped directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_landed_outside_the_root_is_detected() {
+        // Detection, not prevention: the bytes are already elsewhere. The
+        // point is that the command cannot then report the path as
+        // exported.
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(outer.path()).unwrap().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = outer.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "escaped").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        assert!(landed_inside(&root, &root.join("a.md")).is_err());
+        std::fs::write(root.join("a.md"), "inside").unwrap();
+        landed_inside(&root, &root.join("a.md")).expect("a file inside the root");
+        let error = landed_inside(&root, &root.join("link").join("a.md")).unwrap_err();
+        assert!(error.contains("outside"), "{error}");
     }
 
     #[test]
@@ -425,17 +636,7 @@ mod tests {
         let target = Dir::open(canonical.clone()).unwrap();
         let child = target.child(&canonical, "sub").unwrap();
         assert!(child.path().ends_with("sub"));
-        // Accepting an existing real directory (a re-run) is fine.
         assert!(target.child(&canonical, "sub").is_ok());
-    }
-
-    #[test]
-    fn temporary_names_are_hidden_and_unique() {
-        let first = temp(1).file_name("md");
-        let second = temp(2).file_name("md");
-        assert_ne!(first, second);
-        assert!(first.starts_with('.'), "{first}");
-        assert!(first.contains(TEMP_PREFIX), "{first}");
     }
 
     #[test]
