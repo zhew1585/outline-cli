@@ -19,6 +19,7 @@ use reqwest::blocking::Client;
 use crate::auth::credentials::ClientRegistration;
 use crate::auth::endpoint::{self, Call};
 use crate::auth::error::{OAuthError, Stage};
+use crate::auth::transport;
 
 /// Client name shown on the consent screen and in the admin UI.
 pub const CLIENT_NAME: &str = "outline-cli (otl)";
@@ -108,6 +109,18 @@ pub fn delete(http: &Client, registration: &ClientRegistration) -> Result<bool, 
     ) else {
         return Ok(false);
     };
+    // Re-validated at USE time, not trusted because a past registration
+    // response contained it: this request carries the management token as a
+    // bearer credential, and the URI comes off disk.
+    transport::require_secure(uri, "the stored client management URI")?;
+    if let Some(origin) = registration.origin.as_deref() {
+        if endpoint::origin_of(uri) != origin {
+            return Err(OAuthError::ForeignEndpoint {
+                origin: origin.to_string(),
+                endpoint: "registration_client_uri",
+            });
+        }
+    }
     let call = Call {
         stage: Stage::Deregistration,
         url: uri,

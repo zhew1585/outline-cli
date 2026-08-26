@@ -373,3 +373,286 @@ fn auth_info_works_with_no_credentials_at_all() {
     assert!(report["method"].is_null(), "{stdout}");
     assert_eq!(report["credential_file_exists"], false);
 }
+
+// --- finding [17]: cross-instance WRITES must not create a mixed profile --
+
+/// Seed an OAuth session issued by `issuer`, bound to it.
+fn seed_session_for(dir: &Path, issuer: &str) {
+    let store = CredentialStore::at(dir.to_path_buf());
+    let mut file = CredentialFile::default();
+    let entry = file.profile_mut("default");
+    entry.origin = engine::base_url_origin(issuer);
+    entry.oauth = Some(OAuthSession {
+        access_token: OAUTH_TOKEN.to_string(),
+        refresh_token: Some("refresh-1".to_string()),
+        expires_at: Some(otl::auth::oauth::now_unix() + 3600),
+        scope: Some("read write".to_string()),
+        client_id: "client-1".to_string(),
+        token_endpoint: format!("{issuer}/oauth/token"),
+        revocation_endpoint: None,
+        account: None,
+        workspace: None,
+    });
+    store.save(&file).unwrap();
+}
+
+#[test]
+fn set_key_for_another_instance_is_refused_rather_than_merged() {
+    // The R1 regression: `set-key` used to rewrite `profile.origin` to the
+    // new instance while leaving the old one's OAuth session in place. The
+    // profile then LOOKED bound to B, but OAuth outranks an API key - so
+    // the next request sent A's access token to B, and on expiry refreshed
+    // at A and sent that to B too.
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    seed_session_for(dir.path(), "https://a.example.com");
+
+    let mut child = otl(dir.path(), "https://b.example.com")
+        .args(["auth", "set-key"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"ol_api_FOR_B\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("a.example.com"), "stderr: {stderr}");
+    assert!(stderr.contains("b.example.com"), "stderr: {stderr}");
+    assert!(stderr.contains("OUTLINE_PROFILE"), "stderr: {stderr}");
+
+    // Nothing was written, and the profile still belongs to A alone.
+    let stored = CredentialStore::at(dir.path().to_path_buf())
+        .load()
+        .unwrap();
+    let entry = stored.profile("default").unwrap();
+    assert!(entry.api_key.is_none(), "a key for B was stored anyway");
+    assert_eq!(entry.origin.as_deref(), Some("https://a.example.com"));
+}
+
+#[test]
+fn a_hand_mixed_profile_is_refused_by_the_sessions_own_origin() {
+    // Defence in depth for the same bug: even if `profile.origin` says B -
+    // by a hand edit, or a future write path that forgets the guard - the
+    // session names its own issuer through the token endpoint discovery
+    // validated at login, so it cannot be passed off as B's.
+    let dir = tempfile::tempdir().unwrap();
+    seed_session_for(dir.path(), "https://a.example.com");
+
+    let store = CredentialStore::at(dir.path().to_path_buf());
+    let mut file = store.load().unwrap();
+    file.profile_mut("default").origin = Some("https://b.example.com".to_string());
+    store.save(&file).unwrap();
+
+    let output = otl(dir.path(), "https://b.example.com")
+        .args(["api", "documents.info", "id=d"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("a.example.com"), "stderr: {stderr}");
+    assert!(!stderr.contains(OAUTH_TOKEN), "token leaked: {stderr}");
+}
+
+#[test]
+fn login_against_another_instance_is_refused_before_any_network_work() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_session_for(dir.path(), "https://a.example.com");
+
+    let output = otl(dir.path(), "https://b.example.invalid")
+        .args(["auth", "login", "--no-browser"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("a.example.com"), "stderr: {stderr}");
+    // Refused locally: no DNS lookup for the unreachable host was made.
+    assert!(!stderr.contains("network error"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_purge_hint_is_offered_when_a_dynamic_registration_would_linger() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CredentialStore::at(dir.path().to_path_buf());
+    let mut file = CredentialFile::default();
+    let entry = file.profile_mut("default");
+    entry.origin = Some("https://a.example.com".to_string());
+    entry.api_key = Some("key-a".to_string());
+    entry.client = Some(otl::auth::credentials::ClientRegistration {
+        client_id: "c".to_string(),
+        client_secret: None,
+        registration_access_token: Some("rat".to_string()),
+        registration_client_uri: Some("https://a.example.com/oauth/clients/c".to_string()),
+        redirect_uri: "http://127.0.0.1:41234/callback".to_string(),
+        dynamic: true,
+        origin: Some("https://a.example.com".to_string()),
+    });
+    store.save(&file).unwrap();
+
+    let output = otl(dir.path(), "https://b.example.com")
+        .args(["auth", "login", "--no-browser"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("logout --purge"),
+        "a dynamic registration needs --purge to clear: {stderr}"
+    );
+}
+
+// --- finding [21]: a leftover registration must not block an env key -----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_client_registration_alone_does_not_block_an_environment_key() {
+    // A client registration cannot authenticate anything, so a leftover one
+    // from another instance must not stop an environment key supplied for
+    // this one.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&server)
+        .await;
+    let base = server.uri();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let (code, sent) = {
+        let base = base.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = CredentialStore::at(path.clone());
+            let mut file = CredentialFile::default();
+            let entry = file.profile_mut("default");
+            entry.origin = Some("https://a.example.com".to_string());
+            entry.client = Some(otl::auth::credentials::ClientRegistration {
+                client_id: "c".to_string(),
+                client_secret: None,
+                registration_access_token: None,
+                registration_client_uri: None,
+                redirect_uri: "http://127.0.0.1:41234/callback".to_string(),
+                dynamic: true,
+                origin: Some("https://a.example.com".to_string()),
+            });
+            store.save(&file).unwrap();
+
+            let output = otl(&path, &base)
+                .env("OUTLINE_API_KEY", ENV_KEY)
+                .env("OUTLINE_NO_KEY_WARNING", "1")
+                .args(["api", "documents.info", "id=d"])
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            )
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(code, Some(0), "stderr: {sent}");
+
+    let bearer = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .next()
+        .unwrap_or_default();
+    assert_eq!(bearer, format!("Bearer {ENV_KEY}"));
+}
+
+// --- finding [18]: the ordinary API channel must require TLS -------------
+
+#[test]
+fn a_remote_plaintext_instance_is_refused_for_ordinary_api_calls() {
+    // The R1 gap: only `auth login` checked transport, so `otl api` against
+    // http://remote-host put the bearer token on the wire in the clear.
+    let dir = tempfile::tempdir().unwrap();
+    let output = otl(dir.path(), "http://docs.example.invalid")
+        .env("OUTLINE_API_KEY", ENV_KEY)
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .args(["api", "documents.info", "id=d"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("https://"), "stderr: {stderr}");
+    assert!(!stderr.contains(ENV_KEY), "key leaked: {stderr}");
+    // Refused locally, before any resolution or connection.
+    assert!(!stderr.contains("network error"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_remote_plaintext_instance_is_refused_for_a_stored_key_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CredentialStore::at(dir.path().to_path_buf());
+    let mut file = CredentialFile::default();
+    let entry = file.profile_mut("default");
+    entry.origin = Some("http://docs.example.invalid".to_string());
+    entry.api_key = Some(STORED_KEY.to_string());
+    store.save(&file).unwrap();
+
+    let output = otl(dir.path(), "http://docs.example.invalid")
+        .args(["api", "documents.info", "id=d"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("https://"), "stderr: {stderr}");
+    assert!(!stderr.contains(STORED_KEY), "key leaked: {stderr}");
+}
+
+#[test]
+fn a_remote_plaintext_instance_is_refused_by_auth_info_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = otl(dir.path(), "http://docs.example.invalid")
+        .env("OUTLINE_API_KEY", ENV_KEY)
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .args(["auth", "info"])
+        .output()
+        .unwrap();
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!printed.contains(ENV_KEY), "key leaked: {printed}");
+    assert!(
+        printed.contains("https://") || printed.contains("not usable"),
+        "the transport problem must be reported: {printed}"
+    );
+}
+
+#[test]
+fn a_loopback_instance_still_works_over_plaintext() {
+    // The documented exception must keep working, or every local
+    // development setup breaks.
+    let dir = tempfile::tempdir().unwrap();
+    let output = otl(dir.path(), "http://127.0.0.1:9")
+        .env("OUTLINE_API_KEY", ENV_KEY)
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .args(["api", "documents.info", "id=d"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Nothing listens on port 9, so this is a transport failure (7) - which
+    // proves the request was attempted rather than refused as insecure (2).
+    assert_eq!(output.status.code(), Some(7), "stderr: {stderr}");
+}

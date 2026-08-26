@@ -144,7 +144,7 @@ fn require_issuer(document: &Value, expected: &str, origin: &str) -> Result<Stri
             " (it has no {FIELD_ISSUER} field, which RFC 8414 requires)"
         )));
     };
-    if claimed.trim_end_matches('/') != expected.trim_end_matches('/') {
+    if strip_one_slash(&claimed) != strip_one_slash(expected) {
         // The claimed value is server-controlled text, so it is not echoed:
         // naming the expectation is enough to act on, and enough to avoid
         // putting an attacker's string on the terminal.
@@ -153,6 +153,18 @@ fn require_issuer(document: &Value, expected: &str, origin: &str) -> Result<Stri
         )));
     }
     Ok(claimed)
+}
+
+/// Drop at most ONE trailing slash.
+///
+/// RFC 8414 leaves the trailing slash of an issuer unconstrained and
+/// servers differ, so a single one is treated as a formatting difference.
+/// Collapsing ANY number would not be: `https://host/tenant///` and
+/// `https://host/tenant` are different paths to a reverse proxy that routes
+/// on the path without normalizing repeated separators, and those can be
+/// different security domains.
+fn strip_one_slash(issuer: &str) -> &str {
+    issuer.strip_suffix('/').unwrap_or(issuer)
 }
 
 /// Require an advertised endpoint to be same-origin AND TLS-protected.
@@ -391,6 +403,32 @@ mod tests {
         let mut document = full_document();
         document["issuer"] = json!("https://docs.example.com/");
         assert!(check(&document).is_ok());
+    }
+
+    #[test]
+    fn repeated_trailing_slashes_are_not_folded_away() {
+        // One trailing slash is a formatting difference RFC 8414 leaves
+        // open. Several are a different PATH, and a reverse proxy that
+        // routes on the path without collapsing separators can serve a
+        // different security domain from it.
+        for claimed in ["https://docs.example.com//", "https://docs.example.com///"] {
+            let mut document = full_document();
+            document["issuer"] = json!(claimed);
+            assert!(
+                check(&document).is_err(),
+                "{claimed:?} was folded onto the expected issuer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tenant_path_with_repeated_slashes_is_a_different_issuer() {
+        let expected = "https://docs.example.com/tenant";
+        let mut document = full_document();
+        document["issuer"] = json!("https://docs.example.com/tenant///");
+        document["authorization_endpoint"] = json!("https://docs.example.com/oauth/authorize");
+        document["token_endpoint"] = json!("https://docs.example.com/oauth/token");
+        assert!(build(&document, expected, ORIGIN, call()).is_err());
     }
 
     #[test]

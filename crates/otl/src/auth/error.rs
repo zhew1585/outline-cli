@@ -331,6 +331,73 @@ pub enum OAuthError {
         current: String,
     },
 
+    /// A write would add credentials for one instance to a profile that
+    /// already belongs to another.
+    ///
+    /// Refused rather than merged or silently overwritten. Merging is what
+    /// made the read-side binding defeatable: a profile holding instance
+    /// A's OAuth session with its `origin` rewritten to B sends A's token
+    /// to B on the very next request, because OAuth outranks the API key
+    /// that was just added. Overwriting silently is no better - it would
+    /// throw away a session without revoking it and orphan a dynamic client
+    /// registration on the server.
+    #[error(
+        "profile {profile:?} already holds credentials for {stored}, and \
+         this command would add credentials for {current}.\n\
+         Keeping both in one profile would mean sending one instance's \
+         credentials to the other, so this is refused.\n\
+         Either use a separate profile per instance \
+         (OUTLINE_PROFILE=<name>), or clear this one first:\n\
+         \x20 OUTLINE_URL={stored} otl auth logout{purge_hint}"
+    )]
+    ProfileBoundElsewhere {
+        /// Active profile name.
+        profile: String,
+        /// Origin the profile currently belongs to.
+        stored: String,
+        /// Origin the write was for.
+        current: String,
+        /// ` --purge` when a dynamic registration would otherwise linger.
+        purge_hint: &'static str,
+    },
+
+    /// An endpoint recorded in the credential file is not TLS-protected.
+    ///
+    /// Checked again at USE time, not only when it was stored: a credential
+    /// file can be edited, can predate a rule, or can be carried between
+    /// machines, and the value is about to receive a refresh token.
+    #[error(
+        "the {what} recorded for profile {profile:?} is not safe to use: \
+         {detail}.\nRun `otl auth login` to re-discover this instance's \
+         endpoints."
+    )]
+    InsecureStoredEndpoint {
+        /// Active profile name.
+        profile: String,
+        /// Which stored endpoint is at fault.
+        what: &'static str,
+        /// Why it was refused.
+        detail: String,
+    },
+
+    /// Another `otl auth login` for the same profile finished first.
+    ///
+    /// The registration this one created has been removed again, so the
+    /// server is left with exactly the one that is recorded on disk.
+    #[error(
+        "another `otl auth login` for profile {profile:?} completed while \
+         this one was running, so this login was abandoned{cleanup}.\n\
+         The other login's credentials are the ones in effect; run \
+         `otl auth info` to see them, or `otl auth login` again to replace \
+         them."
+    )]
+    ConcurrentLogin {
+        /// Active profile name.
+        profile: String,
+        /// What became of the registration this login created.
+        cleanup: String,
+    },
+
     /// A dynamic registration exists on the server but could not be
     /// recorded locally, and the compensating delete also failed.
     ///

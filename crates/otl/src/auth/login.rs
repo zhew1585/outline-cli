@@ -27,6 +27,11 @@ use crate::auth::source::CredentialProvider;
 use crate::auth::{browser, dcr, endpoint, AuthError, Identity};
 use crate::stdio;
 
+/// Maximum characters kept from a server-supplied client id when it is
+/// printed. Long enough for any real identifier, short enough that a
+/// hostile one cannot flood the terminal.
+const MAX_CLIENT_ID_CHARS: usize = 80;
+
 /// What `otl auth login` was asked to do.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -105,12 +110,17 @@ pub fn run(
     store: &CredentialStore,
     options: &Options,
 ) -> Result<Outcome, AuthError> {
+    // Before ANY network work: if this profile already belongs to another
+    // instance there is nothing to discover here, and asking would tell a
+    // server we are not going to use that this user exists.
+    let existing = store.load()?;
+    crate::auth::ensure_bindable(existing.profile(profile), profile, origin)?;
+
     let http = endpoint::http_client()?;
     let metadata = metadata::discover(&http, base_url)?;
     require_s256(&metadata, base_url)?;
     warn_about_unsupported_scopes(&metadata, &options.scope);
 
-    let existing = store.load()?;
     let acquired = acquire_client(&http, &metadata, origin, &existing, profile, options)?;
     if acquired.source == ClientSource::Registered {
         // Persist before the browser step: see the module docs. Under the
@@ -122,15 +132,25 @@ pub fn run(
     let tokens = authorize(&http, &metadata, &acquired, options)?;
     let session = build_session(&metadata, &acquired.registration, tokens);
     let scope = session.scope.clone();
-    store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+    let registration = acquired.registration.clone();
+    let claimed = store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+        crate::auth::ensure_bindable(file.profile(profile), profile, origin)?;
+        // The client on disk must still be the one these tokens were issued
+        // for. A concurrent login that finished first owns the profile now,
+        // and overwriting its registration would drop the only credential
+        // that can ever delete the application it created.
+        claim_client(file.profile(profile), &registration, profile)?;
         let entry = file.profile_mut(profile);
         // The binding is what stops these tokens being sent to another
         // instance later; it is written together with them, never after.
         entry.origin = Some(origin.to_string());
-        entry.client = Some(acquired.registration.clone());
+        entry.client = Some(registration.clone());
         entry.oauth = Some(session);
         Ok(())
-    })?;
+    });
+    if let Err(error) = claimed {
+        return Err(abandon(&http, &acquired, error));
+    }
 
     let identity = capture_identity(base_url, profile, origin, store);
     Ok(Outcome {
@@ -139,50 +159,6 @@ pub fn run(
         client_source: acquired.source,
         credential_path: store.path().to_path_buf(),
     })
-}
-
-/// Record a brand-new dynamic registration, undoing it if that fails.
-///
-/// A registration that exists on the server but not on disk is the worst
-/// outcome available: its `registration_access_token` is the only thing
-/// that can ever delete it, and losing that leaves an application no one
-/// can remove. So a failed save triggers a compensating RFC 7592 delete,
-/// and if THAT fails too the orphan is reported loudly with the client id
-/// an administrator needs to find it.
-fn persist_registration(
-    store: &CredentialStore,
-    profile: &str,
-    origin: &str,
-    acquired: &Acquired,
-    http: &HttpClient,
-) -> Result<(), AuthError> {
-    let registration = acquired.registration.clone();
-    let saved = store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
-        let entry = file.profile_mut(profile);
-        entry.origin = Some(origin.to_string());
-        entry.client = Some(registration.clone());
-        Ok(())
-    });
-    let Err(error) = saved else {
-        return Ok(());
-    };
-    match dcr::delete(http, &acquired.registration) {
-        // Undone: the server no longer has it, so the failed save is just a
-        // failed save and the original error is the useful one.
-        Ok(true) => Err(error),
-        Ok(false) => Err(AuthError::OAuth(OAuthError::OrphanedRegistration {
-            origin: origin.to_string(),
-            client_id: acquired.registration.client_id.clone(),
-            reason: error.to_string(),
-            cleanup: "the server issued no management token for it".to_string(),
-        })),
-        Err(cleanup) => Err(AuthError::OAuth(OAuthError::OrphanedRegistration {
-            origin: origin.to_string(),
-            client_id: acquired.registration.client_id.clone(),
-            reason: error.to_string(),
-            cleanup: cleanup.to_string(),
-        })),
-    }
 }
 
 /// Refuse to continue without PKCE `S256`.
@@ -227,6 +203,118 @@ fn warn_about_unsupported_scopes(metadata: &Metadata, scope: &str) {
         unknown.join(", "),
         metadata.scopes_supported.join(", ")
     ));
+}
+
+/// Record a brand-new dynamic registration, undoing it if that fails.
+///
+/// A registration that exists on the server but not on disk is the worst
+/// outcome available: its `registration_access_token` is the only thing
+/// that can ever delete it, and losing that leaves an application no one
+/// can remove. So a failed save triggers a compensating RFC 7592 delete,
+/// and if THAT fails too the orphan is reported loudly with the client id
+/// an administrator needs to find it.
+fn persist_registration(
+    store: &CredentialStore,
+    profile: &str,
+    origin: &str,
+    acquired: &Acquired,
+    http: &HttpClient,
+) -> Result<(), AuthError> {
+    let registration = acquired.registration.clone();
+    let saved = store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
+        crate::auth::ensure_bindable(file.profile(profile), profile, origin)?;
+        // A concurrent login registered its own client while this one was
+        // talking to the server. Both registrations now exist there, but
+        // only one management token fits on disk - so the loser gives up
+        // and deletes its own, rather than overwriting the winner's and
+        // stranding an application nobody can remove.
+        claim_client(file.profile(profile), &registration, profile)?;
+        let entry = file.profile_mut(profile);
+        entry.origin = Some(origin.to_string());
+        entry.client = Some(registration.clone());
+        Ok(())
+    });
+    match saved {
+        Ok(()) => Ok(()),
+        Err(error) => Err(abandon(http, acquired, error)),
+    }
+}
+
+/// Whether the client recorded on disk is still the one this login owns.
+///
+/// Absent is fine (we are about to write it). A DIFFERENT one means another
+/// login won the race for this profile.
+fn claim_client(
+    entry: Option<&crate::auth::credentials::ProfileCredentials>,
+    ours: &ClientRegistration,
+    profile: &str,
+) -> Result<(), AuthError> {
+    let stored = entry.and_then(|entry| entry.client.as_ref());
+    match stored {
+        Some(other) if other.client_id != ours.client_id => {
+            Err(AuthError::OAuth(OAuthError::ConcurrentLogin {
+                profile: profile.to_string(),
+                cleanup: String::new(),
+            }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Give up on a login, removing anything it created on the server first.
+///
+/// Only a registration THIS login created is removed: a reused or
+/// administrator-supplied client belongs to someone else. Exactly one
+/// deletion is attempted, and whatever became of it is folded into the
+/// reported error - so a server-side leftover is never silent.
+fn abandon(http: &HttpClient, acquired: &Acquired, cause: AuthError) -> AuthError {
+    if acquired.source != ClientSource::Registered {
+        return cause;
+    }
+    let client_id = display_client_id(&acquired.registration.client_id);
+    let removed = dcr::delete(http, &acquired.registration);
+    let cleanup = match &removed {
+        Ok(true) => "the registration it created has been removed from the server".to_string(),
+        Ok(false) => format!(
+            "client {client_id} cannot be removed automatically because the \
+             server issued no management token for it"
+        ),
+        Err(error) => format!("client {client_id} could not be removed: {error}"),
+    };
+    // A concurrent login is a normal race, not a fault: report it as such.
+    if let AuthError::OAuth(OAuthError::ConcurrentLogin { profile, .. }) = cause {
+        return AuthError::OAuth(OAuthError::ConcurrentLogin {
+            profile,
+            cleanup: format!(" ({cleanup})"),
+        });
+    }
+    // Anything else: if the registration really is gone, the original
+    // failure is the useful message. If it is not, an application is
+    // stranded on the server and that outranks everything else.
+    if matches!(removed, Ok(true)) {
+        return cause;
+    }
+    AuthError::OAuth(OAuthError::OrphanedRegistration {
+        origin: acquired
+            .registration
+            .origin
+            .clone()
+            .unwrap_or_else(|| "the instance".to_string()),
+        client_id,
+        reason: cause.to_string(),
+        cleanup,
+    })
+}
+
+/// Make a server-supplied client id safe to print.
+///
+/// A client id is not a secret - it travels through the browser in the
+/// authorization URL, and an administrator needs it to find a stranded
+/// application - but it IS server-controlled text arriving on a terminal.
+/// Without this, a hostile registration endpoint could return a client id
+/// containing newlines or escape sequences and forge diagnostic lines.
+fn display_client_id(client_id: &str) -> String {
+    engine::sanitize::clean_server_text(client_id, "", false, MAX_CLIENT_ID_CHARS)
 }
 
 /// Pick the OAuth client to use and bind its callback port.
@@ -341,7 +429,7 @@ fn retire(
          (client {client}) is being abandoned rather than deleted \
          ({failure}). Ask an admin to remove it under Settings -> \
          Applications.",
-        client = registration.client_id
+        client = display_client_id(&registration.client_id)
     ));
     Ok(())
 }

@@ -50,7 +50,7 @@ fn seed(dir: &Path) -> CredentialStore {
         expires_at: Some(otl::auth::oauth::now_unix() + 3600),
         scope: Some("read write".to_string()),
         client_id: SECRET.to_string(),
-        token_endpoint: "https://docs.example.com/oauth/token".to_string(),
+        token_endpoint: format!("{INSTANCE}/oauth/token"),
         revocation_endpoint: None,
         account: Some("Alice <alice@example.com>".to_string()),
         workspace: Some("Acme".to_string()),

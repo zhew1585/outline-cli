@@ -49,6 +49,15 @@ so that 服务器与本地都不残留。
 
 ## Dev Notes
 
+### R2 审查后的修正（MAJOR [20]）
+
+- **清理决定只应用到本次真正操作过的那个对象**。R1 的 logout 用**网络之前**的快照决定删什么，
+  却把决定无条件作用到**锁内重读**的新状态：P1 purge 删掉 C1 期间 P2 完成 login 写入 C2/RAT2，
+  P1 随后直接清空 client → C2 还在服务器上而 RAT2 永久丢失。普通 logout 同理会删掉并发写入的新 session。
+  现在每个字段都经 `clear_if_unchanged` + 显式比较函数（session 比 access token，registration 比
+  client id 与管理 URI）。比较不上就保留——留下一个多余凭证可以再跑一次 logout 清掉，
+  误删一个管理 token 则不可恢复，方向选安全的一侧。
+
 ### R1 审查后的修正（BLOCKER）
 
 - **purge 失败仍清本地管理凭证**。原实现的清除条件是 `options.purge || registration_deleted`，

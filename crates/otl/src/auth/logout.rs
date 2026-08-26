@@ -27,8 +27,9 @@ use reqwest::blocking::Client as HttpClient;
 use crate::auth::credentials::{
     ClientRegistration, CredentialFile, CredentialStore, OAuthSession, ProfileCredentials,
 };
+use crate::auth::error::OAuthError;
 use crate::auth::oauth::ClientAuth;
-use crate::auth::{dcr, endpoint, oauth, AuthError};
+use crate::auth::{dcr, endpoint, oauth, transport, AuthError};
 
 /// What `otl auth logout` was asked to do.
 #[derive(Debug, Clone, Copy, Default)]
@@ -57,7 +58,12 @@ pub struct Report {
 }
 
 /// Forget the profile's credentials, revoking what can be revoked.
-pub fn run(profile: &str, store: &CredentialStore, options: Options) -> Result<Report, AuthError> {
+pub fn run(
+    profile: &str,
+    origin: &str,
+    store: &CredentialStore,
+    options: Options,
+) -> Result<Report, AuthError> {
     let Some(entry) = store.load()?.profile(profile).cloned() else {
         return Ok(Report::default());
     };
@@ -71,25 +77,46 @@ pub fn run(profile: &str, store: &CredentialStore, options: Options) -> Result<R
     // deregistration are slow, and holding the credential lock across them
     // would block every other otl process on this machine.
     if let Some(session) = &entry.oauth {
-        revoke_tokens(&http, session, entry.client.as_ref(), &mut report);
+        revoke_tokens(
+            &http,
+            session,
+            entry.client.as_ref(),
+            origin,
+            profile,
+            &mut report,
+        );
     }
     if options.purge {
         purge_registration(&http, entry.client.as_ref(), &mut report);
     }
 
     // Local removal happens regardless of what the server said - the user
-    // asked for these credentials to be gone from this machine - but the
-    // MANAGEMENT credential only goes once the server confirmed the
-    // registration it manages is gone. See `drop_registration`.
+    // asked for these credentials to be gone from this machine - but every
+    // removal is applied ONLY to the exact credential this run acted on.
+    //
+    // The decisions above were made from a snapshot taken before the
+    // network work. Another process can finish a login while a revocation
+    // or a DELETE is in flight, and blindly clearing the fields afterwards
+    // would delete ITS session, or worse, its registration_access_token -
+    // stranding on the server an application that nothing can remove. So
+    // each field is compared with what was seen before it is cleared.
     let drop_client = drop_registration(options, &entry, &report);
     store.update(|file: &mut CredentialFile| -> Result<(), AuthError> {
         let profile_entry = file.profile_mut(profile);
-        profile_entry.oauth = None;
-        profile_entry.api_key = None;
+        clear_if_unchanged(&mut profile_entry.oauth, entry.oauth.as_ref(), same_session);
+        clear_if_unchanged(
+            &mut profile_entry.api_key,
+            entry.api_key.as_ref(),
+            |a, b| a == b,
+        );
         if drop_client {
-            profile_entry.client = None;
+            clear_if_unchanged(
+                &mut profile_entry.client,
+                entry.client.as_ref(),
+                same_registration,
+            );
         }
-        if profile_entry.client.is_none() {
+        if profile_entry.is_empty() {
             // Nothing left for the binding to protect, and a stale one
             // would only confuse the next `auth info`.
             profile_entry.origin = None;
@@ -98,6 +125,46 @@ pub fn run(profile: &str, store: &CredentialStore, options: Options) -> Result<R
     })?;
     report.file_removed = !store.path().exists();
     Ok(report)
+}
+
+/// Clear `current` only if it still holds the value this run acted on.
+///
+/// `None` for `acted_on` means there was nothing to remove, so whatever is
+/// there now arrived afterwards and is not ours to delete.
+fn clear_if_unchanged<T>(
+    current: &mut Option<T>,
+    acted_on: Option<&T>,
+    same: impl Fn(&T, &T) -> bool,
+) {
+    let Some(acted_on) = acted_on else {
+        return;
+    };
+    if current.as_ref().is_some_and(|now| same(now, acted_on)) {
+        *current = None;
+    }
+}
+
+/// Whether two session records are the same stored session.
+///
+/// Compared on the access token: a refresh rotates it, and a rotated
+/// session is still the same login, but it is also a session another
+/// process just wrote and is entitled to keep using. Erring towards
+/// "different" leaves a usable credential in place, which is the safe
+/// direction - a leftover session can be removed by running logout again,
+/// while one deleted by mistake cannot be recovered.
+fn same_session(current: &OAuthSession, acted_on: &OAuthSession) -> bool {
+    current.access_token == acted_on.access_token
+}
+
+/// Whether two registration records name the same server-side application.
+///
+/// Compared on the client id and the management URI: those identify what
+/// the DELETE was aimed at. A different id means another login registered a
+/// new application while this logout was in flight, and ITS management
+/// token must survive.
+fn same_registration(current: &ClientRegistration, acted_on: &ClientRegistration) -> bool {
+    current.client_id == acted_on.client_id
+        && current.registration_client_uri == acted_on.registration_client_uri
 }
 
 /// Whether the local client registration record may be discarded.
@@ -132,8 +199,14 @@ fn revoke_tokens(
     http: &HttpClient,
     session: &OAuthSession,
     registration: Option<&ClientRegistration>,
+    origin: &str,
+    profile: &str,
     report: &mut Report,
 ) {
+    if let Err(error) = validate_revocation_endpoint(session, origin, profile) {
+        report.warnings.push(error.to_string());
+        return;
+    }
     let Some(endpoint_url) = session.revocation_endpoint.as_deref() else {
         report.warnings.push(
             "this instance advertises no token revocation endpoint, so the \
@@ -162,6 +235,24 @@ fn revoke_tokens(
         }
     }
     report.revoked = revoked_any;
+}
+
+/// Re-check a stored revocation endpoint before a token is posted to it.
+///
+/// The value comes off disk, so it is validated at USE time and not merely
+/// trusted because some past login wrote it: a credential file can be
+/// edited or carried between machines, and this endpoint is about to
+/// receive both tokens.
+fn validate_revocation_endpoint(
+    session: &OAuthSession,
+    origin: &str,
+    profile: &str,
+) -> Result<(), OAuthError> {
+    let Some(url) = session.revocation_endpoint.as_deref() else {
+        return Ok(());
+    };
+    transport::require_stored_secure(url, profile, "OAuth revocation endpoint")?;
+    transport::require_same_origin(url, origin, profile, "OAuth revocation endpoint")
 }
 
 /// Delete the dynamic client registration from the server.
@@ -210,6 +301,8 @@ mod tests {
 
     use super::*;
 
+    const ORIGIN: &str = "https://docs.example.com";
+
     fn scratch() -> (tempfile::TempDir, CredentialStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = CredentialStore::at(dir.path().to_path_buf());
@@ -253,7 +346,7 @@ mod tests {
         entry.api_key = Some("key".to_string());
         store.save(&file).unwrap();
 
-        let report = run("default", &store, Options::default()).unwrap();
+        let report = run("default", ORIGIN, &store, Options::default()).unwrap();
         assert!(report.had_credentials);
         assert!(
             report.file_removed,
@@ -277,7 +370,7 @@ mod tests {
         entry.client = Some(dynamic_registration());
         store.save(&file).unwrap();
 
-        run("default", &store, Options::default()).unwrap();
+        run("default", ORIGIN, &store, Options::default()).unwrap();
         let after = store.load().unwrap();
         assert!(
             after.profile("default").unwrap().client.is_some(),
@@ -288,7 +381,7 @@ mod tests {
         // This registration has no management credentials, so the server
         // never confirmed anything: the local record is KEPT so the orphan
         // stays visible and `--purge` stays retryable.
-        let report = run("default", &store, Options { purge: true }).unwrap();
+        let report = run("default", ORIGIN, &store, Options { purge: true }).unwrap();
         assert!(!report.registration_deleted);
         assert!(
             report.remote_cleanup_failed,
@@ -374,7 +467,7 @@ mod tests {
         file.profile_mut("default").oauth = Some(session());
         store.save(&file).unwrap();
 
-        let report = run("default", &store, Options { purge: true }).unwrap();
+        let report = run("default", ORIGIN, &store, Options { purge: true }).unwrap();
         assert!(!report.registration_deleted);
         assert!(
             report.warnings.iter().any(|w| w.contains("administrator")),
@@ -391,7 +484,7 @@ mod tests {
         file.profile_mut("work").api_key = Some("key-b".to_string());
         store.save(&file).unwrap();
 
-        let report = run("default", &store, Options::default()).unwrap();
+        let report = run("default", ORIGIN, &store, Options::default()).unwrap();
         assert!(
             !report.file_removed,
             "another profile still has credentials"
@@ -404,10 +497,100 @@ mod tests {
         );
     }
 
+    // --- finding [20]: only remove what this run acted on ---------------
+
+    #[test]
+    fn a_session_written_after_the_snapshot_survives_logout() {
+        // P1 snapshots the profile, then spends time on the network. P2
+        // completes a login in the meantime. P1 must not delete P2's
+        // session just because its own snapshot had one.
+        let acted_on = session();
+        let mut current = Some(OAuthSession {
+            access_token: "written-by-another-login".to_string(),
+            ..session()
+        });
+        clear_if_unchanged(&mut current, Some(&acted_on), same_session);
+        assert!(
+            current.is_some(),
+            "logout deleted a session another process had just written"
+        );
+
+        // The session it did act on is removed as normal.
+        let mut current = Some(acted_on.clone());
+        clear_if_unchanged(&mut current, Some(&acted_on), same_session);
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn a_registration_written_after_the_snapshot_keeps_its_management_token() {
+        // The dangerous one: P1 deletes C1 on the server, P2 registers C2
+        // while P1 waits. Clearing the field afterwards would drop RAT2 -
+        // the only credential that can ever delete C2 - leaving an
+        // application on the server that nothing can remove.
+        let acted_on = dynamic_registration();
+        let mut current = Some(ClientRegistration {
+            client_id: "registered-by-another-login".to_string(),
+            registration_access_token: Some("rat-2".to_string()),
+            ..dynamic_registration()
+        });
+        clear_if_unchanged(&mut current, Some(&acted_on), same_registration);
+        assert_eq!(
+            current
+                .as_ref()
+                .and_then(|reg| reg.registration_access_token.as_deref()),
+            Some("rat-2"),
+            "logout discarded the management token of a newer registration"
+        );
+    }
+
+    #[test]
+    fn a_registration_whose_management_uri_changed_is_not_ours_to_remove() {
+        let acted_on = ClientRegistration {
+            registration_client_uri: Some("https://docs.example.com/oauth/clients/c".to_string()),
+            ..dynamic_registration()
+        };
+        let mut current = Some(ClientRegistration {
+            registration_client_uri: Some("https://docs.example.com/oauth/clients/z".to_string()),
+            ..dynamic_registration()
+        });
+        clear_if_unchanged(&mut current, Some(&acted_on), same_registration);
+        assert!(current.is_some());
+    }
+
+    #[test]
+    fn nothing_is_removed_when_there_was_nothing_to_act_on() {
+        // A credential that appeared after an empty snapshot belongs to
+        // whoever wrote it.
+        let mut current = Some("written-later".to_string());
+        clear_if_unchanged(&mut current, None, |a, b| a == b);
+        assert_eq!(current.as_deref(), Some("written-later"));
+    }
+
+    #[test]
+    fn a_plaintext_revocation_endpoint_is_refused_at_use_time() {
+        // The endpoint comes off disk and is about to receive both tokens.
+        let mut stored = session();
+        stored.revocation_endpoint = Some("http://docs.example.com/oauth/revoke".to_string());
+        let error = validate_revocation_endpoint(&stored, ORIGIN, "default")
+            .expect_err("a plaintext stored endpoint must be refused");
+        let text = error.to_string();
+        assert!(text.contains("revocation endpoint"), "{text}");
+        assert!(text.contains("otl auth login"), "{text}");
+    }
+
+    #[test]
+    fn a_revocation_endpoint_on_another_host_is_refused_at_use_time() {
+        let mut stored = session();
+        stored.revocation_endpoint = Some("https://evil.example.net/oauth/revoke".to_string());
+        let error = validate_revocation_endpoint(&stored, ORIGIN, "default")
+            .expect_err("an off-origin stored endpoint must be refused");
+        assert!(error.to_string().contains(ORIGIN), "{error}");
+    }
+
     #[test]
     fn logging_out_with_nothing_stored_is_not_an_error() {
         let (_dir, store) = scratch();
-        let report = run("default", &store, Options { purge: true }).unwrap();
+        let report = run("default", ORIGIN, &store, Options { purge: true }).unwrap();
         assert!(!report.had_credentials);
         assert!(report.warnings.is_empty());
     }

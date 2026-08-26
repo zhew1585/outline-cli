@@ -75,6 +75,19 @@ so that 无需找管理员即可 OAuth 登录。
   现在报 `RetireFailed`（退出码 2）并提供显式逃生阀 `otl auth login --force-new-client`，
   后者会把孤儿的存在明确告知用户，是用户的知情选择而非静默后果。
 
+### R2 审查后的修正（MAJOR [19]）
+
+- **并发 login 不再产生无人管理的注册**。`CredentialStore::update` 只串行化**落盘**，两个 login
+  仍会各自在锁外读到「无缓存」并分别注册 C1/C2；随后后写的那个直接覆盖前者，服务器上多出一个
+  **管理 token 已从磁盘消失**的应用。
+  现在锁内多一步 `claim_client`：磁盘上的 client 必须仍是本次 login 的那个（或为空）。输的一方拿到
+  `ConcurrentLogin`，并由 `abandon()` **删除自己刚建的注册**后退出——赢家的注册与管理凭证完好。
+  测试 `concurrent_logins_never_leave_an_unmanaged_registration` 真的起两个进程，统计
+  register/DELETE 次数，并断言竞争确实发生（created >= 2）后才判定。
+- **client_id 是服务器控制的终端文本**（MINOR [22]）。它不是 bearer secret（本来就出现在授权 URL 里，
+  而且管理员需要它来找孤儿应用），但恶意注册端点可以在里面塞换行/ESC 伪造诊断行。
+  显示前一律过 `display_client_id`（`clean_server_text` + 长度上限）。
+
 ### 已知缺口（有意保留）
 
 - origin 变更时旧实例上的注册不会被自动删除，只提示用户手动 purge。跨实例自动删除需要同时持有

@@ -132,7 +132,54 @@ impl ProfileCredentials {
     pub fn is_bound_to(&self, origin: &str) -> bool {
         self.origin.as_deref() == Some(origin)
     }
+
+    /// Whether this profile holds anything that could AUTHENTICATE a
+    /// request.
+    ///
+    /// A client registration is not such a thing: it names the OAuth client
+    /// the login flow speaks as, and cannot be sent to an API. That
+    /// distinction matters because a leftover registration must not make a
+    /// profile look "bound" to an instance for the purposes of refusing an
+    /// environment API key meant for a different one.
+    pub fn has_authenticator(&self) -> bool {
+        self.api_key.is_some() || self.oauth.is_some()
+    }
+
+    /// The origin an OAuth session provably belongs to.
+    ///
+    /// Derived from the token endpoint captured at login, which discovery
+    /// had already proved same-origin with the instance. That makes the
+    /// session SELF-DESCRIBING: even if the profile-level binding were
+    /// rewritten by a later write, the session still names the server that
+    /// issued it, so the check cannot be defeated by editing one field.
+    pub fn session_origin(&self) -> Option<String> {
+        let session = self.oauth.as_ref()?;
+        Some(
+            engine::base_url_origin(&session.token_endpoint)
+                .unwrap_or_else(|| UNKNOWN_ORIGIN.to_string()),
+        )
+    }
+
+    /// Discard everything that does not belong to `origin`, then bind to it.
+    ///
+    /// Returns whether anything had to be discarded, so a caller can say so
+    /// out loud. Used only where discarding is what the user asked for.
+    pub fn rebind_to(&mut self, origin: &str) -> bool {
+        if self.is_bound_to(origin) || self.is_empty() {
+            self.origin = Some(origin.to_string());
+            return false;
+        }
+        *self = Self {
+            origin: Some(origin.to_string()),
+            ..Self::default()
+        };
+        true
+    }
 }
+
+/// Stand-in when a stored endpoint has no recoverable origin. Never equal
+/// to a real origin, so it fails closed.
+const UNKNOWN_ORIGIN: &str = "an unrecognizable instance";
 
 /// An OAuth session: the tokens plus what is needed to renew them.
 #[derive(Serialize, Deserialize, Clone)]

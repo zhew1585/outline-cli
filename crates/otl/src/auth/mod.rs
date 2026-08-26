@@ -4,14 +4,18 @@
 //! Module map:
 //!
 //! - [`paths`]: where the credential file lives, and which profile is active.
-//! - [`secret_file`]: the create-owner-only / validate / atomic-write
-//!   filesystem primitives every credential read and write goes through.
+//! - [`secret_file`]: the create-owner-only / atomic-write filesystem
+//!   primitives every credential read and write goes through.
+//! - [`file_guard`]: what is allowed to hold credentials - permissions,
+//!   file type, ownership, and the directory around them.
 //! - [`credentials`]: the credential file's contents.
 //! - [`lock`]: the advisory lock that makes token refresh single-flight.
 //! - [`endpoint`]: the one place that speaks HTTP to an OAuth endpoint.
 //! - [`metadata`], [`pkce`], [`loopback`], [`oauth`], [`dcr`]: the pieces of
 //!   the authorization-code flow.
 //! - [`transport`]: the TLS rule every OAuth URL has to pass.
+//! - [`selection`]: which credential a profile offers, and whether it may
+//!   be used against the instance in hand.
 //! - [`source`]: the `engine::CredentialSource` the request channel calls.
 //! - [`login`], [`logout`], [`report`]: what the `otl auth` subcommands do.
 //!
@@ -24,6 +28,7 @@ pub mod credentials;
 pub mod dcr;
 pub mod endpoint;
 pub mod error;
+pub mod file_guard;
 pub mod lock;
 pub mod login;
 pub mod logout;
@@ -34,6 +39,7 @@ pub mod paths;
 pub mod pkce;
 pub mod report;
 pub mod secret_file;
+pub mod selection;
 pub mod source;
 pub mod transport;
 
@@ -147,6 +153,13 @@ pub fn instance_origin(base_url: &str) -> Result<String, AuthError> {
     // engine's own specific diagnosis (a query string, embedded userinfo, a
     // bad scheme) rather than a vaguer one invented here.
     engine::check_base_url(base_url)?;
+    // Then the transport rule, for EVERY command and not just `auth login`.
+    // The engine is generic and accepts plain http on purpose; the policy
+    // that a credential may not travel in the clear belongs here, at the
+    // one place that decides which instance a credential is for. Without
+    // this, `otl api ...` against `http://remote-host` would put the bearer
+    // token on the wire unprotected.
+    transport::require_secure(base_url, "the instance URL")?;
     engine::base_url_origin(base_url).ok_or_else(|| {
         AuthError::Engine(EngineError::InvalidBaseUrl {
             reason: "it has no usable scheme/host origin, so credentials \
@@ -154,6 +167,48 @@ pub fn instance_origin(base_url: &str) -> Result<String, AuthError> {
                 .to_string(),
         })
     })
+}
+
+/// Refuse to add credentials for `origin` to a profile that already belongs
+/// to a different instance.
+///
+/// The read-side check ([`source`]) refuses to USE mismatched credentials.
+/// This is the other half: it stops the mismatched state from being created
+/// at all. Without it a write can rewrite `profile.origin` and leave the
+/// previous instance's higher-priority credentials in place, which is
+/// exactly the state the read-side check was built to catch - and the state
+/// it would then wrongly accept, since the profile-level binding now
+/// "matches".
+///
+/// Must be called INSIDE the credential transaction as well as before any
+/// network work: another process can bind the profile in between.
+pub fn ensure_bindable(
+    entry: Option<&credentials::ProfileCredentials>,
+    profile: &str,
+    origin: &str,
+) -> Result<(), AuthError> {
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    if entry.is_empty() || entry.is_bound_to(origin) {
+        return Ok(());
+    }
+    let dynamic_client = entry
+        .client
+        .as_ref()
+        .is_some_and(|registration| registration.dynamic);
+    Err(AuthError::OAuth(OAuthError::ProfileBoundElsewhere {
+        profile: profile.to_string(),
+        stored: entry
+            .origin
+            .clone()
+            .unwrap_or_else(|| "an unrecorded instance".to_string()),
+        current: origin.to_string(),
+        // A dynamic registration can only be removed with the token stored
+        // alongside it, so point at the flag that does that rather than let
+        // the user strand an application on the server.
+        purge_hint: if dynamic_client { " --purge" } else { "" },
+    }))
 }
 
 /// The credential store, profile and instance origin, without requiring
@@ -170,6 +225,19 @@ pub fn open_store() -> Result<StoreContext, AuthError> {
         base_url,
         origin,
     })
+}
+
+impl StoreContext {
+    /// What is currently stored for the active profile, if anything.
+    ///
+    /// Best effort: an unreadable file is reported by the operation that
+    /// actually needs it, not by this convenience accessor.
+    pub fn stored_profile(&self) -> Option<credentials::ProfileCredentials> {
+        self.store
+            .load()
+            .ok()
+            .and_then(|file| file.profile(&self.profile).cloned())
+    }
 }
 
 /// Where credentials for this invocation live, and which instance they are
@@ -289,8 +357,11 @@ fn oauth_exit_code(error: &OAuthError) -> ExitCode {
         OAuthError::RegistrationUnavailable { .. }
         | OAuthError::NoCallbackPort { .. }
         | OAuthError::InstanceMismatch { .. }
+        | OAuthError::ProfileBoundElsewhere { .. }
         | OAuthError::InsecureTransport { .. }
-        | OAuthError::RetireFailed { .. } => ExitCode::Usage,
+        | OAuthError::InsecureStoredEndpoint { .. }
+        | OAuthError::RetireFailed { .. }
+        | OAuthError::ConcurrentLogin { .. } => ExitCode::Usage,
         // A registration exists on the server that nothing can remove. Not
         // a local configuration problem, and not something a retry fixes:
         // it needs an administrator, so it gets the generic failure code

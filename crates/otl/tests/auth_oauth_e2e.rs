@@ -1426,3 +1426,190 @@ async fn concurrent_processes_refresh_once_even_with_a_short_lived_token() {
     // `.expect(1)` on the refresh grant is the assertion that matters.
     drop(server);
 }
+
+// --- finding [19]: concurrent logins must not strand a registration ------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_logins_never_leave_an_unmanaged_registration() {
+    // Two logins start against an empty profile, both see "no cached
+    // client", and both register. Only one management token fits on disk,
+    // so the loser must DELETE its own registration rather than overwrite
+    // the winner's - otherwise an application is left on the server that
+    // nothing can ever remove.
+    let server = MockServer::start().await;
+    let base = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata(&base)))
+        .mount(&server)
+        .await;
+    // Each registration gets its own id, so the two logins really do own
+    // different applications.
+    for (index, client) in ["dcr-a", "dcr-b", "dcr-c", "dcr-d"].iter().enumerate() {
+        Mock::given(method("POST"))
+            .and(path("/oauth/register"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "client_id": client,
+                "registration_access_token": format!("rat-{client}"),
+                "registration_client_uri": format!("{base}/oauth/clients/{client}")
+            })))
+            .up_to_n_times(1)
+            .with_priority((index + 1) as u8)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/oauth/clients/{client}")))
+            .and(header("authorization", format!("Bearer rat-{client}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let outcomes = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            // Neither login gets a redirect, so both stop at the callback
+            // wait - after registering and after persisting. That is the
+            // window this test is about.
+            let children: Vec<_> = (0..2)
+                .map(|_| {
+                    otl(&path, &base)
+                        .args(["auth", "login", "--no-browser", "--timeout", "1"])
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect::<Vec<_>>()
+        }
+    })
+    .await
+    .unwrap();
+
+    for output in &outcomes {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Both fail (no browser), but neither may report an orphan.
+        assert!(
+            !stderr.contains("orphaned"),
+            "a registration was stranded on the server: {stderr}"
+        );
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let registered: Vec<String> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/oauth/register")
+        .filter_map(|request| {
+            serde_json::from_slice::<Value>(&request.body)
+                .ok()
+                .map(|_| String::new())
+        })
+        .collect();
+    let deleted: Vec<&str> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "DELETE")
+        .filter_map(|request| request.url.path().rsplit('/').next())
+        .collect();
+
+    // Every registration that was created and is NOT the one on disk must
+    // have been deleted again.
+    let stored_client_id = store(dir.path())
+        .load()
+        .ok()
+        .and_then(|file| file.profile("default").and_then(|p| p.client.clone()))
+        .map(|client| client.client_id);
+    let created = registered.len();
+    let survivors = created - deleted.len();
+    eprintln!(
+        "concurrent logins: created={created} deleted={}",
+        deleted.len()
+    );
+    assert!(
+        created >= 2,
+        "the race did not happen: only {created} registration(s) were created, \
+         so this test proved nothing"
+    );
+    assert!(
+        survivors <= 1,
+        "{created} registrations created, {} deleted: {survivors} left \
+         unmanaged on the server",
+        deleted.len()
+    );
+    if survivors == 1 {
+        assert!(
+            stored_client_id.is_some(),
+            "a registration survived on the server with no local record of it"
+        );
+    }
+    drop(server);
+}
+
+// --- finding [22]: a server-supplied client id is untrusted terminal text -
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_client_id_cannot_forge_diagnostic_lines() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    let base = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata(&base)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/register"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "client_id": "evil\n\u{1b}[31merror: your credentials were stolen\u{200b}",
+            "registration_access_token": "rat-1",
+            "registration_client_uri": format!("{base}/oauth/clients/evil")
+        })))
+        .mount(&server)
+        .await;
+    // Deletion fails, so the orphan report prints the client id.
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("readonly");
+    std::fs::create_dir(&config).unwrap();
+    let path = config.clone();
+
+    let run = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            drop(otl::auth::lock::CredentialLock::acquire(&path).unwrap());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let outcome = drive_login(&path, &base, &[], |_| {});
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+            outcome
+        }
+    })
+    .await
+    .unwrap();
+
+    let printed = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        printed.contains("orphaned"),
+        "the stranded application must still be reported: {printed}"
+    );
+    // The id is shown - an admin needs it - but stripped of anything that
+    // could forge a line or move the cursor.
+    assert!(printed.contains("evil"), "{printed}");
+    assert!(
+        !printed.contains('\u{1b}'),
+        "escape sequence survived: {printed:?}"
+    );
+    assert!(
+        !printed.contains('\u{200b}'),
+        "invisible char survived: {printed:?}"
+    );
+    drop(server);
+}

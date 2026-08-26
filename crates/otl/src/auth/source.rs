@@ -35,24 +35,21 @@ use std::sync::Mutex;
 use engine::{CredentialError, CredentialSource};
 use reqwest::blocking::Client;
 
-use crate::auth::credentials::{
-    ClientRegistration, CredentialFile, CredentialStore, OAuthSession, ProfileCredentials,
+pub use crate::auth::selection::{
+    available, check_binding, env_api_key, fresh_enough, superseded_by, Method, Snapshot,
+    EXPIRY_SKEW_SECONDS,
 };
+
+use crate::auth::credentials::{ClientRegistration, CredentialFile, CredentialStore, OAuthSession};
 use crate::auth::endpoint;
 use crate::auth::error::{OAuthError, StoreError};
 use crate::auth::lock::CredentialLock;
 use crate::auth::oauth::{self, ClientAuth};
-use crate::config::ENV_API_KEY;
+use crate::auth::transport;
 use crate::stdio;
 
 /// Environment variable that silences the plaintext-key warning.
 pub const ENV_NO_KEY_WARNING: &str = "OUTLINE_NO_KEY_WARNING";
-
-/// How long before its stated expiry an access token is treated as spent.
-///
-/// Covers clock skew and the time a request spends in flight, so a token
-/// is refreshed slightly early rather than used a moment too late.
-pub const EXPIRY_SKEW_SECONDS: i64 = 60;
 
 /// The one-time warning about keeping an API key in the environment.
 const ENV_KEY_WARNING: &str = "warning: authenticating with the API key in \
@@ -60,74 +57,6 @@ const ENV_KEY_WARNING: &str = "warning: authenticating with the API key in \
      you start and tends to end up in shell history, CI logs and crash \
      reports. Run `otl auth set-key` to store it in the credential file \
      (owner-only) instead. Set OUTLINE_NO_KEY_WARNING=1 to silence this.";
-
-/// How a profile is authenticating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    /// An OAuth session obtained through `otl auth login`.
-    OAuth,
-    /// An API key stored in the credential file.
-    StoredApiKey,
-    /// An API key taken from the environment.
-    EnvApiKey,
-}
-
-impl Method {
-    /// Label for `auth info`.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::OAuth => "oauth (browser login)",
-            Self::StoredApiKey => "api key (credential file)",
-            Self::EnvApiKey => "api key (OUTLINE_API_KEY environment variable)",
-        }
-    }
-}
-
-/// What the provider can say about itself without revealing anything.
-#[derive(Debug, Clone)]
-pub struct Snapshot {
-    /// The method actually in use.
-    pub method: Method,
-    /// Every credential available for this profile, highest priority
-    /// first, so `auth info` can show what is being shadowed.
-    pub available: Vec<Method>,
-    /// Granted scope, when known.
-    pub scope: Option<String>,
-    /// Account label captured at login, when known.
-    pub account: Option<String>,
-    /// Workspace label captured at login, when known.
-    pub workspace: Option<String>,
-    /// Seconds until the access token expires; negative when already
-    /// expired, `None` for credentials that do not expire.
-    pub expires_in: Option<i64>,
-    /// Whether a refresh token is stored, so renewal is possible.
-    pub renewable: bool,
-    /// Whether the client was obtained by dynamic registration.
-    pub dynamic_client: bool,
-}
-
-/// Which credentials a profile has, in precedence order.
-pub fn available(profile: Option<&ProfileCredentials>) -> Vec<Method> {
-    let mut methods = Vec::new();
-    if profile.is_some_and(|p| p.oauth.is_some()) {
-        methods.push(Method::OAuth);
-    }
-    if profile.is_some_and(|p| p.api_key.is_some()) {
-        methods.push(Method::StoredApiKey);
-    }
-    if env_api_key().is_some() {
-        methods.push(Method::EnvApiKey);
-    }
-    methods
-}
-
-/// `OUTLINE_API_KEY`, blank treated as unset.
-pub fn env_api_key() -> Option<String> {
-    env::var(ENV_API_KEY)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
 
 /// What the provider holds between requests.
 enum State {
@@ -143,6 +72,9 @@ enum State {
 pub struct CredentialProvider {
     store: CredentialStore,
     profile: String,
+    /// Instance origin this provider was resolved for. Stored endpoints are
+    /// re-checked against it before any credential is sent to them.
+    origin: String,
     method: Method,
     /// The client registration, for the `client_id` a refresh needs.
     registration: Option<ClientRegistration>,
@@ -216,6 +148,7 @@ impl CredentialProvider {
         Ok(Some(Self {
             store,
             profile: profile.to_string(),
+            origin: origin.to_string(),
             method,
             registration: entry.and_then(|profile| profile.client.clone()),
             state: Mutex::new(state),
@@ -293,6 +226,22 @@ impl CredentialProvider {
     /// Perform the refresh grant, translating a rejected grant into the
     /// "sign in again" message.
     fn request_refresh(&self, session: &OAuthSession) -> Result<oauth::Tokens, OAuthError> {
+        // The endpoint comes off disk, so it is re-validated here rather
+        // than trusted because a past login stored it: a credential file
+        // can be hand-edited, can predate this rule, or can be copied
+        // between machines - and a refresh token is about to be posted to
+        // whatever this says.
+        transport::require_stored_secure(
+            &session.token_endpoint,
+            &self.profile,
+            "OAuth token endpoint",
+        )?;
+        transport::require_same_origin(
+            &session.token_endpoint,
+            &self.origin,
+            &self.profile,
+            "OAuth token endpoint",
+        )?;
         let refresh_token =
             session
                 .refresh_token
@@ -385,39 +334,6 @@ impl CredentialSource for CredentialProvider {
     }
 }
 
-/// Whether a session may be sent without refreshing it first.
-///
-/// Applies the safety margin: a token inside [`EXPIRY_SKEW_SECONDS`] of its
-/// expiry is refreshed EARLY, so clock skew and time in flight cannot turn
-/// it into a failed request.
-fn fresh_enough(session: &OAuthSession) -> bool {
-    match session.expires_at {
-        Some(at) => oauth::now_unix() + EXPIRY_SKEW_SECONDS < at,
-        // No expiry was recorded: use it and let a 401 sort it out, rather
-        // than refreshing on every single request.
-        None => true,
-    }
-}
-
-/// Whether the session on disk already replaces `superseded`.
-///
-/// This is the single-flight acceptance test, and it deliberately does NOT
-/// apply the safety margin. The margin exists to refresh early; applying it
-/// here would make a queue of waiting processes each refresh again whenever
-/// the server issues a short-lived token, spending one single-use refresh
-/// token per waiter and turning a successful batch into an authentication
-/// failure. What matters to a waiter is only: is this a different token
-/// than the one we know is spent, and has it not actually expired yet.
-fn superseded_by(session: &OAuthSession, superseded: &str) -> bool {
-    if session.access_token == superseded {
-        return false;
-    }
-    match session.expires_at {
-        Some(at) => oauth::now_unix() < at,
-        None => true,
-    }
-}
-
 /// What the in-memory state can offer right now.
 enum Current {
     /// A credential good to send.
@@ -425,29 +341,6 @@ enum Current {
     /// A credential that needs replacing; carries the spent value so the
     /// refresh can tell "mine is stale" from "someone else replaced it".
     Spent(String),
-}
-
-/// Refuse stored credentials that belong to another instance.
-fn check_binding(
-    entry: Option<&ProfileCredentials>,
-    profile: &str,
-    origin: &str,
-) -> Result<(), OAuthError> {
-    let Some(entry) = entry else {
-        return Ok(());
-    };
-    // Nothing stored means nothing to misdirect.
-    if entry.is_empty() || entry.is_bound_to(origin) {
-        return Ok(());
-    }
-    Err(OAuthError::InstanceMismatch {
-        profile: profile.to_string(),
-        stored: entry
-            .origin
-            .clone()
-            .unwrap_or_else(|| "an unrecorded instance".to_string()),
-        current: origin.to_string(),
-    })
 }
 
 /// Fold a token response into the stored session.
@@ -518,6 +411,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::auth::credentials::ProfileCredentials;
 
     const ORIGIN: &str = "https://docs.example.com";
 

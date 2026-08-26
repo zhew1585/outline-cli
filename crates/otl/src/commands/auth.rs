@@ -149,6 +149,7 @@ fn run_logout(args: &LogoutArgs, mode: OutputMode) -> Result<(), CliError> {
     let context = auth::open_store().map_err(auth::map_auth_error)?;
     let report = logout::run(
         &context.profile,
+        &context.origin,
         &context.store,
         logout::Options { purge: args.purge },
     )
@@ -179,11 +180,30 @@ fn run_logout(args: &LogoutArgs, mode: OutputMode) -> Result<(), CliError> {
 /// concurrent token refresh had already rotated.
 fn run_set_key(mode: OutputMode) -> Result<(), CliError> {
     let context = auth::open_store().map_err(auth::map_auth_error)?;
+    // Checked before the prompt: asking for a secret and then refusing it
+    // would be rude.
+    auth::ensure_bindable(
+        context.stored_profile().as_ref(),
+        &context.profile,
+        &context.origin,
+    )
+    .map_err(auth::map_auth_error)?;
     let key = read_api_key()?;
     context
         .store
         .update(
             |file: &mut auth::credentials::CredentialFile| -> Result<(), AuthError> {
+                // Re-checked INSIDE the transaction: another process may
+                // have bound this profile elsewhere while the prompt was
+                // open. Writing here would rewrite `origin` and leave that
+                // instance's OAuth session in place - and OAuth outranks an
+                // API key, so the next request would send the wrong
+                // instance's token.
+                auth::ensure_bindable(
+                    file.profile(&context.profile),
+                    &context.profile,
+                    &context.origin,
+                )?;
                 let entry = file.profile_mut(&context.profile);
                 entry.origin = Some(context.origin.clone());
                 entry.api_key = Some(key);
@@ -202,17 +222,23 @@ fn run_info(args: &InfoArgs, mode: OutputMode) -> Result<(), CliError> {
     let store = auth::credentials::CredentialStore::discover()
         .map_err(|error| auth::map_auth_error(AuthError::Store(error)))?;
     let health = report::credential_health(&store);
-    let base_url = auth::base_url().ok();
-    let origin = base_url.as_deref().and_then(engine::base_url_origin);
+    // The same resolution every other command performs, including the
+    // transport rule, so `auth info` reports the instance exactly as it
+    // would be used - a plaintext remote URL is shown as unusable here
+    // rather than quietly accepted and refused everywhere else.
+    let instance = auth::base_url()
+        .and_then(|base_url| auth::instance_origin(&base_url).map(|origin| (base_url, origin)))
+        .map_err(|error| error.to_string());
 
-    // A report must work even when the file cannot be used - that is
-    // exactly when it is needed - so resolution failures (including a
-    // credential bound to another instance) become part of the output
-    // rather than aborting it.
+    // A report must work even when nothing can be used - that is exactly
+    // when it is needed - so failures become part of the output rather
+    // than aborting it.
+    let origin = instance.as_ref().ok().map(|(_, origin)| origin.clone());
     let resolved = resolve_for_info(&store, &profile, origin.as_deref());
+    let base_url = instance.as_ref().ok().map(|(base_url, _)| base_url.clone());
     let identity = live_identity(args, &base_url, &resolved);
     emit(
-        info_output(&profile, base_url.as_deref(), &health, &resolved, &identity),
+        info_output(&profile, &instance, &health, &resolved, &identity),
         mode,
     )
 }
@@ -404,7 +430,7 @@ fn set_key_output(profile: &str, health: &CredentialHealth) -> Output {
 /// Human lines plus the machine-readable object for `auth info`.
 fn info_output(
     profile: &str,
-    base_url: Option<&str>,
+    instance: &Result<(String, String), String>,
     health: &CredentialHealth,
     resolved: &Result<Option<Arc<CredentialProvider>>, String>,
     identity: &Option<Result<Identity, String>>,
@@ -414,12 +440,14 @@ fn info_output(
         .ok()
         .and_then(|provider| provider.as_ref())
         .map(|provider| provider.snapshot());
+    let origin = instance.as_ref().ok().map(|(_, origin)| origin.as_str());
     let mut lines = vec![format!("profile:          {profile}")];
     lines.push(format!(
         "instance:         {}",
-        base_url
-            .and_then(engine::base_url_origin)
-            .unwrap_or_else(|| "not configured (set OUTLINE_URL)".to_string())
+        match instance {
+            Ok((_, origin)) => origin.clone(),
+            Err(reason) => format!("not usable ({reason})"),
+        }
     ));
     lines.extend(method_lines(resolved, snapshot.as_ref()));
     lines.extend(identity_lines(snapshot.as_ref(), identity));
@@ -428,7 +456,8 @@ fn info_output(
         lines,
         value: json!({
             "profile": profile,
-            "instance": base_url.and_then(engine::base_url_origin),
+            "instance": origin,
+            "instance_problem": instance.as_ref().err(),
             "method": snapshot.as_ref().map(|snapshot| snapshot.method.label()),
             "available": snapshot
                 .as_ref()
@@ -615,16 +644,23 @@ mod tests {
             },
             usable: false,
             directory: std::path::PathBuf::from("/home/u/.config/outline-cli"),
+            directory_mode: Some("0700".to_string()),
             directory_problem: None,
             profiles: Vec::new(),
             env_api_key: false,
         };
         let resolved = Err("credential file is accessible to users other than you".to_string());
-        let output = info_output("default", None, &health, &resolved, &None);
+        let output = info_output(
+            "default",
+            &Err("OUTLINE_URL is not set".to_string()),
+            &health,
+            &resolved,
+            &None,
+        );
         let rendered = output.lines.join("\n");
         assert!(rendered.contains("0644"), "{rendered}");
         assert!(rendered.contains("unavailable"), "{rendered}");
-        assert!(rendered.contains("not configured"), "{rendered}");
+        assert!(rendered.contains("not usable"), "{rendered}");
     }
 
     #[test]
@@ -637,13 +673,17 @@ mod tests {
             },
             usable: true,
             directory: std::path::PathBuf::from("/tmp"),
+            directory_mode: Some("0700".to_string()),
             directory_problem: None,
             profiles: Vec::new(),
             env_api_key: true,
         };
         let output = info_output(
             "default",
-            Some("https://docs.example.com"),
+            &Ok((
+                "https://docs.example.com".to_string(),
+                "https://docs.example.com".to_string(),
+            )),
             &health,
             &Ok(None),
             &None,

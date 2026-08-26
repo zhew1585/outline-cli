@@ -49,24 +49,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum bytes read from one request line.
 const MAX_REQUEST_LINE_BYTES: u64 = 8 * 1024;
 
-/// Sanity bound on connections handled in one login.
+/// Pause applied after any connection that did not carry the redirect.
 ///
-/// The real limit is the DEADLINE, not this: browsers send stray requests
-/// (favicon, prefetch, connection reuse) that must be answered and ignored,
-/// and failing the login because a local process opened some sockets would
-/// hand any unprivileged local user a way to break every login. This exists
-/// only so a client that connects and disconnects instantly cannot spin the
-/// loop forever, and it is generous enough that legitimate traffic never
-/// reaches it.
-const MAX_CONNECTIONS: u32 = 4096;
-
-/// Pause after a connection that yielded nothing, so a peer that connects
-/// and closes immediately cannot spin the accept loop at full speed.
-///
-/// Sized together with [`MAX_CONNECTIONS`]: the product
-/// (4096 x 5ms ~ 20s) is comfortably under [`AUTH_TIMEOUT`], so a flood of
-/// empty connections runs out the iteration bound only long after the user
-/// would have finished consenting - it cannot end a login early.
+/// This is what bounds the loop: the DEADLINE is the only thing that ends
+/// the wait, and every unproductive connection costs at least this long, so
+/// the iteration count can never exceed `timeout / EMPTY_CONNECTION_BACKOFF`
+/// however fast a peer connects. A fixed connection budget was tried first
+/// and was wrong: a local process could spend it on stray requests and make
+/// the login fail before the user had finished consenting.
 const EMPTY_CONNECTION_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Every redirect URI an administrator must allow when pre-registering an
@@ -164,33 +154,46 @@ impl CallbackServer {
     /// its code exchanged, whatever else it carries.
     pub fn wait_for_code(&self, state: &str, timeout: Duration) -> Result<String, OAuthError> {
         let deadline = Instant::now() + timeout;
-        for _ in 0..MAX_CONNECTIONS {
-            // Checked before every connection AND inside the accept poll,
-            // so the announced timeout is the real bound on this loop. A
-            // per-connection read timeout alone would let N slow clients
-            // stretch the wait to N times its length.
-            if Instant::now() >= deadline {
-                break;
-            }
+        // Bounded by the deadline and NOTHING ELSE. Browsers send stray
+        // requests (favicon, prefetch, connection reuse) that must be
+        // answered and ignored, and any local process can send more; a
+        // connection budget would let that end the login early, which is a
+        // denial of service handed to every unprivileged user on the box.
+        while Instant::now() < deadline {
             let stream = self.accept_before(deadline, timeout)?;
-            let Some(target) = read_request_target(&stream, deadline) else {
-                respond(&stream, "400 Bad Request", "Malformed request.");
-                // Nothing usable arrived; do not spin on a peer that keeps
-                // connecting and closing.
-                std::thread::sleep(EMPTY_CONNECTION_BACKOFF);
-                continue;
-            };
-            let Some(redirect) = parse_redirect(&target) else {
-                // A stray browser request (favicon, prefetch): answer and
-                // keep waiting for the real redirect.
-                respond(&stream, "404 Not Found", "Not the otl callback.");
-                continue;
-            };
-            return self.finish(&stream, redirect, state);
+            let handled = self.handle(&stream, state, deadline);
+            match handled {
+                Some(outcome) => return outcome,
+                // Not the redirect. Answer, pause, keep waiting: the pause
+                // is what stops a peer that connects and closes in a tight
+                // loop from spinning this thread at full speed, and it is
+                // what bounds the iteration count.
+                None => std::thread::sleep(EMPTY_CONNECTION_BACKOFF),
+            }
         }
         Err(OAuthError::CallbackTimeout {
             seconds: timeout.as_secs(),
         })
+    }
+
+    /// Serve one connection: `Some` when it was the redirect (successfully
+    /// or not), `None` when it was anything else and the wait continues.
+    fn handle(
+        &self,
+        stream: &TcpStream,
+        state: &str,
+        deadline: Instant,
+    ) -> Option<Result<String, OAuthError>> {
+        let Some(target) = read_request_target(stream, deadline) else {
+            respond(stream, "400 Bad Request", "Malformed request.");
+            return None;
+        };
+        let Some(redirect) = parse_redirect(&target) else {
+            // A stray request: answer it and keep waiting for the real one.
+            respond(stream, "404 Not Found", "Not the otl callback.");
+            return None;
+        };
+        Some(self.finish(stream, redirect, state))
     }
 
     /// Validate one redirect and turn it into a code or a typed failure.
@@ -537,6 +540,72 @@ mod tests {
             .wait_for_code("state", Duration::from_secs(20))
             .expect("stray connections must not defeat the real redirect");
         assert_eq!(code, "real-code");
+    }
+
+    #[test]
+    fn valid_non_callback_requests_do_not_consume_the_login() {
+        // The specific case a fixed connection budget got wrong: these are
+        // well-formed GETs that simply are not the callback (a browser
+        // sends them, and so can any local process). They must be answered
+        // and ignored without ever ending the wait early - only the
+        // deadline may do that.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpStream;
+
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let port = port_of(server.redirect_uri()).expect("a bound port");
+
+        std::thread::spawn(move || {
+            let stray = |path: &str| {
+                if let Ok(mut stream) = TcpStream::connect((CALLBACK_HOST, port)) {
+                    let _ = stream.write_all(
+                        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(),
+                    );
+                    let _ = stream.flush();
+                    // Read the answer so the exchange completes normally.
+                    let mut sink = [0_u8; 64];
+                    let _ = stream.read(&mut sink);
+                }
+            };
+            for _ in 0..60 {
+                stray("/favicon.ico");
+            }
+            if let Ok(mut stream) = TcpStream::connect((CALLBACK_HOST, port)) {
+                let _ = stream.write_all(
+                    b"GET /callback?code=real-code&state=state HTTP/1.1\r\n\
+                      Host: 127.0.0.1\r\n\r\n",
+                );
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+
+        let code = server
+            .wait_for_code("state", Duration::from_secs(20))
+            .expect("stray GETs must not defeat the real redirect");
+        assert_eq!(code, "real-code");
+    }
+
+    #[test]
+    fn the_wait_is_bounded_by_the_deadline_alone() {
+        // There is no connection budget left to exhaust: the loop ends when
+        // the deadline passes, and the mandatory pause after every
+        // unproductive connection is what bounds the iteration count.
+        let server = CallbackServer::bind_ephemeral().expect("loopback bind");
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let error = server
+            .wait_for_code("state", budget)
+            .expect_err("no redirect is coming");
+        assert!(
+            matches!(error, OAuthError::CallbackTimeout { .. }),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < budget + READ_TIMEOUT,
+            "the wait overran its budget: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

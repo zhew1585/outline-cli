@@ -70,6 +70,18 @@ so that 两种认证方式都有一等体验。
 - **`auth info` 默认联网**：这是「我的凭证还有效吗」的真答案。`--offline` 供无网/排障使用，
   此时 account/workspace 显示为「上次登录时」。
 
+### R2 审查后的修正（BLOCKER [17]）
+
+- **跨实例写入被拒绝，而不是静默混存**。R1 只在**读取**侧检查绑定；`set-key` 依然可以在
+  `OUTLINE_URL=B` 时把 profile 的 origin 改成 B、写入 B 的 key，却**保留 A 的 OAuth session**。
+  profile 看起来绑定到 B 了，但 OAuth 优先级高于 API key，于是下一条命令把 **A 的 access token 发给 B**；
+  过期后还会去 A 刷新再把新 token 发给 B——R1 [1] 从写入侧完整复活。
+  现在 `auth::ensure_bindable` 在 `set-key` 与 `login` 的**网络动作之前**和**事务之内**各检查一次
+  （两次都必要：另一进程可能在提示打开期间绑定该 profile）。
+- **第二道防线：session 自证来源**。`ProfileCredentials::session_origin()` 从登录时记录的
+  `token_endpoint` 推导 session 自己的 origin（discovery 当时已校验过同源），`check_binding` 额外比对它。
+  即便 `profile.origin` 被手工改写或被将来某条忘记加守卫的写路径改写，那个 session 也**不可用**而非危险。
+
 ### R1 审查后的修正
 
 - **交互输入现在关闭回显**（原列为 deliberate gap，审查者不接受，已改）。加入 `rpassword` 依赖：

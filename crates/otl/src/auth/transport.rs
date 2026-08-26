@@ -89,6 +89,48 @@ pub fn require_secure(url: &str, what: &'static str) -> Result<(), OAuthError> {
     })
 }
 
+/// Refuse a plaintext endpoint that came out of the credential file.
+///
+/// Same rule as [`require_secure`], but reported as a STORED value rather
+/// than a configured one, because the remedy differs: a fresh `otl auth
+/// login` re-discovers the endpoints, whereas a bad `OUTLINE_URL` is edited
+/// by hand.
+pub fn require_stored_secure(
+    url: &str,
+    profile: &str,
+    what: &'static str,
+) -> Result<(), OAuthError> {
+    require_secure(url, what).map_err(|error| OAuthError::InsecureStoredEndpoint {
+        profile: profile.to_string(),
+        what,
+        detail: match error {
+            OAuthError::InsecureTransport { detail, .. } => detail,
+            other => other.to_string(),
+        },
+    })
+}
+
+/// Refuse a stored endpoint that does not belong to the instance in use.
+///
+/// Discovery enforced this when the endpoint was first recorded; enforcing
+/// it again at use time means a credential file that was edited, or carried
+/// from another machine, cannot redirect a refresh token to a third party.
+pub fn require_same_origin(
+    url: &str,
+    origin: &str,
+    profile: &str,
+    what: &'static str,
+) -> Result<(), OAuthError> {
+    if crate::auth::endpoint::origin_of(url) == origin {
+        return Ok(());
+    }
+    Err(OAuthError::InsecureStoredEndpoint {
+        profile: profile.to_string(),
+        what,
+        detail: format!("it does not belong to {origin}, the instance in use"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

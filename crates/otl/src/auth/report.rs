@@ -47,6 +47,8 @@ pub struct CredentialHealth {
     pub usable: bool,
     /// Absolute path of the directory holding it.
     pub directory: PathBuf,
+    /// Octal mode of the directory, where the platform has one.
+    pub directory_mode: Option<String>,
     /// Why the directory is unusable, if it is.
     ///
     /// Reported as well as the file's own state: a directory other users
@@ -85,6 +87,7 @@ pub fn credential_health(store: &CredentialStore) -> CredentialHealth {
             && (!exists || loaded.is_some()),
         permissions,
         directory: store.dir().to_path_buf(),
+        directory_mode: crate::auth::secret_file::directory_mode(store.dir()),
         directory_problem,
         profiles: loaded.as_ref().map(profiles_of).unwrap_or_default(),
         env_api_key: crate::auth::source::env_api_key().is_some(),
@@ -188,10 +191,18 @@ impl CredentialHealth {
 
 impl CredentialHealth {
     /// One line about the directory holding the credential file.
+    ///
+    /// States the ACTUAL mode rather than a reassuring label. The security
+    /// criterion is "only the owner can write", which `0755` satisfies -
+    /// but calling `0755` "owner-only" would claim a stronger permission
+    /// state than the directory has, and a health report that overstates
+    /// protection is worse than one that says nothing.
     fn describe_directory(&self) -> String {
-        match &self.directory_problem {
-            Some(problem) => format!("{} - PROBLEM: {problem}", self.directory.display()),
-            None => format!("{} (owner-only)", self.directory.display()),
+        let path = self.directory.display();
+        match (&self.directory_problem, &self.directory_mode) {
+            (Some(problem), _) => format!("{path} - PROBLEM: {problem}"),
+            (None, Some(mode)) => format!("{path} ({mode}, not writable by other users)"),
+            (None, None) => format!("{path} (present)"),
         }
     }
 }
@@ -359,6 +370,34 @@ mod tests {
         assert!(rendered.contains("PROBLEM"), "{rendered}");
         assert!(rendered.contains("0777"), "{rendered}");
         assert!(!rendered.contains(SECRET), "{rendered}");
+
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_0755_directory_is_reported_with_its_real_mode() {
+        // Allowed, because others cannot WRITE it - but it is not
+        // owner-only, and a health report that overstates protection is
+        // worse than one that says nothing.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = scratch();
+        populated(&store);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let health = credential_health(&store);
+        assert!(health.usable, "0755 must remain usable");
+        let rendered = health.lines().join("\n");
+        assert!(rendered.contains("0755"), "{rendered}");
+        assert!(
+            !rendered.contains("owner-only"),
+            "0755 was described as owner-only: {rendered}"
+        );
+        assert!(
+            rendered.contains("not writable by other users"),
+            "{rendered}"
+        );
 
         let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700));
     }

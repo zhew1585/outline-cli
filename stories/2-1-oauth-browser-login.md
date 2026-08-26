@@ -56,6 +56,14 @@ so that 用工作区身份安全登录。
 ## Dev Notes
 
 - **先读 `project-context.md`**。本 story 最相关红线：engine 禁止 OAuth 内容（全部落 otl）、除凭证文件外任何位置不得出现凭证、硬编码值提常量。
+- **安全决策 0-fix（R2：TLS 强制覆盖所有命令，不只 login）**：R1 只在 `metadata::discover` 里做检查，
+  于是 `otl api` / `auth info` / env key / 已存 session 走 `http://remote-host` 时 bearer 仍然明文上网。
+  现在 `auth::instance_origin()`（`open_session` 与 `open_store` 的共同入口）调用 `require_secure`，
+  所以**每条**需要凭证的命令都过这条规则。engine 保持通用、仍然接受 http——「凭证不得明文传输」是
+  产品策略，属于 otl，不属于通用 RPC 引擎。
+  另外**凭证文件里的 endpoint 在使用时重新校验**（refresh 的 token endpoint、logout 的 revocation
+  endpoint、purge 的 registration management URI）：那些值来自磁盘，文件可被手工编辑、可能早于本规则、
+  也可能是从别的机器拷来的，而它们马上就要接收 refresh token。
 - **安全决策 0（R1 后新增：TLS 强制）**：`auth/transport.rs` 要求实例 URL 与所有广播端点为 `https://`，
   唯一例外是**回环 IP 字面量**（`127.0.0.0/8`、`[::1]`）。理由：授权码、PKCE verifier、refresh token、
   client secret、撤销令牌全部在请求体里；明文 HTTP 下这些对路径上任何人可读，而 refresh token 是长期凭证。
