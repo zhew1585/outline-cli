@@ -15,7 +15,10 @@
 #   --linux    also run the suite on real Linux in docker (needs docker)
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+# `|| exit` matters here for the same reason as the header above: without it a
+# failed cd would run every gate against whatever directory we happened to be
+# in and report the results as if they were this repository's.
+cd "$(dirname "$0")/.." || exit 1
 export PATH="$HOME/.cargo/bin:$PATH"
 
 WITH_WINDOWS=0

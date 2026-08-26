@@ -29,10 +29,15 @@
 # It is also nearly free: the step compiles the same package, profile and
 # target that `dist build` compiles moments later in the same job, with the
 # same RUSTFLAGS, so dist reuses this compilation instead of redoing it.
+#
+# The cheap structural assertions run BEFORE it on purpose: they take under a
+# second, the size build takes minutes, and ordering them this way means a
+# size failure can never hide a broken gating chain behind it.
 - name: install musl cross toolchain (Linux release builds)
   if: runner.os == 'Linux'
   shell: bash
   run: bash scripts/install-linux-musl-toolchain.sh
+
 
 # Belt and braces for the checks that protect the supply chain. The
 # preflight job (release-guards) is the primary gate and blocks `host`
