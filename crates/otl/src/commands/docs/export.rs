@@ -233,6 +233,30 @@ impl Export<'_> {
         }
     }
 
+    /// Refuse a destination that IS a file this run already wrote.
+    ///
+    /// Checked before writing, not after: a `rename` installs a new inode,
+    /// so asking afterwards would compare against an identity that did not
+    /// exist before this write and could never match. Reached when the
+    /// filesystem considers two of our names equivalent even though the
+    /// de-duplication key does not - which is also why `--overwrite` is the
+    /// only mode that needs it, the no-replace link used otherwise refusing
+    /// such a collision outright.
+    fn check_not_already_taken(&self, dest: &Path) -> Result<(), String> {
+        let Some(existing) = target::existing_identity(dest) else {
+            return Ok(());
+        };
+        if !self.written_ids.contains(&existing) {
+            return Ok(());
+        }
+        Err(
+            "another document in this export already occupies this file: \
+             the filesystem treats their two names as one directory entry, \
+             so writing this one would lose the other"
+                .to_string(),
+        )
+    }
+
     /// Fetch and write one document.
     fn write_document(&mut self, dir: &Dir, plan: &Plan<'_>, node: usize, stem: &str) {
         let id = plan.id(node);
@@ -244,21 +268,8 @@ impl Export<'_> {
                 return;
             }
         };
-        // Before writing, not after: a `rename` installs a new inode, so a
-        // check afterwards can never see that it just replaced a file this
-        // run had already written.
-        if let Some(existing) = target::existing_identity(&dir.path().join(&file_name)) {
-            if self.written_ids.contains(&existing) {
-                self.fail(
-                    id,
-                    "another document in this export already occupies this \
-                     file: the filesystem treats their two names as one \
-                     directory entry, so writing this one would lose the \
-                     other"
-                        .to_string(),
-                );
-                return;
-            }
+        if let Err(reason) = self.check_not_already_taken(&dir.path().join(&file_name)) {
+            return self.fail(id, reason);
         }
         let written = target::write_atomically(
             dir,
