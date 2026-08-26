@@ -32,19 +32,31 @@
 #       musl static 3,740,216 vs gnu dynamic 3,806,048  ->  musl is 65,832 B
 #       SMALLER. Statically linking musl libc is NOT what costs the megabyte;
 #       the obvious hypothesis is simply wrong.
-#   Linux/ELF/static vs macOS/Mach-O, arch held fixed (aarch64):
-#       3,740,216 vs 3,431,568                          ->  +308,648 B (+9.0%)
-#   x86_64 vs aarch64, OS and libc held fixed (linux-musl):
-#       4,523,120 vs 3,740,216                          ->  +782,904 B (+20.9%)
-#   x86_64 vs aarch64 on darwin, as an independent check of the same effect:
-#       3,970,784 vs 3,431,568                          ->  +539,216 B (+15.7%)
+#   architecture, platform held fixed (x86_64 vs aarch64):
+#       on darwin      3,970,784 vs 3,431,568           ->  +15.7%
+#       on linux-musl  4,523,120 vs 3,740,216           ->  +20.9%
+#   platform, architecture held fixed:
+#       aarch64  linux-musl vs darwin                   ->   +9.0%
+#       x86_64   musl vs darwin                         ->  +13.9%
+#       x86_64   musl vs windows-msvc                   ->  +20.4%
 #
-# So the dominant term is x86_64 code generation, not musl: the same source
-# compiles ~16-21% larger for x86_64 than for aarch64 on both platforms. That
-# is a property of the instruction set, and no amount of dependency trimming
-# changes it. `cargo bloat` on the musl build agrees that nothing is
-# anomalous - .text is 2.4 MiB spread as otl 414K, std 363K, aws-lc-sys 264K,
-# rustls 249K, reqwest 162K, clap 124K, with no single unexpected entry.
+# Neither term dominates: architecture costs +16-21% and platform +9-20%, and
+# they compound. (An earlier version of this comment called architecture "the
+# dominant term". That was drawn from the single darwin-arm64 -> musl-x86_64
+# path that caused the red build, and the Windows measurement showed it to be
+# too strong a claim.) What matters for the gate is that both are inherent:
+# neither is code that could be trimmed away.
+#
+# Within one architecture the spread is large enough to be worth naming -
+# across the three published x86_64 targets it is 765,552 B, ordered
+# msvc 3,757,568 < darwin 3,970,784 < musl 4,523,120. Note that Windows is
+# the *smallest* of the three despite also linking its CRT statically, so
+# "static linking" is not the axis; ELF plus `-Clink-self-contained=yes` is
+# simply the most expensive combination we ship.
+#
+# `cargo bloat` on the musl build agrees that nothing is anomalous - .text is
+# 2.4 MiB spread as otl 414K, std 363K, aws-lc-sys 264K, rustls 249K,
+# reqwest 162K, clap 124K, with no single unexpected entry.
 #
 # Fat LTO is confirmed in effect on the musl path too (cargo passes a bare
 # `-C lto`); building musl with dist's default thin LTO instead costs
@@ -58,35 +70,42 @@
 # +33,040 B that Story 4.3 (`otl doctor`) adds once it lands:
 #
 #   target                        measured    +doctor     budget    of budget
-#   aarch64-apple-darwin         3,431,568  3,464,608  3,750,000        92%
-#   x86_64-apple-darwin          3,970,784  4,003,824  4,330,000        92%
-#   x86_64-unknown-linux-musl    4,523,120  4,556,160  4,920,000        92%
-#   x86_64-pc-windows-msvc        not yet measured     4,330,000  provisional
+#   aarch64-apple-darwin         3,431,568  3,464,608  3,750,000        91%
+#   x86_64-pc-windows-msvc       3,757,568  3,790,608  4,094,000        91%
+#   x86_64-apple-darwin          3,970,784  4,003,824  4,330,000        91%
+#   x86_64-unknown-linux-musl    4,523,120  4,556,160  4,920,000        91%
+#
+# All four are measured; none is provisional. The darwin pair was built
+# locally (the x86_64 one cross-compiled on an arm64 host), musl and
+# windows-msvc come from CI legs - MSVC cannot be linked off Windows, and
+# that leg reported 3,757,568 B twice on different commits, so the figure is
+# stable rather than a one-off.
 #
 # (The doctor delta is the +33,040 B its implementer measured on darwin; on
 # x86_64 it will scale up with the same ~1.16-1.21 factor as everything else,
-# so read the musl row's +doctor column as a floor. The 8% headroom absorbs
+# so read the x86_64 rows' +doctor column as a floor. The 8% headroom absorbs
 # either value.)
 #
-# Sources: darwin triples built locally (the x86_64 one cross-compiled on an
-# arm64 host); musl from CI; the aarch64-linux numbers above from a container,
-# used for the controlled comparisons rather than as budgets, since neither
-# aarch64-linux triple is published.
+# The aarch64-linux numbers quoted in the comparisons above are from a
+# container and are deliberately NOT budgets: neither aarch64-linux triple is
+# published, so they exist only to hold a variable fixed.
 #
-# The Windows budget is provisional because MSVC cannot be linked off Windows.
-# It is not looser than reality: CI's Windows leg passed the previous 4 MiB
-# gate, so that target is known to be under 4,194,304 B today. Replace this
-# with the measured value from a Windows run and tighten.
+# Every budget sits ~8% above its measurement, which is why all four read the
+# same 91% - the gate is equally strict everywhere, which is the whole point
+# of splitting it.
 #
-# Every budget sits ~8% above its measurement, which is why all three measured
-# targets read the same 92% - the gate is equally strict everywhere, which is
-# the whole point of splitting it.
+# HEADROOM AGAINST THE PROMISE, stated plainly because it is the number a
+# future maintainer needs and it should not have to be recomputed:
 #
-# The musl budget is also the binding one against NFR2: at 4,523,120 B that
-# artifact is already 90% of the 5,000,000 B promise. Its budget is set below
-# the ceiling on purpose, so the regression check can never authorise breaking
-# the promise. If musl needs to grow past ~4.9 MB, that is a product decision
-# about NFR2, not a constant to bump here.
+#   x86_64-unknown-linux-musl is the largest artifact we ship, at 4,523,120 B.
+#   NFR2 promises ~5 MB = 5,000,000 B.
+#   Remaining headroom: 476,880 B (9.5%). After `otl doctor` lands: ~443,840 B.
+#
+# That is the whole budget for every future feature, on the target that binds.
+# The musl regression budget (4,920,000) is set below the ceiling on purpose,
+# so the regression check can never authorise breaking the promise. If musl
+# needs to grow past ~4.9 MB, that is a product decision about NFR2 - raise it
+# deliberately, with the user, or trim; it is not a constant to bump here.
 #
 # Raising any budget is a deliberate act: update the measurement in the table
 # in the same commit, and say which dependency bought the space.
@@ -139,7 +158,7 @@ budget_for_target() {
         aarch64-apple-darwin) echo 3750000 ;;
         x86_64-apple-darwin) echo 4330000 ;;
         x86_64-unknown-linux-musl) echo 4920000 ;;
-        x86_64-pc-windows-msvc) echo 4330000 ;;
+        x86_64-pc-windows-msvc) echo 4094000 ;;
         *) echo "" ;;
     esac
 }
