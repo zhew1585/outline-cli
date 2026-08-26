@@ -1,0 +1,618 @@
+//! Turning document titles into safe file names.
+//!
+//! Every name written by `otl docs export` comes from a document title,
+//! which is arbitrary server-controlled text. This module is the single
+//! place that turns such text into ONE path component, and it is
+//! deliberately paranoid: the output can never contain a path separator, a
+//! `..` segment, a character Windows rejects, a Windows device name, a
+//! trailing dot or space, an invisible re-ordering character, or a name
+//! that collides with one already used in the same directory - including on
+//! a case-insensitive filesystem.
+//!
+//! Nothing here touches the filesystem, so all of it is unit-testable.
+
+use std::collections::HashSet;
+
+/// Replacement for every character that cannot appear in a file name.
+const REPLACEMENT: char = '-';
+/// Prefix that makes a Windows device name usable again.
+const RESERVED_PREFIX: char = '_';
+/// Name used when a title sanitizes down to nothing.
+const FALLBACK_STEM: &str = "untitled";
+/// Maximum length in BYTES of one generated path component (before the
+/// `.md` extension).
+///
+/// Filesystem limits are per byte, not per character: 255 bytes is the
+/// common ceiling, and a CJK title reaches it three times faster than an
+/// ASCII one. The cap leaves room for the extension and a de-duplication
+/// suffix.
+const MAX_STEM_BYTES: usize = 96;
+/// Highest de-duplication suffix tried before giving up.
+const MAX_DEDUP_ATTEMPTS: u32 = 10_000;
+/// Case-folding passes applied before accepting the result as stable.
+///
+/// Two is enough for every mapping in Unicode today (`ẞ` needs two); the
+/// extra passes are headroom, and the loop stops as soon as nothing
+/// changes.
+const MAX_FOLD_PASSES: usize = 4;
+/// Growth factor a single folding pass may not exceed.
+const MAX_FOLD_GROWTH: usize = 4;
+
+/// Characters that are illegal in a Windows file name, plus the two path
+/// separators. `:` is included for macOS as well, where it is a separator
+/// in some path APIs.
+const ILLEGAL: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// Windows device names. Reserved with or without an extension, in any
+/// letter case, so `CON`, `con.md` and `CoN.txt` are all unusable.
+const RESERVED: &[&str] = &[
+    "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+    "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "clock$", "conin$", "conout$",
+];
+
+/// Sanitize one arbitrary string into a single safe path component.
+///
+/// The result is never empty, never longer than [`MAX_STEM_BYTES`] bytes,
+/// contains no separator or illegal character, is not a Windows device
+/// name, and neither starts nor ends with a dot or a space.
+pub fn safe_stem(raw: &str) -> String {
+    let replaced = replace_illegal(raw);
+    let dotted = neutralize_dot_runs(&replaced);
+    let collapsed = collapse_runs(&dotted);
+    let trimmed = trim_edges(&collapsed);
+    let capped = truncate_bytes(trimmed, MAX_STEM_BYTES);
+    // Truncation can re-expose a trailing dot or space, so trim again.
+    let capped = trim_edges(capped);
+    if capped.is_empty() {
+        return FALLBACK_STEM.to_string();
+    }
+    if is_reserved(capped) {
+        // Prefixing keeps the original readable while making the name
+        // usable on Windows; re-cap in case the prefix pushed it over.
+        let prefixed = format!("{RESERVED_PREFIX}{capped}");
+        return truncate_bytes(&prefixed, MAX_STEM_BYTES).to_string();
+    }
+    capped.to_string()
+}
+
+/// Map every character that cannot appear in a file name to
+/// [`REPLACEMENT`], and drop the invisible ones entirely.
+///
+/// A file name is a NAME, so every invisible category goes - including
+/// `Joiner`, which other surfaces keep. Two files whose names render
+/// identically while differing underneath is exactly what the
+/// de-duplication below exists to prevent, and an emoji ligature in a file
+/// name is not worth reintroducing it for.
+fn replace_illegal(raw: &str) -> String {
+    use crate::text::Hazard;
+
+    raw.chars()
+        .filter_map(|c| match crate::text::hazard(c) {
+            Some(Hazard::BidiFormat | Hazard::Invisible | Hazard::Joiner) => None,
+            Some(Hazard::Control) => Some(REPLACEMENT),
+            None if ILLEGAL.contains(&c) => Some(REPLACEMENT),
+            None => Some(c),
+        })
+        .collect()
+}
+
+/// Replace every run of two or more dots with a single [`REPLACEMENT`].
+///
+/// A single dot is a legitimate part of a title (`v1.2 release notes`), but
+/// `..` is the parent-directory name. Even inside one component it is worth
+/// removing: nothing good comes of a file called `..-..-etc-passwd.md`, and
+/// a later normalization step elsewhere must never be able to read it as a
+/// traversal.
+fn neutralize_dot_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut dots = 0_usize;
+    let flush = |out: &mut String, dots: usize| match dots {
+        0 => {}
+        1 => out.push('.'),
+        _ => out.push(REPLACEMENT),
+    };
+    for c in text.chars() {
+        if c == '.' {
+            dots += 1;
+            continue;
+        }
+        flush(&mut out, dots);
+        dots = 0;
+        out.push(c);
+    }
+    flush(&mut out, dots);
+    out
+}
+
+/// Collapse runs of whitespace to one space and runs of [`REPLACEMENT`] to
+/// one, so a title of nothing but slashes does not become a wall of dashes.
+fn collapse_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous: Option<char> = None;
+    for c in text.chars() {
+        let normalized = if c.is_whitespace() { ' ' } else { c };
+        let repeated =
+            previous == Some(normalized) && (normalized == ' ' || normalized == REPLACEMENT);
+        if !repeated {
+            out.push(normalized);
+        }
+        previous = Some(normalized);
+    }
+    out
+}
+
+/// Trim characters that must not sit at either end of a name.
+///
+/// Windows silently strips trailing dots and spaces, which would make
+/// `foo.` and `foo` the same file; a leading dot would hide the export; a
+/// leading dash would make the path look like a flag to the next tool that
+/// reads it.
+fn trim_edges(text: &str) -> &str {
+    text.trim_matches(|c: char| c == '.' || c.is_whitespace() || c == REPLACEMENT)
+}
+
+/// Truncate to at most `limit` bytes, never splitting a character.
+fn truncate_bytes(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Whether a name is a Windows device name (extension and case ignored).
+fn is_reserved(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    let lowered = base.to_ascii_lowercase();
+    RESERVED.contains(&lowered.as_str())
+}
+
+/// The names already used inside ONE directory.
+///
+/// Uniqueness is tracked case-insensitively because macOS and Windows
+/// filesystems are: `Deploy.md` and `deploy.md` are one file there, and
+/// exporting both would silently lose a document.
+#[derive(Debug, Default)]
+pub struct Names {
+    used: HashSet<String>,
+}
+
+impl Names {
+    /// An empty name set for a fresh directory.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim a unique safe stem derived from `title`.
+    ///
+    /// The stem is reserved for both `<stem>.md` and a `<stem>/` directory,
+    /// so a document and its children's folder can share it while a second
+    /// document with the same title cannot.
+    pub fn claim(&mut self, title: &str) -> String {
+        let base = safe_stem(title);
+        if self.insert(&base) {
+            return base;
+        }
+        for suffix in 2..=MAX_DEDUP_ATTEMPTS {
+            let candidate = with_suffix(&base, suffix);
+            if self.insert(&candidate) {
+                return candidate;
+            }
+        }
+        // Unreachable for any realistic collection: it would need 10_000
+        // documents with the same title in one directory. Falling back to a
+        // long random-ish name is still better than returning a duplicate.
+        let unique = with_suffix(&base, MAX_DEDUP_ATTEMPTS + self.used.len() as u32);
+        let _ = self.insert(&unique);
+        unique
+    }
+
+    /// Claim an already-sanitized stem verbatim, de-duplicating if taken.
+    ///
+    /// Used for a document's own file inside the directory named after it,
+    /// so that `Deploy-2/` holds `Deploy-2.md` and not `Deploy.md`: the
+    /// directory and the document it belongs to carry the same name.
+    pub fn claim_exact(&mut self, stem: &str) -> String {
+        if self.insert(stem) {
+            return stem.to_string();
+        }
+        self.claim(stem)
+    }
+
+    /// Record a name, reporting whether it was still free.
+    fn insert(&mut self, name: &str) -> bool {
+        self.used.insert(collision_key(name))
+    }
+}
+
+/// The key two names collide under.
+///
+/// Two things have to be folded away, because two filesystems in wide use
+/// fold them and would otherwise turn two documents into one file:
+///
+/// - **case**. Not `to_lowercase` alone: lowercasing is not case FOLDING,
+///   and the difference is reachable. Greek final sigma `ς` is already
+///   lowercase, so `to_lowercase` leaves it distinct from `σ` even though a
+///   case-insensitive filesystem treats the two names as one entry.
+///   Uppercasing first collapses both to `Σ`, and lowercasing that gives
+///   one key - a caseless comparison without carrying a full case-folding
+///   table. Applied to a FIXPOINT rather than once, because a single round
+///   trip is not stable for every character (see the loop below).
+/// - **normalization**, via NFC: `é` written as one codepoint (U+00E9) and
+///   as `e` + a combining acute (U+0065 U+0301) are DIFFERENT byte strings
+///   but the same directory entry on a macOS volume.
+///
+/// NFC rather than NFKC for the normalization step: NFKC folds ordinary
+/// letters together (full-width to ASCII, `№` to `No`) far beyond anything a
+/// filesystem does.
+///
+/// The two steps err in OPPOSITE directions, and that is deliberate. The
+/// uppercase-then-lowercase round trip is slightly too aggressive - it also
+/// collapses a few compatibility spellings, so `ﬁle`/`file` and
+/// `Straße`/`Strasse` share a key even though a real filesystem keeps them
+/// apart. Both error directions were weighed:
+///
+/// - folding too much costs a `-2` suffix on a name that could have kept its
+///   own spelling. Cosmetic.
+/// - folding too little means two documents claim one directory entry, and
+///   one of them is gone. That is the bug this key exists to prevent.
+///
+/// So the key leans toward over-folding. And because it is a MODEL of what
+/// filesystems do rather than a copy (macOS and NTFS each use their own
+/// table), it is not the last line of defence either: `otl docs export`
+/// checks, BEFORE each write, whether the destination is already a file it
+/// wrote earlier in the run, and reports a collision rather than
+/// overwriting one document with another.
+fn collision_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    let mut folded = name.to_string();
+    // ONE round trip is not a fixpoint, and the gap is reachable: capital
+    // sharp S `ẞ` uppercases to itself and lowercases to `ß`, while `ß`
+    // uppercases to `SS` and lowercases to `ss`. A single pass therefore
+    // gives `ß` and `ss` - two keys for one case-folding equivalence class,
+    // which is under-folding, the direction that loses documents. Iterating
+    // to a fixpoint closes it: `ẞ` -> `ß` -> `ss`.
+    for _ in 0..MAX_FOLD_PASSES {
+        let next: String = folded.to_uppercase().to_lowercase();
+        if next == folded {
+            break;
+        }
+        // Case mappings can expand (one character to three); a bound keeps
+        // a pathological input from growing the key without limit.
+        if next.len() > folded.len().saturating_mul(MAX_FOLD_GROWTH) + MAX_FOLD_GROWTH {
+            break;
+        }
+        folded = next;
+    }
+    folded.nfc().collect()
+}
+
+/// `base` with a `-N` de-duplication suffix, keeping the byte cap.
+fn with_suffix(base: &str, suffix: u32) -> String {
+    let tail = format!("{REPLACEMENT}{suffix}");
+    let room = MAX_STEM_BYTES.saturating_sub(tail.len());
+    let head = trim_edges(truncate_bytes(base, room));
+    if head.is_empty() {
+        return format!("{FALLBACK_STEM}{tail}");
+    }
+    format!("{head}{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_path_separators_and_traversal() {
+        // The single most important property: one title can never become
+        // more than one path component, and never an escape upwards.
+        for title in [
+            "../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+            "...",
+            "/",
+        ] {
+            let stem = safe_stem(title);
+            assert!(!stem.contains('/'), "{title:?} -> {stem:?}");
+            assert!(!stem.contains('\\'), "{title:?} -> {stem:?}");
+            assert!(!stem.is_empty(), "{title:?} -> empty");
+            assert_ne!(stem, "..", "{title:?}");
+            assert_ne!(stem, ".", "{title:?}");
+            assert!(!stem.starts_with('.'), "{title:?} -> hidden file {stem:?}");
+        }
+        assert_eq!(safe_stem("../../etc/passwd"), "etc-passwd");
+        assert_eq!(safe_stem(".."), FALLBACK_STEM);
+    }
+
+    #[test]
+    fn replaces_characters_windows_rejects() {
+        let stem = safe_stem("a<b>c:d\"e|f?g*h");
+        for illegal in ILLEGAL {
+            assert!(!stem.contains(*illegal), "kept {illegal:?} in {stem:?}");
+        }
+    }
+
+    #[test]
+    fn drops_control_characters_and_newlines() {
+        let stem = safe_stem("re\u{1b}[31mport\nline\u{0}");
+        assert!(
+            !stem.chars().any(char::is_control),
+            "control character survived: {stem:?}"
+        );
+    }
+
+    #[test]
+    fn drops_invisible_reordering_characters() {
+        // `report-<RLO>fdp.md` renders as `report-md.pdf`.
+        let stem = safe_stem("report-\u{202e}fdp");
+        assert!(!stem.contains('\u{202e}'), "{stem:?}");
+        assert_eq!(stem, "report-fdp");
+    }
+
+    #[test]
+    fn escapes_windows_device_names() {
+        for reserved in ["CON", "con", "CoN", "nul", "COM1", "lpt9", "aux", "prn"] {
+            let stem = safe_stem(reserved);
+            assert!(!is_reserved(&stem), "{reserved:?} -> {stem:?}");
+        }
+        // Reserved with an extension too: `con.md` is unusable on Windows,
+        // and the exporter appends `.md` to every stem.
+        assert!(!is_reserved(&safe_stem("con.txt")));
+        // A name that merely starts with a device name is fine.
+        assert_eq!(safe_stem("console"), "console");
+        assert_eq!(safe_stem("com10"), "com10");
+    }
+
+    #[test]
+    fn trims_trailing_dots_and_spaces() {
+        // Windows strips these silently, which would fuse two names.
+        assert_eq!(safe_stem("Notes... "), "Notes");
+        assert_eq!(safe_stem("  Notes  "), "Notes");
+        assert_eq!(safe_stem(".hidden"), "hidden");
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_titles_get_a_fallback() {
+        for title in ["", "   ", "\t\n", "....", "///"] {
+            assert!(!safe_stem(title).is_empty(), "{title:?}");
+        }
+        assert_eq!(safe_stem(""), FALLBACK_STEM);
+        assert_eq!(safe_stem("   "), FALLBACK_STEM);
+    }
+
+    #[test]
+    fn caps_the_length_in_bytes_without_splitting_characters() {
+        let long = "\u{4e2d}".repeat(200); // 3 bytes each
+        let stem = safe_stem(&long);
+        assert!(stem.len() <= MAX_STEM_BYTES, "{} bytes", stem.len());
+        assert!(stem.chars().all(|c| c == '\u{4e2d}'), "split a character");
+
+        let ascii = "a".repeat(500);
+        assert_eq!(safe_stem(&ascii).len(), MAX_STEM_BYTES);
+    }
+
+    #[test]
+    fn truncation_does_not_leave_a_trailing_dot() {
+        // A cap that lands right after a dot would recreate the Windows
+        // trailing-dot problem.
+        let title = format!("{}.tail", "a".repeat(MAX_STEM_BYTES - 1));
+        let stem = safe_stem(&title);
+        assert!(!stem.ends_with('.'), "{stem:?}");
+    }
+
+    #[test]
+    fn collapses_runs_of_replacements() {
+        assert_eq!(safe_stem("a////b"), "a-b");
+        assert_eq!(safe_stem("a    b"), "a b");
+    }
+
+    #[test]
+    fn single_dots_are_part_of_a_title_but_dot_runs_are_not() {
+        assert_eq!(safe_stem("v1.2 release notes"), "v1.2 release notes");
+        assert_eq!(safe_stem("a..b"), "a-b");
+    }
+
+    #[test]
+    fn unique_titles_keep_their_names() {
+        let mut names = Names::new();
+        assert_eq!(names.claim("Deploy"), "Deploy");
+        assert_eq!(names.claim("Runbook"), "Runbook");
+    }
+
+    #[test]
+    fn duplicate_titles_get_numbered() {
+        let mut names = Names::new();
+        assert_eq!(names.claim("Deploy"), "Deploy");
+        assert_eq!(names.claim("Deploy"), "Deploy-2");
+        assert_eq!(names.claim("Deploy"), "Deploy-3");
+    }
+
+    #[test]
+    fn collisions_are_detected_case_insensitively() {
+        // macOS and Windows would otherwise fuse the two files and lose a
+        // document.
+        let mut names = Names::new();
+        assert_eq!(names.claim("Deploy"), "Deploy");
+        assert_eq!(names.claim("deploy"), "deploy-2");
+        assert_eq!(names.claim("DEPLOY"), "DEPLOY-3");
+    }
+
+    #[test]
+    fn titles_that_sanitize_to_the_same_name_are_still_distinct() {
+        // Different titles, one safe name: they must not overwrite.
+        let mut names = Names::new();
+        assert_eq!(names.claim("a/b"), "a-b");
+        assert_eq!(names.claim("a\\b"), "a-b-2");
+        assert_eq!(names.claim(""), FALLBACK_STEM);
+        assert_eq!(names.claim("   "), format!("{FALLBACK_STEM}-2"));
+    }
+
+    #[test]
+    fn deduplicated_names_stay_within_the_byte_cap() {
+        let mut names = Names::new();
+        let long = "\u{4e2d}".repeat(200);
+        for _ in 0..5 {
+            let stem = names.claim(&long);
+            assert!(
+                stem.len() <= MAX_STEM_BYTES,
+                "{stem:?} is {} bytes",
+                stem.len()
+            );
+        }
+    }
+
+    #[test]
+    fn collisions_are_detected_across_unicode_normalization_forms() {
+        // NFC `é` and NFD `e`+U+0301 are one directory entry on macOS. Two
+        // documents must not both claim it.
+        let mut names = Names::new();
+        assert_eq!(names.claim("Caf\u{e9}"), "Caf\u{e9}");
+        assert_eq!(
+            names.claim("Cafe\u{301}"),
+            "Cafe\u{301}-2",
+            "NFD spelling of the same title reused the name"
+        );
+    }
+
+    #[test]
+    fn normalization_and_case_folding_combine() {
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{c9}clair"), "\u{c9}clair"); // NFC É
+        assert_eq!(names.claim("e\u{301}clair"), "e\u{301}clair-2"); // NFD é
+    }
+
+    #[test]
+    fn case_folding_catches_capital_sharp_s() {
+        // `ẞ` uppercases to itself and lowercases to `ß`; `ß` uppercases to
+        // `SS`. One round trip therefore stops at `ß` for the first and
+        // reaches `ss` for the second - two keys for one case-folding
+        // class, and a silent overwrite on a filesystem that folds them.
+        for spelling in ["\u{1e9e}", "\u{df}", "SS", "ss", "Ss"] {
+            assert_eq!(
+                collision_key(spelling),
+                collision_key("ss"),
+                "{spelling:?} folded to a different key"
+            );
+        }
+        let mut names = Names::new();
+        assert_eq!(names.claim("Stra\u{1e9e}e"), "Stra\u{1e9e}e");
+        assert_eq!(names.claim("Stra\u{df}e"), "Stra\u{df}e-2");
+        assert_eq!(names.claim("STRASSE"), "STRASSE-3");
+    }
+
+    #[test]
+    fn the_case_fold_is_a_fixpoint() {
+        // Folding an already-folded key must not change it again, or the
+        // key would depend on how many times it happened to be applied.
+        for name in [
+            "\u{1e9e}",
+            "\u{df}",
+            "\u{3c2}",
+            "Deploy",
+            "\u{4e2d}\u{6587}",
+            "\u{130}",
+        ] {
+            let once = collision_key(name);
+            assert_eq!(collision_key(&once), once, "{name:?} is not stable");
+        }
+    }
+
+    #[test]
+    fn case_folding_catches_greek_final_sigma() {
+        // `ς` is already lowercase, so `to_lowercase` alone leaves it
+        // distinct from `σ` - and a case-insensitive filesystem does not.
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{3c3}"), "\u{3c3}"); // σ
+        assert_eq!(
+            names.claim("\u{3c2}"),
+            "\u{3c2}-2",
+            "final sigma reused the name of a plain sigma"
+        );
+    }
+
+    #[test]
+    fn case_folding_is_at_least_as_strong_as_lowercasing() {
+        // Property check over a spread of scripts: anything `to_lowercase`
+        // would fold must still fold, so the stronger key cannot regress
+        // the case the previous one handled.
+        for (left, right) in [
+            ("Deploy", "deploy"),
+            ("\u{c9}", "\u{e9}"),   // É / é
+            ("\u{412}", "\u{432}"), // Cyrillic Ve
+            ("\u{3a3}", "\u{3c3}"), // Σ / σ
+            ("STRASSE", "strasse"),
+        ] {
+            assert_eq!(
+                collision_key(left),
+                collision_key(right),
+                "{left:?} and {right:?} must share a key"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_letters_are_not_folded_by_normalization() {
+        // NFKC would merge these; no filesystem does. Folding them would
+        // refuse names that can plainly coexist, and unlike the case fold
+        // there is no collision risk on the other side of the trade.
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{ff21}bc"), "\u{ff21}bc"); // full-width A
+        assert_eq!(names.claim("Abc"), "Abc");
+        assert_eq!(names.claim("\u{2116}5"), "\u{2116}5"); // NUMERO SIGN
+        assert_eq!(names.claim("No5"), "No5");
+    }
+
+    #[test]
+    fn the_case_fold_deliberately_errs_toward_over_folding() {
+        // The uppercase round trip also collapses a few compatibility
+        // spellings. That is accepted: the cost is a `-2` suffix on a name
+        // that could have kept its own spelling, whereas under-folding costs
+        // a document. Asserted so the direction is a decision, not a
+        // surprise, and so a future change to a stricter fold has to be
+        // deliberate.
+        let mut names = Names::new();
+        assert_eq!(names.claim("\u{fb01}le"), "\u{fb01}le"); // ligature fi
+        assert_eq!(names.claim("file"), "file-2");
+    }
+
+    #[test]
+    fn distinct_titles_still_get_distinct_names() {
+        // Guard against an over-eager fold: normalization must not collapse
+        // genuinely different names.
+        let mut names = Names::new();
+        for title in ["alpha", "beta", "\u{4e2d}\u{6587}", "\u{e9}", "\u{ea}"] {
+            let claimed = names.claim(title);
+            assert!(
+                !claimed.ends_with("-2"),
+                "{title:?} collided with an earlier name as {claimed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_exact_keeps_an_already_safe_stem() {
+        // A document's own file inside its own directory must carry the
+        // directory's name, suffix included.
+        let mut names = Names::new();
+        assert_eq!(names.claim_exact("Deploy-2"), "Deploy-2");
+        assert_eq!(names.claim_exact("Deploy-2"), "Deploy-2-2");
+    }
+
+    #[test]
+    fn every_claimed_name_is_unique_over_many_collisions() {
+        let mut names = Names::new();
+        let claimed: HashSet<String> = (0..500)
+            .map(|_| names.claim("Same Title").to_lowercase())
+            .collect();
+        assert_eq!(claimed.len(), 500, "a claimed name repeated");
+    }
+}

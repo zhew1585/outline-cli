@@ -47,6 +47,14 @@ unicode-width = "0.2"
 # Emoji ligatures (ZWJ sequences, skin-tone modifiers) are one grapheme
 # cluster of width 2, not the sum of their codepoints' widths.
 unicode-segmentation = "1.12"
+# Unicode normalization for export file names: NFC and NFD spellings of the
+# same title are ONE directory entry on macOS, so the de-duplication key has
+# to be normalization-insensitive.
+unicode-normalization = "0.1"
+# Terminal height, to decide whether `docs view` output exceeds one screen.
+# There is no std API for this and the alternative (an ioctl) needs unsafe,
+# which both crates forbid.
+terminal_size = "0.4"
 
 # dev / test
 wiremock = "0.6"
