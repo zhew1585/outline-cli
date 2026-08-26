@@ -148,6 +148,12 @@ fn run_reset(mode: OutputMode) -> Result<(), CliError> {
 /// The returned label is what goes into the cache: an origin for a URL
 /// (never the full URL, which may carry a token in its query) and a fixed
 /// placeholder for a file (never its path).
+///
+/// For a fetched document the origin is the one that ANSWERED, not the one
+/// that was asked. A redirect can move the answer to another host, and
+/// `source` is the only signal a user has for "who wrote these endpoint
+/// definitions" - recording the host that merely pointed elsewhere would
+/// make that signal a lie.
 fn load_document(args: &SyncArgs) -> Result<(String, Source, String), CliError> {
     if let Some(path) = &args.spec_file {
         let document = read_local(path)?;
@@ -156,18 +162,14 @@ fn load_document(args: &SyncArgs) -> Result<(String, Source, String), CliError> 
     let url = args.url.as_deref().unwrap_or(spec::UPSTREAM_SPEC_URL);
     // Announced on stderr, not stdout: stdout is data.
     stdio::write_diagnostic_line("fetching the OpenAPI document...");
-    let document =
+    let fetched =
         fetch::fetch_document(url, MAX_DOCUMENT_BYTES, FETCH_TIMEOUT).map_err(map_fetch_error)?;
-    let label = origin_of(url);
-    Ok((document, Source::Remote, label))
-}
-
-/// Origin of a URL, for the provenance record.
-///
-/// Falls back to a placeholder rather than storing the full URL: a query
-/// string can carry a credential and the cache file is not a secret store.
-fn origin_of(url: &str) -> String {
-    fetch::document_origin(url).unwrap_or_else(|| UNKNOWN_SOURCE.to_string())
+    let label = if fetched.origin.is_empty() {
+        UNKNOWN_SOURCE.to_string()
+    } else {
+        fetched.origin
+    };
+    Ok((fetched.text, Source::Remote, label))
 }
 
 /// Read a local document, refusing anything that is not a plain file of
@@ -207,25 +209,30 @@ fn read_local(path: &Path) -> Result<String, CliError> {
 fn open_regular(path: &Path) -> Result<fs::File, CliError> {
     let not_regular = || {
         CliError::usage(anyhow!(
-            "the spec path {} is not a regular file; pass a saved OpenAPI \
-             document (a pipe, socket, device or directory cannot be read \
-             safely: opening one can block forever)",
+            "the spec path {} is not the regular file it was a moment ago; \
+             pass a saved OpenAPI document (a pipe, socket, device or \
+             directory cannot be read safely: opening one can block forever)",
             path.display()
         ))
     };
     // Follows symlinks (a symlink to a regular file is fine) but reports
-    // the TYPE of the target, which is what matters here.
-    let metadata = fs::metadata(path).map_err(|error| read_error(path, error))?;
-    if !metadata.is_file() {
+    // the TYPE of the target, which is what keeps the open below from
+    // blocking on a pipe.
+    let expected = fs::metadata(path).map_err(|error| read_error(path, error))?;
+    if !expected.is_file() {
         return Err(not_regular());
     }
-    if metadata.len() > MAX_DOCUMENT_BYTES {
+    if expected.len() > MAX_DOCUMENT_BYTES {
         return Err(too_large(path));
     }
     let file = openfile::open_with_timeout(path, OPEN_TIMEOUT)
         .map_err(|error| open_error(path, &error))?;
+    // Re-checked through the open handle by IDENTITY, the same way the
+    // cache path does it. A type comparison would accept a path swapped
+    // for a DIFFERENT regular file between the two calls, which is exactly
+    // what this claims to catch.
     let opened = file.metadata().map_err(|error| read_error(path, error))?;
-    if !opened.is_file() {
+    if !opened.is_file() || !openfile::is_same_file(&expected, &opened) {
         return Err(not_regular());
     }
     if opened.len() > MAX_DOCUMENT_BYTES {
@@ -456,13 +463,22 @@ mod tests {
         assert!(!LOCAL_SOURCE.contains('/'));
     }
 
+    /// The provenance label for a URL is an origin and nothing else: a
+    /// path or query can carry a token, and the cache is a plain file.
     #[test]
     fn a_url_is_reduced_to_its_origin() {
         assert_eq!(
-            origin_of("https://raw.example.com/openapi/main/spec.json?token=secret"),
-            "https://raw.example.com"
+            engine::fetch::document_origin(
+                "https://raw.example.com/openapi/main/spec.json?token=secret"
+            )
+            .as_deref(),
+            Some("https://raw.example.com")
         );
-        assert!(!origin_of("https://u:p@example.com/x").contains('p'));
+        // A URL this channel would not fetch has no origin to record.
+        assert_eq!(
+            engine::fetch::document_origin("https://u:p@example.com/x"),
+            None
+        );
     }
 
     #[test]

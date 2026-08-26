@@ -36,6 +36,15 @@
 //! A fetched body is UNTRUSTED input: size-capped and UTF-8 checked here,
 //! and validated by whoever parses it. An error response body is never
 //! echoed - a document host's error page is not a diagnostic.
+//!
+//! # Redirects
+//!
+//! Redirects are followed (bounded by the client's own policy), which
+//! means the host that ANSWERS need not be the host that was asked. A
+//! caller recording where a document came from must therefore be told the
+//! responding origin, not the requested one - so that is what
+//! [`FetchedDocument::origin`] carries, and it is re-validated on the way
+//! out. Nothing else changes: no credentials are sent to either host.
 
 use std::io::Read;
 use std::thread;
@@ -57,6 +66,19 @@ pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Accept header sent with every document request.
 const ACCEPT_TYPES: &str = "application/json, text/plain, */*";
+
+/// A document and the origin that actually served it.
+#[derive(Debug, Clone)]
+pub struct FetchedDocument {
+    /// The body, UNTRUSTED: only its size and encoding have been checked.
+    pub text: String,
+    /// Origin (`scheme://host[:port]`) that answered, after any redirects.
+    ///
+    /// Not the origin that was asked: a redirect can move the answer to
+    /// another host, and a record of "where this came from" that names the
+    /// wrong one is worse than no record.
+    pub origin: String,
+}
 
 /// Why a document could not be fetched.
 ///
@@ -173,32 +195,41 @@ impl DocumentFetch {
         Self { max_bytes, ..self }
     }
 
-    /// Fetch a document and return its body as text.
+    /// Fetch a document, with the origin that served it.
     ///
     /// The URL must be an absolute `http`/`https` URL with a host and
     /// without userinfo. No credentials are sent. HTTP 429 is retried per
     /// the retry policy; every attempt is paced by the throttle.
     ///
-    /// The returned string is UNTRUSTED: only its size and encoding have
+    /// The returned body is UNTRUSTED: only its size and encoding have
     /// been checked.
-    pub fn get_text(&self, url: &str) -> Result<String, FetchError> {
+    pub fn get_text(&self, url: &str) -> Result<FetchedDocument, FetchError> {
         let parsed = validate_document_url(url)?;
-        let origin = parsed.origin().ascii_serialization();
+        let asked = parsed.origin().ascii_serialization();
         let mut attempt: u32 = 0;
         loop {
-            let response = self.send(&parsed, &origin)?;
+            let response = self.send(&parsed, &asked)?;
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS {
-                attempt = self.wait_for_retry(&response, &origin, attempt)?;
+                attempt = self.wait_for_retry(&response, &asked, attempt)?;
                 continue;
             }
+            // Where the answer actually came from. Errors keep naming the
+            // origin that was ASKED, which is the one the user typed and
+            // can act on; a successful document is labelled with the one
+            // that served it, which is the one the caller has to record.
+            let answered = answering_origin(&response).unwrap_or_else(|| asked.clone());
             if !status.is_success() {
                 return Err(FetchError::Status {
-                    origin,
+                    origin: asked,
                     status: status.as_u16(),
                 });
             }
-            return self.read_text(response, &origin);
+            let text = self.read_text(response, &answered)?;
+            return Ok(FetchedDocument {
+                text,
+                origin: answered,
+            });
         }
     }
 
@@ -304,10 +335,27 @@ impl DocumentFetch {
 /// Fetch one document with the default policies.
 ///
 /// Convenience wrapper over [`DocumentFetch`] for the one-shot case.
-pub fn fetch_document(url: &str, max_bytes: u64, timeout: Duration) -> Result<String, FetchError> {
+pub fn fetch_document(
+    url: &str,
+    max_bytes: u64,
+    timeout: Duration,
+) -> Result<FetchedDocument, FetchError> {
     DocumentFetch::new(timeout)?
         .with_max_bytes(max_bytes)
         .get_text(url)
+}
+
+/// The origin that answered, taken from the response's final URL and put
+/// through the same shape rules as the requested one.
+///
+/// `None` when the final URL is not one this channel would have accepted
+/// (it cannot normally be: redirects to other schemes are not followed),
+/// in which case the caller falls back to the requested origin rather than
+/// recording something unvalidated.
+fn answering_origin(response: &reqwest::blocking::Response) -> Option<String> {
+    validate_document_url(response.url().as_str())
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
 }
 
 /// The `Retry-After` header of a response, if present and readable.

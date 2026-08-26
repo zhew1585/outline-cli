@@ -31,7 +31,9 @@ fn fast_policy() -> RetryPolicy {
 
 /// Run a blocking fetch off the async test runtime, with fast policies.
 async fn fetch_text(url: String, max_bytes: u64) -> Result<String, FetchError> {
-    fetch_with(url, max_bytes, fast_policy(), test_throttle()).await
+    fetch_with(url, max_bytes, fast_policy(), test_throttle())
+        .await
+        .map(|fetched| fetched.text)
 }
 
 async fn fetch_with(
@@ -39,7 +41,7 @@ async fn fetch_with(
     max_bytes: u64,
     retry: RetryPolicy,
     throttle: Throttle,
-) -> Result<String, FetchError> {
+) -> Result<engine::fetch::FetchedDocument, FetchError> {
     tokio::task::spawn_blocking(move || {
         DocumentFetch::new(Duration::from_secs(5))?
             .with_max_bytes(max_bytes)
@@ -292,6 +294,72 @@ async fn rejects_unusable_urls_before_any_request() {
             "credential leaked: {error}"
         );
     }
+}
+
+/// A redirect moves the answer to another host. Whatever a caller records
+/// as "where this document came from" has to name the host that ANSWERED,
+/// not the one that pointed elsewhere - `source` is the only signal a user
+/// has about who wrote the endpoint definitions they are about to call.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reported_origin_is_the_host_that_answered() {
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/moved.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"answered\":true}"))
+        .mount(&target)
+        .await;
+
+    let redirector = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/spec.json"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/moved.json", target.uri()).as_str()),
+        )
+        .mount(&redirector)
+        .await;
+
+    let fetched = fetch_with(
+        format!("{}/spec.json", redirector.uri()),
+        MAX_DOCUMENT_BYTES,
+        fast_policy(),
+        test_throttle(),
+    )
+    .await
+    .expect("follows the redirect");
+
+    assert_eq!(fetched.text, "{\"answered\":true}");
+    assert!(
+        target.uri().starts_with(&fetched.origin),
+        "origin {:?} is not the host that answered ({})",
+        fetched.origin,
+        target.uri()
+    );
+    assert!(
+        !redirector.uri().starts_with(&fetched.origin),
+        "origin {:?} names the redirector, not the answering host",
+        fetched.origin
+    );
+}
+
+/// Without a redirect the two are the same host, and that is what is
+/// reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reported_origin_is_the_requested_one_when_nothing_redirects() {
+    let server = serve(ResponseTemplate::new(200).set_body_string("{}")).await;
+    let fetched = fetch_with(
+        format!("{}/spec.json", server.uri()),
+        MAX_DOCUMENT_BYTES,
+        fast_policy(),
+        test_throttle(),
+    )
+    .await
+    .expect("fetches");
+    assert!(
+        server.uri().starts_with(&fetched.origin),
+        "{:?}",
+        fetched.origin
+    );
 }
 
 /// The fetch error type is deliberately NOT `EngineError`: nothing about a

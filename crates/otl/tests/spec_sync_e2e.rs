@@ -470,6 +470,44 @@ async fn a_document_with_terminal_escapes_is_neutralized() {
     assert!(!stderr.contains('\u{1b}'), "escape echoed: {stderr:?}");
 }
 
+/// End to end: the provenance recorded in the cache, and printed by the
+/// command, is the host that served the document - not the one that was
+/// asked and redirected elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_recorded_source_is_the_host_that_answered() {
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/moved.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(document_with("things.brandNew")))
+        .mount(&target)
+        .await;
+    let redirector = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(SPEC_PATH))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/moved.json", target.uri()).as_str()),
+        )
+        .mount(&redirector)
+        .await;
+
+    let cache = TempDir::new().unwrap();
+    let url = format!("{}{SPEC_PATH}", redirector.uri());
+    let (stdout, stderr, code) =
+        run(cache.path(), &["spec", "sync", "--url", &url, "--json"]).await;
+    assert_eq!(code, 0, "{stderr}");
+    let source = parse(&stdout)["source"].as_str().unwrap().to_string();
+    assert!(
+        target.uri().starts_with(&source),
+        "recorded {source:?}, but {} served the document",
+        target.uri()
+    );
+    assert!(
+        !redirector.uri().starts_with(&source),
+        "recorded the redirector {source:?} as the source"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bad_source_url_is_rejected_before_any_request() {
     let cache = TempDir::new().unwrap();
@@ -535,7 +573,7 @@ async fn a_directory_is_not_accepted_as_a_document() {
     )
     .await;
     assert_eq!(code, 2, "{stderr}");
-    assert!(stderr.contains("not a regular file"), "{stderr}");
+    assert!(stderr.contains("regular file"), "{stderr}");
 }
 
 #[test]
