@@ -33,7 +33,7 @@ so that 上手零门槛 —— 打一个 tag 就自动产出三平台的 brew ta
   - [x] 现有 `.github/workflows/ci.yml` 一字未动
   - [x] musl 交叉工具链经 `github-build-setup` 注入（`.github/build-setup/release-build-setup.yml` → `scripts/install-linux-musl-toolchain.sh`）
 - [x] Task 3: 二进制体积门禁 (AC: 2)
-  - [x] `scripts/check-binary-size.sh`：默认 `--profile dist`，上限 4 MiB，支持 `BINARY_SIZE_TARGET` 交叉编译与 Windows `.exe`，并复刻 dist 的 per-target RUSTFLAGS
+  - [x] `scripts/check-binary-size.sh`：默认 `--profile dist`，**per-target 实测预算 + 独立的 NFR2 天花板**，支持 `BINARY_SIZE_TARGET` 交叉编译与 Windows `.exe`，并复刻 dist 的 per-target RUSTFLAGS
   - [x] 门禁以 step 形式注入 dist 自己的 `build-local-artifacts`，失败 → 该 job failure → host skip → announce skip → 不产生 Release（R1-[1]）
   - [x] `.github/workflows/binary-size.yml` 三平台矩阵做 PR 期反馈，Linux 侧构建真正发布的 musl 目标
 - [x] Task 3b: 发布 preflight（`.github/workflows/release-guards.yml`，注册为 `local-artifacts-jobs`）
@@ -74,7 +74,15 @@ so that 上手零门槛 —— 打一个 tag 就自动产出三平台的 brew ta
 - **`[profile.dist]` 必须去掉 dist 默认的 `lto = "thin"`**：`inherits = "release"` 之后再写 `lto = "thin"` 会把 `[profile.release]` 的 fat LTO 降级。实测 aarch64-apple-darwin 上 thin LTO 3_290_656 B vs fat LTO 2_567_312 B —— 白涨 0.69 MB。NFR2 比 release 构建墙钟时间重要，故 `[profile.dist]` 只留 `inherits`，发布产物与 `--release` 逐字节一致。
 - **体积门槛 4 MiB 的依据（R2-[4] 后修正）**：本分支实测 2_567_312 B（≈2.45 MiB，占 61%），但那是一条**只有发布配置、零功能代码**的分支——原来写的「约 40% 余量」是拿这个数说的，对合并后的产物不成立。R2 逐分支实测的增量：auth +317KB、commands +283KB、config +233KB、specsync +116KB；加性最坏估计合并后 darwin ≈3.35 MiB，musl 再高约 9% ≈**3.66 MiB ≈ 预算的 91%**。
   **合并前实测更新（2026-08）**：`develop` 已经并入 config/completions track，实测 release 二进制 **2_800_112 B（66% 预算）**——与 R2 单独测 `feat/epic4-config` 的数字一字不差，说明那条 track 的内容就是当前 develop。剩余待并三条（auth/commands/specsync）加性最坏估计 ≈3.35 MiB darwin（84%）、musl ≈3.66 MiB（91%）。脚本头部已换成这组数字。
-  **结论：维持 4 MiB，不上调。** 理由：NFR2 的承诺是 5MB≈4.77 MiB，只比预估合并值高 14%，把门设在承诺线上等于什么都不管；4 MiB 是「仍然有意义」的最大值。为了让 9% 余量可管理而不是悬崖，脚本新增 **85% 警戒带**：越过就打 `::warning::` 但仍然通过，让「什么变大了」这个问题在变红之前就被提出来，而不是让维护者面对一个红叉和一个显然可以调高的常量。脚本头部的实测值已全部换成上面这组真实数字，并写明合并后必须在 develop 上重测四个目标。
+  **CI 实测推翻了这个投影（2026-08）**：五条 track 全并入后，CI 的 musl leg 实测 **4_523_120 B = 旧门禁的 107%**，门禁按设计红了。我的 musl 投影（~3.57 MiB / 89%）低估约 0.74 MiB。低估的根因是那个「musl 比 darwin 高约 9%」的系数**从来没被实测过**——它继承自最初 story 文本里的一句约数，我在 R2 把它当成依据写进了脚本头部。教训与本 track 其它几轮同源：投影必须标成投影，而且不能拿投影当门禁的标定基准。
+  **1.04 MiB 差值是什么：三组受控实验（都是实测）**。
+  - **musl vs glibc，锁定架构（aarch64-linux）**：musl 静态 3_740_216 vs gnu 动态 3_806_048 → musl **小 65_832 B**。「静态链接 libc 撑大了体积」这个最直觉的假设是**错的**。
+  - **Linux/ELF/静态 vs macOS/Mach-O，锁定架构（aarch64）**：3_740_216 vs 3_431_568 → +308_648 B（+9.0%）。
+  - **x86_64 vs aarch64，锁定 OS 与 libc（linux-musl）**：4_523_120 vs 3_740_216 → +782_904 B（+20.9%）；在 darwin 上独立复现同一效应：3_970_784 vs 3_431_568 → +539_216 B（+15.7%）。
+  所以主导项是 **x86_64 代码生成**，不是 musl：同一份源码编到 x86_64 比 aarch64 大 16-21%，两个平台各自都成立。这是指令集属性，削依赖削不掉。`cargo bloat`（musl 构建）也证实无异常：`.text` 2.4 MiB 摊在 otl 414K / std 363K / aws-lc-sys 264K / rustls 249K / reqwest 162K / clap 124K，`rpassword` 与 `rustix` 连前 22 名都没进——auth 实现者「这两个很小、应先看静态 libc 与 LTO」的判断方向对，结论（是静态 libc）不对，真正的答案是架构。
+  **fat LTO 在 musl 路径上确认生效**：cargo 传的是裸 `-C lto`（即 fat）；用 dist 默认的 thin LTO 重建同一 target 要多 **525_432 B**，说明 R2 那个修复在 musl 上比在 darwin 上更值。`cargo-auditable` / `cargo-cyclonedx` / `omnibor` 全部确认关闭（配置无该键、生成的 workflow 无对应 step、`check-release-gating.sh` 有常驻断言）。
+  **结论：改成 per-target 预算，并把「回归门」与「NFR2 承诺」拆成两个数。** 一个数管四个 triple 时，它对最小的 target 毫无约束、对最大的 target 又误伤。现在：每个 target 的预算 = 该 target 实测（含 doctor 的 +33_040）× 1.08，于是三个已实测 target 都落在 **92%**——门禁对每个 target 一样严。另一条独立的 **NFR2 天花板 5_000_000 B** 对所有 target 硬失败，这样以后任何一次调预算都不可能悄悄授权突破承诺。警戒带从 85% 改为 **95%**（窄带「快撞了」而不是常亮告警），NFR2 侧另有 95% 的独立告警。
+  **需要产品决策的一条**：musl 实测 4_523_120 B 已经是 5 MB 承诺的 **90%**。它的预算 4_920_000 故意设在天花板以下。若 musl 真要越过 ~4.9 MB，那是关于 NFR2 的产品决定，不是这里的常量。
 - **musl + aws-lc-sys 是本 story 最脆的一环**：reqwest 0.13 的 `rustls` feature 走 aws-lc-rs → aws-lc-sys，那是 C 代码。从 glibc 宿主构建 musl 目标需要 musl-gcc（`musl-tools`）、cmake，以及 bindgen 兜底时的 libclang。dist 自带的 `[dist.dependencies.apt]` **不能用**：它生成的是 `sudo apt-get install <pkgs>`，没有 `--yes`，而 GitHub Actions 的 `run:` 步骤 stdin 挂在 /dev/null，apt 的确认提示读到 EOF 会直接 Abort。因此改为 `github-build-setup` 注入一个手写步骤，调用 `scripts/install-linux-musl-toolchain.sh`；包清单只在脚本里出现一次，release 构建与 `binary-size.yml` 的 musl 预检共用它，两条路径不可能漂移。
 - **`github-build-setup` 片段放在 `.github/build-setup/` 而不是 `.github/workflows/`**：GitHub 会把 workflows 目录里每个 .yml 都当 workflow 解析，一个裸 step 列表会被报成 invalid workflow file。dist 把配置里的路径按 `.github/workflows/` 解析，所以配置值是 `"../build-setup/release-build-setup.yml"`。
 - **release.yml 是生成物，禁止手改**：它被 `dist generate --check` 逐字节校验，往里插一个 step 会立刻让校验失败。所以一切自定义能力都必须走配置项：`github-build-setup` 往构建 job 注入 step，`local-artifacts-jobs` 注册 preflight，`post-announce-jobs` 挂 attestation，`github-action-commits` 钉 action，`github-release` 决定 Release 在哪一步创建。

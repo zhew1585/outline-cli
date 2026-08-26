@@ -33,6 +33,20 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# These checks are implemented in Python to stay readable; keep the
+# dependency explicit and fail with a message that says what is missing
+# rather than a bare "command not found" from three lines down. Every
+# runner this is wired into (ubuntu-*, macos-*) ships python3; a slim
+# container image may not.
+require_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "error: python3 is required by $(basename "${BASH_SOURCE[1]}") but is not on PATH" >&2
+        echo "hint: this gate fails closed on purpose - install python3 rather than skipping it" >&2
+        exit 1
+    fi
+}
+require_python3
 MANIFEST="${REPO_ROOT}/crates/otl/Cargo.toml"
 
 if [[ $# -ge 1 ]]; then
