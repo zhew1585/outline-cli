@@ -243,33 +243,37 @@ R5 确认了 R4 的核心修法（367 MB → 实测 29.2 MB、IgnoredAny 零分�
 
 审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
 
-### 合并集成注意（develop 已前移，orchestrator 请看这一段）
+### 合并集成记录（已完成，`git merge develop` 于本分支）
 
-复核门禁时发现 `develop` 已合入 Epic 4a 的 schema 驱动列（`IR_SCHEMA_VERSION` 4 → 5，新增
-`engine::ir::FieldSpec` 与 `OpSpec::response_fields`）。本分支相对**合并基**仍未碰过 `ir.rs`/`error.rs`
-（`git diff develop...HEAD -- crates/engine/src/{ir,error}.rs` 为 0 行），所以之前的声明依然成立；
-但合并时需要动的地方是确定的，列在这里免得漏：
+develop 前移了两条 track：Epic 4a（config/profile、补全、schema 驱动列，含 IR schema 5）与发布管道
+（dist、gating 脚本、体积门禁、README 派生退出码块）。集成不是机械合并，实际做的事：
 
-1. `otl::spec::to_ir` 用的是 `OpSpec { .. }` 全字段字面量，**会编译失败直到补上 `response_fields`**。
-   这是当初特意选结构体字面量而非 `..Default::default()` 的目的：新字段必须被显式处理，不能静默取默认值。
-   最省事且正确的落法是让 `spec-compile` 也编译 response 字段（4a 的编译器侧已有实现，可复用），
-   实在赶时间可以先填空 `Cow::Borrowed(&[])`——但那会让「synced 缓存的表格列」退化，属功能缺口而非安全问题。
-2. **`bounded.rs::footprint_of` 必须给 `response_fields` 计费**（连同其内层字符串），否则新增的容器就是一条
-   没被预算看见的放大路径。
-3. `bounded.rs` 模块注释里「`OpSpec` 嵌套两层」要改成三层：serde 的 per-container 预留是**每层一次**，
-   最坏单记录从 ~2 MiB 变成 ~3 MiB，组合场景从 3.19 MiB 变成约 4.2 MiB。
-4. 因此 `tests/memory_bounds.rs` 的两条阈值（4 MiB / 6 MiB）要按合并后实测重设，
-   并把「三层都撒谎」加进那条 fixture——**这一步别省**，R5 的教训正是 fixture 落后于代码。
-5. `IR_SCHEMA_VERSION` 变 5 会让所有旧缓存判为 stale 并回退内置表（设计如此，有测试覆盖）。
-   `build.rs` 里的 `IR_SCHEMA_VERSION` 常量副本也要同步（否则生成代码里的 `const _: () = assert!(...)` 会失败——
-   这是它存在的意义）。
-6. 双方都改过的共享文件（`main.rs`/`lib.rs`/`commands/mod.rs`/`build.rs`/`api.rs`/`startup_guard.rs`/
-   `ir_table.rs`/`docs/exit-codes.md`/两个 `Cargo.toml`）都是追加式改动，冲突应为机械冲突。
-   注意 `crates/otl/tests/{api_list,api_params,api_e2e,paging_e2e,contract_smoke,startup_guard}.rs`
-   两侧都碰了：我加的是 `OTL_CACHE_DIR` 隔离（`mod common;`），合并后**务必保留**，否则 4a 的断言会重新
-   依赖开发机上的真实缓存。
+1. **response fields 走共用编译器。** 4a 在 build.rs 内联解析器里加了 `OpSpec::response_fields`；本分支已把解析器
+   搬进 `spec-compile`。把他们的提取逻辑（success schema pointer、envelope 解包、数组解包、`readOnly`、声明顺序）
+   移植进 `spec-compile`，并把 envelope 属性做成 `CompileOptions` 字段——「payload 在 `data` 下」是 Outline 约定，
+   通用 crate 不能知道。除 `spec_parity` 外另加一条把话说窄的测试：**synced spec 的列与内置 spec 逐字段同序**。
+2. **`preserve_order` 换了位置，而且它不再只影响构建期。** 4a 的注释说该 feature 只在 build-dependency 上、
+   运行时仍是排序 map——共用编译器之后这个理由不成立：构建期与运行期解析顺序不一致会让 synced 表与内置表列序不同、
+   `spec_parity` 直接失败。所以 feature 归给做解析的那个 crate，它**会**统一进运行时：`--json` 现在按服务器给的顺序
+   打印键，而不是排序。这在契约内（`otl api` 输出明示不稳定），也更忠实；新增
+   `tests/json_key_order.rs` 把它钉住并在头注写明理由，让它是个有署名的决定而不是意外。
+3. **预算必须学会新容器。** `response_fields` 是 `OpSpec` 上第三个容器；没被计费的容器正是 footprint 预算存在的
+   理由，所以 `footprint_of` 给它计费、`validate_ops` 复检它的文本——字段名会变成**列标题**，是藏转义序列的好地方。
+4. **fixture 加了第三个撒谎容器，而实测纠正了我的预测。** 我预计三处同时预留（单记录约 3 MiB）；**实测 2.03 MiB**，
+   原因是撒谎的容器永远不会读完，因此它后面的容器根本到不了。真正的界由**解码路径的深度**决定，而不是容器数量。
+   两种可达形状现在都实测：全部撒谎 **2.03 MiB**、参数表完整+字段表撒谎 **1.46 MiB**、最坏记录在满表内 **3.39 MiB**。
+   `bounded.rs` 的说明改成这条推理，并写明「下一个字段到来时，同时改计费与 fixture」。
+5. **守卫在合并代码上按设计触发。** 按调用站点登记的文件读取守卫抓到 4a 的 config 文件读取（已登记并注明理由）；
+   `to_ir` 的完整 struct 字面量与生成代码里的 `IR_SCHEMA_VERSION` 断言都拒绝编译，直到新字段与版本被处理。
+6. **修了 4a config 探针的 mtime 抽奖。** 它取 `deps` 里最新的 `libserde-*.rlib`，而 host 与 target 两份都在那里、
+   文件名无法区分；加了 build-dependency 后构建顺序一变它就以「config tree 编译失败」这种误导信息报错。现在按
+   新旧顺序试候选，**保留能让未修改副本编译通过的那一组**——它自己的 baseline 来选依赖，选错就选不上。
+7. 六个共享测试文件里**两种隔离都保留**（我的 cache 隔离 + 4a 的 profile/config 隔离）。
 
-### Completion Notes List
+合并后实测余量：最大记录 761 B / 32 KiB（43 倍）、单 op 最多 25 个响应字段 / 256（10 倍）、
+整表 34 KB / 1 MiB（30 倍）、dist 二进制 2.79 MiB / 4 MiB（69%）。
+
+### Completion Notes List### Completion Notes List
 
 - 偏差 1：`--spec` 实现为 `spec sync --spec <path>` 而非全局 flag（理由见 Dev Notes）。
 - 偏差 2：额外加了 `otl spec reset`。没有它，用户 sync 到一份坏 spec 后无法自助恢复（需要知道缓存路径去手删）。
