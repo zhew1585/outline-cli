@@ -1084,11 +1084,128 @@ async fn a_collection_of_only_unusable_rows_does_not_claim_to_be_empty() {
     assert!(stderr.contains("listing row 1"), "{stderr}");
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_can_never_leave_an_empty_document_file() {
+    // The property the placeholder broke, watched on the path that HAD the
+    // placeholder: the default, no-`--overwrite` export into a fresh
+    // directory. (An earlier version of this test ran `--overwrite`, which
+    // never used a placeholder at all - it could not have failed.)
+    //
+    // The structural guarantee is that the destination name is only ever
+    // created by linking a finished temp file; this watcher is the
+    // observable half of it.
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let watched = out.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher_stop = std::sync::Arc::clone(&stop);
+    let watcher = std::thread::spawn(move || {
+        let mut sightings = 0_usize;
+        let mut empty = 0_usize;
+        while !watcher_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(content) = std::fs::read(watched.join("Alpha.md")) {
+                sightings += 1;
+                if content.is_empty() {
+                    empty += 1;
+                }
+            }
+        }
+        (sightings, empty)
+    });
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (sightings, empty) = watcher.join().unwrap();
+
+    assert_eq!(
+        empty, 0,
+        "the destination existed with no content at some point"
+    );
+    // The watcher has to have actually seen the file, or "never empty"
+    // would be true of a test that looked at nothing.
+    assert!(sightings > 0, "the watcher never observed the file at all");
+    assert!(std::fs::read_to_string(out.join("Alpha.md"))
+        .unwrap()
+        .contains("body of a"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_document_id_cannot_rewrite_the_terminal() {
+    // The id of a document that FAILED goes into the failure summary. Like
+    // a title it is server text; unlike a title it also has to stay
+    // verbatim in the JSON so the user can retry with it. So the JSON keeps
+    // it raw and the terminal summary quotes it.
+    const HOSTILE: &str = "evil\u{1b}]52;c;cGF5bG9hZA==\u{7}\n  forged: failure";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{
+                "id": HOSTILE,
+                "title": "Hostile",
+                "updatedAt": "2026-08-01T00:00:00.000Z",
+            }],
+            "pagination": { "offset": 0, "limit": 100 },
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "ok": false,
+            "error": "not_found",
+            "message": "Document not found",
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains('\u{1b}'), "ESC reached stderr: {stderr:?}");
+    assert!(!stderr.contains('\u{7}'), "BEL reached stderr: {stderr:?}");
+    let forged = stderr
+        .lines()
+        .filter(|line| line.trim_start().starts_with("forged:"))
+        .count();
+    assert_eq!(forged, 0, "an id forged a failure line: {stderr:?}");
+
+    // The JSON keeps the id exactly as the server sent it: that is what a
+    // retry needs, and JSON encoding makes it safe to carry.
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["failed"][0]["id"], json!(HOSTILE));
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_successful_export_reports_itself_as_durable() {
-    // The `durable` field exists so an automated backup can tell "written"
-    // from "written and flushed". On the happy path it must be true, or the
-    // field would be noise.
+    // `durable` exists so an automated backup can tell "written" from
+    // "written and flushed". On Unix, where a directory CAN be flushed, the
+    // happy path must report true - otherwise the field is noise.
     let server = server_with(vec![row("a", "Alpha", None), row("b", "Beta", Some("a"))]).await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("export");
@@ -1107,60 +1224,69 @@ async fn a_successful_export_reports_itself_as_durable() {
     let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(parsed["durable"], json!(true));
     assert_eq!(parsed["complete"], json!(true));
+    assert_eq!(parsed["stray"], json!([]));
+}
+
+#[cfg(not(unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_that_cannot_flush_reports_unconfirmed_durability() {
+    // The counterpart, and the reason `durable` is a tri-state: a platform
+    // with no way to flush a directory must say so rather than claim a
+    // guarantee nothing checked.
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let uri = server.uri();
+    let target = out.clone();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        parsed["durable"],
+        Value::Null,
+        "an unflushable platform must not report durable: true"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not be confirmed"));
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_crash_can_never_leave_an_empty_document_file() {
-    // The property the placeholder broke: at no point does the destination
-    // exist without its full content. Approximated here by watching the
-    // directory while the export runs - every time `Alpha.md` is visible,
-    // it must already be complete.
+async fn creating_a_nested_output_path_flushes_every_directory_it_created() {
+    // The output directory's own NAME is an entry in the directory above
+    // it. `--out a/b/c` creates three names, and flushing only `c` would
+    // leave the names themselves unflushed - yet still report the export
+    // durable.
     let server = server_with(vec![row("a", "Alpha", None)]).await;
     let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("export");
-    std::fs::create_dir_all(&out).unwrap();
-
-    let watched = out.clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watcher_stop = std::sync::Arc::clone(&stop);
-    let watcher = std::thread::spawn(move || {
-        let mut empty_sightings = 0_usize;
-        while !watcher_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Ok(content) = std::fs::read(watched.join("Alpha.md")) {
-                if content.is_empty() {
-                    empty_sightings += 1;
-                }
-            }
-        }
-        empty_sightings
-    });
-
+    let out = dir.path().join("deep").join("nested").join("export");
     let uri = server.uri();
     let target = out.clone();
-    let assert = blocking(move || {
+    let output = blocking(move || {
         otl_at(&uri)
-            .args([
-                "docs",
-                "export",
-                "--collection",
-                COLLECTION,
-                "--overwrite",
-                "--out",
-            ])
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
             .arg(&target)
-            .assert()
+            .output()
+            .unwrap()
     })
     .await;
-    assert.success();
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let empty_sightings = watcher.join().unwrap();
 
     assert_eq!(
-        empty_sightings, 0,
-        "the destination existed with no content at some point"
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(std::fs::read_to_string(out.join("Alpha.md"))
-        .unwrap()
-        .contains("body of a"));
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Reported durable only because every created directory - and the
+    // pre-existing one holding the first of them - was flushed.
+    assert_eq!(parsed["durable"], json!(true));
+    assert_eq!(tree(&out), BTreeSet::from(["Alpha.md".to_string()]));
 }

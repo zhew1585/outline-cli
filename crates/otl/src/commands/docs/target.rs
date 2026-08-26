@@ -23,31 +23,49 @@
 //!   atomically - including replacing a symlink at the destination rather
 //!   than following it.
 //!
-//! ## What this cannot do
+//! ## Where a document actually landed is PROVEN, not assumed
 //!
-//! A path-based write can be redirected by someone able to rename
-//! directories inside the output tree while the export runs. Closing that
-//! window needs `openat`-style directory handles, which the standard
-//! library does not expose and which `otl` will not reach for through
-//! `unsafe`. Two things bound it instead:
+//! The temporary file's filesystem identity is taken from its open handle
+//! (`fstat`, no path involved), so it is the identity of the file this run
+//! created and nothing else. After the file is given its real name, the
+//! destination path is stat'ed and the two identities are compared.
 //!
-//! - such an attacker already has write access to the tree being written,
-//!   so they can rewrite the exported files anyway;
-//! - a write that lands outside the output directory is DETECTED after the
-//!   fact: [`landed_inside`] re-resolves the file that was just written and
-//!   the caller reports it as a failure. That is detection rather than
-//!   prevention (the bytes are already elsewhere), but it is what stops the
-//!   command from exiting 0 and listing a path it did not actually write.
+//! That is what makes a directory swap detectable even when it is REVERTED.
+//! If a directory in the path is replaced mid-write, the file lands in the
+//! attacker's directory; restoring the original before the check does not
+//! help them, because the original directory does not contain the inode
+//! that was just created - it contains nothing at that name, or an older
+//! file with a different one. Either way the comparison fails and the
+//! caller reports the document rather than listing a path it did not write.
 //!
-//! [`Dir::verify`] additionally catches a directory that was swapped and
-//! left swapped. A swap that is reverted before the next check is not
-//! detectable this way; the post-write resolution above is what covers that
-//! case.
+//! An earlier version resolved the destination path instead and checked
+//! that it was lexically inside the output root. That proved only where the
+//! path pointed at the instant of the check, which is exactly what a
+//! reverted swap makes meaningless.
 //!
-//! On Windows the identity pin in `Dir` is inert, because the file index is
-//! only reachable through an unstable standard-library API. The
+//! ## What this still cannot do
+//!
+//! It cannot PREVENT the redirected write. Closing that window needs
+//! `openat`-style directory handles, which the standard library does not
+//! expose and which `otl` will not reach for through `unsafe`. The bytes
+//! may already be in the attacker's directory by the time the mismatch is
+//! noticed; what is guaranteed is that the command will not report success
+//! for them. Such an attacker also already has write access to the tree
+//! being written, so they can rewrite the exported files anyway.
+//!
+//! On Windows there is no identity to compare: the file index is only
+//! reachable through an unstable standard-library API. The check degrades
+//! to the weaker path resolution there, and says so at the call site. The
 //! `hard_link`/`rename` rules above are platform-independent and do the
 //! load-bearing work.
+//!
+//! ## Durability is reported, never assumed
+//!
+//! Renaming or linking a file into place makes it visible, not durable: the
+//! directory entry is separate metadata. Directories are therefore fsynced,
+//! and the outcome is a [`Durability`] value rather than a bare `Ok`, so a
+//! platform where the flush cannot be performed reports that instead of
+//! being indistinguishable from one where it succeeded.
 
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::path::{Path, PathBuf};
@@ -55,23 +73,62 @@ use std::path::{Path, PathBuf};
 /// Prefix of the temporary file each document is written through.
 const TEMP_PREFIX: &str = ".otl-export-";
 
-/// The filesystem identity of a path, where the platform exposes one.
+/// The filesystem identity of a file or directory.
 ///
-/// `None` means "not available", never "different": callers must treat an
-/// absent identity as no information rather than as a mismatch.
-fn identity(path: &Path) -> Option<(u64, u64)> {
+/// `None` means "not available on this platform", never "different":
+/// callers must treat an absent identity as no information rather than as a
+/// mismatch, and must not report a guarantee they could not check.
+pub type FileId = (u64, u64);
+
+/// The identity of whatever `path` names right now.
+fn identity(path: &Path) -> Option<FileId> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    identity_of(&metadata)
+}
+
+/// The identity of an OPEN file, taken from its handle.
+///
+/// No path is consulted, so this cannot be redirected by anything happening
+/// to the directory in the meantime. It is the identity of the file this
+/// process is holding, which is what makes it usable as proof later.
+fn identity_of_handle(file: &std::fs::File) -> Option<FileId> {
+    identity_of(&file.metadata().ok()?)
+}
+
+/// Pull the identity out of metadata, where the platform has one.
+fn identity_of(metadata: &std::fs::Metadata) -> Option<FileId> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata = std::fs::symlink_metadata(path).ok()?;
         Some((metadata.dev(), metadata.ino()))
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        // Windows exposes a file index only through an unstable std API.
+        let _ = metadata;
         None
     }
+}
+
+/// Whether a directory's entries were actually flushed to disk.
+///
+/// A separate value rather than a bare `Ok` so that "flushed" and "could not
+/// be flushed on this platform" cannot be confused for each other by a
+/// caller reporting durability to a backup script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// The directory's entries were fsynced.
+    Flushed,
+    /// This platform offers no way to flush a directory through the
+    /// standard library, so nothing can be claimed about whether the names
+    /// written survive a crash.
+    ///
+    /// Only constructed off Unix; the allow keeps the Unix build from
+    /// warning about a variant that is real on another target rather than
+    /// tempting someone to delete it.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unconfirmed,
 }
 
 /// A directory of the output tree, pinned to the entry it named when it was
@@ -158,21 +215,12 @@ impl Dir {
     /// metadata. Without this, a power loss right after a successful export
     /// can leave the backup missing files whose data was already durable.
     ///
-    /// Unix only for the flush itself: Windows has no way to open a
-    /// directory as a handle through the standard library. The verification
-    /// happens on every platform.
-    pub fn sync(&self) -> Result<(), String> {
+    /// Returns [`Durability::Unconfirmed`] on platforms that cannot flush a
+    /// directory, so the caller reports the gap rather than silently
+    /// treating it as a success. The verification happens everywhere.
+    pub fn sync(&self) -> Result<Durability, String> {
         self.verify()?;
-        #[cfg(unix)]
-        {
-            std::fs::File::open(&self.path)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|error| format!("cannot flush the directory: {}", error.kind()))
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(())
-        }
+        flush_directory(&self.path)
     }
 }
 
@@ -187,6 +235,11 @@ impl Dir {
 struct TempFile {
     path: PathBuf,
     file: Option<std::fs::File>,
+    /// Identity taken from the open handle at creation time.
+    ///
+    /// This is what makes the file THIS call's property: a path can be
+    /// pointed at something else afterwards, a handle cannot.
+    id: Option<FileId>,
     keep: bool,
 }
 
@@ -198,9 +251,11 @@ impl TempFile {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        let id = identity_of_handle(&file);
         Ok(Self {
             path,
             file: Some(file),
+            id,
             keep: false,
         })
     }
@@ -222,14 +277,35 @@ impl TempFile {
         self.file = None;
         Ok(())
     }
+
+    /// Remove the temporary file, but only if the path still names it.
+    ///
+    /// Between creating the file and removing it, someone with write access
+    /// to the directory can unlink it and put their own file at the same
+    /// name; deleting by path alone would then destroy that file. The
+    /// identity check makes the removal apply to the inode this call
+    /// created or to nothing at all.
+    ///
+    /// A platform without identities cannot make that check, and removing
+    /// by path is still better than leaving a copy of the document behind,
+    /// so the removal proceeds there.
+    fn remove(&mut self) -> std::io::Result<()> {
+        self.keep = true;
+        self.file = None;
+        match (self.id, identity(&self.path)) {
+            (Some(mine), Some(current)) if mine != current => Ok(()),
+            (Some(_), None) => Ok(()),
+            _ => std::fs::remove_file(&self.path),
+        }
+    }
 }
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        self.file = None;
-        if !self.keep {
-            let _ = std::fs::remove_file(&self.path);
+        if self.keep {
+            return;
         }
+        let _ = self.remove();
     }
 }
 
@@ -275,11 +351,27 @@ impl Default for TempNames {
     }
 }
 
-/// Write one file into `dir` and return the path it was written to.
+/// The outcome of publishing one document.
+#[derive(Debug)]
+pub struct Written {
+    /// Where it was published.
+    pub path: PathBuf,
+    /// Identity of the file that was published, from the handle this call
+    /// held. `None` on platforms without identities.
+    pub id: Option<FileId>,
+    /// A temporary file that could not be removed after a successful
+    /// publish, if any. It is a complete copy of the document sitting in
+    /// the output tree under a hidden name, so the caller must surface it.
+    pub stray: Option<PathBuf>,
+}
+
+/// Write one file into `dir`.
 ///
 /// See the module documentation for the guarantees. In short: the content
-/// lands complete or not at all, and without `overwrite` the name is taken
-/// with no-replace semantics rather than by testing whether it is free.
+/// lands complete or not at all, without `overwrite` the name is taken with
+/// no-replace semantics rather than by testing whether it is free, and the
+/// returned identity is what lets the caller prove the destination really
+/// names the file this call wrote.
 pub fn write_atomically(
     dir: &Dir,
     file_name: &str,
@@ -287,7 +379,7 @@ pub fn write_atomically(
     names: &mut TempNames,
     content: &str,
     overwrite: bool,
-) -> Result<PathBuf, String> {
+) -> Result<Written, String> {
     dir.verify()?;
     let dest = dir.path().join(file_name);
 
@@ -295,53 +387,109 @@ pub fn write_atomically(
         .map_err(|error| format!("cannot create a temporary file: {}", error.kind()))?;
     temp.fill(content)
         .map_err(|error| format!("cannot write the file: {}", error.kind()))?;
+    let id = temp.id;
 
     if overwrite {
         // Replace semantics, and the only step that touches the
         // destination: it either becomes the new file or stays as it was.
         std::fs::rename(&temp.path, &dest)
             .map_err(|error| format!("cannot place the file: {}", error.kind()))?;
-        temp.keep = true; // renamed away; nothing left to remove
-        return Ok(dest);
+        // Renamed away: there is no temporary file left to remove, and the
+        // guard must not try (the name may since belong to someone else).
+        temp.keep = true;
+        return Ok(Written {
+            path: dest,
+            id,
+            stray: None,
+        });
     }
 
     // No-replace semantics: the link fails if anything already answers to
     // that name, including a name the filesystem considers equivalent to
     // one already written.
     match std::fs::hard_link(&temp.path, &dest) {
-        Ok(()) => Ok(dest),
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err("a file already exists at this path; pass --overwrite to replace it".to_string())
+            return Err(
+                "a file already exists at this path; pass --overwrite to replace it".to_string(),
+            )
         }
-        Err(error) => Err(format!("cannot place the file: {}", error.kind())),
+        Err(error) => return Err(format!("cannot place the file: {}", error.kind())),
     }
-    // `temp` drops here and removes itself: on success the content now has
-    // its real name through the hard link, and on failure nothing was
-    // placed.
+    // The document is published; the temporary name is now a second link to
+    // it. Failing to drop that link is not a failure of the export, but it
+    // does leave a full copy of the document in the output tree under a
+    // hidden name - so it is reported rather than swallowed.
+    let stray = temp.remove().err().map(|_| temp.path.clone());
+    Ok(Written {
+        path: dest,
+        id,
+        stray,
+    })
 }
 
-/// Whether the file just written is really inside the output directory.
+/// Confirm that `dest` names the file that was just written.
 ///
-/// Resolved through the filesystem, not compared lexically, so a directory
-/// that was swapped for a link after the last check is caught: the
-/// destination then resolves somewhere else (or no longer resolves at all).
-/// This is the check that keeps a redirected write from being reported as a
-/// successful export.
-pub fn landed_inside(root: &Path, path: &Path) -> Result<(), String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| {
-        format!(
-            "cannot confirm where the file was written: {}",
-            error.kind()
-        )
-    })?;
-    if !resolved.starts_with(root) {
-        return Err(
-            "the file was written outside the export directory: a directory \
-             in the path was replaced while the export was running"
-                .to_string(),
-        );
+/// Compares filesystem IDENTITIES, not paths. A directory swapped during
+/// the write sends the file somewhere else, and restoring the directory
+/// afterwards does not put it back - the original directory holds either
+/// nothing at that name or an older file with a different identity, so the
+/// comparison fails either way. Resolving the path instead would be fooled
+/// by exactly that revert, because it only describes where the name points
+/// at the instant it is asked.
+///
+/// Where the platform has no identities, this degrades to resolving the
+/// path and checking it is lexically inside `root`. That is the weaker
+/// check the paragraph above criticises, and it is all Windows can do
+/// through the standard library; it still catches a swap that is left in
+/// place.
+pub fn confirm_landing(root: &Path, dest: &Path, written: Option<FileId>) -> Result<(), String> {
+    let Some(expected) = written else {
+        let resolved = std::fs::canonicalize(dest).map_err(|error| {
+            format!(
+                "cannot confirm where the file was written: {}",
+                error.kind()
+            )
+        })?;
+        if !resolved.starts_with(root) {
+            return Err(REDIRECTED.to_string());
+        }
+        return Ok(());
+    };
+    match identity(dest) {
+        Some(actual) if actual == expected => Ok(()),
+        _ => Err(REDIRECTED.to_string()),
     }
-    Ok(())
+}
+
+/// Reported when a written file is not where it was supposed to go.
+const REDIRECTED: &str = "the file was not written where it should have been: a directory in \
+     the path was replaced while the export was running";
+
+/// Flush one directory's entries to disk.
+///
+/// Used for the output directory itself and for the ancestors that had to
+/// be created to reach it - the name of a directory lives in its PARENT, so
+/// flushing only the directory that holds the documents would leave the
+/// directory holding that directory unflushed.
+pub fn flush_directory(path: &Path) -> Result<Durability, String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)
+            .and_then(|dir| dir.sync_all())
+            .map(|()| Durability::Flushed)
+            .map_err(|error| format!("cannot flush the directory: {}", error.kind()))
+    }
+    #[cfg(not(unix))]
+    {
+        // No way to obtain a directory handle through the standard library,
+        // so nothing can be flushed and nothing may be claimed. Reported
+        // rather than returned as a success: a Windows branch that pretends
+        // to have done the work is exactly the failure mode this project
+        // forbids.
+        let _ = path;
+        Ok(Durability::Unconfirmed)
+    }
 }
 
 /// The filesystem identity of a file that already exists at `path`.
@@ -356,7 +504,7 @@ pub fn landed_inside(root: &Path, path: &Path) -> Result<(), String> {
 /// This is the backstop for `--overwrite` only. Without it, the no-replace
 /// link in [`write_atomically`] already refuses such a collision on every
 /// platform.
-pub fn existing_identity(path: &Path) -> Option<(u64, u64)> {
+pub fn existing_identity(path: &Path) -> Option<FileId> {
     identity(path)
 }
 
@@ -374,8 +522,10 @@ mod tests {
     fn writes_content_and_leaves_no_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
-        let path = write_atomically(&target, "a.md", "md", &mut names(), "body\n", false).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "body\n");
+        let written =
+            write_atomically(&target, "a.md", "md", &mut names(), "body\n", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&written.path).unwrap(), "body\n");
+        assert!(written.stray.is_none(), "a temporary file survived");
         assert_eq!(entries(dir.path()), vec!["a.md".to_string()]);
     }
 
@@ -516,6 +666,81 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_file_replaced_after_creation_is_not_deleted() {
+        // Random names stop the temp path being occupied in ADVANCE; they
+        // do nothing about someone watching the directory, unlinking the
+        // temp after it is created, and dropping their own file at that
+        // name. Deleting by path alone would then destroy that file, so the
+        // guard removes by identity.
+        let dir = tempfile::tempdir().unwrap();
+        let name = names().next("md");
+        let temp_path = dir.path().join(&name);
+        let mut guard = TempFile::create(dir.path(), &name).unwrap();
+        guard.fill("ours").unwrap();
+
+        // The attacker swaps the file out from under the guard.
+        std::fs::remove_file(&temp_path).unwrap();
+        std::fs::write(&temp_path, "someone else's file").unwrap();
+
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(&temp_path).unwrap(),
+            "someone else's file",
+            "the guard deleted a file it did not create"
+        );
+    }
+
+    #[test]
+    fn a_temporary_file_the_guard_created_is_removed() {
+        // The other half: when nothing interfered, the guard must still
+        // clean up, or every failed write would leak a copy.
+        let dir = tempfile::tempdir().unwrap();
+        let mut namer = names();
+        let name = namer.next("md");
+        let temp_path = dir.path().join(&name);
+        {
+            let mut guard = TempFile::create(dir.path(), &name).unwrap();
+            guard.fill("ours").unwrap();
+            assert!(temp_path.exists());
+        }
+        assert!(!temp_path.exists(), "the temporary file was left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_that_fails_is_reported_rather_than_swallowed() {
+        // After a successful no-overwrite publish the temporary name is a
+        // second link to the document, so failing to drop it leaves a
+        // hidden full copy in the output tree. `remove` must therefore
+        // return the error instead of discarding it - that return value is
+        // what becomes `Written::stray`.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let mut guard = TempFile::create(&work, ".otl-export-test.md").unwrap();
+        guard.fill("body").unwrap();
+
+        // A directory with no write permission refuses the unlink.
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = guard.remove();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        if std::fs::metadata(work.join(".otl-export-test.md")).is_err() {
+            // Running as root, where permissions do not apply and the
+            // removal succeeded. Nothing to assert.
+            return;
+        }
+        assert!(
+            outcome.is_err(),
+            "a failed removal was reported as success, so the leftover copy \
+             would never be mentioned"
+        );
+    }
+
     #[test]
     fn temporary_names_are_hidden_and_unpredictable() {
         let mut namer = names();
@@ -578,10 +803,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_write_that_landed_outside_the_root_is_detected() {
-        // Detection, not prevention: the bytes are already elsewhere. The
-        // point is that the command cannot then report the path as
-        // exported.
+    fn landing_is_confirmed_by_identity_not_by_the_path() {
+        // The attack the path check could not see: the file is written
+        // somewhere else and the directory is put back before anyone looks.
+        // Resolving `root/a.md` afterwards succeeds and points inside the
+        // root - at a DIFFERENT file. Comparing identities catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Stand in for "the file this run wrote": an inode that exists, but
+        // not the one the destination names.
+        let elsewhere = root.join("elsewhere.md");
+        std::fs::write(&elsewhere, "the document that was really written").unwrap();
+        let written = identity(&elsewhere);
+
+        let dest = root.join("a.md");
+        std::fs::write(&dest, "an older file that was here all along").unwrap();
+
+        if written.is_some() {
+            let error = confirm_landing(&root, &dest, written)
+                .expect_err("a destination naming another file must be rejected");
+            assert!(error.contains("not written where"), "{error}");
+        }
+        // And the honest case still passes.
+        confirm_landing(&root, &elsewhere, written).expect("the file it really is");
+    }
+
+    #[test]
+    fn a_destination_that_vanished_is_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let gone = root.join("gone.md");
+        std::fs::write(&gone, "x").unwrap();
+        let written = identity(&gone);
+        std::fs::remove_file(&gone).unwrap();
+        assert!(confirm_landing(&root, &gone, written).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_identities_landing_falls_back_to_resolving_the_path() {
+        // The Windows path, exercised here by passing `None`: weaker, but
+        // it still catches a symlink that is left in place.
         use std::os::unix::fs::symlink;
 
         let outer = tempfile::tempdir().unwrap();
@@ -592,11 +855,10 @@ mod tests {
         std::fs::write(outside.join("a.md"), "escaped").unwrap();
         symlink(&outside, root.join("link")).unwrap();
 
-        assert!(landed_inside(&root, &root.join("a.md")).is_err());
         std::fs::write(root.join("a.md"), "inside").unwrap();
-        landed_inside(&root, &root.join("a.md")).expect("a file inside the root");
-        let error = landed_inside(&root, &root.join("link").join("a.md")).unwrap_err();
-        assert!(error.contains("outside"), "{error}");
+        confirm_landing(&root, &root.join("a.md"), None).expect("a file inside the root");
+        let error = confirm_landing(&root, &root.join("link").join("a.md"), None).unwrap_err();
+        assert!(error.contains("not written where"), "{error}");
     }
 
     #[test]

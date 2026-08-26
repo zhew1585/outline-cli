@@ -43,6 +43,10 @@ so that 内容可进 git 或离线阅读。
         `create_new` **确实由本次创建**的那个文件（`TempFile` 的 Drop），不再按路径删别人的文件
   - [x] R2 修复：目录写完后 `fsync` 目录项（Unix），rename 的持久性不再只依赖文件内容 fsync
   - [x] R3 修复：目录 fsync 失败进入退出码与 `--json`（`durable:false` + exit 9），不再只警告
+  - [x] R4 修复：`durable` 改三态（`true`/`false`/`null`）。无法 flush 目录的平台报 `null` + stderr 提示，
+        绝不报 `true`——Windows 分支不许假装成功
+  - [x] R4 修复：新建 `--out` 时逐级记录**自己创建的目录**，结束时按「最深优先」flush 它们的**父目录**
+        （目录名是父目录的目录项，只 flush 存文档的那一层等于没保住这些名字）
   - [x] 不跟随符号链接：子目录 `create_dir` + `symlink_metadata` 校验 + canonicalize 后必须仍在 root 内；
         文件只经 `create_new` + `rename` 落地（`rename` 替换链接而非跟随），无 check-then-open 竞态
   - [x] R2 修复：目录被**钉住**（`Dir` 记录 open 时的 (dev, ino)），每次写入前 `verify()` 复核；
@@ -50,6 +54,10 @@ so that 内容可进 git 或离线阅读。
   - [x] R3 修复：`Dir::sync()` 也 verify（覆盖「最后一篇写完之后才替换」），
         且每篇写完用 `landed_inside` 重新 canonicalize 目标、要求仍在 root 内——
         逃逸出去的写入会被**报告为失败**，不会以 exit 0 + 列出外部路径收场
+  - [x] R4 重做：落地确认改为**比对文件身份**（temp 的 `fstat` 身份 vs 目标路径的 stat 身份），
+        不再 canonicalize 路径——路径解析挡不住「写入时替换、检查前还原」
+  - [x] R4 修复：`TempFile` 记录创建时的身份，Drop 只删「路径仍指向自己那个 inode」时；
+        无覆盖模式发布成功后 temp 删除失败会作为 `stray` 上报（stderr + JSON），不再 `let _ =` 吞掉
   - [x] `documents.info` 无 `text` 字段（或为 null）→ 记为失败，不写只有标题的文件；空字符串照常导出
   - [x] `--out` 非空目录在**任何请求之前**拒绝（退出码 2），`--overwrite` 才允许覆盖
 - [x] Task 4: 部分失败 (AC: 2)
@@ -62,6 +70,7 @@ so that 内容可进 git 或离线阅读。
         不再「丢掉 + 只警告 + complete:true」；重复 id 仍只警告（文档本身没丢）
   - [x] R3 修复：`Unusable::label` 的服务端标题经 `text::quote` 清洗（控制符→空格、换行折平、
         Cf 格式字符丢弃、长度封顶）才进 stderr；且「全是 unusable 行」不再同时喊「没有文档」和「导出失败」
+  - [x] R4 修复：**可用文档行的服务端 id** 同样清洗后才进终端摘要；JSON 里保留原样（重试要用它）
   - [x] 枚举本身失败 → 沿用其自身退出码（3-7），不写任何文件，不报 9
   - [x] stdout：Table 模式逐行输出相对路径；JSON 模式输出 `{out, exported[], failed[]}`
 - [x] Task 5: 测试 (AC: 1, 2)
@@ -95,10 +104,16 @@ so that 内容可进 git 或离线阅读。
   而下一次无 `--overwrite` 的导出又会因「目标已存在」而拒绝——一次崩溃变成需要人工清理的持久故障。
   现在：temp 写完 fsync 后用 `hard_link`（**不替换**语义，重名即失败）落地，再删 temp。
   互斥仍是内核给的，而目标处从不出现半成品。`--overwrite` 仍用 `rename`（替换语义）。
-- **清理只能删自己创建的东西**（R3 finding 3）：旧代码按路径 cleanup，
+- **清理只能删自己创建的东西**（R3 finding 3 + R4 finding 3）：旧代码按路径 cleanup，
   于是 temp 的 `create_new` 因「已存在」失败时，紧接着的 `remove_file` 把**别人那个文件删了**。
-  现在 `TempFile` 只在 `create_new` 成功后才存在，Drop 删的就是它自己创建的那个；
-  temp 名也从可预测的 `pid+counter` 换成 OS 播种的随机名（否则可被预先占据）。
+  R3 让 `TempFile` 只在 `create_new` 成功后才存在（guard 建立 = 我们创建了它），
+  temp 名也换成 OS 播种的随机名。但随机名只防**预先**占据，防不住「创建之后」被观察并替换：
+  攻击者 unlink 掉 temp、在同名放自己的文件，Drop 仍会按路径删掉那个旁观者。
+  R4 因此让 `TempFile` 记住创建时的**句柄身份**，删除前先确认路径仍指向那个 inode，否则什么都不做。
+- **残留的 temp 是完整副本，不能默默留着**（R4 finding 4）：无覆盖模式下发布成功后，
+  temp 名是文档的第二个硬链接。删不掉时它就是输出树里一份隐藏的完整拷贝——
+  既污染备份也多一份泄漏。现在 `write_atomically` 把它作为 `Written::stray` 返回，
+  stderr 警告 + JSON `stray[]` 列出。退出码不变：文档本身确实导出成功了。
 - **写盘为什么必须原子**（R1 finding 3）：旧实现 `--overwrite` 先 `truncate(true)` 再写，
   一旦 `write_all`/`flush` 中途失败（磁盘满、配额），**上一次有效备份已经被清空了**，
   而命令只报一个 exit 9。改为「同目录 temp → fsync → rename」后：目标文件只被 `rename` 整体替换，
@@ -145,10 +160,27 @@ so that 内容可进 git 或离线阅读。
   默认（无 `--overwrite`）路径用 `hard_link` 落地，**不替换**语义在所有平台上都会因重名而失败——
   文件系统认为两个名字等价时，第二次 link 直接报错，不再依赖 (dev, ino)。
   `--overwrite` 模式下仍只有 Unix 有身份预检查。
+- **`durable` 是三态，不是布尔**（R4 findings 5/6）：R3 引入这个字段是对的方向，但它有两处**未经证明的 true**。
+  其一，Windows 的 `Dir::sync` 是无条件 `Ok(())`——什么都没做却让 `durable:true`，
+  正撞在项目铁律「Windows 分支不得假装成功」上。现在 `sync` 返回 `Durability::{Flushed, Unconfirmed}`，
+  无法 flush 的平台报 `null` 并在 stderr 说明一次；`false` 保留给「试过且失败」。
+  其二，`--out parent/export` 由 `create_dir_all` 建出来时，`export` 这个**名字**是 `parent` 的目录项，
+  只 flush `export` 本身保不住它。现在改用自写的逐级创建，记录「本次创建了哪些目录」，
+  结束时按最深优先 flush 它们的父目录（含第一个已存在的祖先，它持有第一个新建目录的名字）。
 - **(dev, ino) 兜底与目录钉住只在 Unix**：Windows 的 file index 只有 std 的 unstable API 能拿到
   （`MetadataExt::file_index`，`windows_by_handle` feature）。NTFS 大小写不敏感但不做 normalization folding，
   而本键的 uppercase 往返正好覆盖 NTFS 的 uppercase 折叠，所以 Windows 上的残余风险很小；
   但**它确实没有兜底**，这一点在此明记。`create_new` + `rename` 的保证是跨平台的，承重部分在那里。
+- **落地确认必须比对身份，不能比对路径**（R4 finding 2）：R3 用 `canonicalize(dest).starts_with(root)`，
+  它只能证明「**此刻**这个名字指向 root 内」，而攻击序列恰好绕开这一点：
+  写入时把分支目录换成外部 symlink（temp 与最终文件落到外部），在检查**之前**把原目录换回来。
+  `--overwrite` 场景下还原后的目录通常还有同名旧文件，于是路径解析成功、`Dir::sync` 看到原 inode，
+  命令 exit 0 并列出内部旧路径，而新 markdown 在外面。
+  现在改为：temp 的身份取自**打开的文件句柄**（`fstat`，不经路径，不可被重定向），
+  落地后 stat 目标路径并比对。还原目录并不能把那个 inode 变出来——原目录要么该名字不存在、
+  要么是身份不同的旧文件，两种情况都会失配并报失败。
+  仍然只是**检测**而非阻止（字节已经在外面了），但「以成功姿态汇报一个自己没写的路径」被堵死了。
+  无身份的平台（Windows）退化为路径解析，代码里明说这是较弱的那一种。
 - **逃逸必须至少被报告**（R3 finding 4）：R2 声称「替换会被报告」，那半句不成立——
   `verify()` 之后到落地之间被替换、且最后一篇文档之后不再 verify 时，
   写入可以成功落到 root 外而命令仍 exit 0 并把外部路径列为已导出。两处补上：

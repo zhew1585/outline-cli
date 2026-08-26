@@ -21,8 +21,9 @@ use crate::fields;
 use crate::render::{self, OutputMode};
 use crate::session::Session;
 use crate::stdio;
+use crate::text;
 
-use super::target::{self, Dir, TempNames};
+use super::target::{self, Dir, Durability, TempNames};
 use super::tree::{self, Plan};
 
 /// Operation that enumerates a collection's documents (auto-paginated).
@@ -57,6 +58,11 @@ pub struct ExportArgs {
 /// One document that could not be exported.
 struct Failure {
     /// Document id, so the user can retry it by hand.
+    ///
+    /// Kept RAW: it is what the caller needs to feed back to the API, and
+    /// the JSON summary carries it verbatim for that reason. It is also
+    /// server-controlled text, so the human-readable summary quotes it
+    /// through [`text::quote`] rather than printing it as it came.
     id: String,
     /// Why it failed (already sanitized: it comes from a `CliError` or an
     /// `io::ErrorKind`, never from raw server text).
@@ -68,7 +74,8 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     // Local checks first: a bad output directory must not cost a request.
     // The canonical path is what everything below joins onto, so an
     // ancestor symlink is resolved once, up front, and reported.
-    let root = prepare_out_dir(&cmd.out, cmd.overwrite)?;
+    let prepared = prepare_out_dir(&cmd.out, cmd.overwrite)?;
+    let root = prepared.root;
     let root_dir = Dir::open(root.clone())
         .map_err(|reason| CliError::usage(anyhow!("{}: {reason}", root.display())))?;
     let session = Session::open()?;
@@ -90,6 +97,8 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
         temp_names: TempNames::new(),
         written_ids: HashSet::new(),
         undurable: Vec::new(),
+        stray: Vec::new(),
+        durability_unconfirmed: false,
         // Only truncation the caller did NOT ask for makes the export
         // incomplete. `--limit N` stopping at N documents is the requested
         // outcome and stays exit 0 - the same boundary the other curated
@@ -106,6 +115,14 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     }
     export.write_level(&root_dir, &plan, &plan.roots, 0, &mut Names::new());
     export.flush(&root_dir);
+    // The output directory's own NAME is an entry in the directory above
+    // it. When this run created that name, flushing only the directory that
+    // holds the documents would leave the name itself unflushed, and a
+    // crash could take the whole export with it.
+    for parent in &prepared.new_entries {
+        let outcome = target::flush_directory(parent);
+        export.record_durability(parent, outcome);
+    }
     export.finish(mode)
 }
 
@@ -135,6 +152,12 @@ struct Export<'a> {
     truncated: Option<engine::Truncation>,
     /// Whether `--limit` is what stopped the enumeration.
     limited: bool,
+    /// Temporary files that survived a successful publish, each a hidden
+    /// copy of a document.
+    stray: Vec<String>,
+    /// True when a directory could not be flushed because this platform
+    /// offers no way to do it, as opposed to because the flush failed.
+    durability_unconfirmed: bool,
     /// Directories whose entries could not be flushed to disk.
     ///
     /// The files are written and readable; what is unknown is whether they
@@ -223,13 +246,26 @@ impl Export<'_> {
     /// Also the last time this directory is verified, which is what covers
     /// a swap performed after the final write into it.
     fn flush(&mut self, dir: &Dir) {
-        if let Err(reason) = dir.sync() {
-            stdio::write_diagnostic_line(&format!(
-                "warning: could not flush {} to disk: {reason}",
-                dir.path().display()
-            ));
-            self.undurable
-                .push(format!("{}: {reason}", dir.path().display()));
+        self.record_durability(dir.path(), dir.sync());
+    }
+
+    /// Fold one flush outcome into the run's durability verdict.
+    ///
+    /// Three outcomes, kept apart on purpose: flushed, could not be flushed
+    /// (a real failure), and cannot be flushed on this platform (not a
+    /// failure, but not a confirmation either - claiming durability there
+    /// would be a Windows branch pretending to have done the work).
+    fn record_durability(&mut self, path: &Path, outcome: Result<Durability, String>) {
+        match outcome {
+            Ok(Durability::Flushed) => {}
+            Ok(Durability::Unconfirmed) => self.durability_unconfirmed = true,
+            Err(reason) => {
+                stdio::write_diagnostic_line(&format!(
+                    "warning: could not flush {} to disk: {reason}",
+                    path.display()
+                ));
+                self.undurable.push(format!("{}: {reason}", path.display()));
+            }
         }
     }
 
@@ -279,21 +315,35 @@ impl Export<'_> {
             &markdown,
             self.overwrite,
         );
-        let path = match written {
-            Ok(path) => path,
+        let written = match written {
+            Ok(written) => written,
             Err(reason) => return self.fail(id, reason),
         };
-        // Where did it actually land? Re-resolved rather than trusted: a
-        // directory swapped between the check above and the write would
-        // otherwise be reported as a successful export of a path this run
-        // never wrote to.
-        if let Err(reason) = target::landed_inside(self.root, &path) {
+        // Did the destination end up naming the file that was just written?
+        // Compared by identity, not by resolving the path: a directory
+        // swapped during the write and restored afterwards would satisfy a
+        // path check while the document sat somewhere else entirely.
+        if let Err(reason) = target::confirm_landing(self.root, &written.path, written.id) {
             return self.fail(id, reason);
         }
-        if let Some(identity) = target::existing_identity(&path) {
+        if let Some(stray) = &written.stray {
+            // A full copy of the document under a hidden name. Not a failed
+            // export - the document is where it belongs - but the output
+            // tree is not what was promised, so it does not stay quiet.
+            stdio::write_diagnostic_line(&format!(
+                "warning: could not remove the temporary file {}; it is a \
+                 complete copy of this document and should be deleted",
+                stray.display()
+            ));
+            self.stray.push(stray.display().to_string());
+        }
+        if let Some(identity) = written
+            .id
+            .or_else(|| target::existing_identity(&written.path))
+        {
             self.written_ids.insert(identity);
         }
-        self.record(&path);
+        self.record(&written.path);
     }
 
     /// The markdown for one document, with a title heading.
@@ -374,6 +424,17 @@ impl Export<'_> {
             self.written.len(),
             self.root.display()
         ));
+        if self.durability_unconfirmed {
+            // Said once, plainly: the files are written, and this platform
+            // gives no way to confirm that their names survive a crash.
+            // Silence here would read as a confirmation.
+            stdio::write_diagnostic_line(
+                "notice: this platform cannot flush a directory through the \
+                 standard library, so whether the exported file names survive \
+                 a crash could not be confirmed (the JSON summary reports \
+                 \"durable\": null)",
+            );
+        }
         let mut reasons: Vec<String> = Vec::new();
         if !self.undurable.is_empty() {
             reasons.push(format!(
@@ -407,6 +468,20 @@ impl Export<'_> {
         Err(CliError::partial(anyhow!("{}", reasons.join("\n"))))
     }
 
+    /// The durability verdict, as a JSON tri-state.
+    ///
+    /// `None` becomes `null`: this platform cannot flush a directory, so
+    /// neither `true` nor `false` would be a statement anything checked.
+    fn durable(&self) -> Option<bool> {
+        if !self.undurable.is_empty() {
+            return Some(false);
+        }
+        if self.durability_unconfirmed {
+            return None;
+        }
+        Some(true)
+    }
+
     /// Whether the export delivered everything it was asked for, durably.
     fn is_complete(&self) -> bool {
         self.failures.is_empty() && self.truncated.is_none() && self.undurable.is_empty()
@@ -432,17 +507,22 @@ impl Export<'_> {
     /// - `limit_reached`: `--limit` stopped the listing. Not a failure - it
     ///   is what was requested - but a script asking "is this the whole
     ///   collection?" needs `complete && !limit_reached`.
-    /// - `durable`: every directory written was flushed to disk. False
-    ///   means the files are there and readable, but a crash could still
-    ///   lose them - which is exactly the kind of thing an automated backup
-    ///   has to be able to notice rather than read about on stderr.
+    /// - `durable`: `true` when every directory written was flushed to
+    ///   disk, `false` when a flush was attempted and failed, and `null`
+    ///   when this platform cannot flush a directory at all. `null` is not
+    ///   a formality: reporting `true` there would be claiming a guarantee
+    ///   nothing checked.
+    /// - `stray`: temporary files that survived a successful publish. Each
+    ///   is a complete copy of a document sitting in the output tree under
+    ///   a hidden name.
     fn print_json(&self) -> Result<(), CliError> {
         let payload = serde_json::json!({
             "out": self.root.display().to_string(),
             "complete": self.is_complete(),
             "enumeration_truncated": self.truncated.is_some(),
             "limit_reached": self.limited,
-            "durable": self.undurable.is_empty(),
+            "durable": self.durable(),
+            "stray": self.stray,
             "exported": self.written,
             "failed": self
                 .failures
@@ -469,7 +549,7 @@ impl Export<'_> {
             self.failures
                 .iter()
                 .take(MAX_LISTED_FAILURES)
-                .map(|failure| format!("  {}: {}", failure.id, failure.reason)),
+                .map(|failure| format!("  {}: {}", text::quote(&failure.id), failure.reason)),
         );
         if self.failures.len() > MAX_LISTED_FAILURES {
             lines.push(format!(
@@ -500,8 +580,9 @@ impl Export<'_> {
 /// file is placed by `create_new` + `rename` rather than by opening a path
 /// (see [`write_file_atomically`]), so no link inside the tree can redirect
 /// a write out of it.
-fn prepare_out_dir(out: &Path, overwrite: bool) -> Result<PathBuf, CliError> {
+fn prepare_out_dir(out: &Path, overwrite: bool) -> Result<Prepared, CliError> {
     let usage = |message: String| CliError::usage(anyhow!(message));
+    let mut created = Vec::new();
     match std::fs::symlink_metadata(out) {
         Ok(metadata) if metadata.is_dir() => {
             if !overwrite && !is_empty_dir(out)? {
@@ -521,8 +602,9 @@ fn prepare_out_dir(out: &Path, overwrite: bool) -> Result<PathBuf, CliError> {
             )))
         }
         Ok(_) => return Err(usage(format!("{} is not a directory", out.display()))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(out)
-            .map_err(|error| usage(format!("cannot create {}: {}", out.display(), error.kind())))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            created = create_dir_recording(out)?
+        }
         Err(error) => {
             return Err(usage(format!(
                 "cannot use {}: {}",
@@ -531,13 +613,85 @@ fn prepare_out_dir(out: &Path, overwrite: bool) -> Result<PathBuf, CliError> {
             )))
         }
     }
-    std::fs::canonicalize(out).map_err(|error| {
+    let root = std::fs::canonicalize(out).map_err(|error| {
         usage(format!(
             "cannot resolve {}: {}",
             out.display(),
             error.kind()
         ))
+    })?;
+    Ok(Prepared {
+        root,
+        new_entries: parents_of(created),
     })
+}
+
+/// A validated output directory, plus the directories whose ENTRIES this
+/// run created.
+struct Prepared {
+    /// Canonical output directory.
+    root: PathBuf,
+    /// Directories that gained an entry when the output path was created,
+    /// deepest first. Each has to be flushed for the newly created
+    /// directory NAMES to survive a crash - flushing only the directory
+    /// that holds the documents would leave the directory that holds that
+    /// directory unflushed.
+    new_entries: Vec<PathBuf>,
+}
+
+/// Create every missing component of `out`, returning the ones created.
+///
+/// `create_dir_all` does the same thing but does not say what it made, and
+/// the export has to know: a directory it created is a new entry in the
+/// directory above, and that one needs flushing too.
+///
+/// Existing components are traversed as they are - an ancestor symlink is
+/// legitimate (`/tmp` and `/var` are symlinks on macOS) and is resolved
+/// once, here, before anything is written.
+fn create_dir_recording(out: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let usage = |message: String| CliError::usage(anyhow!(message));
+    let mut created = Vec::new();
+    let mut path = PathBuf::new();
+    for component in out.components() {
+        path.push(component);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => continue,
+            Ok(_) => return Err(usage(format!("{} is not a directory", path.display()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path).map_err(|error| {
+                    usage(format!(
+                        "cannot create {}: {}",
+                        path.display(),
+                        error.kind()
+                    ))
+                })?;
+                created.push(path.clone());
+            }
+            Err(error) => {
+                return Err(usage(format!(
+                    "cannot use {}: {}",
+                    path.display(),
+                    error.kind()
+                )))
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// The parent directories of newly created ones, deepest first, deduplicated.
+///
+/// A directory's own name lives in its parent, so these are the directories
+/// whose entries changed. Deepest first so a flush happens after everything
+/// it records is already durable.
+fn parents_of(created: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut parents: Vec<PathBuf> = created
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect();
+    parents.reverse();
+    parents.dedup();
+    parents
 }
 
 /// Whether a directory has no entries.

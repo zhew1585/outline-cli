@@ -80,8 +80,10 @@ Notes worth knowing:
   traversal, Windows device names, case- and normalization-insensitive collisions, length limits),
   refuses a non-empty output directory unless `--overwrite` is given, and keeps going when one
   document fails — the failures are summarized at the end and the exit code is 9 (partial failure).
-  Each file is written through a temporary file and renamed into place, so an interrupted export never
-  leaves a half-written document and a failed `--overwrite` never destroys the previous backup.
+  Each file is written to a temporary file, flushed, and only then given its real name, so an
+  interrupted export never leaves a half-written or empty document and a failed `--overwrite` never
+  destroys the previous backup. `--json` reports `"complete"`, `"durable"` (`true`/`false`/`null` —
+  `null` where the platform cannot flush a directory) and `"stray"` alongside the exported paths.
 - **Pagination never truncates silently, and never lies about it either.** `--limit N` caps the total
   rows, warns on stderr and exits 0 — you asked for it. But when the CLI's own page cap stops a fetch
   before the server ran out of rows, the result is incomplete through no choice of yours, so
