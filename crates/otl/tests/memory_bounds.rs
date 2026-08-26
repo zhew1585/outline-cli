@@ -102,6 +102,7 @@ fn op(name: &str) -> OpSpec {
         content_type: String::new().into(),
         body_mode: BodyMode::KeyValue,
         params: Vec::new().into(),
+        response_fields: Vec::new().into(),
     }
 }
 
@@ -251,9 +252,9 @@ fn parsing_and_loading_stay_within_their_bounds() {
         mib(peak)
     );
 
-    // 5. The worst single record, hand-encoded: BOTH nested containers
-    //    lie about their length, so each one reserves serde's
-    //    per-container cap at the same time. This is the shape the prose
+    // 5. The worst single record, hand-encoded: EVERY nested container
+    //    lies about its length, so each one reserves serde's per-container
+    //    cap at the same time. This is the shape the prose
     //    bound kept mis-counting, and the shape the FIRST version of this
     //    test failed to build - its outer container was honest, so it
     //    measured a cheaper case than its own comment claimed.
@@ -283,6 +284,14 @@ fn parsing_and_loading_stay_within_their_bounds() {
     fat.extend_from_slice(&[0, 0, 0, 0]); // name, ty, required, nullable
     fat.push(252);
     fat.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+    // ...and so does `response_fields`, the THIRD container, which the IR
+    // gained after this fixture was written. A container missing from the
+    // fixture is a reservation nobody measures, so the count in
+    // `bounded.rs` and the lies here have to be kept in step. (The decoder
+    // fails inside `params` before it reaches this one, but it is what the
+    // record declares, and the next field to arrive belongs here too.)
+    fat.push(252);
+    fat.extend_from_slice(&1_000_000_000u32.to_le_bytes());
     assert!(
         fat.len() < cache::MAX_OP_RECORD_BYTES,
         "the crafted record must fit the per-record limit to be decoded at \
@@ -307,13 +316,53 @@ fn parsing_and_loading_stay_within_their_bounds() {
         assert!(cache::load_at(&file).is_err());
     });
     report.push(format!(
-        "one record, both containers lying ({} B): {:.2} MiB peak",
+        "one record, all three containers lying ({} B): {:.2} MiB peak",
         fat.len(),
         mib(peak)
     ));
     assert!(
         peak < 4 * 1024 * 1024,
         "the worst single record allocated {:.2} MiB",
+        mib(peak)
+    );
+
+    // 5c. The other reachable shape: a COMPLETE parameter list (so
+    //     decoding gets past it) followed by a lying `response_fields`.
+    //     This is what says the reservations are bounded by the DEPTH of
+    //     the path being decoded, not by how many containers the type has:
+    //     a lying container never completes, so the one after it is never
+    //     reached, and the two shapes below bracket the real worst case.
+    let mut complete = Vec::new();
+    complete.extend_from_slice(&[0, 0, 0, 0]); // four empty strings
+    complete.push(0); // body_mode
+    complete.push(251); // params: u16 length
+    complete.extend_from_slice(&(honest_fill as u16).to_le_bytes());
+    for _ in 0..honest_fill {
+        complete.extend_from_slice(&[0u8; 8]); // a complete empty parameter
+    }
+    complete.push(252); // response_fields claims a billion
+    complete.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+
+    let mut body = Vec::new();
+    record(
+        &bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap(),
+        &mut body,
+    );
+    body.extend_from_slice(&1u32.to_le_bytes());
+    record(&complete, &mut body);
+    write_body(&file, &body);
+    let peak = peak_of(|| {
+        assert!(cache::load_at(&file).is_err());
+    });
+    report.push(format!(
+        "one record, complete params then a lying field list ({} B): {:.2} MiB peak",
+        complete.len(),
+        mib(peak)
+    ));
+    assert!(
+        peak < 4 * 1024 * 1024,
+        "a complete parameter list followed by a lying field list allocated \
+         {:.2} MiB",
         mib(peak)
     );
 

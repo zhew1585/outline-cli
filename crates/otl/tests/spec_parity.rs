@@ -46,6 +46,46 @@ fn runtime_compilation_reproduces_the_built_in_table() {
     }
 }
 
+/// The columns a SYNCED spec yields must be the columns the built-in spec
+/// yields - same fields, same order. `runtime_compilation_reproduces_the_
+/// built_in_table` compares whole operations, so this narrows to the part a
+/// reader is most likely to doubt after the two tracks merged, and states it
+/// in its own terms.
+#[test]
+fn a_synced_spec_yields_the_same_response_columns() {
+    let compiled = spec_compile::compile_json(&vendored_spec(), &spec::compile_options())
+        .expect("the vendored spec compiles at run time");
+    let runtime = spec::to_ir(&compiled);
+
+    let mut compared = 0;
+    for (fresh, built_in) in runtime.iter().zip(ops::OPS) {
+        let fresh_fields: Vec<(&str, bool)> = fresh
+            .response_fields
+            .iter()
+            .map(|field| (field.name.as_ref(), field.read_only))
+            .collect();
+        let built_in_fields: Vec<(&str, bool)> = built_in
+            .response_fields
+            .iter()
+            .map(|field| (field.name.as_ref(), field.read_only))
+            .collect();
+        assert_eq!(
+            fresh_fields, built_in_fields,
+            "{}: synced columns differ from built-in ones",
+            fresh.name
+        );
+        if !fresh_fields.is_empty() {
+            compared += 1;
+        }
+    }
+    // Not vacuous: the vendored spec really does describe response shapes.
+    assert!(
+        compared > 10,
+        "only {compared} operations had response fields; the comparison is \
+         not proving much"
+    );
+}
+
 #[test]
 fn every_built_in_operation_passes_the_safety_rules() {
     // The same rules a cache file is re-checked against, applied to the

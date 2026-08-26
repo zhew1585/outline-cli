@@ -43,7 +43,8 @@ pub use document::MAX_PARSED_BYTES;
 pub use schema::MAX_SCHEMA_DEPTH;
 pub use text::{
     is_display_safe, MAX_CONTENT_TYPE_BYTES, MAX_ENUM_VALUES, MAX_ENUM_VALUE_BYTES,
-    MAX_FORMAT_BYTES, MAX_PARAM_NAME_BYTES, MAX_SUMMARY_BYTES, MAX_SUMMARY_CHARS,
+    MAX_FORMAT_BYTES, MAX_PARAM_NAME_BYTES, MAX_RESPONSE_FIELDS, MAX_SUMMARY_BYTES,
+    MAX_SUMMARY_CHARS,
 };
 
 /// The only request content type a generic JSON RPC client can assemble.
@@ -99,6 +100,27 @@ pub struct CompiledParam {
     pub maximum: Option<f64>,
 }
 
+/// One field of an operation's success response payload.
+///
+/// Mirrors `engine::ir::FieldSpec`. Declaration order is preserved (see
+/// `Cargo.toml` for the `preserve_order` note): it is the schema's own
+/// statement of which fields matter most, and a renderer ranks columns by
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledField {
+    /// Field name as it appears in the JSON response.
+    pub name: String,
+    /// Declared wire type; [`ScalarKind::Json`] for anything that is not a
+    /// single displayable value.
+    pub ty: ScalarKind,
+    /// Declared `format` (e.g. `uuid`), empty when absent.
+    pub format: String,
+    /// Whether the schema allows an explicit JSON `null`.
+    pub nullable: bool,
+    /// Whether the schema marks the field `readOnly`.
+    pub read_only: bool,
+}
+
 /// One compiled RPC operation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledOp {
@@ -113,10 +135,14 @@ pub struct CompiledOp {
     pub content_type: String,
     /// How the request body may be supplied.
     pub body_mode: BodyKind,
-    /// Request-body parameters, in the order `serde_json` yields object
-    /// keys (alphabetical, since `preserve_order` is off). Deterministic
-    /// either way, which is what the build-time/run-time parity rests on.
+    /// Request-body parameters, in the order the document declares them
+    /// (`preserve_order` is on). Deterministic either way, which is what
+    /// the build-time/run-time parity rests on.
     pub params: Vec<CompiledParam>,
+    /// Fields of one item of the success response payload, in the order the
+    /// source schema declares them. Empty when the document describes no
+    /// response shape.
+    pub response_fields: Vec<CompiledField>,
 }
 
 /// A whole compiled document: operations sorted by name.
@@ -135,13 +161,31 @@ pub struct CompileOptions {
     /// This is where a service-specific convention enters; the compiler
     /// itself knows no service.
     pub path_prefix: String,
+    /// Property of a success response that holds the payload (e.g. `data`),
+    /// for services that wrap their responses in an envelope. Empty when
+    /// the response schema IS the payload.
+    ///
+    /// Also service-specific, and for the same reason it lives here rather
+    /// than in the compiler: the compiler knows about OpenAPI, not about
+    /// anybody's envelope.
+    pub envelope_data_property: String,
 }
 
 impl CompileOptions {
-    /// Options with the given path prefix.
+    /// Options with the given path prefix and no response envelope.
     pub fn with_prefix(path_prefix: impl Into<String>) -> Self {
         Self {
             path_prefix: path_prefix.into(),
+            envelope_data_property: String::new(),
+        }
+    }
+
+    /// Same, for a service whose success payload sits under one property.
+    #[must_use]
+    pub fn with_envelope(self, data_property: impl Into<String>) -> Self {
+        Self {
+            envelope_data_property: data_property.into(),
+            ..self
         }
     }
 }
@@ -255,6 +299,8 @@ const UNSAFE_TEXT_REASON: &str =
     "it contains control or direction-changing characters, or exceeds its length limit";
 /// Reason text for an over-long enum.
 const TOO_MANY_ENUM_VALUES: &str = "it declares more enumerated values than the limit";
+/// Reason text for an over-long response field list.
+const TOO_MANY_RESPONSE_FIELDS: &str = "it declares more response fields than the limit";
 
 /// Compile a JSON OpenAPI document.
 ///
@@ -311,12 +357,15 @@ fn compile_op(
         None => (Vec::new(), false),
     };
     let body_mode = body_kind(&content_type, root_union);
+    let response_fields =
+        schema::extract_response_fields(post, components, &options.envelope_data_property)?;
     let op = CompiledOp {
         path: format!("{}{path}", options.path_prefix),
         summary: extract_summary(post),
         content_type,
         body_mode,
         params,
+        response_fields,
         name,
     };
     check_identifiers(&op, options)?;
@@ -355,6 +404,21 @@ fn check_text(op: &CompiledOp) -> Result<(), CompileError> {
             .all(|value| is_display_safe(value, MAX_ENUM_VALUE_BYTES))
         {
             return Err(unsafe_text("parameter enum value", UNSAFE_TEXT_REASON));
+        }
+    }
+    // Response field names and formats are printed too - as table column
+    // HEADERS, which is about as good a place to inject an escape as
+    // exists - so they are held to the same rule as everything else that
+    // reaches a terminal.
+    if op.response_fields.len() > MAX_RESPONSE_FIELDS {
+        return Err(unsafe_text("response field list", TOO_MANY_RESPONSE_FIELDS));
+    }
+    for field in &op.response_fields {
+        if field.name.is_empty() || !is_display_safe(&field.name, MAX_PARAM_NAME_BYTES) {
+            return Err(unsafe_text("response field name", UNSAFE_TEXT_REASON));
+        }
+        if !is_display_safe(&field.format, MAX_FORMAT_BYTES) {
+            return Err(unsafe_text("response field format", UNSAFE_TEXT_REASON));
         }
     }
     Ok(())
@@ -541,14 +605,17 @@ mod tests {
         assert_eq!(op.summary, "Info about a thing");
         assert_eq!(op.content_type, JSON_CONTENT_TYPE);
         assert_eq!(op.body_mode, BodyKind::KeyValue);
-        // Parameter order follows serde_json's object-key order.
+        // DECLARATION order, not alphabetical: `preserve_order` is on,
+        // because the document's own ordering is what a renderer ranks
+        // columns by. (`id` is declared first here even though `count`
+        // sorts before it.)
         assert_eq!(op.params.len(), 2);
-        assert_eq!(op.params[0].name, "count");
-        assert_eq!(op.params[0].ty, ScalarKind::Integer);
-        assert!(!op.params[0].required);
-        assert_eq!(op.params[1].name, "id");
-        assert_eq!(op.params[1].ty, ScalarKind::String);
-        assert!(op.params[1].required);
+        assert_eq!(op.params[0].name, "id");
+        assert_eq!(op.params[0].ty, ScalarKind::String);
+        assert!(op.params[0].required);
+        assert_eq!(op.params[1].name, "count");
+        assert_eq!(op.params[1].ty, ScalarKind::Integer);
+        assert!(!op.params[1].required);
     }
 
     #[test]

@@ -15,7 +15,11 @@ fn otl() -> Command {
     cmd.env_remove("OUTLINE_URL")
         .env_remove("OUTLINE_API_KEY")
         // These assertions are about the spec compiled into the binary.
-        .env(CACHE_DIR_ENV, no_cache_dir());
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file, so the developer's own
+        // profiles cannot influence the assertions below (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 

@@ -508,6 +508,7 @@ mod tests {
             content_type: String::new().into(),
             body_mode: engine::ir::BodyMode::KeyValue,
             params: Vec::new().into(),
+            response_fields: Vec::new().into(),
         }
     }
 

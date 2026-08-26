@@ -89,7 +89,10 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
         .env_remove("OUTLINE_API_KEY")
         // The guard is about the spec inside the binary; a synced cache on
         // the developer's machine must not stand in for it.
-        .env(CACHE_DIR_ENV, no_cache_dir());
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 
@@ -276,6 +279,19 @@ const FILE_READ_ALLOWLIST: &[Exception] = &[
         file: "crates/otl/src/spec/openfile.rs",
         pattern: "File::open",
         context: "sender.send(File::open(owned))",
+    },
+    // The user config file (Story 4.1), at a path that comes from
+    // `OUTLINE_CONFIG` or from `directories` - never from the build, so it
+    // cannot reach the vendored spec.
+    Exception {
+        file: "crates/otl/src/config/file.rs",
+        pattern: "File::open",
+        context: "let file = File::open(path)",
+    },
+    Exception {
+        file: "crates/otl/src/config/file.rs",
+        pattern: "read_to_string",
+        context: ".read_to_string(&mut raw)",
     },
     // Test-only, in that module's own tests: opening the write end of a
     // FIFO so the blocked worker thread finishes.

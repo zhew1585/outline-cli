@@ -353,3 +353,116 @@ fn ops_without_request_body_have_empty_param_tables() {
 fn find_returns_none_for_unknown_operation() {
     assert!(builtin("documents.doesNotExist").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Story 1-5b: response-shape descriptors compiled into the IR.
+// ---------------------------------------------------------------------------
+
+/// Field names of an operation's compiled response shape, in order.
+fn response_field_names(op: &engine::OpSpec) -> Vec<&str> {
+    op.response_fields
+        .iter()
+        .map(|field| field.name.as_ref())
+        .collect()
+}
+
+#[test]
+fn response_fields_are_compiled_for_list_and_single_operations() {
+    // A list response (`data` is an array of items) and a single-object
+    // response must both yield the item's fields.
+    for name in ["documents.list", "documents.info"] {
+        let op = ops::find(name).unwrap();
+        let fields = response_field_names(op);
+        assert!(fields.contains(&"id"), "{name}: {fields:?}");
+        assert!(fields.contains(&"title"), "{name}: {fields:?}");
+        assert!(fields.contains(&"updatedAt"), "{name}: {fields:?}");
+    }
+}
+
+#[test]
+fn response_fields_keep_the_specs_declaration_order() {
+    // Declaration order is load-bearing for column selection: the renderer
+    // ranks ties by it, so an alphabetically sorted table would pick the
+    // document body over its title.
+    let fields = response_field_names(ops::find("documents.list").unwrap());
+    let position = |name: &str| fields.iter().position(|f| *f == name);
+    assert_eq!(position("id"), Some(0), "{fields:?}");
+    assert!(position("title") < position("text"), "{fields:?}");
+    assert!(position("createdAt") < position("updatedAt"), "{fields:?}");
+    // Collection declares its read-only `url` before the writable `name`.
+    let collections = response_field_names(ops::find("collections.list").unwrap());
+    let cpos = |name: &str| collections.iter().position(|f| *f == name);
+    assert!(cpos("url") < cpos("name"), "{collections:?}");
+}
+
+#[test]
+fn response_field_facets_are_compiled() {
+    let op = ops::find("documents.list").unwrap();
+    let field = |name: &str| {
+        op.response_fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {:?}", response_field_names(op)))
+    };
+    let id = field("id");
+    assert_eq!(id.ty, ParamType::String);
+    assert_eq!(id.format.as_ref(), "uuid");
+    assert!(!id.nullable);
+    assert!(id.read_only, "`id` is readOnly in the spec");
+
+    let title = field("title");
+    assert_eq!(title.format.as_ref(), "");
+    assert!(!title.nullable);
+    assert!(!title.read_only, "`title` is writable");
+
+    assert_eq!(field("updatedAt").format.as_ref(), "date-time");
+    assert!(field("collectionId").nullable);
+    // Containers stay Json so a generic renderer can never make them cells.
+    assert_eq!(field("tasks").ty, ParamType::Json);
+    assert_eq!(field("createdBy").ty, ParamType::Json);
+    // `url` is derived, `name`-like fields are not.
+    assert!(field("url").read_only);
+}
+
+#[test]
+fn operations_without_a_described_response_have_no_response_fields() {
+    // `documents.delete` documents only an empty success response.
+    let op = ops::find("documents.delete").unwrap();
+    assert!(
+        op.response_fields.is_empty(),
+        "{:?}",
+        response_field_names(op)
+    );
+}
+
+#[test]
+fn most_operations_carry_a_compiled_response_shape() {
+    // Guard against a silent regression that empties the whole column
+    // source (e.g. a pointer typo): the vendored spec describes a response
+    // payload for the large majority of its operations.
+    let described = ops::OPS
+        .iter()
+        .filter(|op| !op.response_fields.is_empty())
+        .count();
+    assert!(
+        described * 2 > ops::OPS.len(),
+        "only {described} of {} operations have response fields",
+        ops::OPS.len()
+    );
+}
+
+#[test]
+fn response_fields_never_repeat_a_name() {
+    for op in ops::OPS {
+        let mut names = response_field_names(op);
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "{} has duplicate response fields",
+            op.name
+        );
+    }
+}

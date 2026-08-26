@@ -7,3 +7,10 @@ crates/otl/tests/golden/* -text
 
 # The vendored spec is upstream's bytes; leave them alone.
 crates/otl/spec/spec3.json -text
+
+# cargo-dist generates the WiX definition with CRLF (the Windows-native
+# convention for .wxs). `dist generate --check` compares byte for byte, so
+# letting the `* eol=lf` rule above normalize it would make a fresh CI
+# checkout disagree with what dist regenerates - and `dist plan` fails on
+# that, which would break releasing at tag time.
+crates/otl/wix/main.wxs -text

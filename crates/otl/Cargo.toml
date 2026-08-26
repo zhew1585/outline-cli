@@ -7,6 +7,25 @@ description = "Outline CLI (otl): UX layer over the generic engine"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Required by cargo-dist's GitHub backend: installers and the Homebrew
+# formula embed release-artifact URLs derived from this repository, the MSI
+# takes its Manufacturer from `authors`, and the formula its `homepage`.
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "339F52C9-2FA2-4724-B43E-04C01774EB48"
+path-guid = "3E6CF235-552B-4E3C-A786-10EF1CD89BC0"
+license = false
+eula = false
+# `AllowSameVersionUpgrades='yes'` in wix/main.wxs makes the MSI's detect
+# range include its own version, which Windows Installer's ICE61 validation
+# reports ("This product should remove only older versions of itself"). It
+# is a warning, not an error, but silence it so a real linker problem is not
+# lost in the noise. cargo-wix passes these straight to light.exe
+# (cargo-wix 0.3.9, src/create.rs::linker_args).
+linker-args = ["-sice:ICE61"]
 
 [lib]
 name = "otl"
@@ -22,6 +41,7 @@ spec-compile = { workspace = true }
 anyhow = { workspace = true }
 bincode = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,10 +55,13 @@ tempfile = { workspace = true }
 # the command layer); a cache failure needs to be inspectable - "stale" and
 # "damaged" get different diagnostics - so it is a real enum.
 thiserror = { workspace = true }
+toml = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [build-dependencies]
+# The spec compiler; it owns the parse, so the `preserve_order` decision
+# that used to live here moved into its own manifest (see the note there).
 spec-compile = { workspace = true }
 
 [dev-dependencies]

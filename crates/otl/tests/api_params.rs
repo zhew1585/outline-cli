@@ -22,7 +22,10 @@ fn otl_offline() -> Command {
     cmd.env("OUTLINE_URL", CLOSED_PORT_URL)
         .env("OUTLINE_API_KEY", "test-key")
         // Validation is asserted against the built-in spec's facets.
-        .env(CACHE_DIR_ENV, no_cache_dir());
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 
@@ -31,7 +34,10 @@ fn otl_online(uri: &str) -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
     cmd.env("OUTLINE_URL", uri)
         .env("OUTLINE_API_KEY", "test-key")
-        .env(CACHE_DIR_ENV, no_cache_dir());
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 

@@ -21,7 +21,20 @@ publish = false
 # `default-features` here is ignored (the workspace entry does not set it)
 # and cargo warns about that on every build.
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order` so a compiled table keeps the document's own property
+# order: it is the schema's statement of which response fields matter most,
+# and the table renderer ranks columns by it. This crate parses for BOTH the
+# build script and `spec sync`, so the feature cannot differ between them -
+# a synced table and the built-in one would order fields differently, column
+# ranking would depend on where the spec came from, and `spec_parity` would
+# fail.
+#
+# Consequence, deliberate and pinned by `crates/otl/tests/json_key_order.rs`:
+# unlike the old build-only arrangement, this DOES unify into the runtime, so
+# `--json` prints response keys in the order the server sent them instead of
+# sorted. `otl api` output is explicitly unstable, and the server's own order
+# is the more faithful of the two.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror = { workspace = true }
 
 [lints]

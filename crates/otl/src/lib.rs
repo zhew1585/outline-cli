@@ -11,3 +11,4 @@ pub mod paging;
 pub mod render;
 pub mod spec;
 pub mod stdio;
+pub mod text;

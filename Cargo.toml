@@ -7,6 +7,13 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/weizhesafeheron/outline-cli"
 rust-version = "1.85"
+# Release-pipeline metadata (Story 4.5). The MSI's Manufacturer field is
+# taken from `authors`, and the Homebrew formula's `homepage` from
+# `homepage`; cargo-dist refuses to generate either when they are missing.
+# Deliberately no e-mail address: these strings are embedded verbatim in
+# published installer metadata.
+authors = ["weizhe"]
+homepage = "https://github.com/weizhesafeheron/outline-cli"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
@@ -23,9 +30,18 @@ reqwest = { version = "0.13", default-features = false, features = [
     "webpki-roots",
 ] }
 clap = { version = "4.6", features = ["derive"] }
+# Shell completion scripts are generated from the same clap command tree the
+# binary parses with, augmented with operation names from the IR.
+clap_complete = "4.6"
 httpdate = "1.0"
-# Cross-platform config/cache directories (never assume Unix paths).
-directories = "6.0"
+# User config file. `parse` only: the CLI reads config, it never writes it.
+toml = { version = "1", default-features = false, features = [
+    "parse",
+    "serde",
+] }
+# Cross-platform config and cache directory resolution. Never assume Unix
+# paths.
+directories = "6"
 # On-disk IR cache written by `spec sync`. bincode 2.x with the `serde`
 # feature; 3.0.0 on crates.io is an empty placeholder release.
 bincode = { version = "2.0", features = ["serde"] }
@@ -63,6 +79,15 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# The profile that 'dist' will build with. Deliberately a bare `inherits`:
+# `dist init` writes `lto = "thin"` here to keep release CI fast, but that
+# downgrades the fat LTO configured above and cost 0.7 MB of binary in
+# measurement (2.45 MiB -> 3.13 MiB on aarch64-apple-darwin), which NFR2
+# and scripts/check-binary-size.sh care about far more than release-build
+# wall time. Shipped artifacts must be byte-identical to `--release`.
+[profile.dist]
+inherits = "release"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

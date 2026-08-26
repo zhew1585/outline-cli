@@ -34,6 +34,12 @@ pub const MAX_CONTENT_TYPE_BYTES: usize = 128;
 pub const MAX_FORMAT_BYTES: usize = 64;
 /// Longest accepted single enum value, in bytes.
 pub const MAX_ENUM_VALUE_BYTES: usize = 256;
+/// Most response fields kept for one operation.
+///
+/// Each one can become a table column and a cached `FieldSpec`, so an
+/// unbounded list is both an unreadable table and unbounded IR.
+pub const MAX_RESPONSE_FIELDS: usize = 256;
+
 /// Most enum values kept for one parameter.
 ///
 /// Every one of them can end up in a single "allowed values" diagnostic,

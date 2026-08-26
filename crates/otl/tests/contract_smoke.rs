@@ -42,6 +42,8 @@ fn documents_search_succeeds_against_real_workspace() {
         // A contract test checks the VENDORED spec against the live API;
         // a synced cache on the runner would test something else.
         .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        .env("OUTLINE_CONFIG", "")
         .args(["api", "documents.search", "query=contract-smoke"])
         .output()
         .unwrap();

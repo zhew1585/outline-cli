@@ -19,9 +19,9 @@ pub(crate) mod openfile;
 
 use std::collections::HashSet;
 
-use engine::ir::{BodyMode, OpSpec, ParamSpec, ParamType};
+use engine::ir::{BodyMode, FieldSpec, OpSpec, ParamSpec, ParamType};
 use spec_compile::{
-    is_display_safe, BodyKind, CompiledOp, CompiledParam, CompiledSpec, ScalarKind,
+    is_display_safe, BodyKind, CompiledField, CompiledOp, CompiledParam, CompiledSpec, ScalarKind,
 };
 
 /// Upstream source of the OpenAPI document, community-maintained.
@@ -33,6 +33,14 @@ use spec_compile::{
 pub const UPSTREAM_SPEC_URL: &str =
     "https://raw.githubusercontent.com/outline/openapi/main/spec3.json";
 
+/// Outline envelope convention: a success payload lives under `data`.
+///
+/// Service-specific, like the path prefix, so it is passed to the compiler
+/// as an option rather than being known by it. `build.rs` carries its own
+/// copy for the same reason it copies the prefix, and
+/// `tests/spec_parity.rs` asserts the two agree.
+pub const ENVELOPE_DATA_PROPERTY: &str = "data";
+
 /// Outline URL convention: every RPC path lives under this prefix.
 ///
 /// `build.rs` carries its own copy (a build script cannot import from the
@@ -42,7 +50,7 @@ pub const API_PATH_PREFIX: &str = "/api";
 
 /// Compile options for an Outline spec.
 pub fn compile_options() -> spec_compile::CompileOptions {
-    spec_compile::CompileOptions::with_prefix(API_PATH_PREFIX)
+    spec_compile::CompileOptions::with_prefix(API_PATH_PREFIX).with_envelope(ENVELOPE_DATA_PROPERTY)
 }
 
 /// Convert a compiled spec into engine IR.
@@ -67,19 +75,41 @@ fn op_to_ir(op: &CompiledOp) -> OpSpec {
             BodyKind::Unsupported => BodyMode::Unsupported,
         },
         params: op.params.iter().map(param_to_ir).collect::<Vec<_>>().into(),
+        response_fields: op
+            .response_fields
+            .iter()
+            .map(field_to_ir)
+            .collect::<Vec<_>>()
+            .into(),
+    }
+}
+
+fn field_to_ir(field: &CompiledField) -> FieldSpec {
+    FieldSpec {
+        name: field.name.clone().into(),
+        ty: scalar_to_ir(field.ty),
+        format: field.format.clone().into(),
+        nullable: field.nullable,
+        read_only: field.read_only,
+    }
+}
+
+/// The one place a compiler scalar becomes an engine one. Exhaustive, so a
+/// new variant on either side fails to compile rather than defaulting.
+fn scalar_to_ir(kind: ScalarKind) -> ParamType {
+    match kind {
+        ScalarKind::String => ParamType::String,
+        ScalarKind::Integer => ParamType::Integer,
+        ScalarKind::Boolean => ParamType::Boolean,
+        ScalarKind::Number => ParamType::Number,
+        ScalarKind::Json => ParamType::Json,
     }
 }
 
 fn param_to_ir(param: &CompiledParam) -> ParamSpec {
     ParamSpec {
         name: param.name.clone().into(),
-        ty: match param.ty {
-            ScalarKind::String => ParamType::String,
-            ScalarKind::Integer => ParamType::Integer,
-            ScalarKind::Boolean => ParamType::Boolean,
-            ScalarKind::Number => ParamType::Number,
-            ScalarKind::Json => ParamType::Json,
-        },
+        ty: scalar_to_ir(param.ty),
         required: param.required,
         nullable: param.nullable,
         enum_values: param
@@ -198,6 +228,21 @@ fn check_text(op: &OpSpec) -> Result<(), String> {
             return unsafe_text("parameter enum value");
         }
     }
+    // Response field names and formats become table column headers, so a
+    // cached table gets the same treatment as a compiled one.
+    if op.response_fields.len() > spec_compile::MAX_RESPONSE_FIELDS {
+        return unsafe_text("response field list");
+    }
+    for field in op.response_fields.iter() {
+        if field.name.is_empty()
+            || !is_display_safe(&field.name, spec_compile::MAX_PARAM_NAME_BYTES)
+        {
+            return unsafe_text("response field name");
+        }
+        if !is_display_safe(&field.format, spec_compile::MAX_FORMAT_BYTES) {
+            return unsafe_text("response field format");
+        }
+    }
     Ok(())
 }
 
@@ -215,6 +260,7 @@ mod tests {
             content_type: String::new().into(),
             body_mode: BodyMode::KeyValue,
             params: Vec::new().into(),
+            response_fields: Vec::new().into(),
         }]
     }
 

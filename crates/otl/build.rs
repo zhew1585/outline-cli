@@ -11,15 +11,19 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use spec_compile::{BodyKind, CompileOptions, CompiledOp, CompiledParam, ScalarKind};
+use spec_compile::{BodyKind, CompiledField, CompiledOp, CompiledParam, ScalarKind};
 
 /// Outline URL convention: every RPC path lives under this prefix. This is
 /// an Outline-specific rule, so it is applied here (the otl layer), never
 /// in the engine or the compiler - the engine joins `base_url + op.path`
 /// verbatim.
 const API_PATH_PREFIX: &str = "/api";
+/// Outline envelope convention: the payload of a success response lives
+/// under `data`. Service-specific, so it is applied here (the otl layer)
+/// and never in the engine or the compiler.
+const ENVELOPE_DATA_PROPERTY: &str = "data";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 4;
+const IR_SCHEMA_VERSION: u32 = 5;
 
 fn main() {
     println!("cargo:rerun-if-changed=spec/spec3.json");
@@ -33,7 +37,8 @@ fn main() {
             spec_path.display()
         ),
     };
-    let options = CompileOptions::with_prefix(API_PATH_PREFIX);
+    let options = spec_compile::CompileOptions::with_prefix(API_PATH_PREFIX)
+        .with_envelope(ENVELOPE_DATA_PROPERTY);
     let compiled = match spec_compile::compile_json(&raw, &options) {
         Ok(compiled) => compiled,
         Err(error) => panic!("vendored spec {} is unusable: {error}", spec_path.display()),
@@ -95,7 +100,40 @@ fn render_op(out: &mut String, op: &CompiledOp) {
         render_param(out, param);
     }
     let _ = writeln!(out, "        ]),");
+    let _ = writeln!(
+        out,
+        "        response_fields: ::std::borrow::Cow::Borrowed(&["
+    );
+    for field in &op.response_fields {
+        render_field(out, field);
+    }
+    let _ = writeln!(out, "        ]),");
     let _ = writeln!(out, "    }},");
+}
+
+fn render_field(out: &mut String, field: &CompiledField) {
+    let _ = writeln!(out, "            engine::ir::FieldSpec {{");
+    let _ = writeln!(
+        out,
+        "                name: ::std::borrow::Cow::Borrowed({:?}),",
+        field.name
+    );
+    let _ = writeln!(
+        out,
+        "                ty: engine::ir::ParamType::{},",
+        param_type_variant(field.ty)
+    );
+    let _ = writeln!(
+        out,
+        "                format: ::std::borrow::Cow::Borrowed({:?}),",
+        field.format
+    );
+    let _ = writeln!(
+        out,
+        "                nullable: {}, read_only: {},",
+        field.nullable, field.read_only
+    );
+    let _ = writeln!(out, "            }},");
 }
 
 fn render_param(out: &mut String, param: &CompiledParam) {

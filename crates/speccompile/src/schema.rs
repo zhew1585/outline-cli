@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::{CompileError, CompiledParam, ScalarKind};
+use crate::{CompileError, CompiledField, CompiledParam, ScalarKind};
 
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
@@ -196,6 +196,9 @@ fn merge_facets(schema: &Value, facets: &mut Facets) {
     if schema.get("nullable").and_then(Value::as_bool) == Some(true) {
         facets.nullable = true;
     }
+    if schema.get("readOnly").and_then(Value::as_bool) == Some(true) {
+        facets.read_only = true;
+    }
     if facets.enum_values.is_empty() {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
             facets.enum_values = values.iter().map(enum_literal).collect();
@@ -214,6 +217,121 @@ fn merge_facets(schema: &Value, facets: &mut Facets) {
         .or_else(|| schema.get("maximum").and_then(Value::as_f64));
 }
 
+/// JSON pointer to the success response schema of an operation. `~1` is
+/// the pointer escape for the `/` in `application/json`.
+const SUCCESS_SCHEMA_POINTER: &str = "/responses/200/content/application~1json/schema";
+
+/// Fields of one item of an operation's success payload.
+///
+/// The envelope (`{"data": ...}`, named by the caller) and the
+/// list-vs-object distinction are resolved here; an operation whose
+/// document describes no success schema, or whose payload is not an
+/// object, yields no fields and leaves the renderer to fall back on the
+/// data it receives.
+pub(crate) fn extract_response_fields(
+    post: &Value,
+    components: &Value,
+    envelope_property: &str,
+) -> Result<Vec<CompiledField>, CompileError> {
+    let Some(schema) = post.pointer(SUCCESS_SCHEMA_POINTER) else {
+        return Ok(Vec::new());
+    };
+    let walk = Walk {
+        components,
+        params: Vec::new(),
+        seen: HashSet::new(),
+        required: HashSet::new(),
+        root_union: false,
+    };
+    let Some(item) = walk.response_item_schema(schema, envelope_property, 0)? else {
+        return Ok(Vec::new());
+    };
+    let mut fields = Vec::new();
+    let mut seen = HashSet::new();
+    walk.collect_fields(item, 0, &mut fields, &mut seen)?;
+    Ok(fields)
+}
+
+impl Walk<'_> {
+    /// Walk from a response schema to the schema of one payload item.
+    fn response_item_schema<'a>(
+        &'a self,
+        schema: &'a Value,
+        envelope_property: &str,
+        depth: usize,
+    ) -> Result<Option<&'a Value>, CompileError> {
+        check_depth(depth)?;
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let resolved = resolve_ref(reference, self.components)?;
+            return self.response_item_schema(resolved, envelope_property, depth + 1);
+        }
+        let payload = if envelope_property.is_empty() {
+            Some(schema)
+        } else {
+            schema.pointer(&format!("/properties/{envelope_property}"))
+        };
+        match payload {
+            Some(payload) => self.unwrap_array(payload, depth).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The item schema of an array, or the schema itself when it is not one.
+    fn unwrap_array<'a>(
+        &'a self,
+        schema: &'a Value,
+        depth: usize,
+    ) -> Result<&'a Value, CompileError> {
+        check_depth(depth)?;
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let resolved = resolve_ref(reference, self.components)?;
+            return self.unwrap_array(resolved, depth + 1);
+        }
+        Ok(match schema.get("items") {
+            Some(items) if schema.get("type").and_then(Value::as_str) == Some("array") => items,
+            _ => schema,
+        })
+    }
+
+    /// Collect response fields in declaration order, expanding `$ref` and
+    /// `allOf`. The first definition of a name wins.
+    fn collect_fields(
+        &self,
+        schema: &Value,
+        depth: usize,
+        out: &mut Vec<CompiledField>,
+        seen: &mut HashSet<String>,
+    ) -> Result<(), CompileError> {
+        check_depth(depth)?;
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let resolved = resolve_ref(reference, self.components)?;
+            return self.collect_fields(resolved, depth + 1, out, seen);
+        }
+        if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+            for branch in branches {
+                self.collect_fields(branch, depth + 1, out, seen)?;
+            }
+        }
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        for (name, prop) in properties {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let facets = self.facets(prop)?;
+            out.push(CompiledField {
+                name: name.clone(),
+                ty: self.param_type(prop, depth)?,
+                format: facets.format,
+                nullable: facets.nullable,
+                read_only: facets.read_only,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Schema constraint facets carried into the IR for local validation.
 ///
 /// `pattern` is deliberately not compiled: validating it needs a regex
@@ -222,6 +340,7 @@ fn merge_facets(schema: &Value, facets: &mut Facets) {
 #[derive(Default)]
 struct Facets {
     nullable: bool,
+    read_only: bool,
     enum_values: Vec<String>,
     format: String,
     minimum: Option<f64>,

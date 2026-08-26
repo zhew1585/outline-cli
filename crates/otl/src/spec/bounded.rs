@@ -37,10 +37,23 @@
 //! calls `claim_container_read`, while serde's `Vec` reserves
 //! `min(declared, 1 MiB / size_of::<T>())` of its own accord. Those two
 //! are independent, so a container that lies about its length reserves up
-//! to serde's cap regardless of how small the record is - and it does so
-//! once per NESTING LEVEL. `OpSpec` nests two deep (`params`, then a
-//! parameter's `enum_values`), so one record can reserve twice before it
-//! runs out of bytes and fails.
+//! to serde's cap regardless of how small the record is.
+//!
+//! How many such reservations can be live at once is bounded by the DEPTH
+//! of the path being decoded, not by how many containers the type has.
+//! `OpSpec` has three (`params`, a parameter's `enum_values`, and
+//! `response_fields`), but a container that lies never completes, so the
+//! container AFTER it is never reached: the deepest reachable pair is the
+//! parameter list and one parameter's enum list. Both shapes are measured
+//! in `crates/otl/tests/memory_bounds.rs` - all three lying, and a
+//! complete parameter list followed by a lying field list - and the larger
+//! of the two is the number that matters.
+//!
+//! This is written as reasoning rather than a constant because the IR gains
+//! fields: `response_fields` arrived after this accounting did. When the
+//! next one arrives, charge it in [`footprint_of`] and add its lie to that
+//! fixture; the two have to move together or the budget stops seeing what
+//! the decoder allocates.
 //!
 //! That is a fact about the shape of the IR, not something framing can fix
 //! from the outside; bounding it would mean owning the decode of every
@@ -81,7 +94,7 @@
 
 use std::mem::size_of;
 
-use engine::ir::{OpSpec, ParamSpec};
+use engine::ir::{FieldSpec, OpSpec, ParamSpec};
 
 use super::cache::CacheMeta;
 
@@ -372,7 +385,18 @@ fn check_declared_count(count: usize, remaining: usize) -> Result<usize, TableEr
 fn footprint_of(op: &OpSpec) -> usize {
     let text = op.name.len() + op.path.len() + op.summary.len() + op.content_type.len();
     let params: usize = op.params.iter().map(footprint_of_param).sum();
-    text + CONTAINER_SLACK * (op.params.len() * size_of::<ParamSpec>()) + params
+    // `response_fields` is a container too, and one that arrived later than
+    // this accounting did: an uncharged container is exactly the hole this
+    // budget exists to close, whoever adds it.
+    let fields: usize = op
+        .response_fields
+        .iter()
+        .map(|field| field.name.len() + field.format.len())
+        .sum();
+    text + CONTAINER_SLACK * (op.params.len() * size_of::<ParamSpec>())
+        + params
+        + CONTAINER_SLACK * (op.response_fields.len() * size_of::<FieldSpec>())
+        + fields
 }
 
 fn footprint_of_param(param: &ParamSpec) -> usize {

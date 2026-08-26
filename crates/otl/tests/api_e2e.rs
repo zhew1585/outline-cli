@@ -18,7 +18,11 @@ fn otl() -> Command {
     cmd.env_remove("OUTLINE_URL")
         .env_remove("OUTLINE_API_KEY")
         // Dispatch must come from the built-in spec, not a synced one.
-        .env(CACHE_DIR_ENV, no_cache_dir());
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file, so the developer's own
+        // profiles cannot influence the assertions below (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 
@@ -394,6 +398,8 @@ async fn closed_stdout_pipe_exits_quietly_without_panicking() {
             .env_remove("OUTLINE_URL")
             .env_remove("OUTLINE_API_KEY")
             .env(CACHE_DIR_ENV, no_cache_dir())
+            .env_remove("OUTLINE_PROFILE")
+            .env("OUTLINE_CONFIG", "")
             .env("OUTLINE_URL", uri)
             .env("OUTLINE_API_KEY", "test-key")
             .args(["api", "--json", "documents.list"])
@@ -492,6 +498,7 @@ fn cli_error_debug_and_chain_are_credential_free() {
         content_type: Cow::Borrowed("application/json"),
         body_mode: engine::BodyMode::KeyValue,
         params: Cow::Borrowed(&[]),
+        response_fields: Cow::Borrowed(&[]),
     };
     let engine_error = client
         .execute(&op, &[], engine::ValidationMode::Strict)

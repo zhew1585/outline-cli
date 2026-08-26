@@ -20,7 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use engine::ir::{BodyMode, OpSpec, ParamSpec, ParamType};
+use engine::ir::{BodyMode, FieldSpec, OpSpec, ParamSpec, ParamType};
 use otl::spec::cache::{self, CacheMeta};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -71,6 +71,7 @@ fn op(name: &str, path: &str) -> OpSpec {
         content_type: "application/json".to_string().into(),
         body_mode: BodyMode::KeyValue,
         params: Vec::new().into(),
+        response_fields: Vec::new().into(),
     }
 }
 
@@ -111,6 +112,68 @@ fn stores_and_loads_a_table() {
     assert_eq!(loaded.meta, meta);
     assert_eq!(loaded.meta.cli_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(loaded.meta.ir_schema_version, engine::IR_SCHEMA_VERSION);
+}
+
+/// Response fields are part of the table now (schema-driven columns), so
+/// they have to survive the round trip - a synced spec that lost them would
+/// render different columns than the built-in one, silently.
+#[test]
+fn response_fields_survive_the_round_trip() {
+    let (_dir, file) = temp_cache();
+    let mut op = op("documents.info", "/api/documents.info");
+    op.response_fields = vec![
+        FieldSpec {
+            name: "id".to_string().into(),
+            ty: ParamType::String,
+            format: "uuid".to_string().into(),
+            nullable: false,
+            read_only: true,
+        },
+        FieldSpec {
+            name: "title".to_string().into(),
+            ty: ParamType::String,
+            format: String::new().into(),
+            nullable: true,
+            read_only: false,
+        },
+    ]
+    .into();
+    cache::store_at(&file, &[op.clone()], &meta()).expect("stores");
+    let loaded = cache::load_at(&file).expect("loads").expect("is present");
+    assert_eq!(loaded.ops[0], op, "the round trip changed the operation");
+    // Order is load-bearing: it is what ranks columns.
+    let names: Vec<&str> = loaded.ops[0]
+        .response_fields
+        .iter()
+        .map(|field| field.name.as_ref())
+        .collect();
+    assert_eq!(names, ["id", "title"]);
+}
+
+/// Hostile text in a response field name would land in a column HEADER.
+#[test]
+fn a_cache_with_escapes_in_a_field_name_is_rejected() {
+    let (_dir, file) = temp_cache();
+    let mut hostile = op("things.info", "/api/things.info");
+    hostile.response_fields = vec![FieldSpec {
+        name: "id\u{1b}[31m".to_string().into(),
+        ty: ParamType::String,
+        format: String::new().into(),
+        nullable: false,
+        read_only: false,
+    }]
+    .into();
+    write_raw(
+        &file,
+        MAGIC,
+        FORMAT_VERSION,
+        &Body {
+            meta: meta(),
+            ops: vec![hostile],
+        },
+    );
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(!error.is_stale(), "{error}");
 }
 
 #[test]
