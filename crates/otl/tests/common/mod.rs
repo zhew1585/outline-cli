@@ -6,6 +6,7 @@
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
 pub mod cache;
+pub mod completions;
 pub mod export;
 
 use std::path::{Path, PathBuf};
