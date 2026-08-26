@@ -101,7 +101,9 @@ so that 不背命令。
 
 | R4-4 | MINOR | 已修：R3 的检查只挡住了「给未支持 shell 加正面声明」，挡不住反向漂移——把文档改成 “bash, zsh, fish do not complete operation names” 时，正向断言仍因子串匹配通过，该句又被 `not complete` 当成否认句跳过。现在按句子分类做**对称**两条规则：正面声明不得点到未覆盖 shell，否认句不得点到已覆盖 shell，且必须存在一句正面声明点齐全部已覆盖 shell。`is_denial` 特意不以 “only” 为据（“complete in bash, zsh, fish only” 是正面声明）。guard-the-guard 现在两个方向各一个样本，并已做变异验证：两种漂移分别触发 `rustdoc claims powershell...` 与 `rustdoc denies that bash...` |
 
-R2/R3/R4 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
+| R5-2 | MINOR | 已修：R4 的检查按**整句**二元分类，混合句会漏——`powershell does not complete operation names, but elvish does` 整体被判为否定句，后半句对 elvish 的错误正面声明就没被检查。现在两个粒度：句级用于「必须存在一句点齐全部已覆盖 shell 的正面声明」（逗号列表要完整保留），**子句级**用于漂移检测（在 `.` `;` `,` 与 but/while/whereas/however 处切分）。`affirms_completion` 还识别省略动词的子句（“but elvish does”“elvish too”），否则混合句照样能溜过去。guard-the-guard 现在三个方向各一个样本，并已对真实文档做变异验证：三种漂移全部被检出 |
+
+R2/R3/R4/R5 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
 进一步验证」——生成期过滤不依赖 build.rs 的编译期拒绝，是独立的第二道，specsync 合并后可直接复验该接缝。
 
 ### 故意留下的缺口

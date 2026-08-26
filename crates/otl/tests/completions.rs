@@ -394,89 +394,131 @@ fn a_shell_that_claims_operation_names_actually_carries_them() {
 
 #[test]
 fn the_public_module_documentation_matches_the_delivered_coverage() {
-    // R2-5 / R3-7 / R4-4. Each round the check was too weak in a new
-    // direction, so it is now stated as two symmetric rules over SENTENCES,
-    // both driven by the same predicate the generator uses:
+    // R2-5 / R3-7 / R4-4 / R5-2. Each round found the check too weak in a new
+    // direction; the last was a MIXED sentence - "powershell does not
+    // complete operation names, but elvish does" classified as a denial as a
+    // whole, so the affirmative second clause was never examined.
     //
-    //   1. some positive claim names exactly the covered shells;
-    //   2. no positive claim names an uncovered shell, and no denial names a
-    //      covered one.
+    // Two granularities, because the two questions need different ones:
     //
-    // Substring searches were what let the previous versions pass: "bash,
-    // zsh, fish" appears just as happily in "bash, zsh, fish do not complete
-    // operation names".
+    //   1. some SENTENCE positively claims completion and names every covered
+    //      shell (a comma list has to survive intact for this);
+    //   2. no CLAUSE affirms completion for an uncovered shell, and no clause
+    //      denies it for a covered one.
     let doc = module_doc();
     assert!(!doc.is_empty(), "no module documentation found");
 
     let covered = shell_names(true);
     let uncovered = shell_names(false);
-    let mut positive_naming_all_covered = false;
 
-    for sentence in doc.split(['.', ';']) {
-        if !mentions_operation_completion(sentence) {
-            continue;
-        }
-        if is_denial(sentence) {
-            for shell in &covered {
-                assert!(
-                    !sentence.contains(shell),
-                    "rustdoc denies that {shell} completes operation names: {sentence:?}"
-                );
-            }
-            continue;
-        }
-        for shell in &uncovered {
-            assert!(
-                !sentence.contains(shell),
-                "rustdoc claims {shell} completes operation names: {sentence:?}"
-            );
-        }
-        if covered.iter().all(|shell| sentence.contains(shell)) {
-            positive_naming_all_covered = true;
-        }
-    }
+    let positive_naming_all_covered = doc.split(['.', ';']).any(|sentence| {
+        mentions_operation_completion(sentence)
+            && !is_denial(sentence)
+            && covered.iter().all(|shell| sentence.contains(shell))
+    });
     assert!(
         positive_naming_all_covered,
         "no sentence positively states that {covered:?} complete operation names: {doc}"
     );
+
+    for clause in clauses(&doc) {
+        if is_denial(clause) {
+            for shell in &covered {
+                assert!(
+                    !clause.contains(shell),
+                    "rustdoc denies that {shell} completes operation names: {clause:?}"
+                );
+            }
+        } else if affirms_completion(clause) {
+            for shell in &uncovered {
+                assert!(
+                    !clause.contains(shell),
+                    "rustdoc claims {shell} completes operation names: {clause:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn the_coverage_check_catches_drift_in_both_directions() {
-    // Guards the guard, with one sample per direction: the over-claim the R3
-    // review supplied, and the denial the R4 review supplied. Each is run
-    // through the same classification the check above uses.
+fn the_coverage_check_catches_drift_in_every_direction() {
+    // Guards the guard, with the sample each review supplied. Every one is
+    // run through the same classification the check above uses.
     let over_claim = "powershell and elvish operation names complete";
-    assert!(mentions_operation_completion(over_claim));
-    assert!(!is_denial(over_claim), "would be skipped as a denial");
-    assert!(
-        shell_names(false).iter().any(|s| over_claim.contains(s)),
-        "the over-claim sample names no uncovered shell"
-    );
-
     let denial = "bash, zsh, fish do not complete operation names";
-    assert!(mentions_operation_completion(denial));
-    assert!(is_denial(denial), "a denial must be classified as one");
+    let mixed = "powershell does not complete operation names, but elvish does";
+
+    // R3's over-claim: an affirmative clause naming an uncovered shell.
+    assert!(clauses(over_claim)
+        .into_iter()
+        .any(|c| affirms_completion(c) && shell_names(false).iter().any(|s| c.contains(s))));
+
+    // R4's denial: a denying clause naming a covered shell. A comma list
+    // splits across clauses, so the check needs one such clause, not one
+    // naming all three.
+    assert!(clauses(denial)
+        .into_iter()
+        .any(|c| is_denial(c) && shell_names(true).iter().any(|s| c.contains(s))));
+
+    // R5's mixed sentence: the SECOND clause affirms for an uncovered shell,
+    // even though the sentence as a whole reads as a denial.
     assert!(
-        shell_names(true).iter().all(|s| denial.contains(s)),
-        "the denial sample does not name the covered shells"
+        is_denial(mixed),
+        "the mixed sample must still look like a denial as a whole"
+    );
+    assert!(
+        clauses(mixed)
+            .into_iter()
+            .any(|c| affirms_completion(c) && shell_names(false).iter().any(|s| c.contains(s))),
+        "the mixed sample's affirmative clause is not detected"
     );
 }
 
-/// Whether a sentence is about completing operation names at all.
-fn mentions_operation_completion(sentence: &str) -> bool {
-    let lower = sentence.to_ascii_lowercase();
+/// Split documentation into clauses, not just sentences.
+///
+/// A sentence can carry an affirmation and a denial at once ("X does not
+/// complete them, but Y does"), so anything classified as a whole sentence
+/// hides half of what it says.
+fn clauses(doc: &str) -> Vec<&str> {
+    doc.split(['.', ';', ','])
+        .flat_map(|part| part.split(" but ").flat_map(|p| p.split(" while ")))
+        .flat_map(|part| part.split(" whereas ").flat_map(|p| p.split(" however ")))
+        .collect()
+}
+
+/// Whether a clause is about completing operation names at all.
+fn mentions_operation_completion(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
     lower.contains("operation") && (lower.contains("complete") || lower.contains("candidate"))
 }
 
-/// Whether such a sentence denies rather than asserts that completion.
+/// Whether a clause AFFIRMS completion.
+///
+/// Includes clauses whose verb is elided ("but elvish does", "elvish too"),
+/// which is how the mixed sentence smuggled its claim past a check that only
+/// looked for the word "complete".
+fn affirms_completion(text: &str) -> bool {
+    if is_denial(text) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    mentions_operation_completion(text)
+        || lower.contains(" does")
+        || lower.contains(" do ")
+        || lower.contains(" is ")
+        || lower.contains(" are ")
+        || lower.contains(" too")
+        || lower.contains(" as well")
+        || lower.contains(" also")
+}
+
+/// Whether a clause DENIES completion.
 ///
 /// Deliberately not keyed on "only": "complete in bash, zsh, fish only" is a
 /// POSITIVE claim about those three (and silence about the rest), which is
-/// exactly the sentence the documentation is supposed to contain. A denial
-/// has to negate the completion itself.
-fn is_denial(sentence: &str) -> bool {
-    let lower = sentence.to_ascii_lowercase();
+/// exactly the sentence the documentation is supposed to contain.
+fn is_denial(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
     lower.contains("not complete")
         || lower.contains("not completed")
         || lower.contains("no candidates")

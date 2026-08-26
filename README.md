@@ -123,10 +123,12 @@ credential that has been sent cannot be recalled. Origins are compared normalize
 host casing or a default port is never a false conflict. Without a profile there is nothing to bind and
 `OUTLINE_URL` behaves exactly as before.
 
-The gate is enforced by the type system rather than by convention: the resolved settings it reads have no
-public constructor, the credential cannot be read around it, and the token proving the check ran cannot
-be built outside the module that runs it. A credential source added later inherits all of that without
-opting in.
+The gate is enforced by the type system rather than by convention, and that turns out to be a question of
+module layout rather than of the `pub` keyword — a private field in Rust is visible to the declaring
+module *and every descendant of it*. So the three pieces of state live in separate leaf modules, none an
+ancestor of another: resolved settings can only be produced by the resolver, the credential can only be
+read by the source that the gate calls, and the token proving the check ran can only be minted by the
+gate. A credential source added later inherits all of it without opting in.
 
 The config file holds no secrets, by construction: an `api_key` or `token` key — at the top level or in a
 profile — is a hard error pointing at `credentials.toml`, and any other unrecognized key (including a

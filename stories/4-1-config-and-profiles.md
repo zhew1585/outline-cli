@@ -285,6 +285,46 @@ R3 已 VERIFIED：R2-6（Windows/POSIX 双规则参数化执行）、R2-7（64 �
 
 R4 已 VERIFIED（不再改动）：AC2 同项三层优先级、跨 origin 零请求、R3-2/3/4/5/8/9。
 
+### R5 复核处置（2026-08-26）：闸门强度取决于**模块布局**，不是 `pub` 关键字
+
+| # | 级别 | 处置 |
+|---|------|------|
+| 合并前专项 | NOT ESTABLISHED → 已修 | 见下 |
+| R5-1 | BLOCKER | 已修：安全状态与秘密容器各自迁入**私有叶子模块** |
+| R5-2 | MINOR | 已修（见 4-4）：文档覆盖度检查改为**子句级**，可检出混合句 |
+
+**问题**：R4 我把 `Settings` / `EnvLayer` 的字段写成私有就宣称「结构性不可绕过」。审查者指出这在 Rust 里
+不成立——**私有字段对定义模块及其所有后代可见**。`config` 里声明的私有字段，`config` 自己以及将来任何
+`config::credentials`（正是 Epic 2 凭证源最可能落的位置）都能直接读写。审查者还给了现成反证：
+`config/file.rs` **今天就在**读父模块 `Profile` 的私有字段。我的编译失败探针是以**外部 crate** 身份编译的，
+只覆盖公共 API 边界，模拟不了 crate 内子模块的隐私规则——这是我验证方法的盲区，不只是实现的。
+
+**新模块布局**（每个都是**叶子**，互不为祖先）：
+
+| 模块 | 独占能力 | 谁都不能 |
+|------|---------|---------|
+| `config::resolved` | 声明 `Settings`/`UrlSource`，`resolve_settings` 是唯一构造者 | 其他任何模块伪造 `url_source: Flag` |
+| `config::secret` | 声明 `EnvKeys`（密钥存储），`EnvApiKey::fetch` 是唯一读出路径 | 其他任何模块读到密钥；`config` 只能构造与数条数 |
+| `config::release` | 声明 `BindingChecked`，`release_token` 是唯一签发者 | 其他任何模块跳过绑定检查调 `fetch` |
+
+`config/mod.rs` 现在**也**读不到这些——重构过程中编译器立刻报了
+`field base_url of struct Settings is private`，这就是边界生效的第一手证据。
+
+**验证方法补齐了 crate 内视角**（`tests/config_isolation.rs`）：
+- `a_module_added_inside_config_cannot_forge_the_gates_state`：把**真实的** config 源码整棵复制到临时目录
+  编译成独立 crate，先编译未改动版本（许可探针，防止「rustc 全挂」空过），再分别注入 4 个 attacker 兄弟
+  模块（伪造 Settings / 读全局密钥 / 读 per-profile 密钥 / 伪造 BindingChecked），要求全部编译失败。
+- `the_security_state_lives_in_leaf_modules`：断言三个叶子文件不声明任何子模块，且四个安全类型都不在
+  `mod.rs` 里声明——整套论证依赖「无后代」，这条属性必须挡住静默回归。
+- 外部 crate 探针保留并扩充到 6 个。
+- 已做**双向变异验证**：把 `EnvKeys::global` 改成 `pub(super)` → `A MODULE INSIDE config CAN STILL read
+  the global API key out of the layer`；给 `resolved.rs` 加一个真实子模块 → `resolved.rs:154 declares a
+  submodule`。
+
+**给 Epic 2 的接口说明**：凭证文件源实现 `TokenSource` 即可，无需知道闸门存在。但**不要**把它放成
+`config::resolved` / `config::secret` / `config::release` 的子模块——放在 `config` 下的兄弟位置（如
+`config::credentials`）或 config 之外都安全，叶子测试会挡住前一种误放。
+
 R2 已 VERIFIED：R1-3（TOML 文本只用于分类）、R1-4（两层白名单）、R1-7（控制字符清理，并额外确认 bidi
 经 Rust Debug 转义后无法改变终端方向状态）。
 
