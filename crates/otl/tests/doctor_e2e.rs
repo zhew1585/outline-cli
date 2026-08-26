@@ -94,6 +94,18 @@ async fn instance(status: u16) -> MockServer {
     server
 }
 
+/// An Outline instance answering `auth.info` with 200 and a body that is not
+/// JSON at all - a captive portal, a proxy error page, an HTML login form.
+async fn instance_answering(body: &'static str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// Everything a `doctor` run needs pointed somewhere harmless.
 struct Env {
     /// The credential directory (empty unless a test seeds it).
@@ -295,8 +307,14 @@ async fn a_rejected_credential_exits_four() {
     );
 }
 
-/// A credential file other users can read is exit 2 - and doctor must not
-/// send anything while the store it would read from is compromised.
+/// A credential FILE other users can read is exit 2, and nothing is sent.
+///
+/// The invariant is deliberately about the FILE and not about "a compromised
+/// store": `secret_file::read_checked` refuses a widened file on the open
+/// descriptor, so every command - `doctor` included - stops there. A
+/// world-writable DIRECTORY around a sound file is a different case with a
+/// different grade, pinned by
+/// `a_writable_directory_around_a_sound_file_is_a_warning` below.
 ///
 /// The environment key is exported ON PURPOSE: without it, "nothing was
 /// sent" would hold simply because there was nothing to send, and the test
@@ -320,13 +338,17 @@ async fn an_over_wide_credential_file_exits_two_before_anything_is_sent() {
     let report = parse(&stdout);
     let credentials = check(&report, "credentials");
     assert_eq!(credentials["status"], Value::from("problem"), "{report}");
-    assert_eq!(credentials["usable"], Value::from(false));
+    assert_eq!(credentials["file_usable"], Value::from(false));
     // The offending file and its mode are named, with the fix.
     let text = credentials.to_string();
     assert!(text.contains(&file.display().to_string()), "{text}");
     assert!(text.contains("0644"), "{text}");
     assert!(text.contains("chmod 600"), "{text}");
-    assert_eq!(hits(&api).await, 0, "a compromised store must send nothing");
+    assert_eq!(
+        hits(&api).await,
+        0,
+        "a credential file other users can read must not be sent"
+    );
     // And no part of the credential is anywhere in the output.
     for secret in ["SECRET-9c7a", "SECRET-3f1b"] {
         assert!(!stdout.contains(secret), "{secret} in stdout: {stdout}");
@@ -594,4 +616,151 @@ async fn an_unparsable_config_file_exits_two_from_the_configuration_check() {
         "the parse error must locate itself: {configuration}"
     );
     assert!(stderr.contains("configuration"), "{stderr}");
+}
+
+/// A world-writable DIRECTORY around a sound 0600 file is a WARNING, the run
+/// exits 0, and the credential in that file is used as usual.
+///
+/// This is the R1 decision, and the test exists so it cannot be quietly
+/// reverted: `require_regular_owned` checks the OPEN descriptor for the
+/// caller's own uid, so another user cannot plant a file this CLI would read;
+/// the file is unreadable to them anyway; and Story 2.6 deliberately does not
+/// re-permission an existing directory. What is left is nuisance, not a
+/// confidentiality or integrity failure - and a warning never changes the
+/// exit code, which is right because no other command fails in this state
+/// either.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writable_directory_around_a_sound_file_is_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let api = instance(200).await;
+    let env = Env::new();
+    env.seed_key(&api.uri(), "KEY-SECRET-9c7a");
+    // The file keeps the 0600 the store created; only the directory is opened up.
+    std::fs::set_permissions(env.dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let (stdout, stderr, code) =
+        run(env.command(Some(&api.uri()), Some("ENV-SECRET-3f1b"), &["--offline"])).await;
+    let restore = std::fs::set_permissions(env.dir(), std::fs::Permissions::from_mode(0o700));
+
+    assert_eq!(
+        code, 0,
+        "a directory problem must not block: {stdout}{stderr}"
+    );
+    let report = parse(&stdout);
+    let credentials = check(&report, "credentials");
+    assert_eq!(credentials["status"], Value::from("warn"), "{credentials}");
+    // The FILE is fine, and the report says so rather than calling the store
+    // unusable while going on to use it.
+    assert_eq!(credentials["file_usable"], Value::from(true));
+    assert!(
+        credentials["directory_problem"]
+            .as_str()
+            .is_some_and(|text| text.contains("0777")),
+        "the actual mode must be reported: {credentials}"
+    );
+    // And the credential in that file is the one a request would carry.
+    assert_eq!(
+        check(&report, "credential")["status"],
+        Value::from("ok"),
+        "{report}"
+    );
+    assert!(!stdout.contains("SECRET-9c7a"), "{stdout}");
+    restore.unwrap();
+}
+
+/// The same case with the network on: the credential is actually used, which
+/// is the half `--offline` cannot show.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writable_directory_does_not_stop_the_instance_from_being_checked() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let api = instance(200).await;
+    let env = Env::new();
+    env.seed_key(&api.uri(), "KEY-SECRET-9c7a");
+    std::fs::set_permissions(env.dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let (stdout, stderr, code) =
+        run(env.command(Some(&api.uri()), None, &["--spec-url", DEAD])).await;
+    let restore = std::fs::set_permissions(env.dir(), std::fs::Permissions::from_mode(0o700));
+
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let report = parse(&stdout);
+    assert_eq!(check(&report, "credentials")["status"], Value::from("warn"));
+    assert_eq!(
+        check(&report, "connectivity")["status"],
+        Value::from("ok"),
+        "{report}"
+    );
+    assert_eq!(
+        hits(&api).await,
+        1,
+        "the sound file's credential must still be used"
+    );
+    restore.unwrap();
+}
+
+/// A `--spec-url` the fetch channel refuses locally is the INVOCATION being
+/// wrong, not a third party failing: exit 2, like `otl spec sync` gives the
+/// same mistake. A spec host that is merely unreachable stays a warning
+/// (`an_unreachable_spec_source_is_a_warning_and_not_the_exit_code`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_spec_url_is_a_usage_problem_not_a_warning() {
+    let api = instance(200).await;
+    let env = Env::new();
+    let (stdout, stderr, code) = run(env.command(
+        Some(&api.uri()),
+        Some("test-key"),
+        &["--spec-url", "not-a-url"],
+    ))
+    .await;
+
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    let report = parse(&stdout);
+    let online = check(&report, "online-spec");
+    assert_eq!(online["status"], Value::from("problem"), "{online}");
+    assert_eq!(online["exit_code"], Value::from(2));
+    assert_eq!(online["checked"], Value::from(false));
+    assert!(
+        online["summary"]
+            .as_str()
+            .is_some_and(|text| text.contains("--spec-url")),
+        "the offending flag must be named: {online}"
+    );
+    // Everything else was fine, so this is the finding that decided the code.
+    assert_eq!(report["problems"], Value::from(1), "{report}");
+    assert!(stderr.contains("online-spec"), "{stderr}");
+}
+
+/// An instance that answers 200 with something that is not JSON: exit 1, and
+/// the report must NOT claim the instance could not be reached - it was
+/// reached, and it answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_answering_with_something_other_than_json_exits_one() {
+    let api = instance_answering("<html>captive portal</html>").await;
+    let env = Env::new();
+    // The instance must be contacted, so this cannot be `--offline`; the
+    // spec source is pointed at a dead port instead, which is a warning and
+    // therefore does not compete for the exit code.
+    let (stdout, stderr, code) =
+        run(env.command(Some(&api.uri()), Some("test-key"), &["--spec-url", DEAD])).await;
+
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    let report = parse(&stdout);
+    let connectivity = check(&report, "connectivity");
+    assert_eq!(connectivity["status"], Value::from("problem"), "{report}");
+    assert_eq!(connectivity["exit_code"], Value::from(1));
+    // Reached, and it answered: saying otherwise sends the user to look at
+    // their network for a problem that is on the server.
+    assert_eq!(connectivity["reachable"], Value::from(true));
+    let summary = connectivity["summary"].as_str().unwrap_or_default();
+    assert!(
+        !summary.contains("could not be reached"),
+        "the instance answered; the summary must not deny it: {summary}"
+    );
+    assert!(summary.contains("answered"), "{summary}");
+    assert!(stderr.contains("connectivity"), "{stderr}");
+    assert_eq!(hits(&api).await, 1);
 }

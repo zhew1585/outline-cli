@@ -183,8 +183,71 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 | M16 | config 文件不可用只算 Warn | 端到端 `an_unparsable_config_file_exits_two_...` |
 | M17 | `is_deprecated()` 恒 false | speccompile 单测 + 端到端 deprecated |
 
+R1 修复后新增 6 处变异(全部转红),原 17 处在改动后**重跑**仍全部转红(M4/M7/M10 的补丁位置随重构更新):
+
+| # | 改坏了什么 | 转红的测试 |
+|---|-----------|-----------|
+| N1 | 目录可写又判回 Problem | 2 个端到端 + `the_file_blocks_and_a_writable_directory_only_warns` + `a_directory_only_warning_names_...` |
+| N2 | 文件等级改用复合的 `usable` | 同上 4 个 |
+| N3 | 去掉 `read_checked` 对过宽文件的拒绝 | `an_over_wide_credential_file_exits_two_before_anything_is_sent` + 4 个既有凭证测试 |
+| N4 | 非法 `--spec-url` 又判 Warn | `an_invalid_spec_url_is_a_usage_problem_not_a_warning` |
+| N5 | 任何探测失败都写「could not be reached」 | `an_instance_answering_with_something_other_than_json_exits_one` |
+| N6 | `reachable` 恒 false | 同上 |
+
+N3 是审查者点名要求的那条:它证明「文件过宽必须 0 请求」这条收窄后的不变式是**真的被 `read_checked`
+执行**的,而不是因为「反正没东西可发」而空过。
+
+### R1 对抗审查处置（deepseek-v4-pro,只读)
+
+审查结论:可合并,一条 MAJOR + 两条 MINOR。三条全部已修,每条都做了回退验证。
+
+**Finding 1 [MAJOR] — doctor 自相矛盾:宣布凭证库不可用,然后拿它发了请求。**
+`credentials` 检查用 `credential_health().usable`(**含**目录检查),`choose()` 用
+`store.load()` → `read_checked`(**不含**目录检查)。于是目录 0777 + 文件 0600 合法时,同一份报告里
+`credentials.usable=false` 与 `connectivity.reachable=true` 并存,mock 收到 1 个请求。
+
+处置经过一次裁决反转,值得记录:先裁定「store 被判不可用时 `credential`/`connectivity` 进 Skipped」,
+随后被撤回——因为支撑它的威胁模型不成立:
+- `secret_file::read_checked` 对**已打开的描述符**做 `require_regular_owned`(要求属主是本人),
+  攻击者无法在世界可写目录里植入一个属主是受害者的文件;symlink 被 `O_NOFOLLOW` 拒;文件 0600 他也读不到。
+  残余风险只有「删掉/换成一个会被拒的文件」= 骚扰与拒服,**不是机密性或完整性问题**。
+- Story 2.6 AC 6 要求 doctor **报告**权限是否合规,不是阻塞;AC 1 只要求**创建时** 0700,
+  Task 1 明确写了「已存在的目录不动」。去警察既有目录会与创建它的那条 story 相矛盾。
+
+**最终修法**:把「文件自身」与「目录」拆成两个等级(`checks.rs::grade`,理由与依据写在函数文档里):
+- 文件自身不可用(过宽 / 非 regular / 非本人所有 / 解析失败 / 版本过新)→ **Problem/2**,且一个字节都不发
+  (`read_checked` 在描述符上就拒了,doctor 与真实命令答案一致);
+- **仅目录**不安全而文件合规 → **Warn/退 0**,`credential` 与 `connectivity` **照常运行**。
+- doctor 的 JSON 不再输出复合的 `usable`,改输出 `file_usable`——否则「usable=false」会紧挨着一个
+  真的用了它的 `connectivity`,那是同一个矛盾换了个标签。
+- `credential_health` 新增 `file_readable`(加字段,**不改 `usable` 语义**,`auth info` 不受影响)。
+  必须加:目录坏 **与** 文件坏都会让 `usable=false`,只凭 `usable` + `directory_problem` 两个信号
+  无法区分「目录可写且文件损坏」这一格,会把真实的文件问题降级成警告。
+
+**Finding 2 [MINOR] — 非法 `--spec-url` 被降为警告。** `online_spec` 把 `upstream_table` 的任何
+`Err` 一律判 Warn,于是 `--spec-url "not-a-url"` 退 0,而 `docs/exit-codes.md` 把同一个错误在
+`spec sync` 里定为 code 2。「第三方主机故障不该判环境有罪」这条**对用户自己打错 flag 不适用**。
+修法:按 fetch 域**已经**赋予的码分流——`ExitCode::Usage` 只可能是 `FetchError::InvalidUrl`
+(本地校验失败、什么都没发出)→ Problem/2;传输失败、404、5xx、429 耗尽、文档编不过 → 维持 Warn。
+**不做前置校验**:那会复制一份 fetch 通道的 URL 规则,两份规则终将互相漂移。代价是这条 Problem 排在最后,
+被更早的阻塞发现抢占——与整份报告的 first-not-worst 一致。
+
+**Finding 3 [MINOR] — 漏登记可达的退出码 1,且该场景措辞失真。** 实例回 200 + 非 JSON body 时
+`fetch_identity` → `EngineError::InvalidResponse` → 退 **1**,而 doctor 段只写了 0/2/3/4/5/6/7/8。
+已补 1(并明确 9 不可达)。措辞方面,原先任何探测失败都写「the instance could not be reached」——
+实例其实被触达了。现在按码分述(`outcome_summary`),且 `reachable` 只在 `ExitCode::Network`
+时为 false:401/5xx/垃圾 body 都是「答了,但答的东西没用」。补了 200+非 JSON 的端到端。
+
+**R1 修复带出的两处附带改动**(都是审查者没提但同一处的诚实性问题):
+- `connectivity` 的跳过理由原先只有一句「there is no usable instance and credential to try」——
+  用户读不出缺的是哪一半。现在四种理由各自成句(`--offline` / 没有可用实例 URL / 没配凭证 /
+  凭证被拒),`Chosen::Unchecked` 的理由原样透传。函数因此超了 50 行,按已有接缝拆成
+  `connectivity` + `approved` + `probe`。
+- `check-all.sh` 抓到一个我自己漏掉的 clippy `doc_lazy_continuation`(新 doc 注释里一行以 `-` 开头
+  被当成列表项)。这正是那个脚本存在的理由:我在加完注释后只跑了 `cargo test`。
+
 ### Completion Notes
 
-- 新增 42 个测试（26 单测 + 13 端到端 + 2 golden + 1 speccompile）。
+- 新增 51 个测试（28 单测 + 17 端到端 + 2 golden + 3 auth::report 单测 + 1 speccompile）。
 - 不新增退出码；`docs/exit-codes.md` 登记了 doctor 的四条规则，README 的表由它派生（未变）。
 - 网络入口零新增：`tests/no_phone_home.rs` 的收敛表未改动。

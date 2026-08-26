@@ -1,10 +1,10 @@
 //! The two spec checks: which operation table this CLI dispatches from, and
 //! how it differs from what the online API declares (FR23).
 //!
-//! # Neither of these can fail a `doctor` run
+//! # Almost nothing here can fail a `doctor` run
 //!
-//! Both are warnings at most, and that is a decision rather than an
-//! oversight:
+//! Every finding about a spec is a warning, with ONE exception stated at the
+//! end. That is a decision rather than an oversight:
 //!
 //! - a spec cache that cannot be used is documented as *not* an error
 //!   (`docs/exit-codes.md`): the CLI discards it and falls back to the spec
@@ -18,6 +18,11 @@
 //!   has and this build does not is a reason to run `otl spec sync`, not a
 //!   reason for the exit code to say "broken".
 //!
+//! The exception is a `--spec-url` the fetch channel refuses locally: that
+//! is not a third party failing, it is the invocation being wrong, and it is
+//! graded the way `otl spec sync` grades the same mistake. See
+//! [`unfetched`].
+//!
 //! # Nothing here writes a cache
 //!
 //! `doctor` reports; it must not change what the next command dispatches
@@ -30,6 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::commands::spec::{self, UpstreamTable};
+use crate::exit::{CliError, ExitCode};
 use crate::ops;
 use crate::spec::cache;
 
@@ -121,21 +127,57 @@ pub fn online_spec(offline: bool, url: Option<&str>, cached_hash: Option<&str>) 
     }
     match spec::upstream_table(url) {
         Ok(upstream) => compare(&upstream, cached_hash),
-        // The spec source is not the user's instance: its failure says
-        // nothing about whether their environment works.
-        Err(error) => Check::new(
-            "online-spec",
+        Err(error) => unfetched(&error),
+    }
+}
+
+/// The check for a comparison that could not be made.
+///
+/// Two quite different reasons land here, and folding them together was a
+/// real defect: **the user's own flag being wrong** is not a third party's
+/// failure. `--spec-url not-a-url` never reaches any host - the fetch
+/// refuses it locally - and `docs/exit-codes.md` classes exactly that as a
+/// usage error (exit 2) for `otl spec sync`. It must not become a warning
+/// here, or a CI job cannot tell "the spec source is down" from "I typed the
+/// flag wrong".
+///
+/// So the split is made on the code the fetch domain already assigned:
+/// `ExitCode::Usage` is only ever `FetchError::InvalidUrl`, i.e. nothing was
+/// sent because the URL did not pass local checks. Everything else - a host
+/// that is unreachable, a 404, a 500, an exhausted retry budget, a document
+/// that will not compile - remains a warning, because the CLI keeps
+/// dispatching from its local table and the environment still works.
+///
+/// Deliberately classified HERE rather than validated before the checks run:
+/// pre-flight validation would mean a second copy of the fetch channel's URL
+/// rules, and two copies of a rule is how they come to disagree. The
+/// consequence is that this problem is graded last, so a blocking finding in
+/// an earlier check preempts it - which is the same "fix the first thing
+/// first" ordering the rest of the report follows.
+fn unfetched(error: &CliError) -> Check {
+    let local_flag = error.code == ExitCode::Usage;
+    let (status, summary) = if local_flag {
+        (
+            Status::Problem(ExitCode::Usage),
+            "the --spec-url value is not a document URL this CLI will fetch",
+        )
+    } else {
+        (
             Status::Warn,
             "the online API description could not be fetched",
         )
-        .fact("checked", false)
-        .detailed([
-            error.to_string(),
+    };
+    let mut detail = vec![error.to_string()];
+    if !local_flag {
+        detail.push(
             "otl keeps dispatching from its local table; nothing about this \
              affects the commands you run."
                 .to_string(),
-        ]),
+        );
     }
+    Check::new("online-spec", status, summary)
+        .fact("checked", false)
+        .detailed(detail)
 }
 
 /// The three ways the table in use and the online description can differ.

@@ -45,6 +45,20 @@ pub struct CredentialHealth {
     pub permissions: Permissions,
     /// Whether the file may be used as it stands.
     pub usable: bool,
+    /// Whether the FILE's own contents could be read as a credential file.
+    /// `true` when there is no file yet: nothing is wrong with an absent one.
+    ///
+    /// Reported separately from [`CredentialHealth::usable`] because the two
+    /// answer different questions. `usable` is "may this store be used as it
+    /// stands", which folds in the DIRECTORY around the file; this is about
+    /// the file itself. `otl doctor` grades the two differently (a file it
+    /// cannot read blocks; a directory other users can write to is a
+    /// warning), so it needs them apart - and one cannot be derived from the
+    /// other, because a bad directory and a malformed file both leave
+    /// `usable` false with nothing to say which of them it was.
+    ///
+    /// One boolean about whether a parse succeeded. Nothing about content.
+    pub file_readable: bool,
     /// Absolute path of the directory holding it.
     pub directory: PathBuf,
     /// Octal mode of the directory, where the platform has one.
@@ -79,12 +93,12 @@ pub fn credential_health(store: &CredentialStore) -> CredentialHealth {
         .then(|| crate::auth::secret_file::require_private_dir(store.dir()).err())
         .flatten()
         .map(|error| error.to_string());
+    let file_readable = !exists || loaded.is_some();
     CredentialHealth {
         path: store.path().to_path_buf(),
         exists,
-        usable: permissions.usable()
-            && directory_problem.is_none()
-            && (!exists || loaded.is_some()),
+        usable: permissions.usable() && directory_problem.is_none() && file_readable,
+        file_readable,
         permissions,
         directory: store.dir().to_path_buf(),
         directory_mode: crate::auth::secret_file::directory_mode(store.dir()),
@@ -426,6 +440,55 @@ mod tests {
             "the directory must be named: {rendered}"
         );
         assert!(!rendered.contains("PROBLEM"), "{rendered}");
+    }
+
+    /// A file that cannot be parsed is distinguishable from a directory
+    /// problem, which is what lets `otl doctor` grade the two differently.
+    /// Both leave `usable` false, so `usable` alone cannot tell them apart.
+    #[test]
+    fn an_unparsable_file_is_reported_as_unreadable_rather_than_as_a_directory_problem() {
+        let (_dir, store) = scratch();
+        populated(&store);
+        // Overwrites the CONTENT and keeps the 0600 mode the store created,
+        // so this is a file whose permissions are fine and whose contents
+        // are not.
+        std::fs::write(store.path(), b"this is not a credential file").unwrap();
+
+        let health = credential_health(&store);
+        assert!(!health.file_readable, "{health:?}");
+        assert!(!health.usable);
+        assert!(health.permissions.usable(), "the mode is still 0600");
+        assert!(health.directory_problem.is_none(), "{health:?}");
+        assert!(health.profiles.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sound_file_in_a_writable_directory_is_readable_but_not_usable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = scratch();
+        populated(&store);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let health = credential_health(&store);
+        // The other half of the pair above: the FILE is fine, the directory
+        // is not, and the report says which.
+        assert!(health.file_readable, "{health:?}");
+        assert!(health.directory_problem.is_some());
+        assert!(!health.usable);
+
+        let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    fn a_missing_file_counts_as_readable() {
+        let (_dir, store) = scratch();
+        let health = credential_health(&store);
+        assert!(
+            health.file_readable,
+            "there is nothing wrong with a file that does not exist yet"
+        );
     }
 
     #[test]

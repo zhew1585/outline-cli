@@ -229,10 +229,11 @@ deprecated while this build still offers them.
 
 `otl doctor` invents no exit code. It prints the whole report, then exits with the code the first
 blocking finding would have produced in any other command: **0** when nothing is blocking, **2** for
-something to fix locally, **4** when the instance rejected the credential, **6**/**7**/**8** for what the
-instance did to the probe. Warnings — a discarded spec cache, a table behind upstream, an unreachable
-spec host — are reported and leave the exit code at 0, because none of them stops `otl` from working. Both
-requests happen only because you typed the command, and `--offline` skips them.
+something to fix locally, **4** when the instance rejected the credential, and **1**/**3**/**5**/**6**/**7**/**8**
+for whatever the instance did to the probe. Warnings — a discarded spec cache, a table behind upstream, an
+unreachable spec host, a credential directory other users can write to around a sound `0600` file — are
+reported and leave the exit code at 0, because none of them stops `otl` from working. Both requests happen
+only because you typed the command, and `--offline` skips them.
 
 ## Design
 
