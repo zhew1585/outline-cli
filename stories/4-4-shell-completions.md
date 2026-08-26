@@ -111,7 +111,14 @@ so that 不背命令。
 | R6-9 | MINOR | 已修：fish 描述过滤只看 `is_control()`，bidi/零宽可直达补全菜单；现在与表格单元格共用 `otl::text` 的分类 |
 | R5-2 | PARTIAL → 修 | 从句切分器补上 ` and ` / `:` / ` - ` / ` though ` / ` although ` / ` yet ` / 破折号（` - ` 尤其要紧：**它正是本模块文档自己连接从句的写法**），`is_denial` 补上 never/lacks/unavailable/unsupported/without/excluded/omitted。四种此前漏检的漂移已逐一变异验证 |
 
-R2/R3/R4/R5/R6 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
+### R7 复核（2026-08-26）
+
+R6-1 与 R6-9 均 **VERIFIED**，且经**实机**验证：真实 zsh 5.9 装进临时 `$fpath` 后 `compinit -i` 得到
+`_comps[otl]=_otl`；bash 3.2 source 后 `_otl` 函数存在；fish 3.6 里 `complete -C "otl api documents."`
+返回 123 条操作候选。R5-2 的从句切分补全也一并 VERIFIED（11 种绕过拼法全命中、5 个散文负例不误报）。
+本 story 无新发现。
+
+R2/R3/R4/R5/R6/R7 已 VERIFIED：R1-4（build 期与生成期两层白名单都实际生效）。审查者备注「当前仓库尚无运行时缓存接缝可
 进一步验证」——生成期过滤不依赖 build.rs 的编译期拒绝，是独立的第二道，specsync 合并后可直接复验该接缝。
 
 ### 故意留下的缺口

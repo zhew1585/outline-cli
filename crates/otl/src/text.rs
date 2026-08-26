@@ -1,7 +1,7 @@
 //! One classification of characters that are unsafe to print, shared by
-//! every surface that prints them.
+//! every surface that RENDERS text for a human to read.
 //!
-//! Three surfaces emit text the user did not write: configuration
+//! Three such surfaces emit text the user did not write: configuration
 //! diagnostics (a profile name, a path), table cells (a document title from
 //! the server) and completion descriptions (an operation summary). Each was
 //! given its own filter, and each round of review found one of them behind
@@ -14,6 +14,23 @@
 //! a diagnostic wants a visible marker, a data cell wants honest width - but
 //! no surface can be unaware of a category, because [`hazard`] returns one
 //! and the caller has to match on it.
+//!
+//! # `--json` is a deliberate exemption
+//!
+//! JSON output is not a rendering, it is the payload: its contract is that
+//! `jq` can consume it and that it round-trips to the same value the server
+//! sent. Substituting or dropping a codepoint there would corrupt data to
+//! protect a terminal that was not the intended consumer, and would break
+//! the round-trip property `render_golden`'s JSON test asserts. So `--json`
+//! (and the non-TTY default, which is the same path) emits exactly what
+//! arrived, bidi and all.
+//!
+//! The consequence is worth stating rather than leaving implied: piping
+//! `--json` through a pager or `cat` on a terminal can still show reordered
+//! text, because the bytes are the server's. A reader who wants the
+//! protected form is looking at the table, which is what a TTY gets by
+//! default. `json_mode_is_exempt_from_hazard_scrubbing` pins this as a
+//! decision rather than an oversight.
 
 /// A reason a character must not be forwarded to a terminal verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

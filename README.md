@@ -56,12 +56,15 @@ implemented exactly once. There is one `.send()` call in the whole crate.
 **No runtime spec parsing.** `build.rs` compiles the vendored spec into a static IR table. The binary
 contains neither the spec file nor its path, which a test asserts against the built artifact.
 
-**Server text is never printed verbatim.** Document titles, operation summaries, profile names and paths
-all reach a terminal, and control characters are only the obvious half of the problem: an unterminated
-`U+202E` reverses the visual order of everything after it, and zero-width characters hide inside a value.
-One classification (`otl::text`) covers control, bidi and invisible characters, and each surface decides
-how to render each category — a diagnostic marks them, a table cell drops what is invisible and marks
-what has scope, and both keep the zero-width joiner that emoji ligatures and Persian spelling depend on.
+**Server text is never printed verbatim — on the human-readable paths.** Document titles, operation
+summaries, profile names and paths all reach a terminal, and control characters are only the obvious half
+of the problem: an unterminated `U+202E` reverses the visual order of everything after it, and zero-width
+characters hide inside a value. One classification (`otl::text`) covers control, bidi, invisible and
+joiner characters, and each surface decides what to do with each category: a diagnostic replaces all of
+them with a visible marker, a table cell turns controls into spaces, marks what has scope, drops what is
+invisible, and keeps the zero-width joiner that emoji ligatures and Persian spelling depend on. `--json`
+is a deliberate exemption — it is the payload, and its contract is to round-trip what the server sent, so
+it is emitted unchanged.
 
 **Output is two-state.** Data goes to stdout, diagnostics to stderr, always. On a terminal you get a
 table whose columns come from the operation's response schema — one generic policy over the schema's own

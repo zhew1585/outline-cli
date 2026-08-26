@@ -108,6 +108,8 @@ so that 同一个操作每次渲染出同样的列，且没有任何端点需要
 | R4-2 | MAJOR | 已修：R3 只把内容判据加在 schema 候选路径上，`from_schema` 为空时转入的 `select_data_columns` 仍只排容器、不查内容——而「schema 一个候选都没有」恰恰意味着所有排名字段都是空的，于是 fallback 又按名字优先级选中同一批空字段，把真正有内容的挤出四列。现在两条路径共用同一个 `has_content`，并新增「两条路径都不得出现全空列」的统一不变量测试 |
 | R5 | VERIFIED | R4-2（三条路径统一走 `has_content`）经复核确认；本轮无新发现。测试文件按关注点拆分为 `render_golden.rs`（数据驱动 + 布局）与 `render_schema.rs`（schema 驱动列），两者均在 800 行铁律内 |
 | R6-3 | **MAJOR** | 已修：表格单元格只清 `is_control()`，U+202E / U+2066 / U+200B / U+FEFF 直达 stdout，而**未闭合的 RLO 会把整行后续内容视觉重排**（不止它自己那一格）。同一个仓库的 `config/error.rs` 与 `engine/sanitize.rs` 都已经处理这些字符——又是一次「三处修了两处」。根因是三处各有一套过滤器，所以修法不是再加一处，而是把**分类**收进新的 `otl::text`（穷尽 enum：Control / BidiFormat / Invisible / Joiner），各表面只决定**如何渲染**每一类：诊断全部替换为可见标记，单元格把控制符换空格、把有作用域的 bidi 换 U+FFFD（篡改要看得见）、把零宽丢弃（宽度要诚实），三者都保留 ZWJ——否则 emoji 连字与波斯语拼写会被破坏。新增 4 个渲染测试 + `otl::text` 自己的分类单测 |
+| R7 | VERIFIED | R6-3 经独立攻击与实机二进制验证通过：`invoice\u{202e}gnp.exe` 在表格里渲染为 `invoice\u{fffd}gnp.exe`，family emoji 的 3 个 ZWJ 完整保留，CJK/grapheme/截断上界无退化。审查者确认四分类是 R6 已验证集合的忠实拆分，且穷尽 match 会让新增类别编译失败 |
+| R7-2 | MINOR | 已修：JSON 路径不清洗（有意），但 `text.rs` 的「every surface」措辞过宽。已收敛为「渲染给人读的每个表面」，`--json` 作为**明示豁免**并写清代价，新增测试把豁免钉成被检查的决定 |
 | — | 验证 | 审查者独立确认 resolver-2 的 build-dep feature 隔离成立（`.fingerprint` 里 runtime `["default","std"]` 与 build-script `[...,"preserve_order",...]` 两套 artifact 并存） |
 
 ### 故意留下的缺口

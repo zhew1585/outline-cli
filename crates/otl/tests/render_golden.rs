@@ -506,3 +506,36 @@ fn a_zero_width_joiner_survives_because_it_is_part_of_the_text() {
         "the ligature was broken: {rendered:?}"
     );
 }
+
+#[test]
+fn json_mode_is_exempt_from_hazard_scrubbing() {
+    // A deliberate exemption, pinned so it reads as a decision rather than an
+    // oversight (R7 finding 2). `--json` is the payload, not a rendering: its
+    // contract is that `jq` consumes it and that it round-trips to what the
+    // server sent, so substituting a codepoint there would corrupt data to
+    // protect a terminal that is not the intended consumer.
+    //
+    // The trade-off is real and one-directional: the table is what a TTY gets
+    // by default, and the table IS scrubbed.
+    let hostile = "invoice\u{202e}gnp.exe\u{200b}";
+    let payload = json!([{ "id": "a1", "title": hostile, "updatedAt": "x" }]);
+
+    let json = render(&payload, OutputMode::Json, NO_SCHEMA).unwrap();
+    let reparsed: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(reparsed, payload, "--json must round-trip byte-exactly");
+    assert_eq!(
+        reparsed[0]["title"], hostile,
+        "--json must not alter the server's value"
+    );
+
+    // The same payload through the human-readable path is protected.
+    let table = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
+    assert!(
+        !table.contains('\u{202e}'),
+        "the table must scrub: {table:?}"
+    );
+    assert!(
+        !table.contains('\u{200b}'),
+        "the table must scrub: {table:?}"
+    );
+}

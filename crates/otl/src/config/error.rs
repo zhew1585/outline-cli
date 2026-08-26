@@ -48,9 +48,12 @@ const MAX_TEXT_CHARS: usize = 300;
 
 /// Whether a character must not be forwarded into a diagnostic.
 ///
-/// Every category from [`crate::text`], with no exceptions: a diagnostic is
-/// the one surface where making tampering visible matters more than
-/// preserving the text, so all three are replaced rather than dropped.
+/// Every category from [`crate::text`], with no exceptions and no
+/// per-category distinction: a diagnostic is the one surface where making
+/// tampering visible matters more than preserving the text, so each one is
+/// replaced with a visible marker rather than dropped or kept. A category
+/// added later is covered automatically, because this asks whether the
+/// character is classified at all.
 fn is_unsafe_in_diagnostic(c: char) -> bool {
     crate::text::hazard(c).is_some()
 }

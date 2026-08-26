@@ -156,11 +156,12 @@ fn select_columns<'a>(rows: &[&'a Map<String, Value>], schema: &'a [FieldSpec]) 
 
 /// Whether a value would render as anything the reader can see.
 ///
-/// The question is about the CELL, not the raw value: [`sanitize_cell`] turns
-/// control characters into spaces, so `"\u{1b}"` is content by any
-/// string-level test and blank on screen, and a zero-width character such as
-/// `"\u{200b}"` survives sanitizing but occupies no column. Several such
-/// fields in a row could otherwise fill all four columns with nothing.
+/// The question is about the CELL, not the raw value, so it runs the same
+/// [`clean_char`] the renderer does and asks what is left. A string-level
+/// test would call `"\u{1b}"` content and the cell would be blank (the
+/// escape becomes a space), and it would call `"\u{200b}"` content too (the
+/// zero-width space is dropped). Several such fields in one row could
+/// otherwise fill all four columns with nothing.
 ///
 /// Absent and `null` are empty by definition. `false` and `0` are content:
 /// they are values a reader wants to see.
@@ -324,7 +325,9 @@ fn cell_text(value: Option<&Value>) -> String {
 
 /// How one character is rendered in a cell, or `None` when it is dropped.
 ///
-/// The three hazard categories get three answers, for three reasons:
+/// Each category from [`crate::text::Hazard`] gets its own answer, for its
+/// own reason - which is why the match below is exhaustive rather than a
+/// catch-all: a category added later must be decided here, not defaulted.
 ///
 /// - a CONTROL character becomes a space. Most of them stand where a space
 ///   belongs (a newline or tab in a title), so a space keeps the words apart

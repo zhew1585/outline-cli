@@ -334,6 +334,19 @@ R4 已 VERIFIED（不再改动）：AC2 同项三层优先级、跨 origin 零�
 | 合并前专项 (a) | 确认 | 审查者独立验证：兄弟模块安全、叶子的**后代**确实能伪造——即「叶子性」是真实承重的性质，不是装饰 |
 | 合并前专项 (b) | 已修 | 探针 harness 现在**递归复制**目录模块，并自动带上 config 经 `crate::` 引用的兄弟模块（今天是 `text`）。否则 Epic 2 若用 `config/credentials/mod.rs`，harness 会以「the harness is broken」panic，而最省事的「修法」是放宽断言——那等于静默关掉这套安全测试 |
 
+### R7 复核处置（2026-08-26）
+
+R7 判定：R6 的 1 BLOCKER + 2 MAJOR + 6 MINOR **全部 VERIFIED**，无 NOT FIXED、无 REGRESSION，
+**本 track 可以合并**。审查者做了实机验证：真实 zsh 5.9 装进临时 `$fpath` 后 `_comps[otl]=_otl`
+（已注册）、bash 3.2 source 后 `_otl` 存在、fish 3.6 里 `complete -C "otl api documents."` 返回
+123 条候选、洗白调用实机编译失败 `E0061`。
+
+| # | 级别 | 处置 |
+|---|------|------|
+| R7-(d) | 注释（非缺陷） | 已写入 `release.rs` 模块文档：闸门的保证是「**本次调用传入的** settings」。一个**蓄意**的 source 可以自己经公开的 `resolve_settings` 解出另一份能过闸的 `Settings B`（如带 `--url` 的重定向），对 B 再入 `release_token`，把 B 的凭据交给以为在问 A 的调用者。这等价于 source 直接硬编码凭据——闸门防的是**意外**（链式 fallback 误用、新 source 不知道有检查），那类失败现在不可表示；已在二进制内的代码要故意作恶有更简单的路子。把边界写清楚比暗示更强的保证有用 |
+| R7-1 | MINOR | 已修：加入第四类 `Joiner` 后有四处旧表述没跟上（`render.rs` 两处、`config/error.rs` 一处、README 一处）。修法不只是改数字——**prose 里不再写类别数量**：`clean_char` 的文档改为「每一类各有答案，所以下面是穷尽 match」，诊断侧改为「问的是是否被分类，新增类别自动覆盖」。这样加第五类时散文不会失效，代码侧则由穷尽 match 强制 |
+| R7-2 | MINOR | 已修：`text.rs` 首句「every surface」过宽——JSON 路径确实原样发射 bidi。收敛为「every surface that RENDERS text for a human」，并新增一节明确 `--json` 是**有意豁免**（它是 payload，契约是 jq 可消费且能原样往返；清洗会为保护非目标消费者而破坏数据），连同代价一并写明（`--json | cat` 到终端仍可能被重排；受保护的形态是表格，也就是 TTY 的默认）。新增 `json_mode_is_exempt_from_hazard_scrubbing` 把这条豁免钉成**被检查的决定**而非疏漏——已变异验证：让 JSON 走清洗会立刻红 |
+
 **给 Epic 2 的接口说明**：凭证文件源实现 `TokenSource` 即可，无需知道闸门存在。三条约束（R6 复核后收紧）：
 
 1. **不要**放成 `config::resolved` / `config::secret` / `config::release` 的**子模块**；扁平兄弟文件
@@ -341,6 +354,9 @@ R4 已 VERIFIED（不再改动）：AC2 同项三层优先级、跨 origin 零�
 2. 优先用**扁平文件**而非目录模块。harness 现在支持目录模块，但扁平形式更简单，也是审查者的建议。
 3. `fetch` 现在**没有** settings 参数——想服务的 settings 只能从 `checked.settings()` 取。这不是纪律
    要求，是签名层面的：R6 之前那条「拿批准过的 token 去配另一组 settings」的洗白路径现在写都写不出来。
+   保证的边界见 `release.rs` 模块文档的「What the gate does and does not guarantee」。
+4. 叶守卫只扫 `resolved.rs` / `secret.rs` / `release.rs` 三个文件。`config/credentials.rs` **内部**再加
+   子模块不在守卫范围内，但它不持有任何闸门状态，无害；真正要守住的是「不在那三个叶里加任何子模块」。
 
 R2 已 VERIFIED：R1-3（TOML 文本只用于分类）、R1-4（两层白名单）、R1-7（控制字符清理，并额外确认 bidi
 经 Rust Debug 转义后无法改变终端方向状态）。

@@ -23,6 +23,29 @@
 //! configuration model for every user; refusing to release a credential to an
 //! instance its profile never named breaks nothing and is the only outcome
 //! that cannot be undone if it is wrong.
+//!
+//! # What the gate does and does not guarantee
+//!
+//! The guarantee is about the settings passed to THIS call: a source cannot
+//! serve any settings other than the ones the caller handed to
+//! [`release_token`], because `fetch` receives no settings argument and the
+//! proof it does receive is bound to them.
+//!
+//! It is not a sandbox around a hostile source. A source that wanted to
+//! could resolve a DIFFERENT `Settings` of its own - [`super::resolve_settings`]
+//! is public - arrange for that one to pass the gate (an explicit `--url`
+//! redirect does), call [`release_token`] on it, and hand the resulting
+//! credential back to a caller who believes it asked about the first one.
+//! Nothing here prevents that, and nothing here could: it is equivalent to a
+//! source returning a credential it had hardcoded, and code inside the binary
+//! that wants to do that has simpler ways.
+//!
+//! The threat this gate is built for is the accidental one - a chaining or
+//! fallback source reaching for the wrong state, a new source forgetting a
+//! check it did not know existed. That failure mode is now unrepresentable
+//! rather than merely discouraged. Deliberate misuse by code that is already
+//! in the binary is out of scope, and saying so is more useful than implying
+//! otherwise.
 
 use super::{ConfigError, Settings, UrlSource};
 
