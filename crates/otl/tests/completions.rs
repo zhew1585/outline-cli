@@ -307,7 +307,6 @@ fn candidate_descriptions_carry_no_control_characters() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // Per-shell coverage is stated, not implied (R1 finding 5).
 // ---------------------------------------------------------------------------
