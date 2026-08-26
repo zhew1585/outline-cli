@@ -134,15 +134,31 @@ crates/
     src/commands/spec.rs                 # + fetch_remote() / compile_document() / upstream_table()
     src/commands/doctor/
       mod.rs                             # 参数、编排、退出码语义（模块文档即契约）
-      report.rs                          # Status/Check/Report + 双态渲染 + sink 层清洗
-      checks.rs                          # configuration / instance / credentials / credential / connectivity
+      report.rs                          # Status/Check/Report + 双态渲染 + sink 层清洗 + fact 值转换
+      checks.rs                          # 「一次请求会怎样」：configuration / instance / credential / connectivity
+      credentials.rs                     # 「凭证库长什么样」：文件与目录分评级（R2 F1 后独立成文件）
       drift.rs                           # local-spec / online-spec（缺失·撤回·弃用）
-    src/auth/mod.rs                      # + exit_code_of()（map_auth_error 的借用版）
-    src/errors.rs                        # + engine_exit_code()（classify 的借用版）
-    tests/doctor_e2e.rs                  # 13 个 wiremock 端到端
+    src/auth/mod.rs                      # + exit_code_of() / instance_answered()（借用版判定）
+    src/auth/error.rs                    # + StoreError::condition()（描述，不带裁决）
+    src/auth/file_guard.rs               # permissions() 改 symlink_metadata（与 O_NOFOLLOW 同一个问题）
+    src/auth/report.rs                   # + file_readable / lines_without_verdict()
+    src/errors.rs                        # + engine_exit_code() / server_answered()
+    tests/common/doctor.rs               # 两个端到端 suite 共用的 fixture
+    tests/doctor_e2e.rs                  # 环境半边：13 个 wiremock 端到端
+    tests/doctor_spec_e2e.rs             # spec 半边：6 个 wiremock 端到端
     tests/doctor_golden.rs               # 2 个 golden
     tests/golden/doctor_report.txt
 ```
+
+R2 修复把三个文件推过了 800 行,`tests/limits.rs` 当场抓到。按**职责**而不是按行数拆:
+- `checks.rs` 923 → 479 + `credentials.rs` 455:前者问「一次请求会怎样」,后者问「凭证库长什么样」——
+  R2 F1 的整个争点就是这两个问题对同一个目录给出不同答案,所以它们本来就该是两个文件。
+  三个 fact 值转换(`optional` / `optional_number` / `path_value`)移进 `report.rs`,
+  因为两个 check 模块都要产出 fact,而「缺失值渲染成什么」有两份就会分叉。
+- `auth/error.rs` 808 → 737:`condition()` 的测试移进 `auth/report.rs`——它保护的性质是**那个**模块的
+  (「描述不得带裁决」),放在消费方比放在定义方更能说明为什么。
+- `tests/doctor_e2e.rs` 878 → 510 + `doctor_spec_e2e.rs` 213 + `common/doctor.rs` 200:
+  环境半边与 spec 半边是不同主题、不同 fixture(与 `common/cache.rs` 因同样理由存在的先例一致)。
 
 ### References
 
@@ -246,6 +262,66 @@ N3 是审查者点名要求的那条:它证明「文件过宽必须 0 请求」�
 - `check-all.sh` 抓到一个我自己漏掉的 clippy `doc_lazy_continuation`(新 doc 注释里一行以 `-` 开头
   被当成列表项)。这正是那个脚本存在的理由:我在加完注释后只跑了 `cargo test`。
 
+### R2 对抗审查处置(deepseek-v4-pro,只读)
+
+R2 结论:可合并,无 BLOCKER 无 MAJOR,5 个 MINOR。三条 R1 处置的核心行为判定正确、被敏感测试钉住;
+抽查 4 条变异(含点名的 N3)全红。**5 条 MINOR 全部已修**,它们的共同点是「报告说了不实的话」——
+退出码都对,但一份会说假话的诊断报告比没有诊断更糟。
+
+**F1(最重要)—— R1 那个 MAJOR 的文本残留。** 目录 0777 + 文件 0600 时,退出码、JSON 字段名、summary
+都已改对,但 detail 块还站在旧裁决那一边:`directory_problem` 仍含「refusing to use it」,detail 仍有
+`usable: no`(来自复合 `usable`),而同一份报告里紧挨着的是**真的用了这个文件**的 `connectivity: ok`。
+- 「refusing to use it」对**写路径与 lock 路径**为真(那里确实拒绝),对 doctor 走的**读路径**为假
+  (`read_checked` 不看目录),所以不能删——它在自己的语境里是对的。修法是在**转成描述的那一刻**分叉:
+  新增 `StoreError::condition()`(穷举 match),只陈述事实(哪个目录、什么 mode、意味着什么),
+  不带裁决也不带 `chmod` 指令;`credential_health` 的 `directory_problem` 改用它。`Display` 一字未改,
+  写路径的报错照旧。测试把两种措辞放在一起断言(`condition_tests`)。
+- `usable: no`:`CredentialHealth::lines()` 拆成共享的 `where_lines()` + `what_lines()`,
+  `lines()`(auth info,输出逐字节不变)插入复合 verdict 行,新增 `lines_without_verdict()`(doctor)不插。
+  两种渲染共用其余每一行,所以将来新增字段不可能只出现在一边;
+  `the_verdict_free_rendering_drops_only_the_usable_line` 断言「差异恰好是那一行」。
+
+**F3 —— dangling symlink 被判成「文件不存在/可用」。** `permissions()` 用**跟随链接**的 `fs::metadata`,
+dangling 时回 NotFound→`Missing`→`exists=false`,于是 `file_readable = !exists || …` 的 `!exists`
+短路把 `loaded=None` 的拒绝信号吞掉;而 `read_checked` 用 `O_NOFOLLOW`,对同一路径报 ELOOP。
+修法:`permissions()` 改用 `symlink_metadata`,并对 symlink 单独返回
+`Unknown{"it is a symbolic link, and a credential file is never one"}`——即**问与读路径同一个问题**。
+于是 dangling/非 dangling symlink 都是 Problem/2,报告说「symbolic link」而不是「does not exist yet」。
+`grade` 上那句声称也改成了实际成立的话(并写明它成立**是因为**不跟随链接,而不是天然如此)。
+
+**F5 —— `reachable: true` 说「实例答了」,而请求根本没发出。** `OUTLINE_API_KEY` 含换行时
+`EngineError::InvalidRequest` → `Usage(2)`,旧逻辑 `reachable = code != Network` 把它判成 answered。
+根因是**用退出码推断一个退出码回答不了的问题**:`Usage` 既是「本地拼不出请求」(未发出)也是
+「参数被 spec 拒」(未发出),`Failure` 既是「client 建不起来」(未发出)也是「回包不是 JSON」(发出且答了)。
+修法:新增 `errors::server_answered(&EngineError)`(穷举 match,新变体必须自己回答)+
+`auth::instance_answered(&AuthError)`(OAuth 失败一律 false——那是 token 端点答的,不是实例),
+`reachable` 与 summary 都由它决定。端到端断言 mock **收到 0 个请求**,这才是让这条断言敏感的东西。
+
+**F4 —— 「文件健全(文件不存在)」。** 文件缺失 + 目录 0777 时 Warn summary 无条件拼
+`permissions.describe()`,一句话里既说 sound 又说 does not exist。已按 `!health.exists` 分叉。
+
+**F2 —— `auth info --json` 给了判断却不给依据。** `credential_file_usable` 是**复合**值(含目录),
+可能因为目录而 false,而同一份 JSON 里没有任何字段能解释它(`directory_problem`/`directory_mode`
+原先只在 human 行)。按裁决**加性**补上 `credential_directory` / `credential_directory_mode` /
+`credential_directory_problem`,**不改** `credential_file_usable` 的名字或语义(已发布的 semver 面)。
+命名不一致(`credential_file_usable` 复合 vs doctor 的 `file_usable` 仅文件)作为已知旧命名问题保留。
+
+R2 修复的变异验证(9 条,全红):
+
+| # | 改坏了什么 | 转红的测试 |
+|---|-----------|-----------|
+| P1 | detail 又用复合 `lines()` | `a_directory_only_warning_never_claims_the_store_was_refused` + 端到端 0777 |
+| P1b | `directory_problem` 又用 `to_string()`(带 refusing) | 端到端 0777 |
+| P2 | `auth info` 丢掉解释字段 | `a_directory_problem_is_explained_in_the_same_json` |
+| P3 | `permissions()` 又跟随链接 | 3 个(file_guard 单测 + report 单测 + 端到端 dangling) |
+| P3b | symlink 按目标 mode 分类 | 同上 3 个 |
+| P4 | 缺失文件又被称作 sound | `a_warning_about_the_directory_of_an_absent_file_says_the_file_is_absent` |
+| P5 | `reachable` 又由退出码推断 | `a_credential_that_cannot_be_sent_is_not_reported_as_an_answer` |
+| P5b | 未发出的请求又描述成 answered | 同上 + `an_unsent_request_is_never_described_as_an_answer` |
+| P5c | `server_answered` 一律 true | 3 个(errors/auth 单测 + 端到端) |
+
+R1 的 6 条与最初的 17 条在本轮改动后**全部重跑**,仍全红(M7/N5/N6 的补丁位置随重构更新)。
+
 ### 真实 Linux 验证(Docker)与两个**非本 story**的发现
 
 `--lib` 全量 423 个单测(含 doctor 28 + `auth::report` 3)、`doctor_e2e` 17、`doctor_golden` 2、
@@ -269,6 +345,6 @@ N3 是审查者点名要求的那条:它证明「文件过宽必须 0 请求」�
 
 ### Completion Notes
 
-- 新增 51 个测试（28 单测 + 17 端到端 + 2 golden + 3 auth::report 单测 + 1 speccompile）。
+- 新增 72 个测试（doctor 31 单测 + 19 端到端 + 2 golden + auth::report 7 + auth::error 3 + auth::file_guard 1 + errors 1 + auth 1 + auth::output 2 + speccompile 1 + 其余既有文件内的补充）。
 - 不新增退出码；`docs/exit-codes.md` 登记了 doctor 的四条规则，README 的表由它派生（未变）。
 - 网络入口零新增：`tests/no_phone_home.rs` 的收敛表未改动。

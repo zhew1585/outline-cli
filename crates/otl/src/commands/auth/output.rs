@@ -191,7 +191,17 @@ fn info_value(
         "credential_file": health.path.display().to_string(),
         "credential_file_exists": health.exists,
         "credential_file_permissions": health.permissions.describe(),
+        // The STORE-wide verdict: it folds in the directory around the file,
+        // so the three directory fields below exist to explain it. Without
+        // them a consumer sees `credential_file_usable: false` next to
+        // `credential_file_permissions: "0600 (owner read/write only)"` and
+        // has nothing in the same object that accounts for the false - the
+        // reason was only ever in the human lines. Added rather than
+        // renamed: this key is published, and its meaning is unchanged.
         "credential_file_usable": health.usable,
+        "credential_directory": health.directory.display().to_string(),
+        "credential_directory_mode": health.directory_mode,
+        "credential_directory_problem": health.directory_problem,
         "resolution_error": resolved.as_ref().err(),
     })
 }
@@ -369,6 +379,93 @@ mod tests {
         assert!(rendered.contains("0644"), "{rendered}");
         assert!(rendered.contains("unavailable"), "{rendered}");
         assert!(rendered.contains("not usable"), "{rendered}");
+    }
+
+    /// A `false` verdict has to be explicable from the same object.
+    ///
+    /// `credential_file_usable` is the STORE-wide answer, so it can be false
+    /// because of the directory while the file's own permissions are
+    /// perfect. Before these three fields a consumer saw
+    /// `credential_file_usable: false` beside
+    /// `credential_file_permissions: "0600 (owner read/write only)"` and had
+    /// nothing to account for it - the reason was only in the human lines.
+    #[test]
+    fn a_directory_problem_is_explained_in_the_same_json() {
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/home/u/.config/outline-cli/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: false,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/home/u/.config/outline-cli"),
+            directory_mode: Some("0777".to_string()),
+            directory_problem: Some("it is writable by other users (permissions 0777)".to_string()),
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let output = info_output(
+            "default",
+            &Ok("https://docs.example.com".to_string()),
+            &health,
+            &Ok(None),
+            &None,
+            &None,
+        );
+        assert_eq!(output.value["credential_file_usable"], Value::from(false));
+        // The file's own state is sound, so the false must be explained by
+        // the directory - and it is, in the same object.
+        assert_eq!(
+            output.value["credential_file_permissions"],
+            Value::from("0600 (owner read/write only)")
+        );
+        assert_eq!(
+            output.value["credential_directory_mode"],
+            Value::from("0777")
+        );
+        assert!(
+            output.value["credential_directory_problem"]
+                .as_str()
+                .is_some_and(|text| text.contains("0777")),
+            "{}",
+            output.value
+        );
+        assert_eq!(
+            output.value["credential_directory"],
+            Value::from("/home/u/.config/outline-cli")
+        );
+    }
+
+    #[test]
+    fn a_healthy_directory_reports_no_problem_and_still_reports_its_mode() {
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/tmp/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: true,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/tmp"),
+            directory_mode: Some("0700".to_string()),
+            directory_problem: None,
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let output = info_output(
+            "default",
+            &Ok("https://docs.example.com".to_string()),
+            &health,
+            &Ok(None),
+            &None,
+            &None,
+        );
+        assert_eq!(output.value["credential_directory_problem"], Value::Null);
+        assert_eq!(
+            output.value["credential_directory_mode"],
+            Value::from("0700")
+        );
     }
 
     #[test]

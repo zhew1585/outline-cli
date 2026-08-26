@@ -78,6 +78,48 @@ pub fn engine_exit_code(error: &EngineError) -> ExitCode {
     classify(error).0
 }
 
+/// Whether the server answered, i.e. whether the request left this machine
+/// AND something came back.
+///
+/// A separate question from the exit code, and it has to be, because one code
+/// covers both answers: `ExitCode::Usage` is a local validation failure for
+/// `UnknownParam` (nothing sent) and also for `InvalidRequest` (a header this
+/// machine could not build, nothing sent), while `ExitCode::Failure` covers
+/// both `ClientBuild` (nothing sent) and `InvalidResponse` (very much sent).
+/// `otl doctor` reports this as a FACT (`reachable`), so guessing it from the
+/// code makes the report claim a server answered when nothing was ever sent.
+///
+/// Exhaustive on purpose: a new variant has to answer the question rather
+/// than inherit a default.
+pub fn server_answered(error: &EngineError) -> bool {
+    match error {
+        // These are all readings OF a response, so there was one.
+        EngineError::Api { .. }
+        | EngineError::RateLimited { .. }
+        | EngineError::InvalidResponse { .. }
+        | EngineError::Pagination { .. }
+        | EngineError::InvalidPaginationSpec { .. } => true,
+        // A transport failure MAY have arrived - the reply is what went
+        // missing - so a report must not claim it did. `docs/exit-codes.md`
+        // says the same thing about code 7.
+        EngineError::Transport { .. } => false,
+        // Never left this machine: refused by local validation, by the
+        // credential source, or by the client builder.
+        EngineError::Credential(_)
+        | EngineError::InvalidBaseUrl { .. }
+        | EngineError::InvalidRequest { .. }
+        | EngineError::ClientBuild(_)
+        | EngineError::UnknownParam { .. }
+        | EngineError::MissingParam { .. }
+        | EngineError::ComplexParam { .. }
+        | EngineError::InvalidParamValue { .. }
+        | EngineError::InexactNumber { .. }
+        | EngineError::UnionBody { .. }
+        | EngineError::UnsupportedBodyType { .. }
+        | EngineError::InvalidRequestBody { .. } => false,
+    }
+}
+
 /// Pick the exit code and compose the top-level message for an engine error.
 fn classify(error: &EngineError) -> (ExitCode, String) {
     match error {
@@ -236,6 +278,47 @@ mod tests {
             code: code.map(str::to_string),
             message: message.to_string(),
         }
+    }
+
+    /// The question `otl doctor` reports as `reachable`, and why it cannot be
+    /// read off the exit code: `Usage` and `Failure` each cover one error
+    /// that was sent and one that never left the machine.
+    #[test]
+    fn a_request_that_never_left_is_not_an_answer() {
+        // Sent, and answered.
+        assert!(server_answered(&api(401, None, "nope")));
+        assert!(server_answered(&EngineError::RateLimited {
+            origin: "https://docs.example.com".to_string(),
+            retries: 3,
+        }));
+        // Never sent - and note that this one is `Usage`, the same code as a
+        // parameter the spec rejected, while a response that is not JSON is
+        // `Failure`, the same code as a client that could not be built.
+        assert!(!server_answered(&EngineError::InvalidRequest {
+            reason: "a header value contains characters that are not valid in HTTP".to_string(),
+        }));
+        assert!(!server_answered(&EngineError::InvalidBaseUrl {
+            reason: "no host".to_string(),
+        }));
+        assert!(!server_answered(&EngineError::MissingParam {
+            operation: "auth.info".to_string(),
+            name: "id".to_string(),
+            ty: engine::ir::ParamType::String,
+        }));
+        // The exit codes of an unsent and an answered failure can be equal,
+        // which is the whole reason this function exists.
+        let unsent = EngineError::InvalidRequest {
+            reason: "bad header".to_string(),
+        };
+        assert_eq!(engine_exit_code(&unsent), ExitCode::Usage);
+        assert_eq!(
+            engine_exit_code(&EngineError::UnknownParam {
+                operation: "auth.info".to_string(),
+                name: "x".to_string(),
+                valid: "none".to_string(),
+            }),
+            ExitCode::Usage
+        );
     }
 
     #[test]

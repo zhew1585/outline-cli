@@ -1,8 +1,13 @@
-//! End-to-end `otl doctor` (Story 4.3, FR23).
+//! End-to-end `otl doctor`: the ENVIRONMENT half (Story 4.3).
+//!
+//! Config file, instance URL, credential file, the credential a request
+//! would carry, and whether the instance answers. The spec half - which
+//! operation table is in use, and how it differs from the online API
+//! description - is `doctor_spec_e2e.rs`.
 //!
 //! Every case runs the real binary against wiremock servers and throwaway
-//! directories: no test touches the real network, the developer's credential
-//! file, or their spec cache (`common::isolate`).
+//! directories (`common::doctor`): no test touches the real network, the
+//! developer's credential file, or their spec cache.
 //!
 //! Two properties get most of the attention here, because they are the ones
 //! a report can get wrong while still looking right:
@@ -14,192 +19,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::Path;
-
-use assert_cmd::Command;
-use serde_json::{json, Value};
-use tempfile::TempDir;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use otl::auth::credentials::{CredentialFile, CredentialStore};
+use serde_json::Value;
 
 mod common;
-
-/// Path the mock spec host serves the document from.
-const SPEC_PATH: &str = "/openapi/spec3.json";
-
-/// An address nothing listens on: port 1 is reserved and a loopback IP
-/// literal, so the transport rule allows plain `http` for it.
-const DEAD: &str = "http://127.0.0.1:1";
-
-/// An operation the vendored spec certainly has.
-const KNOWN_OP: &str = "documents.info";
-/// An operation name no vendored spec has.
-const NEW_OP: &str = "things.brandNew";
-
-/// A document declaring exactly the named operations.
-fn document(ops: &[&str]) -> String {
-    let entries: Vec<String> = ops
-        .iter()
-        .map(|name| {
-            format!(
-                r#""/{name}":{{"post":{{"summary":"An operation",
-                   "requestBody":{{"content":{{"application/json":{{"schema":{{
-                     "type":"object","properties":{{"id":{{"type":"string"}}}}}}}}}}}}}}}}"#
-            )
-        })
-        .collect();
-    format!(r#"{{"openapi":"3.0.0","paths":{{{}}}}}"#, entries.join(","))
-}
-
-/// A document declaring `KNOWN_OP` and marking it deprecated.
-fn deprecated_document() -> String {
-    format!(
-        r#"{{"openapi":"3.0.0","paths":{{"/{KNOWN_OP}":{{"post":{{
-             "summary":"An operation","deprecated":true}}}}}}}}"#
-    )
-}
-
-/// A spec host serving `body` at [`SPEC_PATH`].
-async fn spec_host(body: String) -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(SPEC_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_string(body))
-        .mount(&server)
-        .await;
-    server
-}
-
-/// An Outline instance answering `auth.info` with `status`.
-async fn instance(status: u16) -> MockServer {
-    let server = MockServer::start().await;
-    let body = json!({
-        "data": {
-            "user": { "name": "Alice Example", "email": "alice@example.com" },
-            "team": { "name": "Acme" }
-        }
-    });
-    let response = if status == 200 {
-        ResponseTemplate::new(200).set_body_json(body)
-    } else {
-        ResponseTemplate::new(status).set_body_json(json!({ "error": "unauthorized" }))
-    };
-    Mock::given(method("POST"))
-        .and(path("/api/auth.info"))
-        .respond_with(response)
-        .mount(&server)
-        .await;
-    server
-}
-
-/// An Outline instance answering `auth.info` with 200 and a body that is not
-/// JSON at all - a captive portal, a proxy error page, an HTML login form.
-async fn instance_answering(body: &'static str) -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/auth.info"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(body))
-        .mount(&server)
-        .await;
-    server
-}
-
-/// Everything a `doctor` run needs pointed somewhere harmless.
-struct Env {
-    /// The credential directory (empty unless a test seeds it).
-    config_dir: TempDir,
-    /// A cache directory, when a test needs a real one. `common::isolate`
-    /// otherwise points the CLI at a directory that cannot contain a cache.
-    cache_dir: Option<TempDir>,
-}
-
-impl Env {
-    fn new() -> Self {
-        Self {
-            config_dir: tempfile::tempdir().unwrap(),
-            cache_dir: None,
-        }
-    }
-
-    fn dir(&self) -> &Path {
-        self.config_dir.path()
-    }
-
-    /// Put something that is not a cache where the cache belongs.
-    fn with_damaged_cache(mut self) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ir-cache.bin"), b"this is not a cache").unwrap();
-        self.cache_dir = Some(dir);
-        self
-    }
-
-    /// Store an API key for the default profile, bound to `base`.
-    fn seed_key(&self, base: &str, key: &str) {
-        let store = CredentialStore::at(self.dir().to_path_buf());
-        let mut file = CredentialFile::default();
-        let entry = file.profile_mut("default");
-        entry.origin = engine::base_url_origin(base);
-        entry.api_key = Some(key.to_string());
-        store.save(&file).unwrap();
-    }
-
-    /// `otl doctor` with the given extra arguments and environment.
-    fn command(&self, url: Option<&str>, key: Option<&str>, args: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("otl").unwrap();
-        common::isolate(&mut cmd);
-        cmd.env("OUTLINE_CONFIG_DIR", self.dir())
-            .env_remove("OUTLINE_URL")
-            .env_remove("OUTLINE_API_KEY");
-        if let Some(cache) = &self.cache_dir {
-            cmd.env(common::CACHE_DIR_ENV, cache.path());
-        }
-        if let Some(url) = url {
-            cmd.env("OUTLINE_URL", url);
-        }
-        if let Some(key) = key {
-            cmd.env("OUTLINE_API_KEY", key);
-        }
-        cmd.arg("doctor").arg("--json").args(args);
-        cmd
-    }
-}
-
-/// Run a command off the async runtime; returns (stdout, stderr, exit code).
-async fn run(mut cmd: Command) -> (String, String, i32) {
-    tokio::task::spawn_blocking(move || {
-        let output = cmd.output().unwrap();
-        (
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-            output.status.code().unwrap_or(-1),
-        )
-    })
-    .await
-    .unwrap()
-}
-
-/// The report object, which must be printed whatever the exit code.
-fn parse(stdout: &str) -> Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|error| panic!("stdout is not the JSON report ({error}): {stdout}"))
-}
-
-/// One check out of a report.
-fn check<'a>(report: &'a Value, key: &str) -> &'a Value {
-    report["checks"]
-        .as_array()
-        .expect("checks is an array")
-        .iter()
-        .find(|check| check["check"] == key)
-        .unwrap_or_else(|| panic!("no {key} check in {report}"))
-}
-
-/// How many requests a mock server received.
-async fn hits(server: &MockServer) -> usize {
-    server.received_requests().await.map_or(0, |all| all.len())
-}
+use common::doctor::{check, hits, instance, instance_answering, parse, run, spec_host};
+use common::doctor::{document, Env, DEAD, KNOWN_OP, SPEC_PATH};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_working_environment_reports_every_check_and_exits_zero() {
@@ -388,134 +212,6 @@ async fn offline_contacts_neither_the_instance_nor_the_spec_host() {
     assert_eq!(hits(&specs).await, 0, "--offline fetched a document");
 }
 
-/// FR23, first half: an operation the online API declares and this build
-/// does not is reported by name, with the command that fixes it. The
-/// instance is deliberately unreachable, so this also shows the online
-/// comparison still runs when the instance check has already failed.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_online_comparison_names_missing_and_withdrawn_operations() {
-    let specs = spec_host(document(&[KNOWN_OP, NEW_OP])).await;
-    let env = Env::new();
-    let (stdout, _, _) = run(env.command(
-        Some(DEAD),
-        Some("test-key"),
-        &["--spec-url", &format!("{}{SPEC_PATH}", specs.uri())],
-    ))
-    .await;
-
-    let report = parse(&stdout);
-    let online = check(&report, "online-spec");
-    assert_eq!(online["status"], Value::from("warn"), "{online}");
-    assert_eq!(online["checked"], Value::from(true));
-    assert_eq!(online["missing"], json!([NEW_OP]), "{online}");
-    // Everything the built-in table has and this document does not.
-    let withdrawn = online["withdrawn"].as_array().unwrap();
-    assert!(
-        withdrawn.len() > 100 && !withdrawn.contains(&Value::from(KNOWN_OP)),
-        "{online}"
-    );
-    // Named in the human-readable detail as well, with the remedy.
-    let detail = online["detail"].to_string();
-    assert!(detail.contains(NEW_OP), "{detail}");
-    assert!(detail.contains("otl spec sync"), "{detail}");
-    assert_eq!(hits(&specs).await, 1, "one document fetch, no more");
-}
-
-/// FR23, second half: an operation the online API marks deprecated and this
-/// build still offers.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_deprecated_operation_this_build_still_offers_is_reported() {
-    let specs = spec_host(deprecated_document()).await;
-    let env = Env::new();
-    let (stdout, _, _) = run(env.command(
-        Some(DEAD),
-        Some("test-key"),
-        &["--spec-url", &format!("{}{SPEC_PATH}", specs.uri())],
-    ))
-    .await;
-
-    let report = parse(&stdout);
-    let online = check(&report, "online-spec");
-    assert_eq!(online["deprecated"], json!([KNOWN_OP]), "{online}");
-    assert!(
-        online["detail"].to_string().contains("deprecated online"),
-        "{online}"
-    );
-    assert_eq!(online["status"], Value::from("warn"));
-}
-
-/// A spec host that cannot be reached is a WARNING: the CLI dispatches from
-/// its local table, so the environment still works. The exit code must not
-/// come from a third-party host.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unreachable_spec_source_is_a_warning_and_not_the_exit_code() {
-    let api = instance(200).await;
-    let env = Env::new();
-    let (stdout, _, code) = run(env.command(
-        Some(&api.uri()),
-        Some("test-key"),
-        &["--spec-url", &format!("{DEAD}{SPEC_PATH}")],
-    ))
-    .await;
-
-    assert_eq!(code, 0, "a spec host must not fail a doctor run: {stdout}");
-    let report = parse(&stdout);
-    let online = check(&report, "online-spec");
-    assert_eq!(online["status"], Value::from("warn"), "{online}");
-    assert_eq!(online["checked"], Value::from(false));
-    assert_eq!(report["healthy"], Value::from(true));
-    // The message talks about the spec source, never about the API key or
-    // the instance URL, neither of which is involved in fetching a document.
-    let detail = online["detail"].to_string();
-    assert!(!detail.contains("OUTLINE_API_KEY"), "{detail}");
-    assert!(!detail.contains("OUTLINE_URL"), "{detail}");
-}
-
-/// A document whose operation name carries terminal escapes is refused, and
-/// nothing it contained reaches either stream as an executable byte.
-///
-/// Three layers already close this: the compiler rejects the name, the
-/// rejection renders it with `Debug` (which escapes control characters as
-/// text), and `doctor`'s own rendering scrubs at the sink. This is the
-/// regression guard over all three - a change that echoed the name raw
-/// would fail here.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_hostile_document_is_refused_and_nothing_executable_is_printed() {
-    // The escapes are written as JSON escapes, so the document the server
-    // serves carries real ESC and BEL bytes while this source file does not.
-    let hostile = concat!(
-        r#"{"openapi":"3.0.0","paths":{"/things\u001b]52;c;cGF3bmVk\u0007.info":"#,
-        r#"{"post":{"summary":"x"}}}}"#
-    )
-    .to_string();
-    let specs = spec_host(hostile).await;
-    let env = Env::new();
-    let (stdout, stderr, code) = run(env.command(
-        Some(DEAD),
-        Some("test-key"),
-        &["--spec-url", &format!("{}{SPEC_PATH}", specs.uri())],
-    ))
-    .await;
-
-    // The exit code is the instance's (unreachable), never the document's.
-    assert_eq!(code, 7, "{stdout}{stderr}");
-    let report = parse(&stdout);
-    let online = check(&report, "online-spec");
-    assert_eq!(online["status"], Value::from("warn"), "{online}");
-    assert_eq!(online["checked"], Value::from(false));
-    assert!(
-        online["detail"].to_string().contains("cannot be used"),
-        "the refusal must be reported: {online}"
-    );
-    for (stream, text) in [("stdout", &stdout), ("stderr", &stderr)] {
-        assert!(
-            !text.contains('\u{1b}'),
-            "an escape sequence reached {stream}: {text}"
-        );
-        assert!(!text.contains('\u{7}'), "a BEL reached {stream}: {text}");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_report_never_carries_a_credential_or_a_fragment_of_one() {
     let api = instance(200).await;
@@ -551,38 +247,6 @@ async fn the_report_never_carries_a_credential_or_a_fragment_of_one() {
             .contains("api key"),
         "{report}"
     );
-}
-
-/// A cache that cannot be used is documented as NOT an error: the CLI
-/// discards it and falls back to the spec built into the binary. `doctor`
-/// must therefore warn, name the remedy, and still exit 0.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_damaged_spec_cache_is_a_warning_and_the_built_in_table_is_used() {
-    let api = instance(200).await;
-    let env = Env::new().with_damaged_cache();
-    let (stdout, stderr, code) =
-        run(env.command(Some(&api.uri()), Some("test-key"), &["--offline"])).await;
-
-    assert_eq!(code, 0, "a damaged cache must not fail a run: {stdout}");
-    let report = parse(&stdout);
-    let local = check(&report, "local-spec");
-    assert_eq!(local["status"], Value::from("warn"), "{local}");
-    // The built-in table is in use, and the report says which.
-    assert_eq!(local["synced"], Value::from(false));
-    assert!(local["operations"].as_u64().unwrap() > 100, "{local}");
-    let detail = local["detail"].to_string();
-    assert!(detail.contains("damaged"), "{detail}");
-    assert!(
-        detail.contains("otl spec sync") || detail.contains("otl spec reset"),
-        "the remedy must be named: {detail}"
-    );
-    // The path of the offending file, so the user can look at it.
-    assert!(
-        detail.contains("ir-cache.bin"),
-        "the cache file must be named: {detail}"
-    );
-    // The CLI's own one-line warning is on stderr, where diagnostics go.
-    assert!(stderr.contains("spec cache"), "{stderr}");
 }
 
 /// A config file that cannot be parsed is the FIRST thing to fix, so it is
@@ -654,11 +318,30 @@ async fn a_writable_directory_around_a_sound_file_is_a_warning() {
     // The FILE is fine, and the report says so rather than calling the store
     // unusable while going on to use it.
     assert_eq!(credentials["file_usable"], Value::from(true));
+    let problem = credentials["directory_problem"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        credentials["directory_problem"]
-            .as_str()
-            .is_some_and(|text| text.contains("0777")),
+        problem.contains("0777"),
         "the actual mode must be reported: {credentials}"
+    );
+    // R2 F1: the text has to agree with what the run then DOES. "refusing to
+    // use it" is true of the write path, which is where that sentence comes
+    // from; the read path this check describes does not look at the
+    // directory at all, and `connectivity` below used the file.
+    assert!(
+        !problem.contains("refusing"),
+        "the report must not claim a refusal it did not perform: {problem}"
+    );
+    let detail = credentials["detail"].to_string();
+    assert!(
+        !detail.contains("usable:"),
+        "the store-wide verdict must not appear beside a check that used the \
+         file: {detail}"
+    );
+    assert!(
+        !detail.contains("refusing"),
+        "the detail must not claim a refusal either: {detail}"
     );
     // And the credential in that file is the one a request would carry.
     assert_eq!(
@@ -702,38 +385,6 @@ async fn a_writable_directory_does_not_stop_the_instance_from_being_checked() {
     restore.unwrap();
 }
 
-/// A `--spec-url` the fetch channel refuses locally is the INVOCATION being
-/// wrong, not a third party failing: exit 2, like `otl spec sync` gives the
-/// same mistake. A spec host that is merely unreachable stays a warning
-/// (`an_unreachable_spec_source_is_a_warning_and_not_the_exit_code`).
-#[tokio::test(flavor = "multi_thread")]
-async fn an_invalid_spec_url_is_a_usage_problem_not_a_warning() {
-    let api = instance(200).await;
-    let env = Env::new();
-    let (stdout, stderr, code) = run(env.command(
-        Some(&api.uri()),
-        Some("test-key"),
-        &["--spec-url", "not-a-url"],
-    ))
-    .await;
-
-    assert_eq!(code, 2, "{stdout}{stderr}");
-    let report = parse(&stdout);
-    let online = check(&report, "online-spec");
-    assert_eq!(online["status"], Value::from("problem"), "{online}");
-    assert_eq!(online["exit_code"], Value::from(2));
-    assert_eq!(online["checked"], Value::from(false));
-    assert!(
-        online["summary"]
-            .as_str()
-            .is_some_and(|text| text.contains("--spec-url")),
-        "the offending flag must be named: {online}"
-    );
-    // Everything else was fine, so this is the finding that decided the code.
-    assert_eq!(report["problems"], Value::from(1), "{report}");
-    assert!(stderr.contains("online-spec"), "{stderr}");
-}
-
 /// An instance that answers 200 with something that is not JSON: exit 1, and
 /// the report must NOT claim the instance could not be reached - it was
 /// reached, and it answered.
@@ -763,4 +414,97 @@ async fn an_instance_answering_with_something_other_than_json_exits_one() {
     assert!(summary.contains("answered"), "{summary}");
     assert!(stderr.contains("connectivity"), "{stderr}");
     assert_eq!(hits(&api).await, 1);
+}
+
+/// A dangling symlink where the credential file belongs: something IS at
+/// that path, and every read of it fails. The report must not call the path
+/// empty and healthy while the credential check refuses it.
+///
+/// The two checks used to disagree here: `permissions()` followed the link,
+/// got `NotFound`, and reported "file does not exist yet / nothing stored
+/// yet", while `read_checked`'s `O_NOFOLLOW` open failed and made
+/// `credential` a problem.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dangling_credential_symlink_is_reported_as_a_file_problem() {
+    let api = instance(200).await;
+    let env = Env::new();
+    std::os::unix::fs::symlink(
+        env.dir().join("nowhere"),
+        env.dir().join("credentials.toml"),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) =
+        run(env.command(Some(&api.uri()), Some("test-key"), &["--offline"])).await;
+
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    let report = parse(&stdout);
+    let credentials = check(&report, "credentials");
+    assert_eq!(credentials["status"], Value::from("problem"), "{report}");
+    assert_eq!(credentials["file_usable"], Value::from(false));
+    // Not "there is nothing there": there is, and it cannot be used.
+    assert_eq!(credentials["credential_file_exists"], Value::from(true));
+    let text = credentials.to_string();
+    assert!(text.contains("symbolic link"), "{text}");
+    assert!(
+        !text.contains("nothing stored yet"),
+        "the path is not empty: {text}"
+    );
+    // And the two checks agree, which is the whole point.
+    assert_eq!(
+        check(&report, "credential")["status"],
+        Value::from("problem"),
+        "{report}"
+    );
+    assert_eq!(hits(&api).await, 0);
+}
+
+/// A credential that cannot be turned into an HTTP header: the request is
+/// never built, so nothing is sent - and the report must not say the
+/// instance answered.
+///
+/// A newline in `OUTLINE_API_KEY` is the failure mode `INVALID_REQUEST_HINT`
+/// exists for. `auth set-key` refuses such a key, but an exported variable
+/// is not validated, so the probe is where it surfaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_that_cannot_be_sent_is_not_reported_as_an_answer() {
+    let api = instance(200).await;
+    let env = Env::new();
+    // Not `--offline`: the probe has to be attempted for this to be about
+    // the probe. The spec source is a dead port, which is only a warning.
+    let (stdout, stderr, code) = run(env.command(
+        Some(&api.uri()),
+        Some("KEY-SECRET-3f1b\nsecond-line"),
+        &["--spec-url", DEAD],
+    ))
+    .await;
+
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    let report = parse(&stdout);
+    let connectivity = check(&report, "connectivity");
+    assert_eq!(connectivity["status"], Value::from("problem"), "{report}");
+    assert_eq!(connectivity["exit_code"], Value::from(2));
+    // The two assertions that matter, and the mock is what makes the second
+    // one mean something.
+    assert_eq!(connectivity["reachable"], Value::from(false));
+    assert_eq!(
+        hits(&api).await,
+        0,
+        "nothing can have been sent: the request could not be built"
+    );
+    let summary = connectivity["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("nothing was sent"),
+        "the summary must say so: {summary}"
+    );
+    assert!(
+        !summary.contains("answered"),
+        "no answer was received: {summary}"
+    );
+    // The key is not echoed anywhere, in any form.
+    for stream in [&stdout, &stderr] {
+        assert!(!stream.contains("SECRET-3f1b"), "the key leaked: {stream}");
+        assert!(!stream.contains("second-line"), "the key leaked: {stream}");
+    }
 }

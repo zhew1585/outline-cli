@@ -47,6 +47,7 @@
 //! background check.
 
 mod checks;
+mod credentials;
 mod drift;
 // Public so that the golden-file test can render a SYNTHETIC report: the
 // real one is a function of the machine it runs on (paths, operation
@@ -125,7 +126,7 @@ fn examine(args: &DoctorArgs, overrides: &Overrides) -> Report {
     let mut all: Vec<Check> = vec![
         checks::configuration(overrides),
         checks::instance(&instance),
-        checks::credentials(&store),
+        credentials::check(&store),
         checks::credential(&chosen, &profile),
         // Consumes the credential: `into_client` is the only thing that can
         // be done with one, by design.

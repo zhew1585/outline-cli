@@ -191,6 +191,30 @@ fn human_line(text: &str) -> String {
     stdio::scrub_terminal_controls(text).replace('\n', " ")
 }
 
+// --- fact values -------------------------------------------------------
+//
+// The small conversions every check uses to build a `--json` fact. They live
+// with the JSON shape rather than with any one check, because both check
+// modules produce facts and a second copy of "how an absent value is
+// rendered" is how two checks come to disagree about `null`.
+
+/// A `Some` string as JSON, `null` otherwise.
+pub(super) fn optional(value: &Option<String>) -> Value {
+    value.clone().map_or(Value::Null, Value::from)
+}
+
+/// A `Some` number as JSON, `null` otherwise.
+pub(super) fn optional_number(value: Option<i64>) -> Value {
+    value.map_or(Value::Null, Value::from)
+}
+
+/// A path as JSON, sanitized because it can come from an environment
+/// variable or a flag, and `null` when there is none.
+pub(super) fn path_value(path: Option<&std::path::Path>) -> Value {
+    path.map(crate::config::sanitize_path)
+        .map_or(Value::Null, Value::from)
+}
+
 /// Everything `otl doctor` found.
 #[derive(Debug, Clone)]
 pub struct Report {

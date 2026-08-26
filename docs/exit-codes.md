@@ -117,13 +117,23 @@ Notes:
     the caller owns (the ownership check is on the open descriptor, and symlinks are refused), cannot read
     the `0600` file, and Story 2.6 deliberately does not re-permission an existing directory. The residual
     risk is deletion or a replacement that then gets refused - nuisance, not disclosure - and no other
-    command fails in that state either, so `doctor` must not.
+    command fails in that state either, so `doctor` must not. The *text* obeys the same rule: a report
+    that is about to use the file does not print the store-wide "usable: no", and does not repeat the
+    write path's "refusing to use it" - that sentence is true where a write or the refresh lock is
+    refused, and false of the read this report describes. A symlink at the credential path, dangling or
+    not, is a FILE problem (code 2): the read opens `O_NOFOLLOW`, so the report is built from
+    `symlink_metadata` and gives the same answer rather than calling the path empty.
   - **The report is always printed**, before the code is decided and whatever the code turns out to be.
     A `--json` consumer gets the same object on every run; a blocking finding is additionally summarized
     on stderr, naming the check it came from. The connectivity summary never overstates what happened:
     only a transport failure (7) says the instance could not be reached, because only that code means the
     request may never have arrived. A 401, a 500 or a non-JSON body all report that the instance answered,
-    and `"reachable"` is `true` for them.
+    and `"reachable"` is `true` for them. A failure that never left this machine - a credential that
+    cannot be expressed as an HTTP header, a stored session that could not be renewed before the call -
+    reports `"reachable": false` and says nothing was sent. That distinction cannot be read off the exit
+    code, which is why it is decided separately: code 2 covers both a header this machine could not build
+    (nothing sent) and a parameter the spec refused (nothing sent), while code 1 covers both a client that
+    could not be built (nothing sent) and a reply that was not JSON (sent, and answered).
   - **`doctor` classifies nothing itself.** Every blocking code comes from the same mapper the failing
     command uses (`auth::exit_code_of`, the borrowing half of `map_auth_error`), so a diagnosis cannot
     disagree with the command it is diagnosing.

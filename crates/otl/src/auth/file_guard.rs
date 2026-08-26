@@ -71,8 +71,23 @@ impl Permissions {
 }
 
 /// Inspect the permissions of a credential file without reading it.
+///
+/// Does NOT follow symlinks, and that is the whole point of using
+/// `symlink_metadata` here. The read path opens the file `O_NOFOLLOW` and
+/// refuses a link outright, so a report built on link-following metadata
+/// answers a different question than the one every actual read answers. A
+/// DANGLING link was the case that made the difference visible: following it
+/// fails with `NotFound`, so the path looked empty ("file does not exist
+/// yet", nothing wrong) while every read of it failed - a report that
+/// contradicted the command it was describing.
 pub fn permissions(path: &Path) -> Permissions {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
+        // A link is never a credential file, whatever it points at, so
+        // there are no permission bits worth classifying: the link's own
+        // mode says nothing about the target, and the target is refused.
+        Ok(metadata) if metadata.file_type().is_symlink() => Permissions::Unknown {
+            reason: "it is a symbolic link, and a credential file is never one".to_string(),
+        },
         Ok(metadata) => classify(&metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Permissions::Missing,
         Err(error) => Permissions::Unknown {
@@ -232,4 +247,57 @@ pub fn directory_mode(dir: &Path) -> Option<String> {
 #[cfg(not(unix))]
 pub fn directory_mode(_dir: &Path) -> Option<String> {
     None
+}
+
+/// Unix-only by construction: every test in here is about POSIX permission
+/// bits and symlinks, and Windows has neither to assert on. Gated on the
+/// MODULE rather than on each item, because a `#[cfg(unix)]` test beside a
+/// plain `use super::*` leaves that import unused on Windows - which
+/// `clippy -- -D warnings` fails on there and nowhere else. That is the
+/// mistake `scripts/win-check.sh` exists to catch, and it caught this one.
+#[cfg(all(test, unix))]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `permissions` must answer the question the READ path asks, which is
+    /// asked with `O_NOFOLLOW`: is the thing at this path a file this program
+    /// wrote? A link never is, whatever it points at - and while this
+    /// followed links, a dangling one reported `Missing`, i.e. "nothing
+    /// there, nothing wrong", for a path every read failed on.
+    #[test]
+    fn a_symlink_is_never_classified_by_the_permissions_of_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.toml");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let dangling = dir.path().join("dangling.toml");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+        for path in [&link, &dangling] {
+            match permissions(path) {
+                Permissions::Unknown { reason } => {
+                    assert!(reason.contains("symbolic link"), "{reason}");
+                }
+                other => panic!("a symlink must not be classified as {other:?}"),
+            }
+        }
+        // The target itself, reached directly, is still judged normally.
+        assert_eq!(
+            permissions(&target),
+            Permissions::OwnerOnly {
+                mode: "0600".to_string()
+            }
+        );
+        // And a path with nothing at all at it is still missing.
+        assert_eq!(
+            permissions(&dir.path().join("absent.toml")),
+            Permissions::Missing
+        );
+    }
 }

@@ -15,34 +15,11 @@ use serde_json::Value;
 
 use crate::auth::credentials::CredentialStore;
 use crate::auth::error::StoreError;
-use crate::auth::report::{credential_health, CredentialHealth};
 use crate::auth::{self, AuthError, Identity, Instance, Resolved};
 use crate::config::{self, AuthMethod, ConfigError, EnvLayer, Overrides, ProfileSource, UrlSource};
 use crate::exit::ExitCode;
 
-use super::report::{Check, Status};
-
-/// How credentials are protected where there are no POSIX permission bits.
-///
-/// Stated unconditionally on that platform, not only when a credential file
-/// happens to exist: Story 2.6 AC 6 requires `doctor` to be explicit about
-/// the platform difference, and "no file yet" is exactly when a user is
-/// deciding whether to trust this machine with one. Never printed on Unix,
-/// where it would be false.
-pub const WINDOWS_PROTECTION_NOTE: &str =
-    "on Windows otl sets no permission bits: this platform has none. Protection \
-     relies entirely on the per-user ACL of your profile directory, so keep the \
-     credential directory inside your own user profile.";
-
-/// The platform note for the credential check, if this platform needs one.
-///
-/// A runtime `cfg!` rather than `#[cfg]` so that both arms compile
-/// everywhere and the note's text is testable on every platform - the
-/// pairing itself is asserted by
-/// `the_windows_note_appears_exactly_where_it_is_true`.
-pub fn protection_note() -> Option<&'static str> {
-    cfg!(windows).then_some(WINDOWS_PROTECTION_NOTE)
-}
+use super::report::{optional, optional_number, path_value, Check, Status};
 
 /// Which config file is read, and which profile it selects.
 pub fn configuration(overrides: &Overrides) -> Check {
@@ -101,141 +78,6 @@ pub fn instance(instance: &Result<Instance, AuthError>) -> Check {
         // plaintext `http://` host, a URL with no usable origin - so it
         // carries whatever code that same failure produces in `otl api`.
         Err(error) => problem("instance", error, "no usable instance URL"),
-    }
-}
-
-/// The credential FILE: where it is, whether it may be used, and what it
-/// holds - never what is in it.
-pub fn credentials(store: &Result<CredentialStore, StoreError>) -> Check {
-    let store = match store {
-        Ok(store) => store,
-        Err(error) => {
-            return Check::new(
-                "credentials",
-                Status::Problem(ExitCode::Usage),
-                "the credential store cannot be used",
-            )
-            .detailed([error.to_string()])
-        }
-    };
-    file_check(&credential_health(store))
-}
-
-/// The check for a credential file that could be inspected.
-fn file_check(health: &CredentialHealth) -> Check {
-    let status = grade(health);
-    Check::new("credentials", status.clone(), summary_of(health, &status))
-        .fact("credential_file", health.path.display().to_string())
-        .fact("credential_file_exists", health.exists)
-        .fact("permissions", health.permissions.describe())
-        // The FILE's own verdict, deliberately not the store-wide `usable`
-        // from `auth::report`: that one folds the directory in, and this
-        // check grades the directory separately below. Publishing the
-        // composite here would say "not usable" beside a `connectivity`
-        // check that went ahead and used it.
-        .fact("file_usable", file_is_usable(health))
-        .fact("directory", health.directory.display().to_string())
-        .fact("directory_problem", optional(&health.directory_problem))
-        .fact(
-            "profiles_stored",
-            health
-                .profiles
-                .iter()
-                .map(|profile| {
-                    Value::from(format!(
-                        "{}: {}",
-                        config::sanitize_name(&profile.profile),
-                        profile.kinds().join(", ")
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        )
-        .fact("plaintext_key_in_environment", health.env_api_key)
-        .detailed(health.lines())
-        .detailed(protection_note().map(str::to_string))
-}
-
-/// Whether the credential FILE itself may be used.
-///
-/// The directory around it is a separate question, graded separately by
-/// [`grade`].
-fn file_is_usable(health: &CredentialHealth) -> bool {
-    health.permissions.usable() && health.file_readable
-}
-
-/// How the credential file and the directory around it are graded.
-///
-/// The two are deliberately NOT the same verdict, and this is the one place
-/// that decides:
-///
-/// - **the file itself** unusable - permissions widened, not a regular file,
-///   owned by someone else, malformed, or written by a newer version - is a
-///   PROBLEM (exit 2, see `docs/exit-codes.md`). No command can use it:
-///   `secret_file::read_checked` refuses it on the open descriptor, so
-///   `doctor` and every other command give the same answer, and nothing is
-///   sent.
-/// - **only the directory** being writable by other users, with a sound
-///   owner-only file inside it, is a WARNING, and `credential` and
-///   `connectivity` go on to use that file.
-///
-/// Three things make the warning the honest grade rather than a downgrade:
-///
-/// 1. the file is opened `O_NOFOLLOW` and then checked THROUGH the open
-///    descriptor by `require_regular_owned`, which demands the caller's own
-///    uid. Another user with write access to the directory therefore cannot
-///    plant a file this CLI will read - they cannot create one the victim
-///    owns - and a symlink is refused outright;
-/// 2. the file is 0600, so they cannot read the credential either;
-/// 3. Story 2.6 Task 1 deliberately does NOT re-permission an EXISTING
-///    directory ("silently changing someone's home directory is overreach"),
-///    so refusing to work in one would contradict the story that created it.
-///
-/// What is left is deletion, or replacement with a file that then gets
-/// refused: nuisance and denial of service, not confidentiality or
-/// integrity. That is a warning.
-///
-/// It is still REPORTED, with the directory's actual mode, which is exactly
-/// what Story 2.6 AC 6 asks of `doctor` - report whether permissions are
-/// sound - and a warning cannot change the exit code, which matches
-/// `doctor`'s own rule: a world-writable directory makes no other command
-/// fail, so it is not blocking.
-///
-/// If a later reader sees "world-writable credential directory, exit 0" and
-/// reaches for a fix: that is what this comment is for. It is a decision,
-/// with the reasoning above, and the two tests
-/// `a_writable_directory_around_a_sound_file_is_a_warning` and
-/// `an_over_wide_credential_file_exits_two_before_anything_is_sent` pin both
-/// halves.
-fn grade(health: &CredentialHealth) -> Status {
-    if !file_is_usable(health) {
-        return Status::Problem(ExitCode::Usage);
-    }
-    if health.directory_problem.is_some() {
-        return Status::Warn;
-    }
-    Status::Ok
-}
-
-/// The one-line verdict for the credential check.
-///
-/// Says something the detail block does not repeat: how many profiles hold
-/// anything, plus the permission state. The detail is `auth::report`'s own
-/// rendering, which Story 2.6 owns and which this check must not paraphrase.
-fn summary_of(health: &CredentialHealth, status: &Status) -> String {
-    match status {
-        Status::Problem(_) => "the credential file cannot be used as it stands".to_string(),
-        Status::Warn => format!(
-            "the file is sound ({}), but the directory holding it is not",
-            health.permissions.describe()
-        ),
-        _ if health.profiles.is_empty() => {
-            format!("nothing stored yet ({})", health.permissions.describe())
-        }
-        _ => format!(
-            "{} profile(s) with stored credentials ({})",
-            health.profiles.len(),
-            health.permissions.describe()
-        ),
     }
 }
 
@@ -353,30 +195,52 @@ fn probe(instance: &Instance, resolved: Resolved) -> Check {
         // command - but it does have to describe the outcome, and only one
         // of those outcomes means the instance was never reached.
         Err(error) => {
+            // Two independent questions, and neither is derivable from the
+            // other: `exit_code_of` says how bad it is, `instance_answered`
+            // says whether anything was actually sent and answered. Deriving
+            // the second from the first is what made this check report
+            // `reachable: true` for a request that could not even be built.
             let code = auth::exit_code_of(&error);
-            problem_with("connectivity", &error, code, outcome_summary(code))
-                // Honest in both directions: a 401 or a malformed body means
-                // the instance ANSWERED. Saying `reachable: false` there
-                // would send a user looking at their network for a problem
-                // that is on the server or in their credential.
-                .fact("reachable", code != ExitCode::Network)
+            let answered = auth::instance_answered(&error);
+            problem_with(
+                "connectivity",
+                &error,
+                code,
+                outcome_summary(code, answered),
+            )
+            // Honest in both directions: a 401 or a malformed body means
+            // the instance ANSWERED, and a header this machine could not
+            // build means it never heard from us at all.
+            .fact("reachable", answered)
         }
     }
 }
 
 /// How to describe a failed probe, without claiming more than is known.
 ///
-/// Only a transport failure (code 7) means the request may never have
-/// arrived - `docs/exit-codes.md` says so explicitly - so it is the only
-/// outcome allowed to say "could not be reached".
-fn outcome_summary(code: ExitCode) -> &'static str {
-    match code {
-        ExitCode::Network => "the instance could not be reached",
-        ExitCode::Auth => "the instance answered, and rejected the credential",
-        ExitCode::Server => "the instance answered with a server error",
-        ExitCode::RateLimited => "the instance answered, and is rate-limiting this client",
-        ExitCode::NotFound => "the instance answered, but has no such operation",
-        _ => "the instance answered, but not with something usable",
+/// `answered` decides the half of the sentence that matters most: whether
+/// the instance was heard from at all. It is passed in rather than inferred
+/// from `code`, because one code covers both cases - `Usage` is a header
+/// this machine could not build (nothing sent) as well as a parameter the
+/// spec rejected (nothing sent), while `Failure` is both a client that could
+/// not be built (nothing sent) and a response that was not JSON (sent, and
+/// answered). Only a transport failure is allowed to say "could not be
+/// reached": `docs/exit-codes.md` says code 7 is the one that may never have
+/// arrived.
+fn outcome_summary(code: ExitCode, answered: bool) -> &'static str {
+    match (answered, code) {
+        (false, ExitCode::Network) => "the instance could not be reached",
+        // A credential that could not be renewed fails at the token
+        // endpoint, before any request to the instance.
+        (false, ExitCode::Auth) => {
+            "nothing was sent: the stored credential could not be renewed first"
+        }
+        (false, _) => "nothing was sent: the request could not even be built locally",
+        (true, ExitCode::Auth) => "the instance answered, and rejected the credential",
+        (true, ExitCode::Server) => "the instance answered with a server error",
+        (true, ExitCode::RateLimited) => "the instance answered, and is rate-limiting this client",
+        (true, ExitCode::NotFound) => "the instance answered, but has no such operation",
+        (true, _) => "the instance answered, but not with something usable",
     }
 }
 
@@ -439,23 +303,6 @@ fn skipped(key: &'static str, reason: &str) -> Check {
     Check::new(key, Status::Skipped, reason.to_string())
 }
 
-/// A `Some` string as JSON, `null` otherwise.
-fn optional(value: &Option<String>) -> Value {
-    value.clone().map_or(Value::Null, Value::from)
-}
-
-/// A `Some` number as JSON, `null` otherwise.
-fn optional_number(value: Option<i64>) -> Value {
-    value.map_or(Value::Null, Value::from)
-}
-
-/// A path as JSON, sanitized because it can come from an environment
-/// variable or a flag, and `null` when there is none.
-fn path_value(path: Option<&std::path::Path>) -> Value {
-    path.map(config::sanitize_path)
-        .map_or(Value::Null, Value::from)
-}
-
 /// Which layer supplied the base URL, phrased for a report.
 fn url_layer(instance: &Instance) -> &'static str {
     match instance.settings().url_source() {
@@ -496,192 +343,48 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::auth::credentials::CredentialFile;
-    use crate::auth::secret_file::Permissions;
 
-    /// The platform note is present exactly where it is true. A note that
-    /// claimed permission bits on Windows - or promised an ACL on Unix -
-    /// would be a health report that lies about protection, which is the one
-    /// thing `auth::report` exists to prevent.
+    /// `reachable` and the summary are about whether the INSTANCE was heard
+    /// from, which is not what the exit code answers. A request that could
+    /// not even be built must not be reported as an answer.
     #[test]
-    fn the_windows_note_appears_exactly_where_it_is_true() {
-        assert_eq!(protection_note().is_some(), cfg!(windows));
-        assert!(WINDOWS_PROTECTION_NOTE.contains("ACL"));
-        assert!(WINDOWS_PROTECTION_NOTE.contains("sets no permission bits"));
-    }
-
-    /// A synthetic health report, so the grading rule can be exercised over
-    /// combinations that are awkward to arrange on a real filesystem (a
-    /// world-writable directory around a malformed file, say).
-    fn health(
-        permissions: Permissions,
-        file_readable: bool,
-        directory: Option<&str>,
-    ) -> CredentialHealth {
-        CredentialHealth {
-            path: std::path::PathBuf::from("/home/u/.config/outline-cli/credentials.toml"),
-            exists: true,
-            permissions,
-            usable: false,
-            file_readable,
-            directory: std::path::PathBuf::from("/home/u/.config/outline-cli"),
-            directory_mode: Some("0700".to_string()),
-            directory_problem: directory.map(str::to_string),
-            profiles: Vec::new(),
-            env_api_key: false,
+    fn an_unsent_request_is_never_described_as_an_answer() {
+        for code in [
+            ExitCode::Usage,
+            ExitCode::Failure,
+            ExitCode::ApiRequest,
+            ExitCode::Server,
+        ] {
+            let unsent = outcome_summary(code, false);
+            assert!(
+                unsent.contains("nothing was sent"),
+                "{code:?} unsent: {unsent}"
+            );
+            assert!(!unsent.contains("answered"), "{code:?} unsent: {unsent}");
+        }
+        // A transport failure keeps its own wording: it is the one outcome
+        // that may have arrived, so "could not be reached" is the honest
+        // thing to say and "nothing was sent" would be a claim too strong.
+        assert_eq!(
+            outcome_summary(ExitCode::Network, false),
+            "the instance could not be reached"
+        );
+        // A credential that could not be renewed never reached the instance
+        // either, and says which half failed.
+        let renew = outcome_summary(ExitCode::Auth, false);
+        assert!(renew.contains("nothing was sent"), "{renew}");
+        assert!(renew.contains("renewed"), "{renew}");
+        // Answered outcomes say so.
+        for code in [ExitCode::Auth, ExitCode::Server, ExitCode::Failure] {
+            let answered = outcome_summary(code, true);
+            assert!(answered.contains("answered"), "{code:?}: {answered}");
+            assert!(
+                !answered.contains("nothing was sent"),
+                "{code:?}: {answered}"
+            );
         }
     }
 
-    fn owner_only() -> Permissions {
-        Permissions::OwnerOnly {
-            mode: "0600".to_string(),
-        }
-    }
-
-    fn too_open() -> Permissions {
-        Permissions::TooOpen {
-            mode: "0644".to_string(),
-        }
-    }
-
-    /// The grading rule the R1 review produced, in one place.
-    ///
-    /// The FILE blocks; the DIRECTORY around a sound file warns. The reasons
-    /// are on [`grade`]; this pins the outcomes so that neither half can be
-    /// "tidied" into the other.
-    #[test]
-    fn the_file_blocks_and_a_writable_directory_only_warns() {
-        let writable = Some("directory 0777 is writable by other users");
-
-        // A file others can read: no command can use it, so it blocks.
-        assert_eq!(
-            grade(&health(too_open(), true, None)),
-            Status::Problem(ExitCode::Usage)
-        );
-        // A file that cannot be parsed: same, and this is the case `usable`
-        // alone could not distinguish from a directory problem.
-        assert_eq!(
-            grade(&health(owner_only(), false, None)),
-            Status::Problem(ExitCode::Usage)
-        );
-        // A sound file in a directory others can write: reported, not
-        // blocking. `credential` and `connectivity` go on to use it.
-        assert_eq!(grade(&health(owner_only(), true, writable)), Status::Warn);
-        // Both wrong: the file's verdict wins, because it is the blocking one.
-        assert_eq!(
-            grade(&health(too_open(), true, writable)),
-            Status::Problem(ExitCode::Usage)
-        );
-        // Nothing wrong at all.
-        assert_eq!(grade(&health(owner_only(), true, None)), Status::Ok);
-    }
-
-    /// The warning has to SAY what is wrong with the directory, and it must
-    /// not describe the file as unusable - the run is about to use it.
-    #[test]
-    fn a_directory_only_warning_names_the_directory_and_not_the_file() {
-        let health = health(owner_only(), true, Some("directory 0777 is writable"));
-        let check = file_check(&health);
-        assert_eq!(check.status, Status::Warn);
-        assert!(
-            check.summary.contains("the file is sound"),
-            "{}",
-            check.summary
-        );
-        assert!(
-            !check.summary.contains("cannot be used"),
-            "a file that is about to be used must not be called unusable: {}",
-            check.summary
-        );
-        let facts: Vec<&(&str, serde_json::Value)> = check.facts.iter().collect();
-        let fact = |name: &str| {
-            facts
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| value.clone())
-                .unwrap_or(Value::Null)
-        };
-        // The FILE's own verdict, not the composite one: publishing "not
-        // usable" here would contradict the connectivity check below it.
-        assert_eq!(fact("file_usable"), Value::from(true));
-        assert!(fact("directory_problem").is_string(), "{check:?}");
-    }
-
-    #[test]
-    fn a_credential_store_that_cannot_be_opened_is_a_local_problem() {
-        let check = credentials(&Err(StoreError::NoConfigDir));
-        assert_eq!(check.status, Status::Problem(ExitCode::Usage));
-        assert!(!check.detail.is_empty(), "the reason must be reported");
-    }
-
-    #[test]
-    fn a_healthy_credential_file_reports_its_path_and_kinds() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = CredentialStore::at(dir.path().to_path_buf());
-        let mut file = CredentialFile::default();
-        file.profile_mut("default").api_key = Some("KEY-SECRET-9c7a".to_string());
-        store.save(&file).unwrap();
-
-        let check = credentials(&Ok(store.clone()));
-        assert_eq!(check.status, Status::Ok);
-        let rendered = format!("{:?}\n{}", check.facts, check.detail.join("\n"));
-        assert!(
-            rendered.contains(&store.path().display().to_string()),
-            "the credential file must be named: {rendered}"
-        );
-        assert!(rendered.contains("api key"), "{rendered}");
-        assert!(
-            !rendered.contains("SECRET-9c7a"),
-            "credential leaked: {rendered}"
-        );
-        // The note about Windows ACLs, and nothing else, differs per
-        // platform; on Unix the mode is stated instead.
-        assert_eq!(
-            check
-                .detail
-                .iter()
-                .any(|line| line.contains("per-user ACL")),
-            cfg!(windows),
-            "{:?}",
-            check.detail
-        );
-    }
-
-    /// An over-wide credential file must be a PROBLEM that names the file and
-    /// its mode, and it must be exit 2 (fix a bit locally), never 4.
-    #[cfg(unix)]
-    #[test]
-    fn an_over_wide_credential_file_is_a_problem_that_names_it() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = CredentialStore::at(dir.path().to_path_buf());
-        let mut file = CredentialFile::default();
-        file.profile_mut("default").api_key = Some("KEY-SECRET-9c7a".to_string());
-        store.save(&file).unwrap();
-        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let check = credentials(&Ok(store.clone()));
-        assert_eq!(check.status, Status::Problem(ExitCode::Usage));
-        let rendered = check.detail.join("\n");
-        assert!(
-            rendered.contains(&store.path().display().to_string()),
-            "the offending file must be named: {rendered}"
-        );
-        assert!(rendered.contains("0644"), "{rendered}");
-        assert!(rendered.contains("chmod 600"), "{rendered}");
-        assert!(!rendered.contains("SECRET-9c7a"), "{rendered}");
-    }
-
-    /// The remedy is the canonical message, not a copy of it.
-    ///
-    /// Asserted by EQUALITY against `AuthError::NoCredentials`: that error
-    /// already lists every way in, and `auth`'s own
-    /// `the_no_credentials_message_names_every_way_in` is what pins the
-    /// content. Restating the advice here would be a second copy to keep in
-    /// step - and naming the environment variable a second time is what
-    /// `tests/credential_paths.rs` refuses, on the grounds that a module
-    /// which names the global key is a module that can fall back to it.
     #[test]
     fn a_missing_credential_reports_the_canonical_remedy() {
         let check = credential(&Chosen::Absent, "work");
