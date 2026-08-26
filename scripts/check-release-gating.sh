@@ -40,6 +40,20 @@
 # cargo-dist upgrade can change the template silently and `dist generate
 # --check` would still pass, because the file would match the new template.
 #
+# Known boundaries of this script, so nobody has to rediscover them:
+#
+#   * The generated workflow is sliced with a regex, not parsed as YAML, to
+#     keep the check dependency-free. `needs_of()` therefore only understands
+#     the block form dist emits (`needs:` followed by `- name` lines). If a
+#     future dist switched to an inline array (`needs: [plan, host]`) that
+#     parser would return nothing - so every job whose needs are inspected is
+#     also asserted to *have* parseable needs, turning a silent no-op into a
+#     failure rather than a false pass.
+#   * The additive-job check keys off the workflow paths registered in
+#     dist-workspace.toml, not off job names, because a name is not an
+#     identity. The name-based sweep is kept as a second net for anything
+#     that looks like an attestation job but was never registered here.
+#
 # Usage:
 #   ./scripts/check-release-gating.sh
 set -euo pipefail
@@ -165,8 +179,59 @@ require(
 #    as success to `announce` - which is how a Release gets published with
 #    no Homebrew formula pushed. Assert the dependency direction instead of
 #    reasoning about which cargo-dist slot is safe.
+#
+#    Registered workflow paths whose failure must never affect publishing.
+#    Identity comes from the path, not the job name: renaming the workflow
+#    changes the name dist derives, so a name-based rule would quietly stop
+#    covering it.
+ADDITIVE_WORKFLOWS = ("./attest-global-artifacts",)
+
+# Every cargo-dist slot a custom job can be registered in. Only
+# post-announce-jobs is inert; the rest can block host, publish or announce
+# (see the table in dist-workspace.toml).
+BLOCKING_SLOTS = (
+    "plan-jobs",
+    "local-artifacts-jobs",
+    "global-artifacts-jobs",
+    "host-jobs",
+    "publish-jobs",
+)
+INERT_SLOT = "post-announce-jobs"
+
+SLOT_ARRAY = r'(?m)^{key}\s*=\s*\[(?P<body>[^\]]*)\]'
+
+
+def slot_entries(key: str) -> list:
+    """Workflow paths registered in a cargo-dist job slot."""
+    match = re.search(SLOT_ARRAY.format(key=re.escape(key)), config)
+    if not match:
+        return []
+    return re.findall(r'"([^"]+)"', match.group("body"))
+
+
+for workflow_ref in ADDITIVE_WORKFLOWS:
+    require(
+        workflow_ref in slot_entries(INERT_SLOT),
+        f"`{workflow_ref}` is registered in {INERT_SLOT}, the only slot nothing depends on",
+    )
+    misplaced = [slot for slot in BLOCKING_SLOTS if workflow_ref in slot_entries(slot)]
+    require(
+        not misplaced,
+        f"`{workflow_ref}` is not registered in a blocking slot "
+        f"{misplaced or '[]'} (a failed attestation must not affect publishing)",
+    )
+
+# Job names dist derives from those paths, plus a name-based sweep as a
+# second net for an attestation job that was never registered above.
 ATTEST_PATTERN = re.compile(r"attest", re.IGNORECASE)
-attest_jobs = [name for name in sections if ATTEST_PATTERN.search(name)]
+attest_jobs = sorted(
+    {f"custom-{ref.removeprefix('./')}" for ref in ADDITIVE_WORKFLOWS}
+    | {name for name in sections if ATTEST_PATTERN.search(name)}
+)
+require(
+    all(name in sections for name in attest_jobs),
+    f"every additive job is present in the workflow ({attest_jobs})",
+)
 require(bool(attest_jobs), "an attestation job is registered")
 
 def needs_of(body: str) -> list:
@@ -198,7 +263,15 @@ require(
     "at least one publish job was found to check (guards against a silent no-op)",
 )
 for name in publishing_path:
-    blockers = sorted(set(needs_of(sections[name])) & set(attest_jobs))
+    # Self-check first: every job on this path has a block-form `needs:` in
+    # dist's template, so an empty parse means the template changed shape and
+    # the dependency check below would be vacuous rather than satisfied.
+    parsed = needs_of(sections[name])
+    require(
+        bool(parsed),
+        f"`{name}`'s needs block is parseable (empty would make the next check vacuous)",
+    )
+    blockers = sorted(set(parsed) & set(attest_jobs))
     require(
         not blockers,
         f"`{name}` does not depend on attestation job(s) "
@@ -209,7 +282,7 @@ for name in publishing_path:
 # what `post-announce-jobs` buys.
 for name in attest_jobs:
     require(
-        "announce" in needs_of(sections[name]),
+        "announce" in needs_of(sections.get(name, "")),
         f"`{name}` runs after `announce` (post-announce slot)",
     )
 
