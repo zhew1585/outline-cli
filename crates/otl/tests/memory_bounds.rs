@@ -1,5 +1,23 @@
-//! What `spec sync` and the cache loader may allocate, asserted rather
+//! What reading a spec and loading a cache may allocate, asserted rather
 //! than argued.
+//!
+//! # What is inside the measurement, and what is not
+//!
+//! Each case measures the library path the command runs, INCLUDING the
+//! input buffer: a document is read from a file inside the profiler
+//! window, because a 16 MiB `String` held for the duration of the compile
+//! is a real part of the peak, and leaving it outside made an earlier
+//! version of this file report about a fifth of the truth.
+//!
+//! Not included: the process itself - the binary, the allocator's arena,
+//! whatever ran before `main`. These numbers are therefore lower than the
+//! RSS of the equivalent command by a roughly constant amount, and they do
+//! not replace it. For scale, measured with `/usr/bin/time -l` at the time
+//! of writing, `spec sync --spec` peaks at 6.9 MB RSS on the vendored
+//! spec, 29.2 MB on a 16 MiB document whose bulk is an ignored key, and
+//! 46.1 MB on the worst shape the budget accepts (16 MiB of long strings).
+//! The gap to the figures below is the process baseline, about 13 MB.
+//! Bounded and small; the assertions cover the parts this code controls.
 //!
 //! Every bound this story claims about memory has been about ALLOCATION,
 //! and every time it was written as prose arithmetic it was wrong - twice
@@ -45,14 +63,31 @@ const DOCUMENT_LIMIT: usize = engine::fetch::MAX_DOCUMENT_BYTES as usize;
 /// Peak heap allocated by `work`, in bytes.
 ///
 /// The profiler is created here, so the count starts at zero and covers
-/// exactly this closure. Anything the caller allocated beforehand (the
-/// test input, for one) is outside the window.
+/// exactly this closure - which is why a document has to be READ inside it
+/// (see [`peak_of_compiling`]).
 fn peak_of(work: impl FnOnce()) -> usize {
     let profiler = dhat::Profiler::builder().testing().build();
     work();
     let peak = dhat::HeapStats::get().max_bytes;
     drop(profiler);
     peak
+}
+
+/// Peak heap for reading a document and compiling it, which is what
+/// `spec sync --spec` does. The read is inside the window: the document
+/// `String` stays live for the whole compile and belongs to the peak.
+fn peak_of_compiling(path: &Path, expect_ok: bool) -> usize {
+    let path = path.to_path_buf();
+    peak_of(move || {
+        let raw = fs::read_to_string(&path).unwrap();
+        let compiled = spec_compile::compile_json(&raw, &otl::spec::compile_options());
+        assert_eq!(
+            compiled.is_ok(),
+            expect_ok,
+            "unexpected outcome: {:?}",
+            compiled.err().map(|error| error.to_string())
+        );
+    })
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -92,64 +127,91 @@ fn parsing_and_loading_stay_within_their_bounds() {
     // 1. The measured 367 MB case: a 16 MiB document whose bulk sits under
     //    a key the compiler never reads. It must cost almost nothing now,
     //    because an unread key is parsed straight into `IgnoredAny`.
+    let inputs = TempDir::new().unwrap();
     let filler = vec!["0"; DOCUMENT_LIMIT / 2 - 100].join(",");
-    let bloat = format!(r#"{{"paths":{{"/a.b":{{"post":{{}}}}}},"x":[{filler}]}}"#);
-    assert!(bloat.len() > DOCUMENT_LIMIT / 2, "test input too small");
-    let peak = peak_of(|| {
-        let compiled = spec_compile::compile_json(&bloat, &otl::spec::compile_options());
-        assert!(compiled.is_ok(), "{:?}", compiled.err());
-    });
+    let ignored_key = inputs.path().join("ignored-key.json");
+    let input_size = {
+        let bloat = format!(r#"{{"paths":{{"/a.b":{{"post":{{}}}}}},"x":[{filler}]}}"#);
+        assert!(bloat.len() > DOCUMENT_LIMIT / 2, "test input too small");
+        fs::write(&ignored_key, &bloat).unwrap();
+        bloat.len()
+    };
+    let peak = peak_of_compiling(&ignored_key, true);
     report.push(format!(
         "ignored-key document ({} MiB in): {:.2} MiB peak",
-        bloat.len() / (1024 * 1024),
+        input_size / (1024 * 1024),
         mib(peak)
     ));
     assert!(
-        peak < 4 * 1024 * 1024,
-        "parsing a document whose bulk is under an unread key allocated \
-         {:.2} MiB; an unread key is parsed straight into `IgnoredAny`, so \
-         this used to be 350+ MB and should now be nothing",
+        peak < 40 * 1024 * 1024,
+        "reading and parsing a document whose bulk is under an unread key \
+         allocated {:.2} MiB; the input buffer is nearly all of it, because \
+         an unread key is parsed straight into `IgnoredAny` - this case used \
+         to cost 350+ MB",
         mib(peak)
     );
 
     // 2. The same bulk under a key the compiler DOES read: refused while
     //    parsing, so the tree is never finished.
-    let bloat = format!(r#"{{"paths":{{"/a.b":[{filler}]}}}}"#);
-    let peak = peak_of(|| {
-        let error = spec_compile::compile_json(&bloat, &otl::spec::compile_options())
-            .expect_err("must be refused");
-        assert!(
-            error.to_string().contains("expands to more than"),
-            "{error}"
-        );
-    });
+    let expanding = inputs.path().join("expanding.json");
+    fs::write(&expanding, format!(r#"{{"paths":{{"/a.b":[{filler}]}}}}"#)).unwrap();
+    drop(filler);
+    let peak = peak_of_compiling(&expanding, false);
     report.push(format!("expanding document: {:.2} MiB peak", mib(peak)));
     assert!(
-        peak < 24 * 1024 * 1024,
+        peak < 64 * 1024 * 1024,
         "a document engineered to expand allocated {:.2} MiB before being \
-         refused; the parse budget is what holds this down",
+         refused; the input buffer plus the parse budget is what holds this \
+         down",
+        mib(peak)
+    );
+
+    // 2b. The worst document the budget ACCEPTS: long strings, which cost
+    //     about what they cost on the wire, so the charge never trips and
+    //     the whole tree is built. This is the largest legitimate-shaped
+    //     document that can get through, and therefore the number that
+    //     matters more than the refused case above.
+    let long_strings = inputs.path().join("long-strings.json");
+    {
+        let value = "x".repeat(4096);
+        let count = DOCUMENT_LIMIT / (value.len() + 8);
+        let items = vec![format!("\"{value}\""); count].join(",");
+        // A real operation alongside the bulk, so the compile succeeds and
+        // the whole materialized tree is live at once.
+        fs::write(
+            &long_strings,
+            format!(r#"{{"paths":{{"/a.b":{{"post":{{}}}},"/bulk":[{items}]}}}}"#),
+        )
+        .unwrap();
+    }
+    let long_size = fs::metadata(&long_strings).unwrap().len();
+    let peak = peak_of_compiling(&long_strings, true);
+    report.push(format!(
+        "accepted long-string document ({} MiB in): {:.2} MiB peak",
+        long_size / (1024 * 1024),
+        mib(peak)
+    ));
+    assert!(
+        peak < 64 * 1024 * 1024,
+        "the largest document the budget accepts allocated {:.2} MiB",
         mib(peak)
     );
 
     // 3. The real vendored spec, for scale: this is what a legitimate sync
     //    costs, and every limit above is a multiple of it.
-    let vendored = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("spec")
-            .join("spec3.json"),
-    )
-    .unwrap();
-    let peak = peak_of(|| {
-        spec_compile::compile_json(&vendored, &otl::spec::compile_options()).expect("compiles");
-    });
+    let vendored_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("spec")
+        .join("spec3.json");
+    let vendored_size = fs::metadata(&vendored_path).unwrap().len();
+    let peak = peak_of_compiling(&vendored_path, true);
     report.push(format!(
         "vendored spec ({} KiB in): {:.2} MiB peak",
-        vendored.len() / 1024,
+        vendored_size / 1024,
         mib(peak)
     ));
     assert!(
-        peak < 8 * 1024 * 1024,
-        "compiling the vendored spec allocated {:.2} MiB",
+        peak < 16 * 1024 * 1024,
+        "reading and compiling the vendored spec allocated {:.2} MiB",
         mib(peak)
     );
 
@@ -189,60 +251,102 @@ fn parsing_and_loading_stay_within_their_bounds() {
         mib(peak)
     );
 
-    // 5. The worst single record, hand-encoded: BOTH nested containers lie
-    //    about their length. This is the shape an independent review
-    //    measured at 2.09 MiB, and the one the previous prose bound missed
-    //    a whole term of - the outer `params` container can reserve
-    //    serde's per-container cap at the same time as an inner
-    //    `enum_values` container does.
+    // 5. The worst single record, hand-encoded: BOTH nested containers
+    //    lie about their length, so each one reserves serde's
+    //    per-container cap at the same time. This is the shape the prose
+    //    bound kept mis-counting, and the shape the FIRST version of this
+    //    test failed to build - its outer container was honest, so it
+    //    measured a cheaper case than its own comment claimed.
     //
-    //    bincode `standard()`: a varint length below 251 is one byte, and
-    //    251 marks a u16, 252 a u32. An empty `ParamSpec` is eight zero
-    //    bytes (empty name, first enum variant, two false booleans, empty
-    //    enum list, empty format, two `None`s).
-    let honest_params: u16 = 4000;
+    //    Mechanism worth keeping written down: bincode's serde bridge
+    //    charges its byte budget for what it CONSUMES and never calls
+    //    `claim_container_read`, while serde's `Vec` reserves
+    //    `min(declared, 1 MiB / size_of::<T>())` on its own. The two are
+    //    independent, so the reservation happens once per nesting level
+    //    however small the record is.
+    //
+    //    bincode `standard()`: a varint below 251 is one byte, 251 marks a
+    //    u16, 252 a u32. An empty `ParamSpec` is eight zero bytes (empty
+    //    name, first enum variant, two false booleans, empty enum list,
+    //    empty format, two `None`s).
+    let honest_fill: usize = 4000;
     let mut fat = Vec::new();
     fat.extend_from_slice(&[0, 0, 0, 0]); // four empty strings
     fat.push(0); // body_mode variant
-    fat.push(251); // params: u16 length follows
-    fat.extend_from_slice(&honest_params.to_le_bytes());
-    for _ in 0..honest_params - 1 {
-        fat.extend_from_slice(&[0u8; 8]); // an empty parameter
-    }
-    // The last parameter's enum_values claims a billion entries.
-    fat.extend_from_slice(&[0, 0, 0, 0]); // name, ty, required, nullable
-    fat.push(252); // enum_values: u32 length follows
+                 // The OUTER container claims a billion parameters.
+    fat.push(252);
     fat.extend_from_slice(&1_000_000_000u32.to_le_bytes());
-
-    let mut body = Vec::new();
-    record(
-        &bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap(),
-        &mut body,
-    );
-    body.extend_from_slice(&1u32.to_le_bytes());
-    record(&fat, &mut body);
+    for _ in 0..honest_fill - 1 {
+        fat.extend_from_slice(&[0u8; 8]); // an empty parameter, honestly
+    }
+    // ...and the last parameter's enum_values claims a billion entries.
+    fat.extend_from_slice(&[0, 0, 0, 0]); // name, ty, required, nullable
+    fat.push(252);
+    fat.extend_from_slice(&1_000_000_000u32.to_le_bytes());
     assert!(
         fat.len() < cache::MAX_OP_RECORD_BYTES,
-        "the crafted record must be within the per-record limit to be \
-         decoded at all: {} bytes",
+        "the crafted record must fit the per-record limit to be decoded at \
+         all: {} bytes",
         fat.len()
     );
-    write_body(&file, &body);
+
+    let one_record = {
+        let mut body = Vec::new();
+        record(
+            &bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap(),
+            &mut body,
+        );
+        body.extend_from_slice(&1u32.to_le_bytes());
+        record(&fat, &mut body);
+        body
+    };
+    write_body(&file, &one_record);
     let peak = peak_of(|| {
-        // Refused: the inner container runs out of record long before it
-        // has a billion entries.
+        // Refused: both containers run out of record long before they have
+        // a billion entries.
         assert!(cache::load_at(&file).is_err());
     });
     report.push(format!(
-        "cache with two lying containers in one {}-byte record: {:.2} MiB peak",
+        "one record, both containers lying ({} B): {:.2} MiB peak",
         fat.len(),
         mib(peak)
     ));
     assert!(
-        peak < 3 * 1024 * 1024,
-        "the worst single record allocated {:.2} MiB; serde's per-container \
-         reservation cap (1 MiB) applies once per nesting level, so this is \
-         where the number to watch lives",
+        peak < 4 * 1024 * 1024,
+        "the worst single record allocated {:.2} MiB",
+        mib(peak)
+    );
+
+    // 5b. The COMBINATION, which is the actual worst case for the loader:
+    //     the table's own Vec at full size AND that record being decoded
+    //     inside it. Neither test covered this, so the largest number
+    //     either of them could report was smaller than what the loader can
+    //     really hold at once.
+    let mut combined = Vec::new();
+    record(
+        &bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap(),
+        &mut combined,
+    );
+    combined.extend_from_slice(&(cache::MAX_CACHED_OPS as u32).to_le_bytes());
+    record(&fat, &mut combined);
+    // Enough minimal records after it that the declared count is not a
+    // lie the framing can reject.
+    for _ in 1..cache::MAX_CACHED_OPS {
+        record(&minimal, &mut combined);
+    }
+    write_body(&file, &combined);
+    let combined_size = fs::metadata(&file).unwrap().len();
+    let peak = peak_of(|| {
+        assert!(cache::load_at(&file).is_err());
+    });
+    report.push(format!(
+        "worst record inside a full table ({combined_size} B file): {:.2} MiB peak",
+        mib(peak)
+    ));
+    assert!(
+        peak < 6 * 1024 * 1024,
+        "the table Vec and the worst record together allocated {:.2} MiB; \
+         this is the loader's real worst case, and the number to watch",
         mib(peak)
     );
 

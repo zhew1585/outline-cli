@@ -26,11 +26,28 @@
 //!
 //! Every length is validated against a limit AND against the bytes that
 //! actually remain before a single byte is decoded, and each record is
-//! decoded from its own slice with its own byte limit. An operation
-//! therefore cannot allocate more than one record's worth of amplification
-//! (about a megabyte, the cap serde's own reservation logic imposes),
-//! whatever it declares, and the table as a whole is bounded by the
-//! footprint budget that is checked after every record.
+//! decoded from its own slice with its own byte limit. What that bounds,
+//! precisely:
+//!
+//! - the number of records, and the bytes any one of them may declare;
+//! - the total decoded footprint of the records ACCEPTED so far.
+//!
+//! What it does not bound, and the mechanism worth remembering: bincode's
+//! serde bridge charges its byte budget for what it CONSUMES and never
+//! calls `claim_container_read`, while serde's `Vec` reserves
+//! `min(declared, 1 MiB / size_of::<T>())` of its own accord. Those two
+//! are independent, so a container that lies about its length reserves up
+//! to serde's cap regardless of how small the record is - and it does so
+//! once per NESTING LEVEL. `OpSpec` nests two deep (`params`, then a
+//! parameter's `enum_values`), so one record can reserve twice before it
+//! runs out of bytes and fails.
+//!
+//! That is a fact about the shape of the IR, not something framing can fix
+//! from the outside; bounding it would mean owning the decode of every
+//! nested type. What framing does is keep it to a small constant instead
+//! of letting it scale with the file. The measured figures - for that
+//! exact shape, and for it inside a full table - are in
+//! `crates/otl/tests/memory_bounds.rs`.
 //!
 //! # The resulting bound
 //!
