@@ -7,10 +7,16 @@
 //! secret is obtained.
 //!
 //! The check is only as strong as what it decides from, so the inputs are
-//! locked down too: [`Settings`] cannot be constructed outside
-//! `super::resolve_settings`, and the credential itself cannot be read off
-//! [`EnvLayer`]. An unforgeable proof token issued from forgeable state
-//! would prove nothing.
+//! locked down in their own leaf modules: `config::resolved` owns
+//! [`Settings`] and is the only module that can build one, and
+//! `config::secret` owns the key storage and is the only module that can read
+//! a key out. An unforgeable proof token issued from forgeable state would
+//! prove nothing, and neither module's privacy would hold if the state lived
+//! in `config` itself, where every sibling could reach it.
+//!
+//! **This module must stay a leaf**: a submodule of it could mint
+//! [`BindingChecked`] without running the check. `config_isolation.rs`
+//! asserts that.
 //!
 //! The separation matters because the two questions have different answers.
 //! Bending precedence to make a profile's URL win would break the published
@@ -18,9 +24,7 @@
 //! instance its profile never named breaks nothing and is the only outcome
 //! that cannot be undone if it is wrong.
 
-use super::{
-    api_key_var_suffix, AuthMethod, ConfigError, EnvLayer, Settings, UrlSource, ENV_API_KEY_PREFIX,
-};
+use super::{ConfigError, Settings, UrlSource};
 
 /// Proof that the credential-binding check has run.
 ///
@@ -117,50 +121,5 @@ fn check_env_url_binding(
         Err(ConfigError::ConflictingUrl {
             profile: profile.to_string(),
         })
-    }
-}
-
-/// The v1 token source: an API key from the environment.
-///
-/// A credential belongs to ONE instance, and a profile names an instance, so
-/// the two are resolved from the same scope:
-///
-/// - no profile in effect: the global `OUTLINE_API_KEY` (the Epic 1 path,
-///   unchanged);
-/// - profile in effect: `OUTLINE_API_KEY_<PROFILE>` and nothing else.
-///
-/// The second rule deliberately does NOT fall back to the global variable.
-/// Falling back is what would send the key for the workspace whose variable
-/// happens to be exported to whichever instance the selected profile points
-/// at - a silent cross-origin credential disclosure produced by nothing more
-/// than `--profile`. Refusing is recoverable (the error names the variable to
-/// set); a key already sent to the wrong server is not.
-pub struct EnvApiKey<'layer>(pub &'layer EnvLayer);
-
-impl TokenSource for EnvApiKey<'_> {
-    fn fetch(&self, settings: &Settings, _checked: &BindingChecked) -> Result<String, ConfigError> {
-        if settings.auth != AuthMethod::ApiKey {
-            return Err(ConfigError::UnsupportedAuthMethod {
-                profile: settings.profile.clone(),
-                method: settings.auth,
-            });
-        }
-        let Some(profile) = settings.profile.as_deref() else {
-            return self.0.api_key.clone().ok_or(ConfigError::MissingApiKey);
-        };
-        let Some(suffix) = api_key_var_suffix(profile) else {
-            return Err(ConfigError::ProfileApiKeyVarUnnameable {
-                profile: profile.to_string(),
-            });
-        };
-        self.0
-            .profile_api_keys
-            .get(&suffix)
-            .cloned()
-            .ok_or_else(|| ConfigError::MissingProfileApiKey {
-                profile: profile.to_string(),
-                variable: format!("{ENV_API_KEY_PREFIX}{suffix}"),
-                global_set: self.0.api_key.is_some(),
-            })
     }
 }

@@ -76,10 +76,14 @@
 mod error;
 mod file;
 mod release;
+mod resolved;
+mod secret;
 
 pub use error::{sanitize_name, sanitize_path, sanitize_text, ConfigError};
 pub use file::{config_dir, default_config_path, load_file, load_from, locate, CONFIG_FILE_NAME};
-pub use release::{release_token, BindingChecked, EnvApiKey, TokenSource};
+pub use release::{release_token, BindingChecked, TokenSource};
+pub use resolved::{resolve_settings, Settings, UrlSource};
+pub use secret::EnvApiKey;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -256,14 +260,13 @@ pub struct EnvLayer {
     profile: Option<String>,
     /// `OUTLINE_URL`.
     url: Option<String>,
-    /// `OUTLINE_API_KEY`: the key used when NO profile is in effect.
-    api_key: Option<String>,
     /// `OUTLINE_CONFIG`.
     config_path: Option<PathBuf>,
-    /// Per-profile API keys, keyed by the variable suffix after
-    /// [`ENV_API_KEY_PREFIX`] (so `OUTLINE_API_KEY_WORK` is stored under
-    /// `WORK`). A profile's key is looked up here and nowhere else.
-    profile_api_keys: BTreeMap<String, String>,
+    /// The API keys, in a container this module cannot read out of - see
+    /// `secret::EnvKeys`. Holding them opaquely is what keeps the
+    /// credential-release gate meaningful for everything in this module
+    /// tree, not just for other crates.
+    keys: secret::EnvKeys,
 }
 
 impl fmt::Debug for EnvLayer {
@@ -278,7 +281,7 @@ impl fmt::Debug for EnvLayer {
             .field("config_path", &redacted_path(self.config_path.as_deref()))
             // Count only: the suffixes name profiles, but the values are
             // keys, and a map rendering would print them.
-            .field("profile_api_keys", &self.profile_api_keys.len())
+            .field("profile_api_keys", &self.keys.profile_key_count())
             .finish()
     }
 }
@@ -291,16 +294,36 @@ impl EnvLayer {
     pub fn from_process() -> Self {
         let read = |name: &str| env::var(name).ok();
         Self {
-            profile_api_keys: profile_api_keys_from_process(),
+            keys: secret::EnvKeys::from_process(),
             ..Self::from_values(
                 read(ENV_PROFILE).as_deref(),
                 read(ENV_URL).as_deref(),
-                read(ENV_API_KEY).as_deref(),
+                None,
                 // Not filtered on emptiness: `OUTLINE_CONFIG=` is the
                 // documented way to say "read no config file at all"
                 // (see [`locate`]).
                 env::var_os(ENV_CONFIG).map(PathBuf::from),
             )
+        }
+    }
+
+    /// Build the layer from explicit values, applying the blank-is-unset
+    /// rule. The seam that lets tests avoid mutating the environment.
+    pub fn from_values(
+        profile: Option<&str>,
+        url: Option<&str>,
+        api_key: Option<&str>,
+        config_path: Option<PathBuf>,
+    ) -> Self {
+        let keys = match api_key {
+            Some(api_key) => secret::EnvKeys::default().with_global(api_key),
+            None => secret::EnvKeys::default(),
+        };
+        Self {
+            profile: non_blank(profile),
+            url: non_blank(url),
+            config_path,
+            keys,
         }
     }
 
@@ -319,6 +342,11 @@ impl EnvLayer {
         self.config_path.as_deref()
     }
 
+    /// The opaque key container. Only `config::secret` can read out of it.
+    pub(super) fn keys(&self) -> &secret::EnvKeys {
+        &self.keys
+    }
+
     /// The layer with `OUTLINE_PROFILE` set.
     pub fn with_profile(mut self, profile: &str) -> Self {
         self.profile = non_blank(Some(profile));
@@ -333,7 +361,7 @@ impl EnvLayer {
 
     /// The layer with the global `OUTLINE_API_KEY` set.
     pub fn with_api_key(mut self, api_key: &str) -> Self {
-        self.api_key = non_blank(Some(api_key));
+        self.keys = self.keys.with_global(api_key);
         self
     }
 
@@ -347,28 +375,8 @@ impl EnvLayer {
     /// The layer with one profile-scoped API key added, applying the same
     /// blank-is-unset rule as the process environment. Test seam.
     pub fn with_profile_api_key(mut self, profile: &str, api_key: &str) -> Self {
-        if let (Some(suffix), Some(value)) = (api_key_var_suffix(profile), non_blank(Some(api_key)))
-        {
-            self.profile_api_keys.insert(suffix, value);
-        }
+        self.keys = self.keys.with_profile(profile, api_key);
         self
-    }
-
-    /// Build the layer from explicit values, applying the blank-is-unset
-    /// rule. The seam that lets tests avoid mutating the environment.
-    pub fn from_values(
-        profile: Option<&str>,
-        url: Option<&str>,
-        api_key: Option<&str>,
-        config_path: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            profile: non_blank(profile),
-            url: non_blank(url),
-            api_key: non_blank(api_key),
-            config_path,
-            profile_api_keys: BTreeMap::new(),
-        }
     }
 }
 
@@ -382,20 +390,7 @@ impl EnvLayer {
 /// case-insensitively or it would miss the variable and report it unset.
 /// POSIX names are case-sensitive, where `outline_api_key_work` is a
 /// genuinely different variable that must NOT be accepted.
-const ENV_NAMES_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
-
-/// Collect every `OUTLINE_API_KEY_*` variable from the process environment.
-///
-/// Blank values count as unset, matching every other variable.
-fn profile_api_keys_from_process() -> BTreeMap<String, String> {
-    env::vars()
-        .filter_map(|(name, value)| {
-            let suffix = profile_api_key_suffix(&name, ENV_NAMES_ARE_CASE_INSENSITIVE)?;
-            let value = non_blank(Some(&value))?;
-            Some((suffix, value))
-        })
-        .collect()
-}
+pub(super) const ENV_NAMES_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
 
 /// The profile-key suffix of an environment variable name, or `None` when the
 /// name is not a per-profile API key variable.
@@ -508,90 +503,6 @@ impl fmt::Debug for LoadedConfig {
     }
 }
 
-/// Which layer supplied the base URL.
-///
-/// Recorded because the credential-release gate treats them differently: a
-/// `--url` in the same command is a deliberate redirect, while an
-/// environment variable is ambient and has to agree with the profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UrlSource {
-    /// `--url`.
-    Flag,
-    /// `OUTLINE_URL`.
-    Env,
-    /// The selected profile's `url`.
-    Profile,
-}
-
-/// Everything resolved except the secret itself.
-///
-/// The fields are private and there is no public constructor: the only way
-/// to obtain a `Settings` is [`resolve_settings`]. That is what makes the
-/// credential-release gate structural rather than decorative - the gate
-/// decides from [`Settings::url_source`], so a caller able to build a
-/// `Settings` by hand could simply claim `UrlSource::Flag` and be handed a
-/// profile's key for any origin at all. Read the parts through the
-/// accessors; produce one only by resolving.
-#[derive(Clone)]
-pub struct Settings {
-    /// Named profile in effect, if any.
-    profile: Option<String>,
-    /// Base URL of the Outline instance.
-    base_url: String,
-    /// Which layer supplied `base_url`.
-    url_source: UrlSource,
-    /// The selected profile's own `url`, when it declared one.
-    ///
-    /// Kept so that [`release_token`] can compare origins without needing
-    /// the config file again.
-    profile_url: Option<String>,
-    /// How to authenticate to it.
-    auth: AuthMethod,
-}
-
-impl Settings {
-    /// The named profile in effect, if any.
-    pub fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
-    }
-
-    /// The resolved base URL.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    /// Which layer supplied the base URL.
-    pub fn url_source(&self) -> UrlSource {
-        self.url_source
-    }
-
-    /// The selected profile's own `url`, when it declared one.
-    pub fn profile_url(&self) -> Option<&str> {
-        self.profile_url.as_deref()
-    }
-
-    /// The resolved authentication method.
-    pub fn auth(&self) -> AuthMethod {
-        self.auth
-    }
-}
-
-impl fmt::Debug for Settings {
-    /// Manual impl: same base-URL redaction rule as [`Config`].
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Settings")
-            .field("profile", &redacted_name(self.profile.as_deref()))
-            .field("base_url_origin", &redacted_origin(Some(&self.base_url)))
-            .field("url_source", &self.url_source)
-            .field(
-                "profile_url_origin",
-                &redacted_origin(self.profile_url.as_deref()),
-            )
-            .field("auth", &self.auth)
-            .finish()
-    }
-}
-
 /// Resolved runtime configuration handed to the request channel.
 #[derive(Clone)]
 pub struct Config {
@@ -651,46 +562,6 @@ fn redacted_origin(url: Option<&str>) -> String {
         .unwrap_or_else(|| REDACTED.to_string())
 }
 
-/// Resolve everything but the secret, applying flag > env > file per key.
-pub fn resolve_settings(
-    overrides: &Overrides,
-    env: &EnvLayer,
-    loaded: &LoadedConfig,
-) -> Result<Settings, ConfigError> {
-    let (requested, from_file) = match overrides.profile.as_deref().or(env.profile.as_deref()) {
-        Some(name) => (Some(name), false),
-        // A name read from the config file is FILE CONTENT, so it is never
-        // echoed back (see the module docs); one the user just typed is not.
-        None => (loaded.file.default_profile.as_deref(), true),
-    };
-    let profile = match requested {
-        Some(name) => Some(lookup_profile(name, loaded, from_file)?),
-        None => None,
-    };
-    if let Some((name, _)) = profile {
-        check_api_key_var_is_unambiguous(name, loaded)?;
-    }
-    // Strict flag > env > file, for this key as for every other. Whether the
-    // resolved origin may receive the resolved credential is a separate
-    // question, asked once at the credential-release boundary
-    // ([`release_token`]) rather than by bending precedence here.
-    let profile_url = profile.and_then(|(_, p)| non_blank(p.url.as_deref()));
-    let (base_url, url_source) = non_blank(overrides.url.as_deref())
-        .map(|url| (url, UrlSource::Flag))
-        .or_else(|| env.url.clone().map(|url| (url, UrlSource::Env)))
-        .or_else(|| profile_url.clone().map(|url| (url, UrlSource::Profile)))
-        .ok_or_else(|| ConfigError::MissingUrl {
-            profile: profile.map(|(name, _)| name.to_string()),
-        })?;
-    Ok(Settings {
-        profile: profile.map(|(name, _)| name.to_string()),
-        base_url,
-        url_source,
-        profile_url,
-        auth: profile.and_then(|(_, p)| p.auth).unwrap_or_default(),
-    })
-}
-
 /// Refuse a selected profile whose API key variable another profile shares.
 ///
 /// Distinct names can map to one variable (`my-work` and `my.work` both give
@@ -741,7 +612,7 @@ impl Config {
     /// Pair resolved settings with a secret from a [`TokenSource`].
     pub fn from_parts(settings: &Settings, api_key: String) -> Self {
         Self {
-            base_url: settings.base_url.clone(),
+            base_url: settings.base_url().to_string(),
             api_key,
         }
     }
