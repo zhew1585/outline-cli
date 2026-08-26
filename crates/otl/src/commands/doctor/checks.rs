@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::auth::credentials::CredentialStore;
 use crate::auth::error::StoreError;
-use crate::auth::report::credential_health;
+use crate::auth::report::{credential_health, CredentialHealth};
 use crate::auth::{self, AuthError, Identity, Instance, Resolved};
 use crate::config::{self, AuthMethod, ConfigError, EnvLayer, Overrides, ProfileSource, UrlSource};
 use crate::exit::ExitCode;
@@ -118,7 +118,11 @@ pub fn credentials(store: &Result<CredentialStore, StoreError>) -> Check {
             .detailed([error.to_string()])
         }
     };
-    let health = credential_health(store);
+    file_check(&credential_health(store))
+}
+
+/// The check for a credential file that could be inspected.
+fn file_check(health: &CredentialHealth) -> Check {
     let status = if health.usable {
         Status::Ok
     } else {
