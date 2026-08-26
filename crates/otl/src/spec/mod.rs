@@ -15,6 +15,7 @@
 
 mod bounded;
 pub mod cache;
+pub(crate) mod openfile;
 
 use std::collections::HashSet;
 

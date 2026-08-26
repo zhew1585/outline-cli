@@ -74,10 +74,15 @@ so that 新端点无需等 CLI 发版。
   文件类型（不跟随 symlink，必须是普通文件）→ 文件尺寸 → 打开后 fstat 复查 → 限长读取 → magic → 布局版本 →
   校验和 → 有界解码（元素数 + 解码后 footprint，见下）且无尾随字节 → IR schema 版本 → CLI 版本 → provenance →
   每个 op 的 name/path/绑定/文本。任一失败即整体废弃，**不做迁移**。
-- **字节上限不是内存上限**（R2 发现）：bincode 的 limit 计的是消耗字节，而最小 OpSpec 编码 6 字节、解码后上百字节，
-  serde 路径也不会为解码结构计费。所以真正的界是三个：文件 1 MiB、元素数 ≤ 8192、解码后 footprint ≤ 8 MiB
-  （逐元素累加）。残留：单个 op 内部的 params 要整个解完才计费，因此峰值 ≈ 预算 + 一个 op 的量，这也是文件上限
-  必须小的原因。
+- **字节上限不是内存上限**（R2 发现，R3 修正）：bincode 的 limit 计的是消耗字节，而最小 OpSpec 编码 6 字节、
+  解码后上百字节。R2 我加了「元素数 + 逐元素 footprint」，并声称峰值约 26 MB——**这个推导 R3 被算术核对证伪**：
+  `footprint_of` 按 `len × 24` 计费，漏掉了 Vec 按翻倍扩容的容量浪费。刚越过 serde cautious 上限（43,690 个
+  `Cow<str>`，约 43 KiB 输入）的容器会一次涨到 87,380 槽 = 2 MiB，一个 1 MiB body 能塞进约 24 个这样的容器 →
+  **约 47 MiB**，全部发生在预算被查之前。
+  R3 的修法不是调数字而是**换表结构**：表改为逐记录分帧（`meta_len | meta | op_count | [op_len | op]*`），
+  每条记录 ≤ 32 KiB 且单独解码。内层容器再怎么声明，也只有一条记录的字节可用；容量计费加了 2× slack。
+  实测最大 vendored 记录 391 字节（documents.search），整表约 16.5 KB，余量 60 倍以上。
+  现在的界：文件 1 MiB + 已接受 4 MiB + 正在解的记录 <2 MiB ≈ **8 MiB 以内**，且随即废弃。
 - **路径校验是安全需求不是洁癖**：engine 以 `format!("{base}{path}")` 拼 URL。若 IR 里出现 `@evil.example/x`，
   `https://host` + 该 path = `https://host@evil.example/x`，host 变成 userinfo，Bearer token 直接送给攻击者。
   因此下载的 spec 与缓存文件两侧都强制「纯绝对路径」白名单（禁 `@ : ? # % //` 与 `..`）。

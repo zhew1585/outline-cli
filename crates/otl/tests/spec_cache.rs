@@ -2,31 +2,66 @@
 //! rejection path.
 //!
 //! Nothing here touches the real cache directory: every case works on a
-//! `tempfile::TempDir`. The hostile cases build a cache file byte by byte
-//! with a mirror of the private body struct, which also pins the file
-//! layout: magic, little-endian layout version, SHA-256 of the body, then
-//! the bincode body.
+//! `tempfile::TempDir`. The hostile cases build a cache file byte by byte,
+//! which also pins the file layout:
+//!
+//! ```text
+//! magic(8) | layout version(4 LE) | sha256(body)(32) | body
+//! body = meta_len(4 LE) | meta | op_count(4 LE) | [ op_len(4 LE) | op ]*
+//! ```
+//!
+//! Each record is one bincode value. Building the bytes by hand is what
+//! lets a test declare something the encoder would never write - an
+//! impossible operation count, a record that lies about its length - which
+//! is exactly what a hostile cache does.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use engine::ir::{BodyMode, OpSpec};
+use engine::ir::{BodyMode, OpSpec, ParamSpec, ParamType};
 use otl::spec::cache::{self, CacheMeta};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-/// Mirror of the private `cache::Body`: same field order, same types.
-#[derive(Serialize)]
+const MAGIC: [u8; 8] = *b"OTL-IRC\x00";
+const FORMAT_VERSION: u32 = 2;
+
+/// A table as the framing layer sees it.
 struct Body {
     meta: CacheMeta,
     ops: Vec<OpSpec>,
 }
 
-const MAGIC: [u8; 8] = *b"OTL-IRC\x00";
-const FORMAT_VERSION: u32 = 1;
+/// Encode one record the way the cache does.
+fn record<T: Serialize>(value: &T) -> Vec<u8> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard().with_limit::<32_768>())
+        .unwrap()
+}
+
+fn push_record(body: &mut Vec<u8>, bytes: &[u8]) {
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(bytes);
+}
+
+/// Frame a body from parts, bypassing every check `store_at` makes.
+fn frame(body: &Body) -> Vec<u8> {
+    frame_with_count(body, body.ops.len() as u32)
+}
+
+/// [`frame`], but with a declared operation count of the caller's choosing
+/// - so a test can claim thousands of operations in a handful of bytes.
+fn frame_with_count(body: &Body, declared: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_record(&mut out, &record(&body.meta));
+    out.extend_from_slice(&declared.to_le_bytes());
+    for op in &body.ops {
+        push_record(&mut out, &record(op));
+    }
+    out
+}
 
 fn op(name: &str, path: &str) -> OpSpec {
     OpSpec {
@@ -43,17 +78,19 @@ fn meta() -> CacheMeta {
     CacheMeta::new("a".repeat(64), "https://spec.example".to_string())
 }
 
-/// Write a cache file from parts, bypassing every check `store_at` makes.
-fn write_raw(file: &Path, magic: [u8; 8], version: u32, body: &Body) {
-    let encoded =
-        bincode::serde::encode_to_vec(body, bincode::config::standard().with_limit::<8_388_608>())
-            .unwrap();
+/// Write a cache file with a valid header around an arbitrary body.
+fn write_body(file: &Path, magic: [u8; 8], version: u32, body: &[u8]) {
     let mut raw = Vec::new();
     raw.extend_from_slice(&magic);
     raw.extend_from_slice(&version.to_le_bytes());
-    raw.extend_from_slice(&Sha256::digest(&encoded));
-    raw.extend_from_slice(&encoded);
+    raw.extend_from_slice(&Sha256::digest(body));
+    raw.extend_from_slice(body);
     fs::write(file, raw).unwrap();
+}
+
+/// Write a cache file from a framed table.
+fn write_raw(file: &Path, magic: [u8; 8], version: u32, body: &Body) {
+    write_body(file, magic, version, &frame(body));
 }
 
 fn temp_cache() -> (TempDir, PathBuf) {
@@ -193,9 +230,13 @@ fn an_oversized_table_is_refused_without_writing_anything() {
         })
         .collect();
     let error = cache::store_at(&file, &ops, &meta()).expect_err("must be refused");
+    // The message names the CAUSE (encoded size) and both numbers, so a
+    // user is not left guessing which limit they hit.
+    let text = error.to_string();
+    assert!(text.contains("encodes to"), "unexpected error: {text}");
     assert!(
-        error.to_string().contains("too large"),
-        "unexpected error: {error}"
+        text.contains(&cache::MAX_CACHE_BODY_BYTES.to_string()),
+        "{text}"
     );
     assert!(!file.exists(), "a rejected table was still written");
     let leftovers = fs::read_dir(file.parent().unwrap()).unwrap().count();
@@ -432,12 +473,7 @@ fn trailing_bytes_after_the_body_are_rejected() {
 
     let mut extended = body.to_vec();
     extended.extend_from_slice(b"appended payload");
-    let mut forged = Vec::new();
-    forged.extend_from_slice(&MAGIC);
-    forged.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    forged.extend_from_slice(&Sha256::digest(&extended));
-    forged.extend_from_slice(&extended);
-    fs::write(&file, &forged).unwrap();
+    write_body(&file, MAGIC, FORMAT_VERSION, &extended);
 
     let error = cache::load_at(&file).expect_err("must be rejected");
     assert!(!error.is_stale(), "unexpected error: {error}");
@@ -558,7 +594,7 @@ fn a_cache_that_is_not_a_regular_file_is_refused_without_reading_it() {
         .success());
     let error = load_with_watchdog(&fifo).expect_err("a FIFO must be refused");
     assert!(!error.is_stale(), "{error}");
-    assert!(error.to_string().contains("not a regular file"), "{error}");
+    assert!(error.to_string().contains("regular file"), "{error}");
 
     // A symlink to an endless device: `fs::metadata` would follow it and
     // report length 0, then read until memory ran out.
@@ -566,7 +602,7 @@ fn a_cache_that_is_not_a_regular_file_is_refused_without_reading_it() {
     let link = dir.path().join("ir-cache.bin");
     std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
     let error = load_with_watchdog(&link).expect_err("a symlink must be refused");
-    assert!(error.to_string().contains("not a regular file"), "{error}");
+    assert!(error.to_string().contains("regular file"), "{error}");
 
     // Even a symlink to a perfectly good cache file: the loader only ever
     // reads the file it wrote, at the path it wrote it.
@@ -663,6 +699,165 @@ fn a_cache_whose_operations_decode_to_too_much_memory_is_refused() {
 
     let error = cache::load_at(&file).expect_err("must be refused");
     assert!(!error.is_stale(), "{error}");
+}
+
+/// The construction that broke the previous bound: many enum containers
+/// just past the point where serde's reservation logic stops capping and
+/// starts doubling. Each one costs ~44 KiB of input and ~2 MiB of heap, so
+/// a body well under the file limit could reach tens of megabytes before
+/// anything measured it.
+///
+/// It is now refused by the per-record size limit, which is the point of
+/// framing the table: an operation only has one record's worth of bytes to
+/// declare its contents with.
+#[test]
+fn an_operation_packed_with_enum_containers_is_refused() {
+    let (_dir, file) = temp_cache();
+    // Just past serde's cautious reservation cap for `Cow<str>`
+    // (1 MiB / 24 = 43,690 elements), which is where capacity doubles.
+    let over_the_cap = 43_691;
+    let mut fat = op("things.info", "/api/things.info");
+    fat.params = (0..3)
+        .map(|_| ParamSpec {
+            name: "p".to_string().into(),
+            ty: ParamType::String,
+            required: false,
+            nullable: false,
+            enum_values: vec![std::borrow::Cow::Owned(String::new()); over_the_cap].into(),
+            format: String::new().into(),
+            minimum: None,
+            maximum: None,
+        })
+        .collect::<Vec<_>>()
+        .into();
+
+    // The write path refuses it outright (here at the semantic enum cap,
+    // which comes first) and leaves no file behind.
+    let error = cache::store_at(&file, &[fat.clone()], &meta()).expect_err("must be refused");
+    assert!(!file.exists(), "a rejected table was written: {error}");
+
+    // The load path is the one that matters, because a hostile cache never
+    // went through the write path. Framed by hand, the operation's record
+    // is far past the per-record limit...
+    let framed = frame(&Body {
+        meta: meta(),
+        ops: vec![fat],
+    });
+    assert!(
+        framed.len() > 3 * 43_691,
+        "the test input is not the amplifying shape: {} bytes",
+        framed.len()
+    );
+    write_body(&file, MAGIC, FORMAT_VERSION, &framed);
+
+    // ...so it is refused by the framing, before a byte of it is decoded
+    // and long before anything could be allocated for those containers.
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(!error.is_stale(), "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("record declares") || text.contains("byte limit"),
+        "not refused by the framing: {text}"
+    );
+}
+
+/// A record may not lie about its own length: the framing checks it
+/// against the limit AND against the bytes that actually remain, before
+/// anything is allocated or decoded.
+#[test]
+fn a_record_that_lies_about_its_length_is_refused() {
+    let (_dir, file) = temp_cache();
+    let good = Body {
+        meta: meta(),
+        ops: vec![op("things.info", "/api/things.info")],
+    };
+    let framed = frame(&good);
+
+    // The operation record's length field sits after the meta record and
+    // the count; overstate it and the body ends before the record does.
+    let meta_len = u32::from_le_bytes(framed[0..4].try_into().unwrap()) as usize;
+    let op_len_at = 4 + meta_len + 4;
+    let mut forged = framed.clone();
+    forged[op_len_at..op_len_at + 4].copy_from_slice(&999_999u32.to_le_bytes());
+    write_body(&file, MAGIC, FORMAT_VERSION, &forged);
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(!error.is_stale(), "{error}");
+
+    // A length past the per-record limit is refused before the remaining
+    // bytes even matter.
+    let mut forged = framed.clone();
+    forged[op_len_at..op_len_at + 4]
+        .copy_from_slice(&((cache::MAX_OP_RECORD_BYTES + 1) as u32).to_le_bytes());
+    write_body(&file, MAGIC, FORMAT_VERSION, &forged);
+    assert!(cache::load_at(&file).is_err());
+}
+
+/// A short body that declares thousands of operations must be refused on
+/// the spot, not reserved for: the count is checked against the bytes that
+/// remain, not against the format's maximum.
+#[test]
+fn a_short_body_cannot_declare_a_huge_operation_count() {
+    let (_dir, file) = temp_cache();
+    let body = Body {
+        meta: meta(),
+        ops: vec![op("things.info", "/api/things.info")],
+    };
+    for declared in [8192u32, 100_000, u32::MAX] {
+        write_body(
+            &file,
+            MAGIC,
+            FORMAT_VERSION,
+            &frame_with_count(&body, declared),
+        );
+        let error = cache::load_at(&file).expect_err("must be refused");
+        assert!(!error.is_stale(), "{declared}: {error}");
+    }
+}
+
+/// Whatever `store_at` accepts, `load_at` accepts - including the
+/// footprint rule, which store used to skip.
+#[test]
+fn a_stored_table_always_loads_back() {
+    let (_dir, file) = temp_cache();
+    // Short, legal parameter names: encodes small, decodes big. This is
+    // the shape that used to store "successfully" and be rejected on the
+    // next command.
+    let mut heavy = op("things.info", "/api/things.info");
+    heavy.params = (0..2000)
+        .map(|index| ParamSpec {
+            name: format!("p{index}").into(),
+            ty: ParamType::String,
+            required: false,
+            nullable: false,
+            enum_values: Vec::new().into(),
+            format: String::new().into(),
+            minimum: None,
+            maximum: None,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let table: Vec<OpSpec> = (0..200)
+        .map(|index| {
+            let mut op = heavy.clone();
+            let name = format!("things.op{index}");
+            op.path = format!("/api/{name}").into();
+            op.name = name.into();
+            op
+        })
+        .collect();
+
+    match cache::store_at(&file, &table, &meta()) {
+        Ok(()) => {
+            let loaded = cache::load_at(&file)
+                .expect("what store wrote, load must read")
+                .expect("is present");
+            assert_eq!(loaded.ops.len(), table.len());
+        }
+        Err(error) => {
+            // Refusing is fine; writing a file that cannot be read is not.
+            assert!(!file.exists(), "refused with {error}, but wrote a file");
+        }
+    }
 }
 
 /// The ceiling is not off by one, and a table right below it still works.

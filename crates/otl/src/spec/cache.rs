@@ -19,14 +19,17 @@
 //! else entirely. So every load checks, in order:
 //!
 //! 1. the path is a regular file (not a symlink, pipe, socket or device)
-//!    and its size is within the limit - checked WITHOUT following links
-//!    and WITHOUT opening anything that could block ([`read_capped`]);
-//! 2. the open handle is still a regular file, and the read itself is
-//!    bounded, so a file that grows or is swapped mid-way gains nothing;
+//!    and its size is within the limit - checked WITHOUT following links,
+//!    before anything is opened ([`read_capped`]);
+//! 2. the open runs under a watchdog (a path that became a pipe in the
+//!    meantime cannot block the process forever), the open handle is the
+//!    SAME file by device and inode, and the read itself is bounded - so a
+//!    file that grows, or is swapped for another regular file, gains
+//!    nothing;
 //! 3. magic, layout version, body checksum, and a decode that consumes
 //!    exactly the body;
-//! 4. the decode is bounded by element count and decoded footprint, not
-//!    just by bytes consumed ([`BoundedOps`]);
+//! 4. the decode is bounded by framing: element count, per-record size and
+//!    decoded footprint, not just bytes consumed ([`super::bounded`]);
 //! 5. IR schema version and CLI version;
 //! 6. the provenance record, and the safety of every operation
 //!    ([`super::validate_ops`]).
@@ -51,7 +54,6 @@ use directories::ProjectDirs;
 use engine::ir::{OpSpec, IR_SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 
-use super::bounded::BoundedOps;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -76,9 +78,15 @@ const CACHE_FILE_NAME: &str = "ir-cache.bin";
 /// [`store_at`] for why a predictable name would be a vulnerability.
 const TEMP_FILE_PREFIX: &str = "ir-cache.bin.tmp.";
 
+/// How long opening the cache may take before the path is treated as
+/// something other than a plain file. Generous: it only has to outlast a
+/// slow disk.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Why a cache path that is not a plain file is refused.
-const NOT_REGULAR_REASON: &str = "it is not a regular file (a symlink, pipe, socket, device or \
-     directory is never a cache this build wrote)";
+const NOT_REGULAR_REASON: &str = "it is not the regular file this build wrote (a symlink, pipe, \
+     socket, device or directory is never a cache, and neither is a file that was \
+     swapped in while it was being opened)";
 
 /// Length of a hex SHA-256 digest.
 const SPEC_HASH_HEX_LEN: usize = 64;
@@ -91,7 +99,10 @@ const MAGIC: [u8; 8] = *b"OTL-IRC\x00";
 ///
 /// Bumped when the container changes; the IR schema has its own version
 /// inside the body. Either mismatch discards the whole file.
-const FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 replaced a single encoded value with the framed table in
+/// [`super::bounded`], which is what bounds decode-time allocation.
+const FORMAT_VERSION: u32 = 2;
 /// Size of the raw prefix: magic + format version + checksum.
 const PREFIX_LEN: usize = 8 + 4 + 32;
 
@@ -101,7 +112,7 @@ const PREFIX_LEN: usize = 8 + 4 + 32;
 /// the decoded table are all bounded. The number is deliberately small:
 /// the vendored spec's 113 operations compile to about 16 KiB, so this is
 /// roughly 7000 operations of headroom, and it is also the multiplier on
-/// every decode-amplification bound below (see [`BoundedOps`]).
+/// every decode-amplification bound (see [`super::bounded`]).
 pub const MAX_CACHE_FILE_BYTES: usize = 1024 * 1024;
 
 /// Maximum size of the encoded body, i.e. the file limit minus the header.
@@ -113,44 +124,9 @@ pub const MAX_CACHE_FILE_BYTES: usize = 1024 * 1024;
 /// success and never worked.
 pub const MAX_CACHE_BODY_BYTES: usize = MAX_CACHE_FILE_BYTES - PREFIX_LEN;
 
-/// Hard ceiling on the number of operations a cache may declare.
-///
-/// A byte limit alone does NOT bound the decoded table: bincode's limit
-/// counts bytes CONSUMED, and a minimal `OpSpec` encodes to six bytes
-/// while occupying well over a hundred once decoded. Without a count
-/// ceiling a valid-looking cache could ask for a million of them.
-/// (Chosen at roughly seventy times the vendored spec's operation count.)
-pub const MAX_CACHED_OPS: usize = 8192;
-
-/// Ceiling on the total decoded footprint of the operation table.
-///
-/// Checked as the table is decoded, element by element, so decoding stops
-/// at the first operation that pushes the total past it instead of
-/// finishing and then being rejected.
-pub(super) const MAX_DECODED_BYTES: usize = 8 * 1024 * 1024;
-
-/// Fewest encoded bytes one operation can possibly occupy: four
-/// zero-length strings, a body-mode discriminant and an empty parameter
-/// list. Used to reject an impossible element count before decoding.
-pub(super) const MIN_ENCODED_OP_BYTES: usize = 6;
-
-/// Bincode configuration: fixed, so a cache written by one build decodes
-/// identically in the next, and limited as a backstop.
-///
-/// The limit is deliberately NOT the file limit. It binds the decoder only
-/// (the encoder never consults it, so [`store_at`] checks the encoded
-/// length itself), and what it counts is bytes consumed PLUS the claims
-/// the decoder makes for containers - which for a table of real
-/// operations comes to roughly twice the body. Setting it to the body
-/// limit would therefore reject files this build had just written.
-///
-/// The real bounds on a decode are the ones that mean something: the file
-/// size, the element ceiling, and the decoded footprint ([`BoundedOps`]).
-/// This limit exists to stop a forged inner container length before those
-/// checks get a turn, so it is set to the footprint budget.
-fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard().with_limit::<MAX_DECODED_BYTES>()
-}
+/// Ceilings that bound a decoded table, defined with the framing that
+/// enforces them and re-exported here as the cache's public limits.
+pub use super::bounded::{MAX_CACHED_OPS, MAX_DECODED_BYTES, MAX_OP_RECORD_BYTES};
 
 /// Provenance of a cached table, kept for diagnostics and for deciding
 /// whether a sync would change anything.
@@ -196,13 +172,6 @@ pub struct CachedIr {
     pub ops: Vec<OpSpec>,
 }
 
-/// The bincode-encoded part of a cache file.
-#[derive(Serialize, Deserialize)]
-struct Body {
-    meta: CacheMeta,
-    ops: BoundedOps,
-}
-
 /// Why a cache could not be located, read, or written.
 ///
 /// Every load failure is recoverable by design: the caller discards the
@@ -245,18 +214,25 @@ pub enum CacheError {
         /// Which version differs.
         reason: String,
     },
-    /// The compiled table does not fit the cache format.
+    /// The whole table encodes to more than the cache format allows.
     ///
     /// Raised BEFORE writing anything: a file that could not be loaded
     /// back must never be reported as a successful sync.
-    #[error(
-        "the compiled spec is too large to cache: {encoded} bytes of operations, \
-         limit {MAX_CACHE_BODY_BYTES}"
-    )]
+    #[error("the compiled spec encodes to {encoded} bytes, over the {limit} byte cache limit")]
     TooLarge {
         /// Size the table encoded to.
         encoded: usize,
+        /// The limit it exceeded.
+        limit: usize,
     },
+    /// The table breaks one of the cache format's structural limits:
+    /// too many operations, one operation too large, or too much memory
+    /// once decoded.
+    ///
+    /// A separate variant per cause, because "trim the document" and
+    /// "trim one operation's parameters" are different instructions.
+    #[error("the compiled spec does not fit the cache format: {}", .0.reason())]
+    Unsupportable(#[from] super::bounded::TableError),
 }
 
 impl CacheError {
@@ -272,9 +248,10 @@ impl CacheError {
                 "run `otl spec sync` again, or `otl spec reset` to drop the cache"
             }
             Self::TooLarge { .. } => {
-                "the document declares far more operations than a real API has; \
-                 check that --url or --spec points at the right document"
+                "check that --url or --spec points at the intended document; if it \
+                 really is this large, cut it down to the operations you need"
             }
+            Self::Unsupportable(error) => error.remedy(),
             Self::Damaged { .. } | Self::Stale { .. } => {
                 "run `otl spec sync` to rebuild it, or `otl spec reset` to drop it"
             }
@@ -316,19 +293,15 @@ pub fn load_at(file: &Path) -> Result<Option<CachedIr>, CacheError> {
         Some(raw) => raw,
         None => return Ok(None),
     };
-    let body = decode_body(file, &raw)?;
-    check_versions(file, &body.meta)?;
+    let (meta, ops) = decode_body(file, &raw)?;
+    check_versions(file, &meta)?;
     let damaged = |reason: String| CacheError::Damaged {
         path: file.to_path_buf(),
         reason,
     };
-    check_meta(&body.meta).map_err(damaged)?;
-    let ops = body.ops.0;
+    check_meta(&meta).map_err(damaged)?;
     super::validate_ops(&ops).map_err(damaged)?;
-    Ok(Some(CachedIr {
-        meta: body.meta,
-        ops,
-    }))
+    Ok(Some(CachedIr { meta, ops }))
 }
 
 /// Check the provenance record itself.
@@ -374,17 +347,22 @@ fn read_capped(file: &Path) -> Result<Option<Vec<u8>>, CacheError> {
         reason,
     };
     let not_regular = || damaged(NOT_REGULAR_REASON.to_string());
-    if stat_regular(file)?.is_none() {
+    let Some(expected) = stat_regular(file)? else {
         return Ok(None);
-    }
-    let handle = fs::File::open(file).map_err(|error| io_error("read", file, error))?;
-    // Re-check through the OPEN handle: if the path was swapped between the
-    // two calls, this is what notices.
-    if !handle
+    };
+    // Opening under a watchdog: the type check above cannot cover the
+    // instant between itself and the open, and a path that became a FIFO in
+    // that instant would block here forever - never reaching the fallback
+    // this whole function exists to reach.
+    let handle = super::openfile::open_with_timeout(file, OPEN_TIMEOUT)
+        .map_err(|error| damaged(error.describe()))?;
+    // Re-check through the OPEN handle, by IDENTITY and not just by type: a
+    // path swapped between the two calls may well point at another regular
+    // file.
+    let opened = handle
         .metadata()
-        .map_err(|error| io_error("read", file, error))?
-        .is_file()
-    {
+        .map_err(|error| io_error("read", file, error))?;
+    if !opened.is_file() || !super::openfile::is_same_file(&expected, &opened) {
         return Err(not_regular());
     }
     let mut raw = Vec::new();
@@ -430,8 +408,8 @@ fn stat_regular(file: &Path) -> Result<Option<fs::Metadata>, CacheError> {
     Ok(Some(metadata))
 }
 
-/// Check the raw prefix and decode the body.
-fn decode_body(file: &Path, raw: &[u8]) -> Result<Body, CacheError> {
+/// Check the raw prefix and decode the framed body.
+fn decode_body(file: &Path, raw: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), CacheError> {
     let damaged = |reason: String| CacheError::Damaged {
         path: file.to_path_buf(),
         reason,
@@ -457,19 +435,11 @@ fn decode_body(file: &Path, raw: &[u8]) -> Result<Body, CacheError> {
             "its checksum does not match its contents".to_string(),
         ));
     }
-    let (decoded, consumed) = bincode::serde::decode_from_slice::<Body, _>(body, bincode_config())
-        .map_err(|error| damaged(format!("it could not be decoded ({error})")))?;
-    // A cache file is exactly one encoded body and nothing else. Trailing
-    // bytes mean the file is not what this build writes - whoever produced
-    // it was not this code path - so it is not trusted, even though the
-    // decoder stopped happily and the checksum covers the suffix too.
-    if consumed != body.len() {
-        return Err(damaged(format!(
-            "it carries {} unexpected trailing bytes",
-            body.len() - consumed
-        )));
-    }
-    Ok(decoded)
+    // The framed decode is where every allocation bound lives, including
+    // the rule that the body is exactly one table and nothing else: bytes
+    // left over mean this file did not come from this code path, however
+    // well its checksum matches.
+    super::bounded::decode_table(body).map_err(CacheError::Unsupportable)
 }
 
 /// Reject a cache this build cannot interpret.
@@ -562,7 +532,7 @@ pub fn store_at(file: &Path, ops: &[OpSpec], meta: &CacheMeta) -> Result<(), Cac
     // be written happily and then rejected as stale on the very next
     // command, which is the same broken promise as an oversized one.
     check_versions(file, meta)?;
-    let encoded = encode(file, ops, meta)?;
+    let encoded = encode(ops, meta)?;
     let dir = file.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(|error| io_error("create", dir, error))?;
     // Same directory as the target: a rename across filesystems is not
@@ -578,25 +548,19 @@ pub fn store_at(file: &Path, ops: &[OpSpec], meta: &CacheMeta) -> Result<(), Cac
     Ok(())
 }
 
-/// Encode the body, refusing a table that would not load back.
+/// Frame the body, refusing a table that would not load back.
 ///
-/// bincode's byte limit binds the decoder only, so the encoded length is
-/// checked here: writing a file that the loader would reject as oversized
-/// would report a successful sync that silently never takes effect.
-fn encode(file: &Path, ops: &[OpSpec], meta: &CacheMeta) -> Result<Vec<u8>, CacheError> {
-    let body = Body {
-        meta: meta.clone(),
-        ops: BoundedOps(ops.to_vec()),
-    };
-    let encoded = bincode::serde::encode_to_vec(&body, bincode_config()).map_err(|error| {
-        CacheError::Damaged {
-            path: file.to_path_buf(),
-            reason: format!("the table could not be encoded ({error})"),
-        }
-    })?;
+/// Every limit the loader enforces is enforced here first - operation
+/// count, per-operation record size, decoded footprint, and the encoded
+/// size of the whole body. A cache that reports success and is then
+/// discarded on the next command is the same broken promise as a failed
+/// sync, only quieter.
+fn encode(ops: &[OpSpec], meta: &CacheMeta) -> Result<Vec<u8>, CacheError> {
+    let encoded = super::bounded::encode_table(meta, ops).map_err(CacheError::Unsupportable)?;
     if encoded.len() > MAX_CACHE_BODY_BYTES {
         return Err(CacheError::TooLarge {
             encoded: encoded.len(),
+            limit: MAX_CACHE_BODY_BYTES,
         });
     }
     Ok(encoded)

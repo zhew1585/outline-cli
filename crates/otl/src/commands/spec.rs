@@ -14,8 +14,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -28,7 +26,7 @@ use crate::errors::map_fetch_error;
 use crate::exit::CliError;
 use crate::ops;
 use crate::render::OutputMode;
-use crate::spec::{self, cache};
+use crate::spec::{self, cache, openfile};
 use crate::stdio;
 
 /// Total timeout for fetching a spec document.
@@ -224,7 +222,8 @@ fn open_regular(path: &Path) -> Result<fs::File, CliError> {
     if metadata.len() > MAX_DOCUMENT_BYTES {
         return Err(too_large(path));
     }
-    let file = open_with_timeout(path, OPEN_TIMEOUT)?;
+    let file = openfile::open_with_timeout(path, OPEN_TIMEOUT)
+        .map_err(|error| open_error(path, &error))?;
     let opened = file.metadata().map_err(|error| read_error(path, error))?;
     if !opened.is_file() {
         return Err(not_regular());
@@ -235,30 +234,13 @@ fn open_regular(path: &Path) -> Result<fs::File, CliError> {
     Ok(file)
 }
 
-/// Open a file, giving up if the open itself does not return in time.
-///
-/// The open runs on another thread and the result comes back over a
-/// channel. If it never arrives the thread stays blocked in the kernel,
-/// which is harmless: the process is about to exit with an error, and
-/// exiting tears the thread down.
-fn open_with_timeout(path: &Path, timeout: Duration) -> Result<fs::File, CliError> {
-    let (sender, receiver) = mpsc::channel();
-    let owned = path.to_path_buf();
-    thread::spawn(move || {
-        // The receiver may already be gone (we timed out); ignore that.
-        let _ = sender.send(fs::File::open(owned));
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(file)) => Ok(file),
-        Ok(Err(error)) => Err(read_error(path, error)),
-        Err(_) => Err(CliError::usage(anyhow!(
-            "opening the spec file {} did not complete within {} seconds; it \
-             is not a plain readable file (a pipe with no writer blocks \
-             forever, and so can an unresponsive network filesystem)",
-            path.display(),
-            timeout.as_secs()
-        ))),
-    }
+/// A failed open of the `--spec` path.
+fn open_error(path: &Path, error: &openfile::OpenError) -> CliError {
+    CliError::usage(anyhow!(
+        "cannot read the spec file {}: {}",
+        path.display(),
+        error.describe()
+    ))
 }
 
 /// A filesystem failure on the `--spec` path, reduced to its error kind.
@@ -471,40 +453,6 @@ mod tests {
             compile_error("not JSON", Source::Remote).code,
             ExitCode::Failure
         );
-    }
-
-    /// The watchdog is what closes the window between the file-type check
-    /// and the open. Tested directly, because the pre-check means the race
-    /// cannot be provoked through the normal path.
-    #[cfg(unix)]
-    #[test]
-    fn an_open_that_blocks_is_reported_instead_of_hanging() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let fifo = dir.path().join("blocking.pipe");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo")
-            .success());
-
-        let started = std::time::Instant::now();
-        let error = open_with_timeout(&fifo, Duration::from_millis(200))
-            .expect_err("a pipe with no writer must not open");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "did not give up"
-        );
-        assert!(
-            error.to_string().contains("did not complete"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn a_normal_file_opens_through_the_watchdog() {
-        let mut file = tempfile::NamedTempFile::new().expect("temp file");
-        std::io::Write::write_all(&mut file, b"{}").expect("write");
-        assert!(open_with_timeout(file.path(), Duration::from_secs(5)).is_ok());
     }
 
     #[test]
