@@ -112,12 +112,12 @@ so that 新端点无需等 CLI 发版。
 ```
 crates/
   speccompile/            # 新：共用 OpenAPI -> IR 编译器（无 vendor 特定内容）
-    src/{lib.rs, schema.rs, text.rs}
+    src/{lib.rs, schema.rs, text.rs, document.rs}   # document.rs：有界解析
   engine/
     src/fetch.rs          # 新：明文文档通道（独立错误域 + 复用 retry/throttle）
   otl/
     build.rs              # 瘦身：只渲染静态表
-    src/spec/{mod.rs, cache.rs}   # 新：spec 生命周期 + bincode 缓存
+    src/spec/{mod.rs, cache.rs, bounded.rs, openfile.rs}  # 生命周期 / 缓存 / 分帧 / 不挂死的 open
     src/ops.rs            # 表解析（缓存优先，内置兜底）
     src/commands/spec.rs  # 新：sync / reset
     tests/{spec_cache.rs, spec_sync_e2e.rs, spec_parity.rs, no_phone_home.rs, common/mod.rs}
@@ -209,6 +209,23 @@ persist、HashSet 化无语义回归、consumed 检查、函数长度）未再�
 「本仓库实际使用的形态不能被悄悄新增」——新的 send 点、fetch 模块的新公开项、任何 manifest/lock 里的第二个 HTTP 栈、
 新的文件打开站点，都会在这里失败，而修改它们本身就是这些测试代替的那次评审。
 
+### Review R4 处置（R3 九条：VERIFIED 5 / PARTIAL 4 / 0 REGRESSED；新增 3 MAJOR + 6 MINOR，全部修复）
+
+R4 换成能真跑门禁的审查者，结论有两条对我不利且都成立：**上界数字第二次被证伪**，以及**真正的内存问题在缓存解码的上一步**。
+
+| # | 处置 |
+|---|------|
+| [2] MAJOR 16 MiB 文档解析放大到 367 MB | 根因是 `serde_json::from_str::<Value>` 无界。新增 `speccompile/src/document.rs`：**只物化编译器真正读的部分**（`paths` / `components`，其余键走 `IgnoredAny`，零分配），并给物化的部分**边解析边计费**（`MAX_PARSED_BYTES` = 24 MiB，超了当场停）。用审查者原样的复现实测：**367 MB → 29 MB**（vendored 对照 7.2 MB）。取消了 `compile(&Value)` 这个公开入口——它会绕过唯一在其它限额之前生效的限制 |
+| [1] MAJOR 上界数字又错（8 MiB vs 实测 10 MiB） | **不再写数字**。`bounded.rs` 的散文上界换成「哪一条检查、对应哪个常量」的清单，真实峰值改为**可执行断言**：新增 `crates/otl/tests/memory_bounds.rs`，用 dhat（`unsafe` 在 dhat 内部，本仓库仍零 unsafe）实测六个场景并断言峰值。当前实测：忽略键文档 **0.00 MiB**、膨胀文档 8.00、vendored 2.25、8192 op 缓存 1.52、两层撒谎记录 1.46、正常缓存 0.04 |
+| 同上，两处低估的根因 | 文件缓冲改为按 stat 大小预留（不再倍增到 3×）；表自身的 `Vec<OpSpec>` **在预留前先计费**（原先完全不计），`footprint_of` 相应只算内容 |
+| [3] MAJOR provenance 撒谎 | `get_text` 改返回 `FetchedDocument { text, origin }`，origin 取**应答方**（`response.url()` 经同一套 URL 规则复检）而非被问方；`CacheMeta.source` 与 sync 报告都用它。双 server 测试（engine 与 e2e 各一）断言记录的是应答主机。错误消息仍用**被问的** origin——那是用户敲的、能据以行动的那个 |
+| [5] MINOR `OperationTooLarge` 解码侧是死变体 | 解码侧新增 `take_op_record`：超长记录报「operation #N，超出每条上限，参数/枚举太多」而不是泛化 framing 错误；测试断言序号、上限与对症 remedy |
+| [6] MINOR `--spec` 没跟上 (dev,ino) | `open_regular` 复检改为 `is_same_file`（与缓存路径同一函数），文案同步。**测试局限如实说明**：竞态本身无法稳定构造，`is_same_file` 有单测，`--spec` 侧靠共用同一函数 |
+| [7] MINOR `[dependencies.X]` table 写法绕过 | 检测抽成 `is_dependency_declaration`，同时认 inline 与 table（含 `[target."cfg(unix)".dependencies.hyper]`），并**给检测器本身加了自测**（6 个应命中 + 6 个不应命中）。已实测：植入 `[dependencies.hyper]` 后守卫失败 |
+| [8] MINOR `record_config` 死参数 | 拆成 `op_record_config` / `meta_record_config`，各自的 bincode 限额为记录上限的 4 倍——**这个倍数有实证理由**：一条 32,008 字节的合法记录在 32 KiB 限额下会被拒（限额计的是「消耗字节 + 容器 claim」） |
+| [9] MINOR File List 漏登记 | 补 `engine/src/retry.rs`、`engine/tests/rate_limit.rs`，并补齐本轮新增文件 |
+| 守卫摘要过度声称 | 摘要改为继承被摘要测试的限制：只保证**具名**的 HTTP/TLS crate 会被抓，而不是「任何 HTTP 依赖」 |
+
 审查者「已查无发现」的结论保持不变（路径跨源防线、下载体积、bincode 分配、OnceLock 不影响 `--help`、mirror/parity 守法、thiserror 用法、运行时无第二条 OpenAPI 解析路径），相关代码未做无谓改动。
 
 ### Completion Notes List
@@ -235,14 +252,16 @@ persist、HashSet 化无语义回归、consumed 检查、函数长度）未再�
 ### File List
 
 - Cargo.toml, Cargo.lock
-- crates/speccompile/Cargo.toml, crates/speccompile/src/{lib.rs, schema.rs, text.rs}
-- crates/engine/Cargo.toml（无改动）, crates/engine/src/{lib.rs, fetch.rs}, crates/engine/tests/fetch.rs
-  （crates/engine/src/error.rs 在 R1 后回到 develop 原状：fetch 用独立错误类型）
+- crates/speccompile/Cargo.toml, crates/speccompile/src/{lib.rs, schema.rs, text.rs, document.rs}
+- crates/engine/Cargo.toml（无改动）, crates/engine/src/{lib.rs, fetch.rs, retry.rs}, 
+  crates/engine/tests/{fetch.rs, rate_limit.rs}
+  （crates/engine/src/error.rs 与 ir.rs 相对 develop **零 diff**，已由 R2/R4 审查者独立核对 blob hash）
 - crates/otl/Cargo.toml, crates/otl/build.rs
 - crates/otl/src/{lib.rs, ops.rs, errors.rs, main.rs}
-- crates/otl/src/spec/{mod.rs, cache.rs}
+- crates/otl/src/spec/{mod.rs, cache.rs, bounded.rs, openfile.rs}
 - crates/otl/src/commands/{mod.rs, api.rs, spec.rs}
 - crates/otl/tests/{spec_cache.rs, spec_sync_e2e.rs, spec_parity.rs, no_phone_home.rs, ir_table.rs, startup_guard.rs,
-  common/mod.rs}；cache 隔离补丁另涉 {api_list.rs, api_params.rs, api_e2e.rs, paging_e2e.rs, contract_smoke.rs}
+  common/mod.rs, memory_bounds.rs}；cache 隔离补丁另涉 {api_list.rs, api_params.rs, api_e2e.rs,
+  paging_e2e.rs, contract_smoke.rs}
 - docs/exit-codes.md, README.md, project-context.md（第 3 条 HTTP 例外 + 两条 Windows/终端注入的反模式）
 - stories/4-2-spec-sync.md

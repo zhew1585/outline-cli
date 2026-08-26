@@ -24,10 +24,11 @@
 //! renamed import, a macro, a subprocess, a dependency doing it on our
 //! behalf - would pass. What the guards do guarantee is that the shapes
 //! this codebase actually uses cannot be added silently: a new send site,
-//! a new public entry point in the fetch module, a new HTTP dependency in
-//! any manifest or in `Cargo.lock`, or a raw socket all fail here, and
-//! adding one means editing this file - which is the review these tests
-//! stand in for.
+//! a new public entry point in the fetch module, a raw socket, or a NAMED
+//! HTTP/TLS crate (the list in `FORBIDDEN_CRATES`, which is the set worth
+//! naming today rather than every client that exists) appearing in a
+//! manifest or in `Cargo.lock` all fail here. Adding one means editing
+//! this file - which is the review these tests stand in for.
 //!
 //! The invariant they support (not replace) is the one in
 //! `project-context.md`: every outbound request goes through one of the
@@ -237,6 +238,23 @@ const FORBIDDEN_CRATES: &[&str] = &[
 /// so the distinction is made where it is visible: our own manifests.
 const INDIRECT_ONLY_CRATES: &[&str] = &["hyper", "rustls", "h2", "tokio-rustls"];
 
+/// Whether one manifest line declares `crate_name` as a dependency, in
+/// either of TOML's two forms.
+fn is_dependency_declaration(line: &str, crate_name: &str) -> bool {
+    let inline = line.contains('=')
+        && [" ", "=", "."]
+            .iter()
+            .any(|separator| line.starts_with(&format!("{crate_name}{separator}")));
+    let table = line.starts_with('[')
+        && line.ends_with(']')
+        && line
+            .trim_matches(['[', ']'])
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last == crate_name);
+    inline || table
+}
+
 /// No new dependency may bring a second HTTP stack or TLS client in
 /// through the back door, which would make the source rules above moot.
 ///
@@ -274,20 +292,20 @@ fn no_second_http_stack_reaches_the_dependency_graph() {
         // fine as a direct dependency of ours: using one directly means
         // speaking HTTP or TLS outside the two channels.
         for indirect in INDIRECT_ONLY_CRATES {
-            // A dependency KEY (`rustls = ...`, `rustls.workspace = true`),
-            // not a feature string inside an array - enabling reqwest's
-            // `rustls` feature is how the TLS backend is chosen, and that
-            // is the point.
+            // Two ways TOML declares a dependency, and only these two are
+            // a declaration:
+            //
+            //   inline:  `hyper = "1"`, `hyper.workspace = true`
+            //   table:   `[dependencies.hyper]`, `[target."cfg(unix)".dependencies.hyper]`
+            //
+            // A feature string inside an array (`"rustls"` in reqwest's
+            // own feature list) is neither, and must keep passing:
+            // choosing the TLS backend that way is the point.
             let declared = text
                 .lines()
-                .filter(|line| !line.trim_start().starts_with('#'))
-                .filter(|line| line.contains('='))
-                .any(|line| {
-                    let trimmed = line.trim_start();
-                    [" ", "=", "."]
-                        .iter()
-                        .any(|separator| trimmed.starts_with(&format!("{indirect}{separator}")))
-                });
+                .map(str::trim)
+                .filter(|line| !line.starts_with('#'))
+                .any(|line| is_dependency_declaration(line, indirect));
             assert!(
                 !declared,
                 "{indirect:?} is declared directly in {}: it may only arrive \
@@ -328,6 +346,40 @@ const CHANNEL_SEND_APIS: &[&str] = &[
 /// channels (the `reqwest` confinement rule covers these too; they are
 /// listed for a clearer failure message).
 const NAMED_REQWEST_SENDS: &[&str] = &["blocking::get(", "reqwest::get("];
+
+/// The dependency detector, tested against the forms it has to catch and
+/// the ones it must not. Without this, the guard is only ever exercised
+/// against manifests that happen to be clean - which is how the table form
+/// slipped through before.
+#[test]
+fn the_dependency_detector_knows_both_toml_forms() {
+    for declaration in [
+        "hyper = \"1\"",
+        "hyper=\"1\"",
+        "hyper.workspace = true",
+        "[dependencies.hyper]",
+        "[dev-dependencies.hyper]",
+        "[target.\"cfg(unix)\".dependencies.hyper]",
+    ] {
+        assert!(
+            is_dependency_declaration(declaration.trim(), "hyper"),
+            "{declaration:?} is a declaration"
+        );
+    }
+    for innocent in [
+        "\"hyper\",", // a feature string in an array
+        "features = [\"hyper\"]",
+        "# hyper = \"1\"",    // commented out (filtered earlier)
+        "hyperlocal = \"1\"", // a different crate
+        "[dependencies.hyperlocal]",
+        "reqwest = { features = [\"hyper\"] }",
+    ] {
+        assert!(
+            !is_dependency_declaration(innocent.trim(), "hyper"),
+            "{innocent:?} is not a declaration of `hyper`"
+        );
+    }
+}
 
 /// One request-sending call per channel, and no other way of sending.
 ///
@@ -442,6 +494,7 @@ fn the_document_channel_exports_only_what_is_reviewed() {
     const EXPECTED: &[&str] = &[
         "pub const MAX_DOCUMENT_BYTES",
         "pub enum FetchError",
+        "pub struct FetchedDocument",
         "pub struct DocumentFetch",
         "pub fn new",
         "pub fn with_retry_policy",
