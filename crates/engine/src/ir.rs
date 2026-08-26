@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 /// Version history: 2 added `OpSpec::summary`; 3 added
 /// `OpSpec::content_type`, `OpSpec::body_mode` and the `ParamSpec`
 /// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`);
-/// 4 added `ParamSpec::format`.
-pub const IR_SCHEMA_VERSION: u32 = 4;
+/// 4 added `ParamSpec::format`; 5 added `OpSpec::response_fields`.
+pub const IR_SCHEMA_VERSION: u32 = 5;
 
 /// How strictly a request is validated against the IR before being sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +118,35 @@ pub struct ParamSpec {
     pub maximum: Option<f64>,
 }
 
+/// One field of an operation's response payload.
+///
+/// These describe the shape of a single response ITEM (one row of a list
+/// response, or the payload object itself), in the order the source schema
+/// declares them. Consumers use them to pick output columns from the schema
+/// rather than from whatever a particular response happened to contain, so
+/// the same operation always renders the same way.
+///
+/// Only facets that a generic presentation layer can act on are carried;
+/// there is deliberately no per-operation presentation data here. Where the
+/// payload lives inside a response envelope is a service convention, so it
+/// is resolved by the spec compiler that emits the IR, never by the engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldSpec {
+    /// Field name as it appears in the JSON response.
+    pub name: Cow<'static, str>,
+    /// Declared wire type; [`ParamType::Json`] for objects, arrays and
+    /// unions (anything that is not a single displayable value).
+    pub ty: ParamType,
+    /// Declared `format` (e.g. `uuid`, `date-time`), empty when absent.
+    pub format: Cow<'static, str>,
+    /// Whether the schema allows an explicit JSON `null`.
+    pub nullable: bool,
+    /// Whether the schema marks the field as server-generated
+    /// (`readOnly`). A generic renderer can use this to tell a writable
+    /// label (a title, a name) from a derived one (a URL, an id-like slug).
+    pub read_only: bool,
+}
+
 /// A single RPC operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpSpec {
@@ -136,6 +165,9 @@ pub struct OpSpec {
     pub body_mode: BodyMode,
     /// Request-body parameters.
     pub params: Cow<'static, [ParamSpec]>,
+    /// Fields of one item of the success response payload, in source-schema
+    /// declaration order. Empty when the spec describes no response shape.
+    pub response_fields: Cow<'static, [FieldSpec]>,
 }
 
 impl OpSpec {

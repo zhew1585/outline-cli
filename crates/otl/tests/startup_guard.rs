@@ -76,7 +76,10 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
     isolate(&mut cmd)
         .current_dir(dir)
         .env_remove("OUTLINE_URL")
-        .env_remove("OUTLINE_API_KEY");
+        .env_remove("OUTLINE_API_KEY")
+        .env_remove("OUTLINE_PROFILE")
+        // Empty value = read no user config file (Story 4.1).
+        .env("OUTLINE_CONFIG", "");
     cmd
 }
 
@@ -158,10 +161,37 @@ const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Reviewed exceptions as (path suffix, pattern) pairs. Empty on purpose:
-/// add an entry with a comment only when a runtime source legitimately needs
-/// one of the patterns above.
-const SOURCE_SCAN_ALLOWLIST: &[(&str, &str)] = &[];
+/// Reviewed exceptions as (path suffix, pattern, exact occurrence count).
+///
+/// The COUNT is what makes an entry a review of specific call sites rather
+/// than a permanent hole in the file: adding another occurrence of an
+/// allowlisted pattern to an allowlisted file fails the guard until someone
+/// looks at the new one and bumps the number. Removing one fails too, so a
+/// stale exception cannot linger unnoticed.
+///
+/// The release-binary assertions above remain the hard proof that no spec is
+/// embedded or opened at runtime; this scan is the early warning.
+const SOURCE_SCAN_ALLOWLIST: &[(&str, &str, usize)] = &[
+    // `otl docs export` refuses to write into a directory that already has
+    // contents unless `--overwrite` is given, and has to tell leftovers of
+    // its own from content the user put there - both of which mean
+    // enumerating the user-supplied output directory. One call site:
+    // `inspect_dir`. Nothing to do with the vendored spec.
+    ("commands/docs/outdir.rs", "read_dir", 1),
+    // One `#[cfg(test)]` helper that lists a temporary directory, so the
+    // write tests can assert exactly which entries a write left behind -
+    // which is how "no temporary file survived" is checked. Test-only, and
+    // the directory it reads is one the test just created.
+    ("commands/docs/target.rs", "read_dir", 1),
+    // Golden-file assertions inside `#[cfg(test)]` modules: the curated
+    // commands' human-readable output is compared byte-for-byte against
+    // `tests/golden/*.txt`. The embedded files are test fixtures, compiled
+    // only into the test harness, never into the shipped binary. One
+    // `include_str!` per golden file.
+    ("commands/collections.rs", "include_str!", 1),
+    ("commands/docs/detail.rs", "include_str!", 1),
+    ("commands/docs/search.rs", "include_str!", 1),
+];
 
 /// Collect `crates/*/src/**/*.rs`. `build.rs` files live outside `src/` and
 /// are therefore excluded by construction.
@@ -194,12 +224,32 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Is this (file, pattern) combination a reviewed exception?
-fn is_allowlisted(file: &Path, pattern: &str) -> bool {
+/// The reviewed occurrence count for this (file, pattern), if any.
+fn allowed_occurrences(file: &Path, pattern: &str) -> Option<usize> {
     let path = file.to_string_lossy().replace('\\', "/");
     SOURCE_SCAN_ALLOWLIST
         .iter()
-        .any(|(suffix, allowed)| *allowed == pattern && path.ends_with(suffix))
+        .find(|(suffix, allowed, _)| *allowed == pattern && path.ends_with(suffix))
+        .map(|(_, _, count)| *count)
+}
+
+/// Judge one file against one forbidden pattern.
+///
+/// `None` means clean. `Some(reason)` is a violation: either the pattern is
+/// present in a file with no exception at all, or the exception exists but
+/// the number of occurrences no longer matches what was reviewed.
+fn scan(file: &Path, source: &str, pattern: &str, reason: &str) -> Option<String> {
+    let found = source.matches(pattern).count();
+    match allowed_occurrences(file, pattern) {
+        None if found > 0 => Some(format!("  {}: {pattern} - {reason}", file.display())),
+        Some(allowed) if found != allowed => Some(format!(
+            "  {}: {pattern} appears {found} time(s), but only {allowed} \
+             reviewed occurrence(s) are allowlisted - review the new one and \
+             update SOURCE_SCAN_ALLOWLIST",
+            file.display()
+        )),
+        _ => None,
+    }
 }
 
 #[test]
@@ -208,9 +258,7 @@ fn runtime_sources_never_reach_for_the_spec() {
     for file in runtime_source_files() {
         let source = std::fs::read_to_string(&file).unwrap();
         for (pattern, reason) in FORBIDDEN_SOURCE_PATTERNS {
-            if source.contains(pattern) && !is_allowlisted(&file, pattern) {
-                violations.push(format!("  {}: {pattern} - {reason}", file.display()));
-            }
+            violations.extend(scan(&file, &source, pattern, reason));
         }
     }
     assert!(
@@ -310,4 +358,42 @@ fn api_unknown_op_rejected_by_ir_with_no_spec_file_reachable() {
         .stderr(predicate::str::contains("unknown API operation"))
         .stderr(predicate::str::contains("nonexistent.op"));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Negative test for the source scan itself: the allowlist must be a review
+/// of specific call sites, not a blanket exemption for a file.
+///
+/// Without the occurrence count, a second `read_dir` added to
+/// `commands/docs/export.rs` - including one that enumerated the vendored
+/// spec directory - would slip through, because the file already holds an
+/// exception for that pattern.
+#[test]
+fn the_allowlist_does_not_exempt_a_whole_file() {
+    let allowlisted = Path::new("crates/otl/src/commands/docs/outdir.rs");
+    let pattern = "read_dir";
+    let reason = "test reason";
+    assert_eq!(
+        allowed_occurrences(allowlisted, pattern),
+        Some(1),
+        "the fixture no longer matches the allowlist"
+    );
+
+    // Exactly the reviewed number of occurrences: clean.
+    assert!(scan(allowlisted, "std::fs::read_dir(dir)", pattern, reason).is_none());
+
+    // One more occurrence than was reviewed: a violation, naming both counts.
+    let extra = "std::fs::read_dir(dir); std::fs::read_dir(spec_dir)";
+    let violation = scan(allowlisted, extra, pattern, reason)
+        .expect("an unreviewed occurrence must be reported");
+    assert!(violation.contains("2 time(s)"), "{violation}");
+    assert!(violation.contains("1 reviewed"), "{violation}");
+
+    // Fewer than reviewed: also a violation, so a stale exception cannot
+    // linger after the code it covered is gone.
+    assert!(scan(allowlisted, "nothing here", pattern, reason).is_some());
+
+    // A file with no exception at all is reported on the first occurrence.
+    let other = Path::new("crates/otl/src/session.rs");
+    assert_eq!(allowed_occurrences(other, pattern), None);
+    assert!(scan(other, "std::fs::read_dir(x)", pattern, reason).is_some());
 }

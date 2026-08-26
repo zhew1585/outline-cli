@@ -32,10 +32,18 @@ fn documents_search_succeeds_against_real_workspace() {
         return;
     };
 
+    // Empty config DIRECTORY too, not just an empty config file: the
+    // credential file lives in that directory and now outranks
+    // OUTLINE_API_KEY, so a developer with a stored credential would be
+    // smoke-testing that one instead of the key this test was given.
+    let config_dir = tempfile::tempdir().unwrap();
     let output = Command::cargo_bin("otl")
         .unwrap()
         .env("OUTLINE_URL", &url)
         .env("OUTLINE_API_KEY", &key)
+        .env_remove("OUTLINE_PROFILE")
+        .env("OUTLINE_CONFIG", "")
+        .env("OUTLINE_CONFIG_DIR", config_dir.path())
         .args(["api", "documents.search", "query=contract-smoke"])
         .output()
         .unwrap();

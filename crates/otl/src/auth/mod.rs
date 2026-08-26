@@ -25,7 +25,6 @@
 //! and a default): the full configuration and profile system lives
 //! elsewhere, and this module only needs a name to file credentials under.
 
-pub mod browser;
 pub mod callback_request;
 pub mod client_acquisition;
 pub mod credentials;
@@ -48,6 +47,7 @@ pub mod selection;
 pub mod source;
 pub mod transport;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use engine::EngineError;
@@ -55,8 +55,9 @@ use thiserror::Error;
 
 use crate::auth::credentials::CredentialStore;
 use crate::auth::error::{OAuthError, StoreError};
-use crate::auth::source::CredentialProvider;
-use crate::config::{ConfigError, ENV_API_KEY, ENV_URL};
+use crate::auth::selection::{check_binding, env_api_key};
+use crate::auth::source::{warn_about_env_key, CredentialProvider};
+use crate::config::{self, ConfigError, EnvLayer, Overrides, Settings, ENV_API_KEY};
 use crate::errors::map_engine_error;
 use crate::exit::{CliError, ExitCode};
 
@@ -108,52 +109,113 @@ pub struct Session {
     pub provider: Arc<CredentialProvider>,
 }
 
-/// The instance base URL, from the environment.
+/// The instance a command is pointed at, resolved through the config layer.
 ///
-/// Kept local and minimal on purpose - the configuration system that will
-/// resolve this from a profile file lives elsewhere - but it reuses the
-/// same error, so the message a user sees is identical either way.
-pub fn base_url() -> Result<String, AuthError> {
-    std::env::var(ENV_URL)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or(AuthError::Config(ConfigError::MissingUrl))
+/// Wraps [`Settings`] rather than re-deriving anything: `--profile`,
+/// `--url`, `--config`, `OUTLINE_PROFILE`, `OUTLINE_URL` and the user config
+/// file are all config's business, and `auth` reading the environment on its
+/// own is how the two would come to disagree about which instance is in
+/// play.
+pub struct Instance {
+    settings: Settings,
+    env: EnvLayer,
+    origin: String,
 }
 
-/// Resolve the active profile's credentials.
+impl Instance {
+    /// Base URL of the instance.
+    pub fn base_url(&self) -> &str {
+        self.settings.base_url()
+    }
+
+    /// Origin (`scheme://host[:port]`) stored credentials are bound to.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The credential file key for the selected profile.
+    ///
+    /// Config leaves "no profile selected" as `None`; the credential file
+    /// still needs a table name, and [`DEFAULT_PROFILE`] is it.
+    pub fn profile_key(&self) -> &str {
+        self.settings.profile().unwrap_or(paths::DEFAULT_PROFILE)
+    }
+
+    /// The resolved settings, for the credential release gate.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// The environment layer, for the environment credential source.
+    pub fn env(&self) -> &EnvLayer {
+        &self.env
+    }
+}
+
+/// Resolve which instance is in play, and refuse it if it is not usable.
+///
+/// The transport rule is applied HERE, at the one place every command's
+/// instance is resolved, and not in `auth login` alone: the engine is
+/// generic and accepts plain `http` on purpose, so the policy that a
+/// credential may not travel in the clear has to live at this boundary.
+pub fn resolve_instance(overrides: &Overrides) -> Result<Instance, AuthError> {
+    let env = EnvLayer::from_process();
+    let loaded = config::load_file(overrides, &env)?;
+    let settings = config::resolve_settings(overrides, &env, &loaded)?;
+    let origin = usable_origin(settings.base_url())?;
+    Ok(Instance {
+        settings,
+        env,
+        origin,
+    })
+}
+
+/// The profile whose credentials a command should act on, WITHOUT resolving
+/// an instance.
+///
+/// `otl auth logout` needs exactly this and nothing else: every URL it
+/// contacts comes out of the credential file, so demanding a usable
+/// `OUTLINE_URL` would make cleanup impossible in the states that most need
+/// it. Profile selection comes from config's own resolver so the two cannot
+/// disagree about which profile is active.
+pub fn active_profile(overrides: &Overrides) -> Result<String, AuthError> {
+    let env = EnvLayer::from_process();
+    let loaded = config::load_file(overrides, &env)?;
+    let (name, _) = config::resolve_profile_name(overrides, &env, &loaded);
+    Ok(name.unwrap_or(paths::DEFAULT_PROFILE).to_string())
+}
+
+/// Resolve the active profile's credentials for an instance.
 ///
 /// The instance's origin is passed into resolution, which refuses stored
 /// credentials issued by a DIFFERENT instance. That check is why this
 /// function exists rather than each command wiring up its own provider: it
 /// must not be possible to build a request-channel client without it.
-pub fn open_session() -> Result<Session, AuthError> {
-    // URL first: with no instance to talk to, which credential would be
-    // used is not yet an interesting question.
-    let base_url = base_url()?;
-    let origin = instance_origin(&base_url)?;
-    let profile = paths::active_profile()?;
+pub fn open_session(overrides: &Overrides) -> Result<Session, AuthError> {
+    let instance = resolve_instance(overrides)?;
+    let profile = instance.profile_key().to_string();
     let store = CredentialStore::discover()?;
     let file = store.load()?;
-    let provider = CredentialProvider::resolve(store.clone(), &profile, &file, &origin)?
+    let provider = CredentialProvider::resolve(store.clone(), &profile, &file, instance.origin())?
         .ok_or_else(|| AuthError::NoCredentials {
             profile: profile.clone(),
         })?;
     Ok(Session {
-        base_url,
+        base_url: instance.base_url().to_string(),
         profile,
         store,
         provider: Arc::new(provider),
     })
 }
 
-/// The origin stored credentials are bound to for a given instance URL.
+/// The origin stored credentials are bound to for a given instance URL,
+/// after the shape and transport rules have both passed.
 ///
 /// Origin, not the whole URL: a bearer credential is scoped to a host, and
 /// a differing path (a trailing slash, a sub-path) does not make it a
 /// different server. A URL with no usable origin cannot be matched against
 /// anything, so it is refused here rather than treated as a wildcard.
-pub fn instance_origin(base_url: &str) -> Result<String, AuthError> {
+pub fn usable_origin(base_url: &str) -> Result<String, AuthError> {
     // Validate through the engine first, so a malformed URL produces the
     // engine's own specific diagnosis (a query string, embedded userinfo, a
     // bad scheme) rather than a vaguer one invented here.
@@ -226,8 +288,10 @@ pub fn ensure_bindable(
 /// only alternative left to a user then is deleting the file by hand, which
 /// takes the `registration_access_token` with it and orphans the DCR
 /// registration for good.
-pub fn open_store_without_instance() -> Result<(String, CredentialStore), AuthError> {
-    Ok((paths::active_profile()?, CredentialStore::discover()?))
+pub fn open_store_without_instance(
+    overrides: &Overrides,
+) -> Result<(String, CredentialStore), AuthError> {
+    Ok((active_profile(overrides)?, CredentialStore::discover()?))
 }
 
 /// The credential store, profile and instance origin, without requiring
@@ -235,14 +299,13 @@ pub fn open_store_without_instance() -> Result<(String, CredentialStore), AuthEr
 ///
 /// Used by `auth login` and `auth set-key`, which run precisely when there
 /// is nothing stored.
-pub fn open_store() -> Result<StoreContext, AuthError> {
-    let base_url = base_url()?;
-    let origin = instance_origin(&base_url)?;
+pub fn open_store(overrides: &Overrides) -> Result<StoreContext, AuthError> {
+    let instance = resolve_instance(overrides)?;
     Ok(StoreContext {
-        profile: paths::active_profile()?,
+        profile: instance.profile_key().to_string(),
         store: CredentialStore::discover()?,
-        base_url,
-        origin,
+        base_url: instance.base_url().to_string(),
+        origin: instance.origin,
     })
 }
 
@@ -278,9 +341,92 @@ pub struct StoreContext {
 /// credential - API key or auto-renewing OAuth session - into
 /// `engine::Client`, so renewal happens inside the one request channel
 /// rather than in each command.
-pub fn client() -> Result<engine::Client, CliError> {
-    let session = open_session().map_err(map_auth_error)?;
-    engine::Client::with_credentials(&session.base_url, session.provider).map_err(map_engine_error)
+pub fn client(overrides: &Overrides) -> Result<engine::Client, CliError> {
+    open_client(overrides).map(|(client, _)| client)
+}
+
+/// Build the request-channel client AND report which instance it points at.
+///
+/// The origin is returned rather than re-derived by the caller: it is the
+/// origin the credential was checked against, and a caller that computed its
+/// own could end up printing links for an instance the credential was never
+/// released for.
+pub fn open_client(overrides: &Overrides) -> Result<(engine::Client, String), CliError> {
+    let instance = resolve_instance(overrides).map_err(map_auth_error)?;
+    let store = CredentialStore::discover().map_err(store_failed)?;
+    let file = store.load().map_err(store_failed)?;
+    let profile = instance.profile_key().to_string();
+    let entry = file.profile(&profile);
+
+    // Refuse a stored credential that another instance issued, whichever
+    // branch below ends up serving it. `CredentialProvider::resolve` runs
+    // this too; it is called here so the fixed-key branches are not
+    // protected only by accident of going through the provider.
+    check_binding(entry, &profile, instance.origin()).map_err(oauth_failed)?;
+
+    // A renewable session outranks any fixed key. `auth = "..."` names the
+    // login flow, not a filter on what is already stored, so a session that
+    // `otl auth login` put there is used even when the setting is left at
+    // its default - and `otl auth info` reports what that shadows.
+    if entry.is_some_and(|entry| entry.oauth.is_some()) {
+        return session_client(&instance, store, &file, profile);
+    }
+    fixed_client(&instance, store.path(), entry)
+}
+
+/// A client backed by a renewable OAuth session.
+///
+/// The provider goes INTO the engine, so a 401 or an expiring token is
+/// renewed inside the single request channel rather than by each command.
+fn session_client(
+    instance: &Instance,
+    store: CredentialStore,
+    file: &credentials::CredentialFile,
+    profile: String,
+) -> Result<(engine::Client, String), CliError> {
+    let provider = CredentialProvider::resolve(store, &profile, file, instance.origin())
+        .map_err(oauth_failed)?
+        .ok_or_else(|| {
+            map_auth_error(AuthError::NoCredentials {
+                profile: profile.clone(),
+            })
+        })?;
+    let client = engine::Client::with_credentials(instance.base_url(), Arc::new(provider))
+        .map_err(map_engine_error)?;
+    Ok((client, instance.origin().to_string()))
+}
+
+/// A client backed by one fixed API key.
+///
+/// Which key is used - the one in the credential file, or the one in the
+/// environment - is [`crate::config`]'s decision, taken from the resolved
+/// settings; the key reaches the request channel only after the release gate
+/// approved it for those settings.
+fn fixed_client(
+    instance: &Instance,
+    path: &Path,
+    entry: Option<&credentials::ProfileCredentials>,
+) -> Result<(engine::Client, String), CliError> {
+    let stored = entry.and_then(|entry| entry.api_key.as_deref());
+    let stored = config::StoredCredential::new(stored, path);
+    if !stored.is_present() && env_api_key().is_some() {
+        warn_about_env_key();
+    }
+    let config = config::Config::release(instance.settings(), instance.env(), &stored)
+        .map_err(|error| map_auth_error(AuthError::Config(error)))?;
+    let client =
+        engine::Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
+    Ok((client, instance.origin().to_string()))
+}
+
+/// A credential-store failure on the client path.
+fn store_failed(error: StoreError) -> CliError {
+    map_auth_error(AuthError::Store(error))
+}
+
+/// An OAuth-layer failure on the client path.
+fn oauth_failed(error: OAuthError) -> CliError {
+    map_auth_error(AuthError::OAuth(error))
 }
 
 /// Who the credential belongs to, as the instance reports it.
@@ -393,10 +539,9 @@ fn oauth_exit_code(error: &OAuthError) -> ExitCode {
             500..=599 => ExitCode::Server,
             _ => ExitCode::ApiRequest,
         },
-        OAuthError::Malformed { .. }
-        | OAuthError::Callback { .. }
-        | OAuthError::Random { .. }
-        | OAuthError::Browser { .. } => ExitCode::Failure,
+        OAuthError::Malformed { .. } | OAuthError::Callback { .. } | OAuthError::Random { .. } => {
+            ExitCode::Failure
+        }
     }
 }
 

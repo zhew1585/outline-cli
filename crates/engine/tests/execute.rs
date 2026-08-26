@@ -17,6 +17,7 @@ fn op_with_path(op_path: &'static str) -> OpSpec {
         summary: Cow::Borrowed("Retrieve a thing"),
         content_type: Cow::Borrowed("application/json"),
         body_mode: engine::BodyMode::KeyValue,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(&[ParamSpec {
             name: Cow::Borrowed("id"),
             ty: ParamType::String,

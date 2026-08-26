@@ -412,9 +412,11 @@ async fn a_failed_revocation_keeps_the_tokens_and_exits_non_zero() {
     .await
     .unwrap();
 
+    // 9 = partial failure: the local half of the logout was deliberately
+    // held back, which is neither success nor a plain request failure.
     assert_eq!(
         code,
-        Some(3),
+        Some(9),
         "a failed revocation reported success: {stderr}"
     );
     assert!(
@@ -452,8 +454,9 @@ async fn force_discards_tokens_that_could_not_be_revoked() {
     .await
     .unwrap();
 
-    // Still non-zero: the server was not told.
-    assert_eq!(code, Some(3));
+    // Still non-zero: the local credentials are gone but the server was
+    // never told, which is exactly a partial result (exit 9).
+    assert_eq!(code, Some(9));
     assert!(stored_session_absent(dir.path()));
     drop(server);
 }
@@ -533,7 +536,7 @@ async fn a_session_written_during_logout_is_reported_not_declared_signed_out() {
     // ...and the user must be told, in every channel.
     assert_eq!(
         code,
-        Some(3),
+        Some(9),
         "a live unrevoked session was left behind with a success exit.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(

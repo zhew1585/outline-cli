@@ -31,6 +31,7 @@ pub mod paginate;
 pub mod retry;
 pub mod sanitize;
 mod scalar;
+pub mod text;
 pub mod throttle;
 
 pub use body::build_request_body;
@@ -39,7 +40,10 @@ pub use client::{
 };
 pub use credential::{CredentialError, CredentialFault, CredentialSource, StaticCredential};
 pub use error::{EngineError, TransportKind};
-pub use ir::{BodyMode, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION};
+pub use ir::{
+    BodyMode, FieldSpec, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION,
+};
 pub use paginate::{Fetched, OffsetEcho, PaginationSpec, Truncation, TruncationCause};
 pub use retry::RetryPolicy;
+pub use text::{has_hazard, hazard, Hazard};
 pub use throttle::{Throttle, TokenBucket};

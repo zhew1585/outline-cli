@@ -14,17 +14,17 @@ use std::io::Read;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{
-    BodyMode, EngineError, ErrorDetail, Fetched, Truncation, TruncationCause, ValidationMode,
-};
+use engine::{BodyMode, EngineError, ErrorDetail, Fetched, ValidationMode};
 use serde_json::Value;
 
 use crate::auth;
+use crate::config::Overrides;
 use crate::errors::map_engine_error_with_hint;
 use crate::exit::CliError;
 use crate::ops;
 use crate::paging;
 use crate::render::{self, OutputMode};
+use crate::session::{self, UNCONFIRMED_OFFSET_NOTICE};
 use crate::stdio;
 
 /// Hint appended to validation errors that only a raw body can express.
@@ -37,13 +37,6 @@ const SHOW_MESSAGE_HINT: &str =
 /// Hint appended when an operation cannot be called generically at all.
 const DEDICATED_COMMAND_HINT: &str =
     "it is not callable via `otl api`; a dedicated command is planned";
-
-/// Notice for a list response that carried no pagination echo, so page
-/// boundaries rest on the CLI's own offset counter.
-const UNCONFIRMED_OFFSET_NOTICE: &str =
-    "notice: the server did not echo the pagination offset, so page \
-     boundaries could not be confirmed; results were paged by offset and \
-     may repeat or omit rows if the server ignored it";
 
 /// Marker appended in `otl api list` to operations that cannot be called.
 const NOT_CALLABLE_MARKER: &str = "[not callable via api";
@@ -105,7 +98,10 @@ enum Payload {
 
 /// Run the `api` subcommand. Configuration and argument validation happen
 /// before any network request.
-pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
+///
+/// `overrides` carries the command-line configuration layer, which outranks
+/// the environment and the user config file key by key.
+pub fn run(cmd: &ApiArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     if cmd.operation == LIST_OPERATION {
         return run_list(cmd);
     }
@@ -124,9 +120,11 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         Payload::Raw(_) => None,
     };
     check_limit_usage(cmd, &payload, pagination.is_some())?;
-    // One place resolves the credential for every command, and it hands the
-    // request channel a source that renews itself (see `crate::auth`).
-    let client = auth::client()?;
+    // One place resolves configuration AND the credential for every command,
+    // and hands the request channel a source that renews itself. `otl api`
+    // must not build its own client: renewal, the transport rule and the
+    // instance binding all live behind this call (see `crate::auth`).
+    let client = auth::client(overrides)?;
     let detail = error_detail(cmd);
     let fetched = match (&payload, &pagination) {
         (Payload::KeyValue(args), Some(spec)) => {
@@ -145,9 +143,9 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         stdio::write_diagnostic_line(UNCONFIRMED_OFFSET_NOTICE);
     }
     if let Some(truncation) = &fetched.truncation {
-        warn_truncated(truncation);
+        session::warn_truncated(truncation);
     }
-    print_response(&fetched.value, mode)
+    print_response(&fetched.value, mode, &op.response_fields)
 }
 
 /// Reject `--limit` where it cannot mean anything, before any request.
@@ -178,38 +176,6 @@ fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Resul
         )));
     }
     Ok(())
-}
-
-/// Explicit stderr warning whenever results may be incomplete (hard rule:
-/// pagination never truncates silently), including how to get more.
-///
-/// Only [`TruncationCause::is_definite`] causes are stated as fact; the
-/// others say results *may* be truncated, because the data could have
-/// ended exactly at the boundary.
-fn warn_truncated(truncation: &Truncation) {
-    let remedy = match truncation.cause {
-        TruncationCause::MaxItems => "raise or drop --limit to fetch more",
-        TruncationCause::PageLimit => {
-            "narrow the query, or continue from this point with an \
-             `offset=` argument"
-        }
-        TruncationCause::ManualPage => {
-            "a `limit=` argument fetches one page only; drop it to fetch \
-             every page, or page manually with `offset=`"
-        }
-        TruncationCause::OffsetSpaceExhausted => {
-            "the pagination offset space is exhausted; narrow the query"
-        }
-    };
-    let certainty = if truncation.cause.is_definite() {
-        "results truncated"
-    } else {
-        "results may be truncated"
-    };
-    stdio::write_diagnostic_line(&format!(
-        "warning: {certainty} after {} items; {remedy}",
-        truncation.fetched
-    ));
 }
 
 /// How strictly to validate locally: `--no-validate` keeps the structural
@@ -385,9 +351,17 @@ fn parse_key_value_args(raw: &[String]) -> Result<Vec<(String, String)>, CliErro
 
 /// Print the `data` field (or the whole envelope if absent) to stdout in
 /// the resolved output mode (raw JSON, or a table for list-shaped data).
-fn print_response(response: &Value, mode: OutputMode) -> Result<(), CliError> {
+///
+/// `schema` is the operation's compiled response shape, which drives table
+/// column selection; the same `data` convention is applied here and by the
+/// build pipeline that extracted it.
+fn print_response(
+    response: &Value,
+    mode: OutputMode,
+    schema: &[engine::FieldSpec],
+) -> Result<(), CliError> {
     let payload = response.get("data").unwrap_or(response);
-    let rendered = render::render(payload, mode)
+    let rendered = render::render(payload, mode, schema)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
     // Never `println!` on the data path: a consumer that closes the pipe
     // early must not turn into a panic and exit code 101.

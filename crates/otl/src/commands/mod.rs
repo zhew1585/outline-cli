@@ -2,3 +2,6 @@
 
 pub mod api;
 pub mod auth;
+pub mod collections;
+pub mod completions;
+pub mod docs;

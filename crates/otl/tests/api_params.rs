@@ -19,10 +19,17 @@ const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 /// so credential resolution depends on the environment alone.
 const NO_CREDENTIALS_DIR: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/no-credentials");
 
-/// Point a command at an empty credential store and silence the one-time
-/// plaintext-key notice, which is not what these tests are about.
+/// Point a command at an empty credential store AND an absent user config
+/// file, and silence the one-time plaintext-key notice.
+///
+/// Three separate things have to be neutralised or the developer's own
+/// machine leaks into the assertions: the credential file
+/// (`OUTLINE_CONFIG_DIR` at a path that does not exist), the user config
+/// file and its profiles (`OUTLINE_CONFIG` empty means "read none"), and a
+/// selected profile (`OUTLINE_PROFILE`).
 fn isolate(cmd: &mut Command) -> &mut Command {
     cmd.env("OUTLINE_CONFIG_DIR", NO_CREDENTIALS_DIR)
+        .env("OUTLINE_CONFIG", "")
         .env("OUTLINE_NO_KEY_WARNING", "1")
         .env_remove("OUTLINE_PROFILE")
 }

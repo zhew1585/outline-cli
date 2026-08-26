@@ -390,7 +390,7 @@ fn unreachable_state(what: &str) -> OAuthError {
 }
 
 /// Warn once about a key living in the environment.
-fn warn_about_env_key() {
+pub(super) fn warn_about_env_key() {
     if env::var(ENV_NO_KEY_WARNING).is_ok() {
         return;
     }

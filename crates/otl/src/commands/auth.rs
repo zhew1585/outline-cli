@@ -19,6 +19,7 @@ use crate::auth::metadata::DEFAULT_SCOPE;
 use crate::auth::report::{self, CredentialHealth};
 use crate::auth::source::{CredentialProvider, Snapshot};
 use crate::auth::{self, login, logout, AuthError, Identity};
+use crate::config::Overrides;
 use crate::exit::{CliError, ExitCode};
 use crate::render::{self, OutputMode};
 use crate::stdio;
@@ -117,18 +118,18 @@ pub struct InfoArgs {
 }
 
 /// Run the `auth` subcommand.
-pub fn run(args: &AuthArgs, mode: OutputMode) -> Result<(), CliError> {
+pub fn run(args: &AuthArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     match &args.command {
-        AuthCommand::Login(login_args) => run_login(login_args, mode),
-        AuthCommand::Logout(logout_args) => run_logout(logout_args, mode),
-        AuthCommand::SetKey => run_set_key(mode),
-        AuthCommand::Info(info_args) => run_info(info_args, mode),
+        AuthCommand::Login(login_args) => run_login(login_args, mode, overrides),
+        AuthCommand::Logout(logout_args) => run_logout(logout_args, mode, overrides),
+        AuthCommand::SetKey => run_set_key(mode, overrides),
+        AuthCommand::Info(info_args) => run_info(info_args, mode, overrides),
     }
 }
 
 /// `otl auth login`.
-fn run_login(args: &LoginArgs, mode: OutputMode) -> Result<(), CliError> {
-    let context = auth::open_store().map_err(auth::map_auth_error)?;
+fn run_login(args: &LoginArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let context = auth::open_store(overrides).map_err(auth::map_auth_error)?;
     let options = login::Options {
         client_id: args.client_id.clone(),
         scope: args.scope.clone(),
@@ -156,8 +157,9 @@ fn run_login(args: &LoginArgs, mode: OutputMode) -> Result<(), CliError> {
 /// step the user asked for did not happen - the local credentials may be
 /// gone, but "the tokens are still live on the server" is not success, and
 /// a script has to be able to see the difference.
-fn run_logout(args: &LogoutArgs, mode: OutputMode) -> Result<(), CliError> {
-    let (profile, store) = auth::open_store_without_instance().map_err(auth::map_auth_error)?;
+fn run_logout(args: &LogoutArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let (profile, store) =
+        auth::open_store_without_instance(overrides).map_err(auth::map_auth_error)?;
     let report = logout::run(
         &profile,
         &store,
@@ -172,8 +174,12 @@ fn run_logout(args: &LogoutArgs, mode: OutputMode) -> Result<(), CliError> {
     }
     emit(logout_output(&profile, &report), mode)?;
     if report.remote_cleanup_failed {
+        // Exit 9 (partial failure), not 3: the local half of the logout DID
+        // happen (or was deliberately kept for a retry), so this is not a
+        // request that simply failed - it is a job that got part-way, which
+        // is exactly what code 9 means everywhere else in this CLI.
         return Err(CliError::new(
-            ExitCode::ApiRequest,
+            ExitCode::Partial,
             anyhow!("{}", logout_failure(&report)),
         ));
     }
@@ -205,8 +211,8 @@ fn logout_failure(report: &logout::Report) -> String {
 /// every other `otl` process for as long as the terminal sits there, and
 /// saving a snapshot read before the prompt would write back whatever a
 /// concurrent token refresh had already rotated.
-fn run_set_key(mode: OutputMode) -> Result<(), CliError> {
-    let context = auth::open_store().map_err(auth::map_auth_error)?;
+fn run_set_key(mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let context = auth::open_store(overrides).map_err(auth::map_auth_error)?;
     // Checked before the prompt: asking for a secret and then refusing it
     // would be rude.
     auth::ensure_bindable(
@@ -243,9 +249,8 @@ fn run_set_key(mode: OutputMode) -> Result<(), CliError> {
 }
 
 /// `otl auth info`.
-fn run_info(args: &InfoArgs, mode: OutputMode) -> Result<(), CliError> {
-    let profile = auth::paths::active_profile()
-        .map_err(|error| auth::map_auth_error(AuthError::Store(error)))?;
+fn run_info(args: &InfoArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let profile = auth::active_profile(overrides).map_err(auth::map_auth_error)?;
     let store = auth::credentials::CredentialStore::discover()
         .map_err(|error| auth::map_auth_error(AuthError::Store(error)))?;
     let health = report::credential_health(&store);
@@ -253,8 +258,13 @@ fn run_info(args: &InfoArgs, mode: OutputMode) -> Result<(), CliError> {
     // transport rule, so `auth info` reports the instance exactly as it
     // would be used - a plaintext remote URL is shown as unusable here
     // rather than quietly accepted and refused everywhere else.
-    let instance = auth::base_url()
-        .and_then(|base_url| auth::instance_origin(&base_url).map(|origin| (base_url, origin)))
+    let instance = auth::resolve_instance(overrides)
+        .map(|instance| {
+            (
+                instance.base_url().to_string(),
+                instance.origin().to_string(),
+            )
+        })
         .map_err(|error| error.to_string());
 
     // A report must work even when nothing can be used - that is exactly
@@ -621,7 +631,10 @@ struct Output {
 fn emit(output: Output, mode: OutputMode) -> Result<(), CliError> {
     match mode {
         OutputMode::Json => {
-            let rendered = render::render(&output.value, mode).map_err(|error| {
+            // `render_json`, not `render`: this value is a summary this
+            // module built, not an operation's response payload, so there is
+            // no response schema to pick table columns from.
+            let rendered = render::render_json(&output.value).map_err(|error| {
                 CliError::new(
                     ExitCode::Failure,
                     anyhow!("failed to render the result: {error}"),

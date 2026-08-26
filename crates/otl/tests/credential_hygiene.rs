@@ -488,3 +488,132 @@ fn set_key_does_not_lose_a_rotation_that_happened_while_it_waited() {
     // And it recorded which instance the key is for.
     assert_eq!(profile.origin.as_deref(), Some(INSTANCE));
 }
+
+// ---------------------------------------------------------------------------
+// A malformed credential file is described by POSITION only.
+//
+// The config file (`config.toml`) and the credential file are parsed by the
+// same crate, but they do not share a diagnostic rule and must not. The
+// config side CLASSIFIES the parser's message (`config::file`'s
+// `classify_parse_error`) and, for a recognised wording, says which kind of
+// mistake it was - useful, and safe there because a credential is refused
+// from that file outright. The credential file is nothing BUT credentials,
+// and several of those parser wordings quote the offending value
+// (`unknown variant \`<token>\``, `invalid type: string "<token>"`), so this
+// side keeps only line and column and never consults the classifier at all.
+//
+// Asserted per wording rather than in general, because the danger is
+// specifically that the two rules get "unified" later by someone who sees
+// two parsers and one crate.
+// ---------------------------------------------------------------------------
+
+/// Every parser wording `config`'s classifier recognises, as a credential
+/// file that provokes it while holding [`SECRET`].
+fn malformed_credential_files() -> Vec<(&'static str, String)> {
+    vec![
+        // An unknown KEY is not in this list on purpose: the credential
+        // file tolerates one (the `version` gate is what refuses a format
+        // this build cannot read, so a downgrade must not choke on a key a
+        // newer build added). Every wording below is one the parser does
+        // produce here.
+        (
+            "missing field",
+            format!("version = 1\n[profiles.default.oauth]\naccess_token = \"{SECRET}\"\n"),
+        ),
+        ("invalid type", format!("version = \"{SECRET}\"\n")),
+        (
+            "duplicate key",
+            format!(
+                "version = 1\n[profiles.default]\napi_key = \"{SECRET}\"\n\
+                 api_key = \"{SECRET}\"\n"
+            ),
+        ),
+        (
+            "plain syntax error",
+            format!("version = 1\n[profiles.default\napi_key = \"{SECRET}\"\n"),
+        ),
+        (
+            "unterminated string",
+            format!("version = 1\n[profiles.default]\napi_key = \"{SECRET}\n"),
+        ),
+    ]
+}
+
+#[test]
+fn a_malformed_credential_file_is_reported_without_any_of_its_content() {
+    for (what, body) in malformed_credential_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::at(dir.path().to_path_buf());
+        fs::write(store.path(), &body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let message = store
+            .load()
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        assert!(
+            !message.is_empty(),
+            "{what}: a malformed credential file was accepted"
+        );
+        assert!(
+            !message.contains(SECRET),
+            "{what}: the diagnostic quoted the credential: {message}"
+        );
+        // Not even a fragment: the sanitizer's own threshold is four
+        // characters, so anything shorter is not a leak, and anything at or
+        // above it is.
+        for window in SECRET.as_bytes().windows(4) {
+            let fragment = String::from_utf8_lossy(window).to_string();
+            assert!(
+                !message.contains(&fragment),
+                "{what}: the diagnostic leaked {fragment:?}: {message}"
+            );
+        }
+        // And it is still actionable: it says where to look.
+        assert!(
+            message.contains("syntax error"),
+            "{what}: the diagnostic does not say what went wrong: {message}"
+        );
+    }
+}
+
+#[test]
+fn the_credential_files_parse_rule_does_not_borrow_the_config_files_wording() {
+    // The config file's classifier turns a recognised parser message into a
+    // description of the mistake ("unknown key", "a key was given a value of
+    // the wrong type", ...). None of those descriptions may appear here: if
+    // one does, this side has started consulting the classifier, and the
+    // wordings that quote the offending value would come with it.
+    const CONFIG_SIDE_DESCRIPTIONS: &[&str] = &[
+        "unknown key",
+        "outside its fixed set of choices",
+        "value of the wrong type",
+        "a required key is missing",
+        "a key is defined twice",
+    ];
+    for (what, body) in malformed_credential_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::at(dir.path().to_path_buf());
+        fs::write(store.path(), &body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let message = store
+            .load()
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        for description in CONFIG_SIDE_DESCRIPTIONS {
+            assert!(
+                !message.contains(description),
+                "{what}: the credential file adopted the config file's \
+                 classifier ({description:?}): {message}"
+            );
+        }
+    }
+}

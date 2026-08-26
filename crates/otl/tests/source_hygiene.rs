@@ -7,50 +7,29 @@
 //! limit was first breached, and then how the function limit was breached
 //! by the very commit that added a guard for files only.
 //!
-//! The lesson from that is the reason this file checks all three: a rule
-//! without a machine to enforce it is a rule that gets broken during the
-//! next refactor, including by whoever just fixed it.
+//! The lesson from that is the reason these rules have machines behind them:
+//! a rule without one is a rule that gets broken during the next refactor,
+//! including by whoever just fixed it.
+//!
+//! This file owns FUNCTION LENGTH and NESTING. File length is `limits.rs`,
+//! which arrived from another track with the same check and a ledger of
+//! exemptions; the check was removed from here rather than duplicated,
+//! because two guards for one rule means two exemption policies.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 
-/// Hard limits from `project-context.md` ("文件 <800 行... 函数 <50 行，
-/// 嵌套 <4 层").
-const MAX_SOURCE_LINES: usize = 800;
+/// Hard limits from `project-context.md` ("函数 <50 行，嵌套 <4 层").
+///
+/// The file-length limit from the same sentence is NOT here: `limits.rs`
+/// enforces it, and one rule with two guards is worse than one with one.
+/// Two of them means two exemption policies - `limits.rs` keeps a shrinking
+/// ledger of files that arrived over the limit from another branch, this file
+/// had none - so a file could be simultaneously excused and forbidden, which
+/// is how the rule stops being a rule.
 const MAX_FUNCTION_LINES: usize = 50;
 const MAX_NESTING_DEPTH: usize = 4;
-
-/// Size at which a file should be split before it becomes a problem.
-/// Reported, not enforced: the rule is the limit above.
-const ADVISORY_SOURCE_LINES: usize = 700;
-
-#[test]
-fn no_source_file_exceeds_the_size_limit() {
-    let mut violations = Vec::new();
-    let mut approaching = Vec::new();
-    for file in source_files() {
-        let lines = read(&file).lines().count();
-        if lines > MAX_SOURCE_LINES {
-            violations.push(format!("  {}: {lines} lines", show(&file)));
-        } else if lines > ADVISORY_SOURCE_LINES {
-            approaching.push(format!("  {}: {lines} lines", show(&file)));
-        }
-    }
-    if !approaching.is_empty() {
-        eprintln!(
-            "note: approaching the {MAX_SOURCE_LINES}-line limit:\n{}",
-            approaching.join("\n")
-        );
-    }
-    assert!(
-        violations.is_empty(),
-        "these files exceed the {MAX_SOURCE_LINES}-line limit from \
-         project-context.md; split them by responsibility rather than \
-         raising the limit:\n{}",
-        violations.join("\n")
-    );
-}
 
 /// Function length and nesting are enforced on PRODUCTION code.
 ///

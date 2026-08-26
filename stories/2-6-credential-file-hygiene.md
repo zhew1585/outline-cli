@@ -219,6 +219,20 @@ so that 明文存储的风险被压到只剩「磁盘被物理读取」这一层
 - [Source: specs/spec-outline-cli/failure-modes.md #6 #7 #10]
 - [Source: project-context.md]「安全与凭证规则」全部条目
 
+## develop 集成记录（Phase 6）
+
+- **解析错误的剥值规则与配置文件那一侧无关**，并且现在有断言钉住这件事。
+  `config/file.rs` 的 `classify_parse_error` 把解析器措辞归类成人话描述；凭证文件这一侧
+  只保留行列位置，一个字都不从解析器那里拿。新增
+  `a_malformed_credential_file_is_reported_without_any_of_its_content`（逐种措辞验证，
+  连 4 字符片段都不泄漏——4 是 sanitizer 自己的片段阈值）与
+  `the_credential_files_parse_rule_does_not_borrow_the_config_files_wording`
+  （分类器的每条描述都不得出现）。两者分别对不同回退变红。
+  未知**键**不在测试清单里，是有意的：凭证文件容忍未知键（`version` 才是拒绝
+  「本 build 读不懂的格式」的机制，降级运行不该被新版加的键噎住）。
+- **服务器文本清洗补上 27 个 `Cf` 码点**，见 2-1 集成记录第 5 节。凭证文件路径与诊断
+  经由 `sanitize_path` / `text::quote`，现在两层读同一张表。
+
 ## Dev Agent Record
 
 ### Agent Model Used

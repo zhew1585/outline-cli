@@ -25,7 +25,8 @@ use crate::auth::loopback::{self, CallbackServer};
 use crate::auth::metadata::{self, Metadata, CODE_CHALLENGE_METHOD, DEFAULT_SCOPE};
 use crate::auth::oauth::{self, ClientAuth};
 use crate::auth::source::CredentialProvider;
-use crate::auth::{browser, dcr, endpoint, AuthError, Identity};
+use crate::auth::{dcr, endpoint, AuthError, Identity};
+use crate::browser;
 use crate::stdio;
 
 /// Maximum characters kept from a server-supplied client id when it is
@@ -364,7 +365,7 @@ fn authorize(
 /// stdout stays reserved for data.
 fn announce(url: &str, open_browser: bool) {
     if open_browser {
-        if let Err(error) = browser::open(url) {
+        if let Err(error) = browser::spawn(url) {
             stdio::write_diagnostic_line(&format!("notice: {error}"));
         } else {
             stdio::write_diagnostic_line("Opening your browser to sign in to Outline.");

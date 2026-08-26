@@ -112,6 +112,19 @@ so that 两种认证方式都有一等体验。
 - [Source: specs/spec-outline-cli/stack.md#认证实现]（API key：Bearer + env 兜底）
 - [Source: specs/spec-outline-cli/SPEC.md#CAP-1]
 
+## develop 集成记录（Phase 6）
+
+- **凭证文件 vs 环境变量的优先级现在是配置层的决定**，实现在 `config/credentials.rs::select`：
+  `auth = "oauth"` 只取凭证文件；否则文件有东西就用文件，环境变量是回落。
+  理由不变（`otl auth set-key` 是有意的动作且文件是 0600；导出的变量常是别的 shell 的残留，
+  且对每个子进程可读），但决定点从散在各处的 `if` 变成一个具名类型。
+- **stored key 现在同样过释放闸门**。`Config::release` 的两条分支都走 `release_token`，
+  所以「profile 声明的实例 ≠ 解析出的实例就拒绝发凭证」这条规则不再只覆盖环境变量。
+  `config_credentials.rs` 正反两面都测（拒绝两种、放行一种），并做了反向验证：
+  给 `StoredCredential` 加一个绕过闸门的取值方法，两条拒绝测试变红。
+- **`otl auth set-key` 现在尊重 `--profile` / `--url` / `--config`**，见 2-1 集成记录第 1 节。
+- **「没有凭证」的诊断改说三条路**，见 2-1 集成记录第 4 节。
+
 ## Dev Agent Record
 
 ### Agent Model Used

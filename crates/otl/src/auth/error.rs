@@ -536,13 +536,6 @@ pub enum OAuthError {
         /// Why the write failed (a [`StoreError`] rendered).
         reason: String,
     },
-
-    /// The browser could not be launched.
-    #[error("could not open a browser ({reason}); open this URL manually")]
-    Browser {
-        /// I/O failure description.
-        reason: String,
-    },
 }
 
 impl OAuthError {

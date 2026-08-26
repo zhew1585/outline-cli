@@ -48,6 +48,7 @@ pub fn op() -> OpSpec {
         summary: Cow::Borrowed("List things"),
         content_type: Cow::Borrowed("application/json"),
         body_mode: BodyMode::KeyValue,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(PARAMS),
     }
 }

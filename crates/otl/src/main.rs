@@ -3,11 +3,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
 use otl::commands::auth::{self, AuthArgs};
+use otl::commands::collections::{self, CollectionsArgs};
+use otl::commands::completions::{self, CompletionsArgs};
+use otl::commands::docs::{self, DocsArgs};
+use otl::config::Overrides;
 use otl::exit::ExitCode;
 use otl::render;
 use otl::stdio;
@@ -20,8 +25,32 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Named profile from the user config file (env: OUTLINE_PROFILE).
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
+
+    /// Outline instance base URL, overriding the profile (env: OUTLINE_URL).
+    #[arg(long, global = true, value_name = "URL")]
+    url: Option<String>,
+
+    /// User config file to read (env: OUTLINE_CONFIG).
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+impl Cli {
+    /// The command-line layer of the configuration, which outranks the
+    /// environment and the config file key by key.
+    fn overrides(&self) -> Overrides {
+        Overrides {
+            profile: self.profile.clone(),
+            url: self.url.clone(),
+            config_path: self.config.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -30,6 +59,12 @@ enum Command {
     Api(ApiArgs),
     /// Sign in, sign out, and inspect stored credentials.
     Auth(AuthArgs),
+    /// Work with documents: search, view, create, update, export.
+    Docs(DocsArgs),
+    /// Work with collections.
+    Collections(CollectionsArgs),
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
+    Completions(CompletionsArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -37,8 +72,11 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
-        Command::Api(args) => api::run(args, mode),
-        Command::Auth(args) => auth::run(args, mode),
+        Command::Api(args) => api::run(args, mode, &cli.overrides()),
+        Command::Auth(args) => auth::run(args, mode, &cli.overrides()),
+        Command::Docs(args) => docs::run(args, mode, cli.json, &cli.overrides()),
+        Command::Collections(args) => collections::run(args, mode, &cli.overrides()),
+        Command::Completions(args) => completions::run(args, Cli::command()),
     };
     match result {
         Ok(()) => ExitCode::Success.into(),

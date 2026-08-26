@@ -40,6 +40,8 @@
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::text::{hazard, Hazard};
+
 /// Placeholder shown instead of secrets.
 pub const REDACTED: &str = "***";
 /// Minimum length (in chars) of a secret fragment worth redacting, and of a
@@ -188,13 +190,18 @@ fn replace_trailing_runs(text: &str) -> String {
 fn normalize(raw: &str) -> String {
     let collapsed = raw
         .chars()
-        .filter_map(|c| match UnicodeWidthChar::width(c) {
-            // Control characters (width None) and whitespace read as gaps.
-            None => Some(' '),
+        .filter_map(|c| match (hazard(c), UnicodeWidthChar::width(c)) {
+            // Control characters and whitespace read as gaps.
+            (Some(Hazard::Control), _) | (_, None) => Some(' '),
             _ if c.is_whitespace() => Some(' '),
-            // Renders as nothing: it can only be there to mislead.
-            Some(0) => None,
-            Some(_) => Some(c),
+            // Renders as nothing, or renders as something other than what it
+            // is. TWO rules, not one, because neither contains the other:
+            // width catches a combining mark stacked onto a neighbour, which
+            // is not a format character; `hazard` catches the 27 `Cf`
+            // codepoints a terminal gives a column to, which width lets
+            // through. Whichever fires, the character does not go out.
+            (Some(_), _) | (_, Some(0)) => None,
+            _ => Some(c),
         })
         .fold(String::new(), |mut acc, c| {
             if c != ' ' || !acc.ends_with(' ') {
@@ -306,6 +313,49 @@ mod tests {
         // stderr: what the reader sees must be what the text is.
         let cleaned = clean("aaa\u{200b}bbb\u{ad}ccc\u{feff}", "unrelated-token");
         assert_eq!(cleaned, "aaabbbccc");
+    }
+
+    #[test]
+    fn normalize_drops_every_format_character_not_just_the_zero_width_ones() {
+        // The scrub used to classify by RENDERED WIDTH alone, and a terminal
+        // gives a column to 27 of the `Cf` codepoints - so these survived
+        // into stderr while the CLI's own scrub dropped them. Enumerated
+        // rather than sampled: the point is that the two layers now read the
+        // same table, so a codepoint one drops cannot be one the other keeps.
+        let ranges: &[(u32, u32)] = &[
+            (0x0600, 0x0605),
+            (0x06dd, 0x06dd),
+            (0x070f, 0x070f),
+            (0x0890, 0x0891),
+            (0x08e2, 0x08e2),
+            (0xfff9, 0xfffb),
+            (0x110bd, 0x110bd),
+            (0x110cd, 0x110cd),
+            (0x13430, 0x1343f),
+            (0x1bca0, 0x1bca3),
+            (0xe0001, 0xe0001),
+        ];
+        for (first, last) in ranges {
+            for code in *first..=*last {
+                let Some(c) = char::from_u32(code) else {
+                    panic!("U+{code:04X} is not a scalar value");
+                };
+                let cleaned = clean(&format!("aaa{c}bbb"), "unrelated-token");
+                assert_eq!(
+                    cleaned, "aaabbb",
+                    "U+{code:04X} survived the server-text scrub"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_still_drops_zero_width_characters_that_are_not_format_ones() {
+        // The width rule is not redundant: a combining mark is not a `Cf`
+        // codepoint, and stacking a few hundred of them on one letter is the
+        // other way to make output unreadable.
+        let cleaned = clean("a\u{301}\u{301}\u{489}b", "unrelated-token");
+        assert_eq!(cleaned, "ab");
     }
 
     #[test]

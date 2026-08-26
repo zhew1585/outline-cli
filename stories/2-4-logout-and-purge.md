@@ -134,6 +134,18 @@ so that 服务器与本地都不残留。
 - [Source: specs/spec-outline-cli/stack.md#认证实现]（DCR 清理约束）
 - RFC 7009（撤销）、RFC 7592（注册删除）
 
+## develop 集成记录（Phase 6）
+
+- **退出码 3 → 9**。develop 的发布 track 新增了退出码 9「部分失败」。logout 在服务端某一步
+  没做到时正是这个形状：本地那一半确实发生了（或者被有意保留以便重试），不是「请求失败了」。
+  代码与 `auth_logout_e2e.rs` 的三处断言同步改成 9；`docs/exit-codes.md` 已经写的是 9，
+  README 的派生块用 `UPDATE_README_EXIT_CODES=1` 重跑后无差异。
+- **仍然不解析实例**。`otl auth logout` 用 `auth::open_store_without_instance(overrides)`，
+  内部走本次新抽出的 `config::resolve_profile_name`，只取 profile 名，不要 URL、不过传输规则。
+  `resolve_settings` 在没有 URL 时会报 `MissingUrl`，而清理恰恰要在配置缺失/错误的时候能用；
+  它联系的每个 URL 都来自凭证文件里各凭证为自己记录的 origin（R3 的结论）。
+  副作用：logout 现在也尊重 `--profile` / `default_profile`，之前只看 `OUTLINE_PROFILE`。
+
 ## Dev Agent Record
 
 ### Agent Model Used
