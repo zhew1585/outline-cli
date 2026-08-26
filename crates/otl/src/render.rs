@@ -41,6 +41,9 @@ const MAX_CELL_CLUSTERS: usize = 200;
 const MAX_CELL_CHARS: usize = 400;
 /// Marker appended to truncated cells.
 const TRUNCATION_MARK: &str = "\u{2026}"; // …
+/// Shown in place of a character that must not reach the terminal but whose
+/// presence the reader should see.
+const REPLACEMENT: char = '\u{fffd}';
 /// Gap between table columns.
 const COLUMN_GAP: &str = "  ";
 /// Placeholder printed for an empty list in table mode.
@@ -171,13 +174,14 @@ fn has_content(value: Option<&Value>) -> bool {
 
 /// Whether the cell this text renders to would occupy any terminal column.
 ///
-/// Mirrors [`sanitize_cell`] - control characters become spaces - and then
-/// asks whether any grapheme cluster is both printable and non-zero-width.
+/// Runs the same per-character cleaning [`sanitize_cell`] does, then asks
+/// whether any grapheme cluster is both printable and non-zero-width. Sharing
+/// [`clean_char`] is what keeps the two answers consistent: a category the
+/// cleaner drops must not be a category the content test counts.
 fn renders_visibly(raw: &str) -> bool {
-    raw.graphemes(true).any(|cluster| {
-        let printable = cluster
-            .chars()
-            .any(|c| !c.is_control() && !c.is_whitespace());
+    let cleaned: String = raw.chars().filter_map(clean_char).collect();
+    cleaned.graphemes(true).any(|cluster| {
+        let printable = cluster.chars().any(|c| !c.is_whitespace());
         printable && display_width_of(cluster) > 0
     })
 }
@@ -318,8 +322,37 @@ fn cell_text(value: Option<&Value>) -> String {
     }
 }
 
-/// Replace control characters (ANSI escapes, newlines, tabs) with spaces
-/// and truncate the cell to fit every cell limit.
+/// How one character is rendered in a cell, or `None` when it is dropped.
+///
+/// The three hazard categories get three answers, for three reasons:
+///
+/// - a CONTROL character becomes a space. Most of them stand where a space
+///   belongs (a newline or tab in a title), so a space keeps the words apart
+///   and the ANSI escape harmless.
+/// - a BIDI FORMAT character becomes U+FFFD. Dropping it silently would hide
+///   that a title was built to mislead, and its effect is not confined to
+///   this cell: an unterminated override reorders the rest of the row.
+/// - an INVISIBLE character is dropped. It occupies no column, so replacing
+///   it would make the cell wider than the text it came from, and the
+///   content test in [`has_content`] would start counting a cell of nothing
+///   as a cell worth a column.
+/// - a JOINER is kept. This is DATA: `U+200D` is what makes an emoji
+///   ligature one glyph and `U+200C` is part of correctly spelled Persian
+///   and Hindi, so removing it would corrupt the value being displayed. It
+///   has no scope beyond the characters it joins, so it cannot affect the
+///   rest of the row.
+fn clean_char(c: char) -> Option<char> {
+    match crate::text::hazard(c) {
+        None | Some(crate::text::Hazard::Joiner) => Some(c),
+        Some(crate::text::Hazard::Control) => Some(' '),
+        Some(crate::text::Hazard::BidiFormat) => Some(REPLACEMENT),
+        Some(crate::text::Hazard::Invisible) => None,
+    }
+}
+
+/// Replace control characters (ANSI escapes, newlines, tabs) with spaces,
+/// mark bidi format characters, drop invisible ones, and truncate the cell to
+/// fit every cell limit.
 ///
 /// Truncation works on GRAPHEME CLUSTERS, never on codepoints: an emoji
 /// ligature (skin-tone modifier, ZWJ sequence, family emoji) is one cluster
@@ -332,10 +365,7 @@ fn cell_text(value: Option<&Value>) -> String {
 /// alone bounds neither the terminal's work nor our output size, because
 /// zero-width codepoints are free in width terms.
 fn sanitize_cell(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let cleaned: String = raw.chars().filter_map(clean_char).collect();
     if fits_cell(&cleaned) {
         return cleaned;
     }

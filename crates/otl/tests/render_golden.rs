@@ -61,6 +61,18 @@ fn assert_golden_with(payload: &Value, mode: OutputMode, schema: &[FieldSpec], g
     );
 }
 
+/// Column names for a payload, ignoring the data-dependent padding.
+fn header_of(payload: &Value, schema: &[FieldSpec]) -> Vec<String> {
+    render(payload, OutputMode::Table, schema)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 fn documents_payload() -> Value {
     json!([
         {
@@ -378,3 +390,119 @@ fn mode_resolution_follows_flag_then_tty() {
 // The data-driven policy above stays as the fallback for payloads no schema
 // describes, so its golden files are unchanged.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Bidi and invisible characters in cell data (R6 finding 3).
+//
+// `is_control()` does not cover the Unicode FORMAT characters, and an
+// unterminated right-to-left override does not stop at the cell boundary: it
+// reverses the visual order of the rest of the ROW. Any Outline user who can
+// name a document controls this text, and the same repository already strips
+// these characters in `config/error.rs` and `engine/sanitize.rs`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bidi_overrides_never_reach_stdout_from_a_cell() {
+    let payload = json!([
+        { "id": "a1", "title": "invoice\u{202e}gnp.exe", "updatedAt": "2024-01-01" },
+        { "id": "b2", "title": "ordinary", "updatedAt": "2024-01-02" }
+    ]);
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
+    for (name, ch) in [
+        ("RLO U+202E", '\u{202e}'),
+        ("LRO U+202D", '\u{202d}'),
+        ("RLE U+202B", '\u{202b}'),
+        ("PDF U+202C", '\u{202c}'),
+        ("LRI U+2066", '\u{2066}'),
+        ("RLI U+2067", '\u{2067}'),
+        ("FSI U+2068", '\u{2068}'),
+        ("PDI U+2069", '\u{2069}'),
+        ("RLM U+200F", '\u{200f}'),
+        ("LRM U+200E", '\u{200e}'),
+        ("ALM U+061C", '\u{61c}'),
+    ] {
+        assert!(
+            !rendered.contains(ch),
+            "{name} reached stdout: {rendered:?}"
+        );
+    }
+    // The row after the tampered cell is still intact.
+    assert!(rendered.contains("2024-01-01"), "{rendered}");
+    assert!(rendered.contains("ordinary"), "{rendered}");
+}
+
+#[test]
+fn invisible_characters_never_reach_stdout_from_a_cell() {
+    let payload = json!([{
+        "id": "a1",
+        "title": "we\u{200b}b\u{feff}si\u{00ad}te\u{2060}x",
+        "updatedAt": "2024-01-01"
+    }]);
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
+    for ch in [
+        '\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}', '\u{00ad}', '\u{2060}',
+    ] {
+        assert!(
+            !rendered.contains(ch),
+            "U+{:04X} reached stdout: {rendered:?}",
+            ch as u32
+        );
+    }
+}
+
+#[test]
+fn legitimate_right_to_left_text_still_renders() {
+    // Stripping the FORMAT characters must not touch the letters: a Hebrew
+    // or Arabic title is RTL because of its own characters, and the terminal
+    // orders it correctly without any explicit override.
+    let payload = json!([{ "id": "a1", "title": "מסמך עברית", "updatedAt": "x" }]);
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
+    assert!(rendered.contains("מסמך עברית"), "{rendered}");
+}
+
+#[test]
+fn a_cell_of_only_invisible_characters_does_not_win_a_column() {
+    // Nothing is left after cleaning, so the column is not worth one of the
+    // four slots - the same rule that keeps an all-null column out.
+    let payload = json!([
+        { "id": "a1", "title": "\u{200b}\u{feff}", "urlId": "visible" },
+        { "id": "b2", "title": "\u{00ad}\u{2060}", "urlId": "visible-2" }
+    ]);
+    let header = header_of(&payload, NO_SCHEMA);
+    assert!(!header.contains(&"title".to_string()), "{header:?}");
+    assert!(header.contains(&"urlId".to_string()), "{header:?}");
+}
+
+#[test]
+fn a_bidi_override_is_shown_as_tampering_rather_than_hidden() {
+    // Deliberately NOT dropped like an invisible character: a title built to
+    // reorder the row is something the reader should be able to see, so it
+    // renders as a replacement marker and keeps its column.
+    let payload = json!([
+        { "id": "a1", "title": "\u{202e}", "urlId": "u1" },
+        { "id": "b2", "title": "\u{2066}", "urlId": "u2" }
+    ]);
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
+    assert!(
+        rendered.contains('\u{fffd}'),
+        "no marker shown: {rendered:?}"
+    );
+    assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+    assert!(
+        header_of(&payload, NO_SCHEMA).contains(&"title".to_string()),
+        "the marker should keep its column"
+    );
+}
+
+#[test]
+fn a_zero_width_joiner_survives_because_it_is_part_of_the_text() {
+    // U+200D is what makes an emoji ligature one glyph; dropping it as an
+    // invisible character would corrupt the value being displayed.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    let payload = json!([{ "id": "a1", "title": family, "updatedAt": "x" }]);
+    let rendered = render(&payload, OutputMode::Table, NO_SCHEMA).unwrap();
+    assert!(
+        rendered.contains(family),
+        "the ligature was broken: {rendered:?}"
+    );
+}
