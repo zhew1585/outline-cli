@@ -56,16 +56,19 @@ fn identity_of(metadata: &std::fs::Metadata) -> Option<FileId> {
 /// be flushed on this platform" cannot be confused for each other by a
 /// caller reporting durability to a backup script.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Each variant is constructed on exactly one side of the `cfg` in
+/// [`flush_directory`], so on any given target the other one looks dead.
+/// The `allow`s say so per target rather than letting a real variant be
+/// deleted for looking unused on the machine someone happens to build on -
+/// and `-D warnings` on the CI matrix means an unsilenced one fails the
+/// build for the OTHER platform.
 pub enum Durability {
     /// The directory's entries were fsynced.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Flushed,
     /// This platform offers no way to flush a directory through the
     /// standard library, so nothing can be claimed about whether the names
     /// written survive a crash.
-    ///
-    /// Only constructed off Unix; the allow keeps the Unix build from
-    /// warning about a variant that is real on another target rather than
-    /// tempting someone to delete it.
     #[cfg_attr(unix, allow(dead_code))]
     Unconfirmed,
 }
@@ -244,6 +247,7 @@ mod tests {
         assert!(Dir::open(path).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_child_directory_that_resolves_outside_the_root_is_refused() {
         use std::os::unix::fs::symlink;

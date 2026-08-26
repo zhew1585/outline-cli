@@ -63,7 +63,8 @@
 //!
 //! Renaming or linking a file into place makes it visible, not durable: the
 //! directory entry is separate metadata. Directories are therefore fsynced,
-//! and the outcome is a [`Durability`] value rather than a bare `Ok`, so a
+//! and the outcome is a [`super::dir::Durability`] value rather than a bare
+//! `Ok`, so a
 //! platform where the flush cannot be performed reports that instead of
 //! being indistinguishable from one where it succeeded.
 
@@ -73,7 +74,13 @@ use std::path::{Path, PathBuf};
 use super::dir::{identity, identity_of_handle, Dir, FileId};
 
 /// Prefix of the temporary file each document is written through.
-const TEMP_PREFIX: &str = ".otl-export-";
+///
+/// Public so the command can RECOGNIZE its own leftovers: a temporary file
+/// that outlived a run (see [`Written::stray`], or a run killed before its
+/// guards could run) is a hidden entry that makes the output directory
+/// non-empty, and telling the user "this directory is not empty" about a
+/// directory that looks empty to them is not a usable diagnostic.
+pub const TEMP_PREFIX: &str = ".otl-export-";
 
 /// A temporary file that removes itself unless it is explicitly kept.
 ///

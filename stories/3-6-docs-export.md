@@ -98,6 +98,25 @@ so that 内容可进 git 或离线阅读。
   1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
   2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
      递归深度因此被 `MAX_DEPTH` 硬性封顶。
+- **相对 `--out` 曾经必然假警报**（R5 finding 2）：`Path::new("backup").parent()` 是 `Some("")` 而不是 `None`，
+  于是 `flush_directory("")` 必然 NotFound，一次**完全成功**的导出被判成 exit 9 + `durable:false` + `complete:false`
+  且 `failed` 为空。`--out backup` 失败而 `--out ./backup` 成功——同一个目录。
+  空路径现在映射成 `.`（同一个目录，但能打开）。`parents_of` 是纯函数，补了 7 条单测覆盖
+  裸相对 / 嵌套相对 / `./` 前缀 / 绝对 / 已存在 / 重复父目录 / 「任何情况下都不产出空路径」。
+- **回归测试必须对被测行为敏感**（R5 finding 3）：R4 为父目录 flush 写的回归测试断言的是
+  `durable == true`，但 `durable` 只在 flush **返回错误**时才为 false——**根本不 flush 不产生错误**，
+  所以删掉整段 flush 逻辑该测试照样全绿。现在改成：预先造一个 0o300（可写可进、不可读）的目录，
+  `File::open` 它必然 EACCES，于是「有没有真的去 flush 它」变成可观测的——删掉 flush 循环，测试变红。
+  **这一点已实测验证过**（删掉循环 → FAILED，恢复 → ok）。
+- **平台专属代码的 cfg 有了自动门禁**（R5 finding 1）：拆分文件时把 `#[cfg(unix)]` 落在了原处，
+  裸露的 `use std::os::unix::...` 让 **Windows CI 的整个 test harness 编译失败**——
+  本机三条门全绿，因为本机是 Unix。新增 `tests/portability.rs` 扫描全工作区，
+  要求每一处 `std::os::{unix,windows,wasi}` 都在同级或更外层的 `#[cfg]` 之下，并自带负向测试。
+  另外本轮起用 `--target x86_64-pc-windows-msvc` 做真实交叉编译验证（`rustls-no-provider` 绕开
+  `aws-lc-sys` 需要 `windows.h` 的构建脚本），实测复现了该 E0433 并确认修复。
+- **文件长度上限也有了门禁**（R5 finding 7）：`tests/limits.rs` 对全工作区执行 `project-context.md`
+  的 800 行上限（测试文件不豁免），带一条只会变短的 grandfather 列表。
+  它在第一次运行时就抓到 `export.rs` 因本轮修复涨到 919 行，于是拆出 `outdir.rs`（输出目录的校验与创建）。
 - **文件系统层拆成两个模块**：`dir.rs`（`Dir` 目录钉住、身份、`flush_directory`、`Durability`）
   与 `target.rs`（temp 写入、落地、`confirm_landing`）。R4 修完后单文件超过 800 行上限，按职责切开。
 - **占位法是错的**（R3 finding 2）：R2 用「先 `create_new` 占名、再 rename 覆盖占位」拿到了互斥，
@@ -112,6 +131,14 @@ so that 内容可进 git 或离线阅读。
   temp 名也换成 OS 播种的随机名。但随机名只防**预先**占据，防不住「创建之后」被观察并替换：
   攻击者 unlink 掉 temp、在同名放自己的文件，Drop 仍会按路径删掉那个旁观者。
   R4 因此让 `TempFile` 记住创建时的**句柄身份**，删除前先确认路径仍指向那个 inode，否则什么都不做。
+- **残留的 temp 会让下一次导出以 exit 2 被拒**（R5 finding 5）：`stray` 文件叫 `.otl-export-*.md`，
+  点号开头，`ls` 不显示；而 `is_empty_dir` 认点文件。于是用户对着一个肉眼为空的目录被告知「非空」。
+  现在分开两种情况：用户自己放的内容仍是「is not empty，加 --overwrite」，
+  本命令自己的残留则给专门文案——列出文件名、说明它们是隐藏的、告诉用户删掉再跑。
+- **`failed[].id` 对 unusable 行本来不是 id**（R5 finding 6）：R4 新写的 doc 承诺「id 原样保留，供脚本重试」，
+  但无 id 的 listing row 塞进去的是 `"listing row 1 (Title)"` 这种人类可读标签，
+  脚本拿它去调 `documents.info` 只会得到本地 schema 校验失败。现在 `Failure` 拆成
+  `id: Option<String>`（无 id 时为 `null`）+ `label: String`（终端摘要用，经 `text::quote`）。
 - **残留的 temp 是完整副本，不能默默留着**（R4 finding 4）：无覆盖模式下发布成功后，
   temp 名是文档的第二个硬链接。删不掉时它就是输出树里一份隐藏的完整拷贝——
   既污染备份也多一份泄漏。现在 `write_atomically` 把它作为 `Written::stray` 返回，

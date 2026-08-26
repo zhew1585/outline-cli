@@ -24,6 +24,7 @@ use crate::stdio;
 use crate::text;
 
 use super::dir::{self, Dir, Durability};
+use super::outdir::{self, Prepared};
 use super::target::{self, TempNames};
 use super::tree::{self, Plan};
 
@@ -58,13 +59,24 @@ pub struct ExportArgs {
 
 /// One document that could not be exported.
 struct Failure {
-    /// Document id, so the user can retry it by hand.
+    /// The document's id, when it has one.
     ///
-    /// Kept RAW: it is what the caller needs to feed back to the API, and
-    /// the JSON summary carries it verbatim for that reason. It is also
-    /// server-controlled text, so the human-readable summary quotes it
-    /// through [`text::quote`] rather than printing it as it came.
-    id: String,
+    /// `None` for a listing row that carried no usable id - which is the
+    /// whole reason that row failed. Distinguishing the two matters to a
+    /// script: `id` is what `documents.info` takes, so handing it a
+    /// stand-in label would produce a confusing local validation error
+    /// instead of "this row never had an id".
+    ///
+    /// Kept RAW where it exists: it is what the caller needs to feed back
+    /// to the API, and the JSON summary carries it verbatim for that
+    /// reason.
+    id: Option<String>,
+    /// How this failure is NAMED to a human - the id, or the position of
+    /// the unusable row in the listing.
+    ///
+    /// Server-controlled text, so the summary quotes it through
+    /// [`text::quote`] rather than printing it as it came.
+    label: String,
     /// Why it failed (already sanitized: it comes from a `CliError` or an
     /// `io::ErrorKind`, never from raw server text).
     reason: String,
@@ -75,7 +87,7 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     // Local checks first: a bad output directory must not cost a request.
     // The canonical path is what everything below joins onto, so an
     // ancestor symlink is resolved once, up front, and reported.
-    let prepared = prepare_out_dir(&cmd.out, cmd.overwrite)?;
+    let prepared: Prepared = outdir::prepare_out_dir(&cmd.out, cmd.overwrite)?;
     let root = prepared.root;
     let root_dir = Dir::open(root.clone())
         .map_err(|reason| CliError::usage(anyhow!("{}: {reason}", root.display())))?;
@@ -93,7 +105,7 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode) -> Result<(), CliError> {
     // exists and this run never fetched. It has to land in the accounting
     // like any other missing document.
     for unusable in plan.unusable() {
-        export.fail(&unusable.label(), unusable.reason.to_string());
+        export.fail_unusable(unusable.label(), unusable.reason.to_string());
     }
     export.write_level(&root_dir, &plan, &plan.roots, 0, &mut Names::new());
     export.flush(&root_dir);
@@ -406,10 +418,20 @@ impl<'a> Export<'a> {
 
     /// Record one failed document.
     fn fail(&mut self, id: &str, reason: String) {
-        self.failures.push(Failure {
-            id: id.to_string(),
-            reason,
-        });
+        self.record_failure(Some(id.to_string()), id.to_string(), reason);
+    }
+
+    /// Record a listing row that never became a document.
+    ///
+    /// No id, because not having one is why it failed; the label carries
+    /// the row's position instead.
+    fn fail_unusable(&mut self, label: String, reason: String) {
+        self.record_failure(None, label, reason);
+    }
+
+    /// Record one failure.
+    fn record_failure(&mut self, id: Option<String>, label: String, reason: String) {
+        self.failures.push(Failure { id, label, reason });
     }
 
     /// Warn once that the hierarchy was deeper than the export mirrors.
@@ -544,6 +566,11 @@ impl<'a> Export<'a> {
     /// - `stray`: temporary files that survived a successful publish. Each
     ///   is a complete copy of a document sitting in the output tree under
     ///   a hidden name.
+    /// - `failed[]`: `id` is the document id and is `null` for a listing
+    ///   row that never had one - so a script can retry exactly the
+    ///   entries where `id != null` and report the rest. `label` is the
+    ///   human-readable name of the same failure (the id, or the row's
+    ///   position in the listing).
     fn print_json(&self) -> Result<(), CliError> {
         let payload = serde_json::json!({
             "out": self.root.display().to_string(),
@@ -558,6 +585,7 @@ impl<'a> Export<'a> {
                 .iter()
                 .map(|failure| serde_json::json!({
                     "id": failure.id,
+                    "label": failure.label,
                     "reason": failure.reason,
                 }))
                 .collect::<Vec<_>>(),
@@ -578,7 +606,7 @@ impl<'a> Export<'a> {
             self.failures
                 .iter()
                 .take(MAX_LISTED_FAILURES)
-                .map(|failure| format!("  {}: {}", text::quote(&failure.id), failure.reason)),
+                .map(|failure| format!("  {}: {}", text::quote(&failure.label), failure.reason)),
         );
         if self.failures.len() > MAX_LISTED_FAILURES {
             lines.push(format!(
@@ -588,147 +616,6 @@ impl<'a> Export<'a> {
         }
         lines.join("\n")
     }
-}
-
-/// Validate and create the output directory, before any network request,
-/// and return its CANONICAL path.
-///
-/// A directory that already holds something is refused unless `--overwrite`
-/// was given: silently mixing a new export into an old one produces a tree
-/// that matches neither.
-///
-/// The canonical path is what the rest of the export joins onto, and it is
-/// what the closing "exported N documents to ..." line names. That matters
-/// for symlinks in the path the user gave: `--out` itself may not BE a
-/// symlink (checked below), but an ancestor of it legitimately can be -
-/// `/tmp` and `/var` are symlinks on macOS, and plenty of home directories
-/// are. Those are followed, once, before anything is written, and the place
-/// they lead to is reported. What is then guaranteed for the rest of the run
-/// is the useful part: every directory created under the root is re-resolved
-/// and required to still be inside it (see [`create_child_dir`]), and every
-/// file is placed by `create_new` + `rename` rather than by opening a path
-/// (see [`write_file_atomically`]), so no link inside the tree can redirect
-/// a write out of it.
-fn prepare_out_dir(out: &Path, overwrite: bool) -> Result<Prepared, CliError> {
-    let usage = |message: String| CliError::usage(anyhow!(message));
-    let mut created = Vec::new();
-    match std::fs::symlink_metadata(out) {
-        Ok(metadata) if metadata.is_dir() => {
-            if !overwrite && !is_empty_dir(out)? {
-                return Err(usage(format!(
-                    "{} is not empty; pass --overwrite to export into it anyway",
-                    out.display()
-                )));
-            }
-        }
-        // `symlink_metadata` does not follow links, so a symlink lands here
-        // rather than in the branch above: an export must not be redirected
-        // somewhere else by a link the user may not have noticed.
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(usage(format!(
-                "{} is a symlink; point --out at a real directory",
-                out.display()
-            )))
-        }
-        Ok(_) => return Err(usage(format!("{} is not a directory", out.display()))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            created = create_dir_recording(out)?
-        }
-        Err(error) => {
-            return Err(usage(format!(
-                "cannot use {}: {}",
-                out.display(),
-                error.kind()
-            )))
-        }
-    }
-    let root = std::fs::canonicalize(out).map_err(|error| {
-        usage(format!(
-            "cannot resolve {}: {}",
-            out.display(),
-            error.kind()
-        ))
-    })?;
-    Ok(Prepared {
-        root,
-        new_entries: parents_of(created),
-    })
-}
-
-/// A validated output directory, plus the directories whose ENTRIES this
-/// run created.
-struct Prepared {
-    /// Canonical output directory.
-    root: PathBuf,
-    /// Directories that gained an entry when the output path was created,
-    /// deepest first. Each has to be flushed for the newly created
-    /// directory NAMES to survive a crash - flushing only the directory
-    /// that holds the documents would leave the directory that holds that
-    /// directory unflushed.
-    new_entries: Vec<PathBuf>,
-}
-
-/// Create every missing component of `out`, returning the ones created.
-///
-/// `create_dir_all` does the same thing but does not say what it made, and
-/// the export has to know: a directory it created is a new entry in the
-/// directory above, and that one needs flushing too.
-///
-/// Existing components are traversed as they are - an ancestor symlink is
-/// legitimate (`/tmp` and `/var` are symlinks on macOS) and is resolved
-/// once, here, before anything is written.
-fn create_dir_recording(out: &Path) -> Result<Vec<PathBuf>, CliError> {
-    let usage = |message: String| CliError::usage(anyhow!(message));
-    let mut created = Vec::new();
-    let mut path = PathBuf::new();
-    for component in out.components() {
-        path.push(component);
-        match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => continue,
-            Ok(_) => return Err(usage(format!("{} is not a directory", path.display()))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&path).map_err(|error| {
-                    usage(format!(
-                        "cannot create {}: {}",
-                        path.display(),
-                        error.kind()
-                    ))
-                })?;
-                created.push(path.clone());
-            }
-            Err(error) => {
-                return Err(usage(format!(
-                    "cannot use {}: {}",
-                    path.display(),
-                    error.kind()
-                )))
-            }
-        }
-    }
-    Ok(created)
-}
-
-/// The parent directories of newly created ones, deepest first, deduplicated.
-///
-/// A directory's own name lives in its parent, so these are the directories
-/// whose entries changed. Deepest first so a flush happens after everything
-/// it records is already durable.
-fn parents_of(created: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut parents: Vec<PathBuf> = created
-        .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .collect();
-    parents.reverse();
-    parents.dedup();
-    parents
-}
-
-/// Whether a directory has no entries.
-fn is_empty_dir(dir: &Path) -> Result<bool, CliError> {
-    let mut entries = std::fs::read_dir(dir).map_err(|error| {
-        CliError::usage(anyhow!("cannot read {}: {}", dir.display(), error.kind()))
-    })?;
-    Ok(entries.next().is_none())
 }
 
 /// `text` with exactly one trailing newline.

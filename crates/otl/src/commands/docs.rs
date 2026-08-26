@@ -14,6 +14,7 @@ mod create;
 mod detail;
 mod dir;
 mod export;
+mod outdir;
 mod search;
 mod target;
 mod tree;

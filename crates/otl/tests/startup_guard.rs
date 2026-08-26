@@ -156,9 +156,11 @@ const FORBIDDEN_SOURCE_PATTERNS: &[(&str, &str)] = &[
 /// embedded or opened at runtime; this scan is the early warning.
 const SOURCE_SCAN_ALLOWLIST: &[(&str, &str, usize)] = &[
     // `otl docs export` refuses to write into a directory that already has
-    // contents unless `--overwrite` is given, which means enumerating the
-    // user-supplied output directory. One call site: `is_empty_dir`.
-    ("commands/docs/export.rs", "read_dir", 1),
+    // contents unless `--overwrite` is given, and has to tell leftovers of
+    // its own from content the user put there - both of which mean
+    // enumerating the user-supplied output directory. One call site:
+    // `inspect_dir`. Nothing to do with the vendored spec.
+    ("commands/docs/outdir.rs", "read_dir", 1),
     // One `#[cfg(test)]` helper that lists a temporary directory, so the
     // write tests can assert exactly which entries a write left behind -
     // which is how "no temporary file survived" is checked. Test-only, and
@@ -350,7 +352,7 @@ fn api_unknown_op_rejected_by_ir_with_no_spec_file_reachable() {
 /// exception for that pattern.
 #[test]
 fn the_allowlist_does_not_exempt_a_whole_file() {
-    let allowlisted = Path::new("crates/otl/src/commands/docs/export.rs");
+    let allowlisted = Path::new("crates/otl/src/commands/docs/outdir.rs");
     let pattern = "read_dir";
     let reason = "test reason";
     assert_eq!(

@@ -2,6 +2,8 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod export;
+
 use assert_cmd::Command;
 
 /// An `otl` command with every environment variable the CLI reads scrubbed,
