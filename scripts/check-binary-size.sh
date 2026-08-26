@@ -43,10 +43,10 @@ MAX_BYTES="${MAX_BINARY_SIZE_BYTES:-4194304}"
 # release artifacts with, i.e. exactly what users download.
 PROFILE="${BINARY_SIZE_PROFILE:-dist}"
 
-# Rust target triple to build for. Empty means the host, which is what the
-# macOS and Windows runners want; the Linux runner sets this to the musl
-# triple so the gate measures the artifact we actually ship rather than a
-# glibc build that is never published.
+# Rust target triple to build for. Empty means the host, which is what a
+# local run and the native pre-merge runners want; the release build passes
+# the triple it is publishing so the gate measures the artifact users
+# actually download rather than a near-miss.
 TARGET="${BINARY_SIZE_TARGET:-}"
 
 # Binary name is fixed by the CLI contract (SPEC.md): crate `outline-cli`,
@@ -68,13 +68,32 @@ else
     OUT_DIR="${REPO_ROOT}/target/${PROFILE_SUBDIR}"
 fi
 
+# Mirror the RUSTFLAGS cargo-dist appends per target environment
+# (cargo-dist 0.32.0, cargo-dist/src/build/cargo.rs). Without this the
+# measured binary is not the shipped binary - statically linking the CRT
+# changes its size - and cargo would rebuild from scratch when `dist build`
+# runs afterwards in the same job instead of reusing this compilation.
+#
+# Keep in sync with dist's defaults: `msvc-crt-static` defaults to true, and
+# musl always gets crt-static + link-self-contained. If dist-workspace.toml
+# ever sets `msvc-crt-static = false`, drop the msvc arm here too.
+FLAG_TARGET="${TARGET}"
+if [[ -z "${FLAG_TARGET}" ]]; then
+    FLAG_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+fi
+case "${FLAG_TARGET}" in
+    *-msvc) DIST_RUSTFLAGS=" -Ctarget-feature=+crt-static" ;;
+    *-musl) DIST_RUSTFLAGS=" -Ctarget-feature=+crt-static -Clink-self-contained=yes" ;;
+    *) DIST_RUSTFLAGS="" ;;
+esac
+
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     build_args=(--profile "${PROFILE}" -p "${PACKAGE}"
         --manifest-path "${REPO_ROOT}/Cargo.toml")
     if [[ -n "${TARGET}" ]]; then
         build_args+=(--target "${TARGET}")
     fi
-    cargo build "${build_args[@]}"
+    RUSTFLAGS="${RUSTFLAGS:-}${DIST_RUSTFLAGS}" cargo build "${build_args[@]}"
 fi
 
 # Windows is a first-class platform: the artifact is otl.exe there, and this

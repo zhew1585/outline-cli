@@ -78,7 +78,35 @@
             SummaryCodepage='1252'
             />
 
+        <!--
+          HAND-MAINTAINED FROM HERE ON. This file started as cargo-dist
+          output, but `allow-dirty = ["msi"]` in dist-workspace.toml now
+          stops dist from regenerating or diffing it, because of the one
+          setting below that dist's template does not emit and no config
+          key controls.
+
+          AllowSameVersionUpgrades: cargo-wix squeezes a SemVer prerelease
+          into the MSI ProductVersion's fourth field, and Windows Installer
+          compares only the first three. So 1.2.3-rc.1, 1.2.3-rc.2 and
+          1.2.3 are all "1.2.3" as far as upgrade detection is concerned.
+          With the default (no), MajorUpgrade's detect range excludes the
+          current version, so installing 1.2.3 over 1.2.3-rc.2 does not
+          find anything to replace: the two end up side by side, or the
+          second installer refuses. Including the current version fixes
+          that; it also triggers ICE61 during validation, which is a
+          warning and is suppressed via [package.metadata.wix] linker-args
+          in the package's Cargo.toml.
+
+          Versions whose prerelease has no numeric part at all (1.2.3-rc)
+          make cargo-wix fail outright; scripts/check-msi-version.sh
+          catches that at plan time instead of mid-release on Windows.
+
+          If you change package metadata (description, license, EULA),
+          mirror it here by hand or temporarily drop the allow-dirty entry
+          and re-diff against `dist generate`.
+        -->
         <MajorUpgrade
+            AllowSameVersionUpgrades='yes'
             Schedule='afterInstallInitialize'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
