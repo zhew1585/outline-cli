@@ -195,9 +195,14 @@ const CONFINED: &[Confined] = &[
     // `TcpStream` is allowed in the same two files for two reasons: the
     // server reads the accepted connection (a stream is what `accept`
     // returns), and their `#[cfg(test)]` harnesses dial the listener to
-    // reproduce the byte-trickle and slot-exhaustion attacks. This scan
-    // reads whole files, so it cannot tell a test block from a runtime one -
-    // the send-site rule above is what bounds what those streams can do.
+    // reproduce the byte-trickle and slot-exhaustion attacks.
+    //
+    // The send-site rule above does NOT bound these: a `TcpStream` has no
+    // `.send()`, so nothing there constrains an outbound `connect`. The
+    // backstop is `every_outbound_connect_is_to_the_loopback_callback`
+    // below, which requires every `TcpStream::connect` to name
+    // `CALLBACK_HOST` - plus the file confinement here, which keeps the
+    // question to two modules.
     Confined {
         needle: "std::net",
         allowed: &[
@@ -255,6 +260,62 @@ fn network_entry_points_stay_confined() {
             rule.why
         );
     }
+}
+
+/// The one constant an outbound `connect` may aim at.
+const LOOPBACK_HOST_CONST: &str = "CALLBACK_HOST";
+
+#[test]
+fn every_outbound_connect_is_to_the_loopback_callback() {
+    // Relaxing `std::net`/`TcpStream` for the OAuth redirect flow opened a
+    // hole the other rules do not close: `accept()` is inbound, but
+    // `TcpStream::connect` is outbound and has no `.send()` for the send-site
+    // rule to count. So it gets its own rule, and it is a rule about the
+    // ARGUMENT rather than the file: a connect may only aim at the loopback
+    // callback constant.
+    //
+    // Every current call is a test harness dialling its own listener. The
+    // rule is written so that a runtime one would have to name the same
+    // constant, which is a loopback IP literal (never the NAME `localhost`,
+    // which a resolver can point elsewhere - see `auth::transport`).
+    let mut offenders = Vec::new();
+    for (path, source) in runtime_sources() {
+        for (index, line) in source.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !line.contains("TcpStream::connect") && !line.contains("UdpSocket::bind") {
+                continue;
+            }
+            if !line.contains(LOOPBACK_HOST_CONST) {
+                offenders.push(format!("  {path}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these outbound connections do not aim at {LOOPBACK_HOST_CONST}:\n{}\n\
+         A socket that leaves this machine bypasses all three request \
+         channels and everything they enforce.",
+        offenders.join("\n")
+    );
+
+    // Not vacuous: there ARE connects, and the constant they name really is
+    // a loopback address rather than a hostname.
+    let connects: usize = runtime_sources()
+        .iter()
+        .map(|(_, source)| source.matches("TcpStream::connect").count())
+        .sum();
+    assert!(
+        connects > 0,
+        "no outbound connect found at all: the rule is looking at nothing"
+    );
+    assert_eq!(
+        otl::auth::loopback::CALLBACK_HOST,
+        "127.0.0.1",
+        "the callback host is no longer a loopback IP literal; a name can be \
+         resolved to another host, which is the whole reason this is pinned"
+    );
 }
 
 #[test]

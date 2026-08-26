@@ -1,20 +1,26 @@
-//! The credential the request channel uses, and how it renews itself.
+//! The OAuth SESSION as the request channel's credential, and how it renews
+//! itself.
 //!
 //! This is the `engine::CredentialSource` implementation: everything
 //! Outline- and OAuth-specific about supplying a bearer token lives here,
 //! behind the generic hook the channel calls. No command refreshes a token
 //! on its own.
 //!
-//! Precedence, when more than one credential exists for a profile:
+//! # A session, and nothing else
 //!
-//! 1. an OAuth session (`otl auth login`),
-//! 2. an API key in the credential file (`otl auth set-key`),
-//! 3. `OUTLINE_API_KEY` from the environment.
+//! This provider used to serve any of the three credential kinds, choosing
+//! between them by precedence - and its environment branch read
+//! `OUTLINE_API_KEY` directly, which meant every caller that went through it
+//! bypassed the config gate's rule that a profile-scoped credential must
+//! come from `OUTLINE_API_KEY_<PROFILE>`. `otl auth info` did exactly that,
+//! and sent a global key that `otl api` refused on the same configuration.
 //!
-//! Interactive credentials win because they are the ones the user last
-//! chose deliberately, and the environment comes last because it is the
-//! least protected of the three - which is also why using it emits a
-//! one-time warning.
+//! So the split is now by CAPABILITY rather than by preference: a session is
+//! the only credential that renews, and renewing is the only reason a
+//! credential needs to live behind a `CredentialSource` at all. A fixed key
+//! needs no state and no lock, so it goes to the engine as a plain string -
+//! obtained from `config::Config::release` and nowhere else. Nothing in this
+//! module can produce a key, which is what makes that "nowhere else" hold.
 //!
 //! Refresh safety has three parts, all required by the fact that Outline
 //! ROTATES the refresh token on every use:
@@ -28,7 +34,6 @@
 //!   would leave the user with a credential file that cannot be recovered
 //!   from.
 
-use std::env;
 use std::fmt;
 use std::sync::Mutex;
 
@@ -36,8 +41,8 @@ use engine::{CredentialError, CredentialSource};
 use reqwest::blocking::Client;
 
 pub use crate::auth::selection::{
-    available, check_binding, env_api_key, fresh_enough, superseded_by, Method, Snapshot,
-    EXPIRY_SKEW_SECONDS,
+    available, check_binding, fresh_enough, superseded_by, warn_about_env_key, Method, Snapshot,
+    ENV_NO_KEY_WARNING, EXPIRY_SKEW_SECONDS,
 };
 
 use crate::auth::credentials::{ClientRegistration, CredentialFile, CredentialStore, OAuthSession};
@@ -46,24 +51,20 @@ use crate::auth::error::{OAuthError, StoreError};
 use crate::auth::lock::CredentialLock;
 use crate::auth::oauth::{self, ClientAuth};
 use crate::auth::transport;
-use crate::stdio;
 
-/// Environment variable that silences the plaintext-key warning.
-pub const ENV_NO_KEY_WARNING: &str = "OUTLINE_NO_KEY_WARNING";
-
-/// The one-time warning about keeping an API key in the environment.
-const ENV_KEY_WARNING: &str = "warning: authenticating with the API key in \
-     OUTLINE_API_KEY. An environment variable is readable by every process \
-     you start and tends to end up in shell history, CI logs and crash \
-     reports. Run `otl auth set-key` to store it in the credential file \
-     (owner-only) instead. Set OUTLINE_NO_KEY_WARNING=1 to silence this.";
-
-/// What the provider holds between requests.
-enum State {
-    /// A fixed key that never changes and cannot be renewed.
-    Fixed(String),
-    /// An OAuth session, replaced in place on every refresh.
-    Session(Box<OAuthSession>),
+/// The session detail `otl auth info` reports. No secret.
+#[derive(Debug, Clone)]
+pub struct SessionDetail {
+    /// Granted scope, when the server stated one.
+    pub scope: Option<String>,
+    /// Account label captured at login.
+    pub account: Option<String>,
+    /// Workspace label captured at login.
+    pub workspace: Option<String>,
+    /// Seconds until the access token expires; negative when already past.
+    pub expires_in: Option<i64>,
+    /// Whether a refresh token is stored, so renewal is possible.
+    pub renewable: bool,
 }
 
 /// The `engine::CredentialSource` for one profile.
@@ -75,13 +76,11 @@ pub struct CredentialProvider {
     /// Instance origin this provider was resolved for. Stored endpoints are
     /// re-checked against it before any credential is sent to them.
     origin: String,
-    method: Method,
     /// The client registration, for the `client_id` a refresh needs.
     registration: Option<ClientRegistration>,
-    state: Mutex<State>,
+    /// The session, replaced in place on every refresh.
+    state: Mutex<OAuthSession>,
     http: Client,
-    /// Cached non-secret summary, so `auth info` needs no lock dance.
-    available: Vec<Method>,
 }
 
 impl fmt::Debug for CredentialProvider {
@@ -90,36 +89,30 @@ impl fmt::Debug for CredentialProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CredentialProvider")
             .field("profile", &self.profile)
-            .field("method", &self.method)
             .field("credential", &"***")
             .finish_non_exhaustive()
     }
 }
 
 impl CredentialProvider {
-    /// Resolve the credential for `profile` from `file` and the
-    /// environment, returning `None` when there is nothing to use.
+    /// Build the provider from the OAuth SESSION stored for `profile`, or
+    /// `None` when there is no session there.
     ///
-    /// `origin` is the instance this command is pointed at, and stored
-    /// credentials are only offered if they were issued BY that instance.
-    /// Without the check, re-pointing `OUTLINE_URL` at another host would
-    /// hand it this profile's bearer token - and, once the token expired,
-    /// would mint a fresh one at the original instance and send that too.
-    /// The check refuses rather than warns: a warning is printed after the
-    /// credential has already gone to the request channel.
+    /// `origin` is the instance this command is pointed at, and a stored
+    /// credential is only offered if it was issued BY that instance. Without
+    /// the check, re-pointing the URL at another host would hand it this
+    /// profile's bearer token - and, once the token expired, would mint a
+    /// fresh one at the original instance and send that too. The check
+    /// refuses rather than warns: a warning is printed after the credential
+    /// has already gone to the request channel.
     ///
-    /// An environment API key needs no stored binding of its own - it is
-    /// supplied per invocation alongside `OUTLINE_URL` - so a profile that
-    /// holds only a leftover client registration does not block it. It is
-    /// NOT exempt from the check as a whole: if the profile also holds a
-    /// stored key or session for another instance, that conflict is
-    /// reported rather than silently resolved by falling through to the
-    /// environment.
-    ///
-    /// The plaintext-environment warning is emitted here - once per
-    /// command run, at the moment the key is actually chosen, rather than
-    /// once per HTTP request.
-    pub fn resolve(
+    /// `None` is not "nothing is configured": a stored API key or an
+    /// environment key may well be usable. It means "there is nothing HERE",
+    /// and the caller
+    /// ([`crate::auth::resolve_credential`]) goes to the config gate for the
+    /// fixed-key cases. This function cannot produce a fixed key at all,
+    /// which is what stops it from becoming a second way to obtain one.
+    pub fn for_session(
         store: CredentialStore,
         profile: &str,
         file: &CredentialFile,
@@ -127,55 +120,24 @@ impl CredentialProvider {
     ) -> Result<Option<Self>, OAuthError> {
         let entry = file.profile(profile);
         check_binding(entry, profile, origin)?;
-        let available = available(entry);
-        let Some(&method) = available.first() else {
+        let Some(session) = entry.and_then(|profile| profile.oauth.clone()) else {
             return Ok(None);
-        };
-        let state = match method {
-            Method::OAuth => {
-                let session = entry
-                    .and_then(|profile| profile.oauth.clone())
-                    .ok_or_else(|| unreachable_state("oauth session"))?;
-                State::Session(Box::new(session))
-            }
-            Method::StoredApiKey => {
-                let key = entry
-                    .and_then(|profile| profile.api_key.clone())
-                    .ok_or_else(|| unreachable_state("stored api key"))?;
-                State::Fixed(key)
-            }
-            Method::EnvApiKey => {
-                warn_about_env_key();
-                State::Fixed(env_api_key().ok_or_else(|| unreachable_state("env api key"))?)
-            }
         };
         Ok(Some(Self {
             store,
             profile: profile.to_string(),
             origin: origin.to_string(),
-            method,
             registration: entry.and_then(|profile| profile.client.clone()),
-            state: Mutex::new(state),
+            state: Mutex::new(session),
             http: endpoint::http_client()?,
-            available,
         }))
     }
 
-    /// Which method is in use.
-    pub fn method(&self) -> Method {
-        self.method
-    }
-
-    /// A non-secret summary for `auth info`.
-    pub fn snapshot(&self) -> Snapshot {
+    /// The non-secret session detail `auth info` reports.
+    pub fn detail(&self) -> SessionDetail {
         let state = self.state.lock().ok();
-        let session = state.as_ref().and_then(|state| match &**state {
-            State::Session(session) => Some(session.as_ref()),
-            State::Fixed(_) => None,
-        });
-        Snapshot {
-            method: self.method,
-            available: self.available.clone(),
+        let session = state.as_deref();
+        SessionDetail {
             scope: session.and_then(|session| session.scope.clone()),
             account: session.and_then(|session| session.account.clone()),
             workspace: session.and_then(|session| session.workspace.clone()),
@@ -183,10 +145,6 @@ impl CredentialProvider {
                 .and_then(|session| session.expires_at)
                 .map(|at| at - oauth::now_unix()),
             renewable: session.is_some_and(|session| session.refresh_token.is_some()),
-            dynamic_client: self
-                .registration
-                .as_ref()
-                .is_some_and(|registration| registration.dynamic),
         }
     }
 
@@ -289,7 +247,7 @@ impl CredentialProvider {
     /// Replace the in-memory session.
     fn adopt(&self, session: &OAuthSession) {
         if let Ok(mut state) = self.state.lock() {
-            *state = State::Session(Box::new(session.clone()));
+            *state = session.clone();
         }
     }
 
@@ -300,21 +258,11 @@ impl CredentialProvider {
             // treat the in-memory view as unusable rather than guess.
             return Current::Spent(String::new());
         };
-        match &*state {
-            State::Fixed(key) => Current::Usable(key.clone()),
-            State::Session(session) => {
-                if fresh_enough(session) {
-                    Current::Usable(session.access_token.clone())
-                } else {
-                    Current::Spent(session.access_token.clone())
-                }
-            }
+        if fresh_enough(&state) {
+            Current::Usable(state.access_token.clone())
+        } else {
+            Current::Spent(state.access_token.clone())
         }
-    }
-
-    /// Whether this provider renews at all.
-    fn renewable(&self) -> bool {
-        matches!(self.method, Method::OAuth)
     }
 }
 
@@ -322,16 +270,14 @@ impl CredentialSource for CredentialProvider {
     fn bearer(&self) -> Result<String, CredentialError> {
         match self.current_token() {
             Current::Usable(token) => Ok(token),
-            // Only an OAuth session can get here: a fixed key is always
-            // usable, so there is nothing to refresh.
             Current::Spent(spent) => self.refresh_locked(&spent).map_err(credential_error),
         }
     }
 
     fn renew(&self, rejected: &str) -> Result<Option<String>, CredentialError> {
-        if !self.renewable() {
-            return Ok(None);
-        }
+        // Always renewable: this provider only ever holds a session. A fixed
+        // key never reaches the engine as a `CredentialSource`, so there is
+        // no "cannot renew" case left to report.
         self.refresh_locked(rejected)
             .map(Some)
             .map_err(credential_error)
@@ -373,28 +319,6 @@ fn credential_error(error: OAuthError) -> CredentialError {
         _ if error.is_grant_rejected() => CredentialError::reauth_required(error.to_string()),
         _ => CredentialError::unavailable(error.to_string()),
     }
-}
-
-/// A state the precedence list said existed but the file did not have.
-///
-/// Only reachable if [`available`] and the match on `method` disagree, so
-/// it is a programming error rather than a user-visible situation - but it
-/// is reported instead of unwrapped, because the library layer never
-/// panics.
-fn unreachable_state(what: &str) -> OAuthError {
-    OAuthError::Malformed {
-        stage: crate::auth::error::Stage::Discovery,
-        origin: "the credential file".to_string(),
-        reason: format!("internal inconsistency: {what} was selected but is not stored"),
-    }
-}
-
-/// Warn once about a key living in the environment.
-pub(super) fn warn_about_env_key() {
-    if env::var(ENV_NO_KEY_WARNING).is_ok() {
-        return;
-    }
-    stdio::write_diagnostic_line(ENV_KEY_WARNING);
 }
 
 impl From<StoreError> for OAuthError {
@@ -599,15 +523,16 @@ mod tests {
         let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
         let mut file = CredentialFile::default();
         *file.profile_mut("default") = bound(Some("key"), None);
-        let error = CredentialProvider::resolve(store, "default", &file, "https://other.example")
-            .expect_err("resolution must refuse a foreign binding");
+        let error =
+            CredentialProvider::for_session(store, "default", &file, "https://other.example")
+                .expect_err("resolution must refuse a foreign binding");
         assert!(error.to_string().contains("refused"), "{error}");
     }
 
     // --- precedence ----------------------------------------------------
 
     #[test]
-    fn precedence_is_oauth_then_stored_key_then_environment() {
+    fn a_session_outranks_a_stored_key_in_the_file() {
         let mut profile = bound(Some("stored"), None);
         assert_eq!(
             available(Some(&profile)).first().copied(),
@@ -623,27 +548,49 @@ mod tests {
     }
 
     #[test]
-    fn a_fixed_key_provider_never_claims_it_can_renew() {
-        let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
-        let mut file = CredentialFile::default();
-        *file.profile_mut("default") = bound(Some("k"), None);
-        let provider = CredentialProvider::resolve(store, "default", &file, ORIGIN)
-            .unwrap()
-            .expect("a stored key resolves");
-        assert_eq!(provider.method(), Method::StoredApiKey);
-        assert_eq!(provider.bearer().unwrap(), "k");
-        assert_eq!(provider.renew("k").unwrap(), None);
+    fn the_file_is_the_only_thing_available_reports() {
+        // The environment used to be discovered here, by reading
+        // OUTLINE_API_KEY directly - which is how `auth info` came to send a
+        // global key that the config gate refuses for a selected profile.
+        // This function now answers about the FILE and cannot see the
+        // environment at all; `credential_paths.rs` pins that structurally
+        // (no module under `auth` may name the variable) and
+        // `auth_curated_path.rs` pins the behaviour end to end. Setting the
+        // variable HERE would prove less than either, and would mutate
+        // process state that the other tests in this binary share.
+        assert!(available(None).is_empty());
+        assert_eq!(
+            available(Some(&bound(Some("stored"), None))),
+            vec![Method::StoredApiKey]
+        );
     }
 
     #[test]
-    fn a_profile_with_nothing_stored_has_no_method() {
+    fn a_fixed_key_never_becomes_a_renewing_provider() {
+        // A stored API key is not a session, so this constructor must not
+        // produce a provider for it: a fixed key reaches the engine as a
+        // plain string, released by the config gate, and nothing here can
+        // make one.
+        let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
+        let mut file = CredentialFile::default();
+        *file.profile_mut("default") = bound(Some("k"), None);
+        assert!(
+            CredentialProvider::for_session(store, "default", &file, ORIGIN)
+                .unwrap()
+                .is_none(),
+            "a stored API key was served as a renewable session"
+        );
+    }
+
+    #[test]
+    fn a_profile_with_no_session_yields_no_provider() {
         let store = CredentialStore::at(std::path::PathBuf::from("/nonexistent"));
         let file = CredentialFile::default();
-        if env_api_key().is_none() {
-            assert!(CredentialProvider::resolve(store, "default", &file, ORIGIN)
+        assert!(
+            CredentialProvider::for_session(store, "default", &file, ORIGIN)
                 .unwrap()
-                .is_none());
-        }
+                .is_none()
+        );
     }
 
     // --- error classification ------------------------------------------

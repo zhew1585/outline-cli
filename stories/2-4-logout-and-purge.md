@@ -56,7 +56,8 @@ so that 服务器与本地都不残留。
   撤销在途时把轮换后的会话写进文件。`clear_if_unchanged` **正确地不删**它——那不是本次操作的对象——
   但接下来告诉用户的是「Signed out」+ exit 0，而磁盘上躺着一条完全有效的 bearer 会话。
   这就是本轮要消灭的状态换了个入口：不是撤销失败，是并发替换。
-  修法：移除事务**内部**回读，仍存在的凭证记为 `survived_concurrent_write` → 警告 + exit 3；
+  修法：移除事务**内部**回读，仍存在的凭证记为 `survived_concurrent_write` → 警告 + 非零退出
+  （当时是 3，集成后为 9，见下方「develop 集成记录」）；
   `Report::signed_out()` 让 `revoked` 变成对 profile 的诚实声明而不只是「本次撤了什么」。
 - **[N3] 「可重试 vs 不可能」二分把永久性拒绝讲成可重试。** `dcr::delete` 的 `Err` 里含
   `require_secure`（明文管理 URI）与 `ForeignEndpoint`（异源）——本地规则每次都拒，重试一万次也没用；
@@ -76,14 +77,15 @@ so that 服务器与本地都不残留。
   把 A 的 token 撤销到 A 不向 B 泄露任何东西；同源校验要防的是被篡改的文件，
   而那个基准是凭证自证的 issuer，不是用户可以随便指的环境变量。
 - **撤销失败进入退出码**。新增 `Report::unrevocable`（无法重试：没有撤销端点／端点不可用）
-  与 `Report::retryable`（可以重试：端点存在但这次失败），两者都置 `remote_cleanup_failed` → exit 3。
+  与 `Report::retryable`（可以重试：端点存在但这次失败），两者都置 `remote_cleanup_failed` → 非零退出
+  （当时是 3，集成后为 9）。
   R2 里三条撤销失败分支**一条都没有**置这个标志，于是模块自述的
   「anything that fails is reported... and the exit code says so」对撤销路径是假的。
 - **logout 不再走 `instance_origin` 传输门**。它根本不需要 base_url——要联系的 URL 全在凭证文件里。
   新增 `open_store_without_instance()`。绑定在明文 http 上的 profile（早于本规则、或从别的机器拷来）
   以前 `logout` 直接 exit 2，用户只能手删文件、连 RAT 一起丢、把 DCR 注册变永久孤儿——
   正是 project-context DON'T-MISS 条款要防的终局。
-- **默认不做不可逆的事**（审查者 §1.4 第 4 点）。可重试的失败**保留**本地凭证并 exit 3；
+- **默认不做不可逆的事**（审查者 §1.4 第 4 点）。可重试的失败**保留**本地凭证并非零退出（当时是 3，集成后为 9）；
   `--force` 是用户明说「我知道这些撤不掉了，还是删」。`--force` 同样覆盖注册记录，
   并在警告里点名那个孤儿 client id——否则用户还是只能 `rm`，那是更糟的静默版本。
 
@@ -105,7 +107,7 @@ so that 服务器与本地都不残留。
   现在由 `drop_registration` 决定：**只有服务端确认删除成功**（`registration_deleted`）才清；
   管理员创建的 client（`dynamic = false`）没有管理凭证、服务器上也没有属于我们的东西，清掉不产生孤儿。
 - **退出码要反映部分失败**。新增 `Report::remote_cleanup_failed`；`run_logout` 在本地清理与报告
-  之后返回退出码 3，stderr 说明「本地已登出，但服务器上的应用仍在，可重试 --purge」。
+  之后返回非零退出码（当时是 3，集成后为 9），stderr 说明「本地已登出，但服务器上的应用仍在，可重试 --purge」。
   已登记进 docs/exit-codes.md。
 - 测试：`a_failed_purge_keeps_the_credential_that_can_retry_it`（DELETE 返回 503 → 断言
   rat/uri 仍在盘上、session 已删、退出码非 0）与 `a_retried_purge_succeeds_once_the_server_recovers`
@@ -133,6 +135,10 @@ so that 服务器与本地都不残留。
 - [Source: planning/epics.md#Story 2.4]
 - [Source: specs/spec-outline-cli/stack.md#认证实现]（DCR 清理约束）
 - RFC 7009（撤销）、RFC 7592（注册删除）
+
+> **退出码更新（develop 集成）**：本文档中 R3/R4 时期的 dev notes 写的是 `exit 3`。
+> 集成后 logout 的非零退出码是 **9（Partial，部分失败）**，见下方「develop 集成记录」。
+> 权威来源是 `docs/exit-codes.md`；README 的表格由它派生，`readme_exit_codes` 钉住一致性。
 
 ## develop 集成记录（Phase 6）
 

@@ -310,6 +310,123 @@ plain-document fetch 通道）。所以本 track 做了第二次合并，接缝�
   跑过 `otl spec sync` 影响断言），本 track 加了 `OUTLINE_CONFIG_DIR`（防止读到真实凭证
   文件）。四个 suite 里各自复制一份的隔离块统一到 `common::isolate`。
 
+## R6 修复记录：[N1] `otl auth info` 绕过 config 闸门
+
+### 缺陷
+
+`run_info` 解析实例走了新的 `auth::resolve_instance`（正确），但**凭证**仍走它自己的一条路：
+`resolve_for_info → CredentialProvider::resolve`，而 `source.rs` 的 `Method::EnvApiKey` 分支
+**直读全局 `OUTLINE_API_KEY`**。config 闸门在 profile 生效时只认
+`OUTLINE_API_KEY_<PROFILE>`，**拒绝**回落到全局变量——理由正是「falling back would send one
+workspace's key to another workspace's server」。
+
+于是同一份配置下：`otl --profile work api ...` 退出 2、零请求；
+`otl --profile work auth info` 把 `Bearer <全局 key>` 发给了 work 的实例。
+
+已按审查者的复现写成测试（`auth_curated_path.rs`），断言的是**实例收到了什么**而不是退出码——
+一个「拒绝了但还是发了请求」的实现能满足退出码断言。回退验证：把 `auth info` 的自有凭证路径
+装回去，测试变红并打印
+`auth info sent the global key to the profile's instance: ["Bearer global-key-for-another-instance"]`。
+
+### 修法：按能力拆分，而不是按优先级
+
+没有只在 `run_info` 里补一个判断。`CredentialProvider` 原本按优先级服务三种凭证，
+**这个结构本身就是缺陷源**：任何拿到 provider 的调用方都自动获得了那条绕过闸门的环境分支。
+
+现在按**能力**拆：
+
+- `CredentialProvider` **只服务 OAuth session**。构造函数只剩
+  `for_session`（无条件跑 `check_binding`），`State::Fixed` 与 `Method::EnvApiKey` 分支删除。
+  会续期是它需要存在的唯一理由——固定 key 不需要状态也不需要锁。
+- `selection::available()` **只报告凭证文件里有什么**。原来它读 `OUTLINE_API_KEY` 来决定
+  「环境里有 key」，正是那个洞；`env_api_key()` 删除。
+- 固定 key 只能来自 `config::Config::release`，别处产生不出来。
+
+`auth::resolve_credential(instance, store, file) -> Resolved` 成为**唯一**凭证路径，
+`otl api`、精选命令、`otl auth info` 全部经过它。`Resolved` 的 `credential` 字段私有、
+不是 `Clone`，唯一出口是消耗式的 `into_client()`——类型上没有任何方法把 secret 取回来，
+所以「将来某个命令直接读 key 再送到别处」不可表达。
+
+顺带删掉两条死路径：`auth::open_session` / `auth::Session`（无调用方）与
+`paths::active_profile()`。`login.rs::query_identity` 改用 `for_session`：
+它要给刚写入的 session 打标签，用一个存储 key 或环境 key 回答会是**另一个身份**。
+
+### 「还有哪条路径能拿到凭证而不经 `Config::release`？」
+
+审查者要求把这个问题答全并写进 story。答案是：**有三类凭证，`Config::release`
+结构上只能是其中一类的入口**，另两类各有自己唯一的入口和各自正确的锚点。
+
+| 类别 | 认证到哪里 | 唯一入口 | 锚点 |
+| --- | --- | --- | --- |
+| 固定 API key | 请求通道的 `Authorization` | `config::Config::release` | 解析出的 profile/URL 绑定 |
+| OAuth session | 请求通道的 `Authorization` | `CredentialProvider::for_session` | `check_binding` + session 自己记录的 origin |
+| OAuth 端点密钥（refresh token / client secret / registration access token） | token / 注册 / 撤销端点 | `auth::endpoint` 里唯一的 `.send()` | 每个凭证**自己**记录的 origin |
+
+**为什么不能三类共用一个入口**：第三类必须在完全没有配置时可用。
+`otl auth logout` 要能在 `OUTLINE_URL` 缺失、错误或已经指向别处的机器上撤销 token、
+删除动态注册——那正是用户会去用它的时刻——所以它的锚点是每个凭证自己记录的 origin，
+不是解析出的实例。让它走 `Config::release` 等于「为了清理一个不可用的实例，先要求一个可用的实例」。
+第二类也不可能是 `Config`：`Config` 装一个固定字符串，而 session 每次刷新都会轮换、还需要锁。
+
+所以不变量不是「一个入口」，而是**「每类一个入口，且没有任何路径跳过它那一类的入口」**。
+
+新增 `crates/otl/tests/credential_paths.rs` 把这件事变成测试而不是保证：
+
+- `Config::release` / `StoredCredential::new` / `select_credential_source` 各只有一个调用点；
+- `ENV_API_KEY` 与字面量 `"OUTLINE_API_KEY"` 的出现位置逐个登记——`auth` 下只允许
+  `mod.rs`（消息文本）与 `report.rs`（**仅探测存在性**、绝不取值、绝不用于决策，调用点写明）；
+- `for_session` 是 provider 的唯一构造函数，调用点只有三处；
+- `Client::new(` / `with_credentials(` 的位置逐个登记（谁能造出已认证的通道）；
+- `no_module_under_auth_reads_the_process_environment_for_a_credential`：
+  `auth` 下每一处 `env::var` 都要连同它读的变量一起登记。这条是最窄也最抗重命名的形式。
+
+自证不空转（每条 needle 必须仍然命中，且至少命中一个白名单文件）、白名单文件必须存在。
+回退验证：把 `env_api_key()` 装回 `selection.rs`，
+`no_module_under_auth_reads_the_process_environment_for_a_credential` 与
+`every_way_to_obtain_a_credential_is_where_it_is_declared_to_be` 同时变红。
+
+### 修 [N1] 时暴露的两处行为变化（都是改好）
+
+1. **明文环境 key 的警告现在也覆盖 profile 作用域变量**。原来它由「全局变量是否被直读」决定，
+   于是 `OUTLINE_API_KEY_WORK` 静默——而那正是 CI 最常用的那个变量，暴露面完全相同。
+   现在由「闸门是否真的从环境释放了 key」决定，并且**指名实际用到的那个变量**
+   （变量名向 config 索取，不自己拼，否则警告可能指向闸门根本不会读的变量）。
+   `profile_e2e.rs::a_matching_env_url_is_not_a_conflict` 的断言从「stderr 为空」
+   改成「没有冲突诊断 + 通知指名 `OUTLINE_API_KEY_WORK` + 不回显 key」。
+2. **`auth info` 的 `available` 只列闸门会释放的凭证**。原来它把全局变量算进去（同一个直读）。
+   被遮蔽的明文环境 key 改为独立观测字段 `plaintext_key_in_environment` 上报，
+   人类输出里原本就有 `OUTLINE_API_KEY: set (plaintext in the environment)` 那一行。
+   `auth_info_names_the_method_in_use_and_what_it_shadows` 两侧都断言，信息没有丢。
+
+另外 `auth info` 现在**说清为什么**：`MissingApiKey`（哪儿都没有）仍报 `method: none`，
+其余（profile 自己的变量未设、`auth = "oauth"` 但凭证文件为空、绑定被拒）都把原因和补救
+完整打出来——包括闸门自己那句 "would give one workspace's key to another workspace's server"。
+静默拒绝会是另一个 bug：用户导出了 key，命令说 "none"，原因不可见。
+
+### [N2] / [N3]
+
+- **[N2]** `stories/2-4` 里 R3/R4 时期的 dev notes 写的是 `exit 3`。已在文件顶部加了醒目的
+  退出码更新说明，正文四处改成「非零退出（当时是 3，集成后为 9）」，并指明权威来源是
+  `docs/exit-codes.md`。
+- **[N3]** `no_phone_home.rs` 的注释说「send-site rule bounds what those streams can do」，
+  对 `TcpStream` 不成立——它没有 `.send()`。注释改准，并按审查者的建议补上真正的兜底规则
+  `every_outbound_connect_is_to_the_loopback_callback`：每一处 `TcpStream::connect`
+  必须指名 `CALLBACK_HOST`，且该常量必须仍是回环 IP 字面量（不是 `localhost` 这个**名字**）。
+  回退验证：把一处 connect 改成 `("example.com", port)`，规则变红并打印那一行。
+
+### 结构变化引起的拆分
+
+`commands/auth.rs` 加了 [N1] 的说明后到 814 行，按责任拆成
+`commands/auth/mod.rs`（参数、`run_*`、读 key）与 `commands/auth/output.rs`（两种渲染）。
+`info_output` 57 行超限，拆出 `info_value`——人类行与 JSON 各自短到藏不住一个字段。
+`guard_registry` 里 `commands/auth.rs` 的登记路径同步改成 `commands/auth/mod.rs`。
+
+### 门禁
+
+`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
+`cargo test --workspace`（1148 个测试）全过；
+`scripts/check-binary-size.sh` 3_431_568 B（81%），未进 85% 告警带，常量未动。
+
 ## Dev Agent Record
 
 ### Agent Model Used
@@ -330,5 +447,7 @@ claude-opus-5 (Claude Code agent), 2026-08-26
 - crates/otl/src/config/credentials.rs（集成：释放闸门的凭证文件适配器）
 - crates/engine/src/text.rs（集成：危险字符分类下沉）
 - crates/otl/tests/config_credentials.rs（集成：闸门接缝的行为测试）
+- crates/otl/tests/credential_paths.rs（R6：三类凭证各自唯一入口的守卫）
+- crates/otl/src/commands/auth/{mod.rs, output.rs}（R6：按责任拆分）
 - crates/otl/src/commands/auth.rs
 - crates/otl/tests/auth_oauth_e2e.rs

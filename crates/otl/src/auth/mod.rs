@@ -47,7 +47,7 @@ pub mod selection;
 pub mod source;
 pub mod transport;
 
-use std::path::Path;
+use std::fmt;
 use std::sync::Arc;
 
 use engine::EngineError;
@@ -55,7 +55,7 @@ use thiserror::Error;
 
 use crate::auth::credentials::CredentialStore;
 use crate::auth::error::{OAuthError, StoreError};
-use crate::auth::selection::{check_binding, env_api_key};
+use crate::auth::selection::{available, check_binding, Method, Snapshot};
 use crate::auth::source::{warn_about_env_key, CredentialProvider};
 use crate::config::{self, ConfigError, EnvLayer, Overrides, Settings, ENV_API_KEY};
 use crate::errors::map_engine_error;
@@ -95,18 +95,6 @@ pub enum AuthError {
         /// The profile that has nothing stored.
         profile: String,
     },
-}
-
-/// Everything one command needs in order to talk to an instance.
-pub struct Session {
-    /// Base URL of the instance.
-    pub base_url: String,
-    /// Active profile name.
-    pub profile: String,
-    /// The credential store backing this profile.
-    pub store: CredentialStore,
-    /// The credential the request channel will use.
-    pub provider: Arc<CredentialProvider>,
 }
 
 /// The instance a command is pointed at, resolved through the config layer.
@@ -183,29 +171,6 @@ pub fn active_profile(overrides: &Overrides) -> Result<String, AuthError> {
     let loaded = config::load_file(overrides, &env)?;
     let (name, _) = config::resolve_profile_name(overrides, &env, &loaded);
     Ok(name.unwrap_or(paths::DEFAULT_PROFILE).to_string())
-}
-
-/// Resolve the active profile's credentials for an instance.
-///
-/// The instance's origin is passed into resolution, which refuses stored
-/// credentials issued by a DIFFERENT instance. That check is why this
-/// function exists rather than each command wiring up its own provider: it
-/// must not be possible to build a request-channel client without it.
-pub fn open_session(overrides: &Overrides) -> Result<Session, AuthError> {
-    let instance = resolve_instance(overrides)?;
-    let profile = instance.profile_key().to_string();
-    let store = CredentialStore::discover()?;
-    let file = store.load()?;
-    let provider = CredentialProvider::resolve(store.clone(), &profile, &file, instance.origin())?
-        .ok_or_else(|| AuthError::NoCredentials {
-            profile: profile.clone(),
-        })?;
-    Ok(Session {
-        base_url: instance.base_url().to_string(),
-        profile,
-        store,
-        provider: Arc::new(provider),
-    })
 }
 
 /// The origin stored credentials are bound to for a given instance URL,
@@ -335,6 +300,144 @@ pub struct StoreContext {
     pub origin: String,
 }
 
+/// The credential a command will authenticate with.
+///
+/// Deliberately opaque and deliberately not `Clone`: the only thing that can
+/// be done with one is [`Resolved::into_client`], which consumes it. There is
+/// no accessor that hands the secret back, so a future command cannot
+/// "just read the key" and route it somewhere the gate never saw.
+enum Credential {
+    /// A renewable OAuth session. Goes into the engine as a
+    /// `CredentialSource` so refresh happens inside the request channel.
+    Session(Arc<CredentialProvider>),
+    /// One fixed key, released by [`config::Config::release`] and by nothing
+    /// else.
+    Fixed(String),
+}
+
+/// A credential the gate has approved, plus the non-secret summary of it.
+///
+/// Returned by [`resolve_credential`], which is the ONE place a credential
+/// is chosen. `otl api`, the curated commands and `otl auth info` all come
+/// through here; before this, `auth info` had its own path and released a
+/// global environment key that `otl api` refused on the same configuration.
+pub struct Resolved {
+    credential: Credential,
+    /// Everything `otl auth info` prints. Contains no secret.
+    pub summary: Snapshot,
+}
+
+impl Resolved {
+    /// Turn the credential into a request channel, consuming it.
+    ///
+    /// The only exit. `base_url` is the caller's, but the credential was
+    /// approved for the settings that produced it, so callers pass the same
+    /// instance's URL - `open_client` and `auth info` both do.
+    pub fn into_client(self, base_url: &str) -> Result<engine::Client, AuthError> {
+        match self.credential {
+            Credential::Session(provider) => {
+                let source: Arc<dyn engine::CredentialSource> = provider as _;
+                engine::Client::with_credentials(base_url, source)
+            }
+            Credential::Fixed(key) => engine::Client::new(base_url, &key),
+        }
+        .map_err(AuthError::Engine)
+    }
+}
+
+impl fmt::Debug for Resolved {
+    /// Manual impl: this type holds a credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resolved")
+            .field("method", &self.summary.method)
+            .field("credential", &"***")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Choose the credential for `instance`, applying every rule exactly once.
+///
+/// # Why this is one function and not three
+///
+/// "Credentials must not cross instances" has now been fixed three times on
+/// three different paths: the read path (R1), the write path (R2), and
+/// `otl auth info`'s live identity check (R6). Each fix was correct and each
+/// one left the other paths to be found later, because each path did its own
+/// resolution. So the paths are gone: there is one, and the rules are stated
+/// here once.
+///
+/// 1. **Instance binding.** [`check_binding`] refuses a stored credential
+///    another instance issued, before anything is chosen.
+/// 2. **A session outranks a fixed key.** `auth = "..."` names the login
+///    FLOW, not a filter on what is already stored, so a session
+///    `otl auth login` wrote is used even at the default setting - and the
+///    summary reports what that shadows.
+/// 3. **A fixed key comes from the config gate and nowhere else.** Which
+///    store supplies it - the credential file or the environment - and
+///    whether the environment may supply it at all for these settings is
+///    [`config::Config::release`]'s decision. That is the rule
+///    `auth info` used to bypass: it read `OUTLINE_API_KEY` directly, while
+///    the gate scopes a profile's key to `OUTLINE_API_KEY_<PROFILE>` and
+///    refuses to fall back, because falling back sends one workspace's key
+///    to another workspace's server.
+pub fn resolve_credential(
+    instance: &Instance,
+    store: &CredentialStore,
+    file: &credentials::CredentialFile,
+) -> Result<Resolved, AuthError> {
+    let profile = instance.profile_key();
+    let entry = file.profile(profile);
+    check_binding(entry, profile, instance.origin())?;
+    let stored = entry.and_then(|entry| entry.api_key.as_deref());
+    let mut available = available(entry);
+
+    if let Some(provider) =
+        CredentialProvider::for_session(store.clone(), profile, file, instance.origin())?
+    {
+        let detail = provider.detail();
+        return Ok(Resolved {
+            credential: Credential::Session(Arc::new(provider)),
+            summary: Snapshot::from_session(available, detail),
+        });
+    }
+
+    // No session: a fixed key, if the gate releases one for these settings.
+    let candidate = config::StoredCredential::new(stored, store.path());
+    let source = config::select_credential_source(instance.settings(), candidate.is_present());
+    let released = config::Config::release(instance.settings(), instance.env(), &candidate)?;
+    let method = match source {
+        config::CredentialSource::CredentialFile => Method::StoredApiKey,
+        config::CredentialSource::Environment => {
+            // Warned here, where the key is CHOSEN: once per command run
+            // rather than once per request, and only for a key the gate
+            // actually released - which is also how the warning learns WHICH
+            // variable to name, since a selected profile has its own.
+            warn_about_env_key(&env_key_variable(instance.settings()));
+            available.push(Method::EnvApiKey);
+            Method::EnvApiKey
+        }
+    };
+    Ok(Resolved {
+        credential: Credential::Fixed(released.api_key),
+        summary: Snapshot::fixed(method, available),
+    })
+}
+
+/// The environment variable a fixed key was released from.
+///
+/// Config owns the naming rule (`OUTLINE_API_KEY_<PROFILE>`, or the global
+/// variable when no profile is in effect); this asks it rather than
+/// reconstructing it, so the warning cannot name a variable the gate would
+/// not have read. A profile whose name has no usable variable form cannot
+/// have released a key from the environment at all, so the fallback is only
+/// reachable if that rule changes.
+fn env_key_variable(settings: &Settings) -> String {
+    settings
+        .profile()
+        .and_then(config::api_key_var)
+        .unwrap_or_else(|| ENV_API_KEY.to_string())
+}
+
 /// Build the request-channel client for the active profile.
 ///
 /// The single entry point every command uses: it wires the resolved
@@ -355,78 +458,16 @@ pub fn open_client(overrides: &Overrides) -> Result<(engine::Client, String), Cl
     let instance = resolve_instance(overrides).map_err(map_auth_error)?;
     let store = CredentialStore::discover().map_err(store_failed)?;
     let file = store.load().map_err(store_failed)?;
-    let profile = instance.profile_key().to_string();
-    let entry = file.profile(&profile);
-
-    // Refuse a stored credential that another instance issued, whichever
-    // branch below ends up serving it. `CredentialProvider::resolve` runs
-    // this too; it is called here so the fixed-key branches are not
-    // protected only by accident of going through the provider.
-    check_binding(entry, &profile, instance.origin()).map_err(oauth_failed)?;
-
-    // A renewable session outranks any fixed key. `auth = "..."` names the
-    // login flow, not a filter on what is already stored, so a session that
-    // `otl auth login` put there is used even when the setting is left at
-    // its default - and `otl auth info` reports what that shadows.
-    if entry.is_some_and(|entry| entry.oauth.is_some()) {
-        return session_client(&instance, store, &file, profile);
-    }
-    fixed_client(&instance, store.path(), entry)
-}
-
-/// A client backed by a renewable OAuth session.
-///
-/// The provider goes INTO the engine, so a 401 or an expiring token is
-/// renewed inside the single request channel rather than by each command.
-fn session_client(
-    instance: &Instance,
-    store: CredentialStore,
-    file: &credentials::CredentialFile,
-    profile: String,
-) -> Result<(engine::Client, String), CliError> {
-    let provider = CredentialProvider::resolve(store, &profile, file, instance.origin())
-        .map_err(oauth_failed)?
-        .ok_or_else(|| {
-            map_auth_error(AuthError::NoCredentials {
-                profile: profile.clone(),
-            })
-        })?;
-    let client = engine::Client::with_credentials(instance.base_url(), Arc::new(provider))
-        .map_err(map_engine_error)?;
-    Ok((client, instance.origin().to_string()))
-}
-
-/// A client backed by one fixed API key.
-///
-/// Which key is used - the one in the credential file, or the one in the
-/// environment - is [`crate::config`]'s decision, taken from the resolved
-/// settings; the key reaches the request channel only after the release gate
-/// approved it for those settings.
-fn fixed_client(
-    instance: &Instance,
-    path: &Path,
-    entry: Option<&credentials::ProfileCredentials>,
-) -> Result<(engine::Client, String), CliError> {
-    let stored = entry.and_then(|entry| entry.api_key.as_deref());
-    let stored = config::StoredCredential::new(stored, path);
-    if !stored.is_present() && env_api_key().is_some() {
-        warn_about_env_key();
-    }
-    let config = config::Config::release(instance.settings(), instance.env(), &stored)
-        .map_err(|error| map_auth_error(AuthError::Config(error)))?;
-    let client =
-        engine::Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
+    let resolved = resolve_credential(&instance, &store, &file).map_err(map_auth_error)?;
+    let client = resolved
+        .into_client(instance.base_url())
+        .map_err(map_auth_error)?;
     Ok((client, instance.origin().to_string()))
 }
 
 /// A credential-store failure on the client path.
 fn store_failed(error: StoreError) -> CliError {
     map_auth_error(AuthError::Store(error))
-}
-
-/// An OAuth-layer failure on the client path.
-fn oauth_failed(error: OAuthError) -> CliError {
-    map_auth_error(AuthError::OAuth(error))
 }
 
 /// Who the credential belongs to, as the instance reports it.

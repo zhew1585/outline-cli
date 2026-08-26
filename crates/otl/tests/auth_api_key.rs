@@ -337,16 +337,28 @@ async fn auth_info_names_the_method_in_use_and_what_it_shadows() {
         "method: {}",
         report["method"]
     );
-    // All three are reported as available, in precedence order.
+    // What the release gate would hand over, in precedence order. The
+    // credential FILE's two entries, session first.
+    //
+    // The exported `OUTLINE_API_KEY` is deliberately NOT in this list, and
+    // that changed with R6 [N1]: `available` used to be assembled by reading
+    // the global variable directly, which is the same read that made
+    // `auth info` send a global key to a profile's instance. It now lists
+    // only credentials the gate would actually release for these settings -
+    // and a profile-scoped setup would not release this one at all - so the
+    // exported key is reported as an observation on its own field below.
     let available: Vec<&str> = report["available"]
         .as_array()
         .unwrap()
         .iter()
         .map(|value| value.as_str().unwrap())
         .collect();
-    assert_eq!(available.len(), 3, "{available:?}");
+    assert_eq!(available.len(), 2, "{available:?}");
+    assert!(available[0].starts_with("oauth"), "{available:?}");
     assert!(available[1].contains("credential file"), "{available:?}");
-    assert!(available[2].contains("environment"), "{available:?}");
+    // ...and the shadowed environment key is still surfaced, so a user who
+    // exported one is told why it is not in use.
+    assert_eq!(report["plaintext_key_in_environment"], true, "{stdout}");
     assert_eq!(report["scope"], "read write");
     assert_eq!(report["account"], "Alice <alice@example.com>");
     assert!(report["credential_file"]

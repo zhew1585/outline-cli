@@ -443,11 +443,13 @@ fn query_identity(
     store: &CredentialStore,
 ) -> Result<Identity, AuthError> {
     let file = store.load()?;
-    let provider =
-        CredentialProvider::resolve(store.clone(), profile, &file, origin)?.ok_or_else(|| {
-            AuthError::NoCredentials {
-                profile: profile.to_string(),
-            }
+    // The SESSION this login just wrote, specifically. Not "whatever
+    // credential this profile resolves to": a stored API key or an
+    // environment key would answer as a different principal, and this call
+    // exists to label the session with the account it belongs to.
+    let provider = CredentialProvider::for_session(store.clone(), profile, &file, origin)?
+        .ok_or_else(|| AuthError::NoCredentials {
+            profile: profile.to_string(),
         })?;
     let client = engine::Client::with_credentials(base_url, Arc::new(provider))?;
     crate::auth::fetch_identity(&client)

@@ -90,8 +90,20 @@ pub fn credential_health(store: &CredentialStore) -> CredentialHealth {
         directory_mode: crate::auth::secret_file::directory_mode(store.dir()),
         directory_problem,
         profiles: loaded.as_ref().map(profiles_of).unwrap_or_default(),
-        env_api_key: crate::auth::source::env_api_key().is_some(),
+        env_api_key: global_env_key_is_set(),
     }
+}
+
+/// Whether `OUTLINE_API_KEY` is set in this environment.
+///
+/// PRESENCE only, and never the value. This is a hygiene observation - the
+/// report says "there is a plaintext key in your environment", which is worth
+/// saying whether or not it is the one in use - and not a credential source:
+/// choosing and releasing a key belongs to the config gate, which scopes it
+/// to the selected profile. Reading it here to DECIDE anything is the bug
+/// this comment exists to prevent.
+fn global_env_key_is_set() -> bool {
+    std::env::var(crate::config::ENV_API_KEY).is_ok_and(|value| !value.trim().is_empty())
 }
 
 /// Summarize every profile in a loaded credential file.

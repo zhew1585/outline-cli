@@ -124,6 +124,13 @@ so that 两种认证方式都有一等体验。
   给 `StoredCredential` 加一个绕过闸门的取值方法，两条拒绝测试变红。
 - **`otl auth set-key` 现在尊重 `--profile` / `--url` / `--config`**，见 2-1 集成记录第 1 节。
 - **「没有凭证」的诊断改说三条路**，见 2-1 集成记录第 4 节。
+- **R6 [N1]**：`otl auth info` 曾用自己的一条凭证路径（直读全局 `OUTLINE_API_KEY`）绕过闸门，
+  在 profile 生效时把全局 key 发给了 profile 的实例。修法是把 `CredentialProvider` 收窄成
+  「只服务 OAuth session」、让 `auth::resolve_credential` 成为唯一凭证路径，并新增
+  `credential_paths.rs` 守卫三类凭证各自的唯一入口。完整记录（含「还有哪条路径不经
+  `Config::release`」的全表）在 2-1。
+- **明文环境 key 的警告现在也覆盖 `OUTLINE_API_KEY_<PROFILE>`**，并指名实际用到的变量。
+  原来它只在全局变量被直读时触发，而 CI 用的恰恰是 profile 作用域那个。
 
 ## Dev Agent Record
 

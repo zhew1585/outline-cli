@@ -502,7 +502,22 @@ async fn a_matching_env_url_is_not_a_conflict() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
-    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+    // No CONFLICT is reported - that is what this test is about. The one
+    // thing on stderr is the plaintext-key notice, which now covers a
+    // profile-scoped variable too (it used to fire only for the global one,
+    // because it was decided by reading that variable directly).
+    assert!(
+        !stderr.contains("conflict") && !stderr.contains("deliberately not used"),
+        "a conflict was reported for a matching URL: {stderr}"
+    );
+    assert!(
+        stderr.contains("OUTLINE_API_KEY_WORK"),
+        "the notice does not name the variable the key came from: {stderr}"
+    );
+    assert!(
+        !stderr.contains("key-for-work"),
+        "the notice echoed the key: {stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

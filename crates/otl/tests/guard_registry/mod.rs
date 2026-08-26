@@ -321,7 +321,7 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
     // handle, not a path - but the pattern list matches the method name, and
     // a blanket file-wide exemption is exactly what this guard refuses.
     Exception {
-        file: "crates/otl/src/commands/auth.rs",
+        file: "crates/otl/src/commands/auth/mod.rs",
         pattern: "read_to_string",
         context: ".read_to_string(&mut raw)",
         count: 1,

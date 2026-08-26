@@ -24,9 +24,9 @@
 #   develop, after the spec-sync track landed on top of those:
 #       3_215_728 B  (~3.06 MiB)   76% of the gate
 #   develop + epic2-auth (the last track), measured after the merge:
-#       3_431_584 B  (~3.27 MiB)   81% of the gate
+#       3_431_568 B  (~3.27 MiB)   81% of the gate
 #
-# The auth track cost +215_856 B once merged, against the +317_360 B its own
+# The auth track cost +215_840 B once merged, against the +317_360 B its own
 # branch measured in isolation: most of what it adds (reqwest with the form
 # feature, base64, sha2) was already linked by the tracks that landed first,
 # and the merge also removed a duplicated browser-opener module and folded
