@@ -98,6 +98,16 @@ so that 内容可进 git 或离线阅读。
   1. 父链成环 → `break_cycles` 把环上一点变成 root，森林里每个节点恰好被写一次；
   2. 超深链在深度上限后若继续递归会爆栈 → 平铺分支改用 `VecDeque`，
      递归深度因此被 `MAX_DEPTH` 硬性封顶。
+- **合并 develop 时 `text.rs` 是 add/add 冲突**：本 track 与 Epic 4a config track 各自独立写了同名模块
+  解决同一类问题。保留 develop 的 `Hazard` 分类 enum（它更通用：表格单元格、配置诊断、补全描述、
+  诊断流四处共用，且强制每个 surface 对每个类别**显式作答**），把本 track 的 `quote` 重新表达在 `hazard()` 之上，
+  三个原先调 `is_invisible` 的点改为显式 match。两处必须调整：
+  (1) develop 的表比本 track 少 147 个码点——正好含 R3 点名过的 U+070F / U+0600–0605 / U+13430 块 /
+  U+206A–206F，照搬会**重开那条 finding**，因此扩成完整 `Cf` 类并加了逐码点枚举测试；
+  (2) tag 块 U+E0020–E007F 归 `Joiner` 而非 `Invisible`——它逐字符合 `Joiner` 的定义（不可见但承载语义），
+  是 flag emoji 的地区码；归 `Invisible` 会让表格单元格把苏格兰旗丢成一面黑旗，
+  归 `Joiner` 则 develop 的渲染器照常保留，与它保留 ZWJ（family emoji）完全一致。
+  出口清洗的语义在重表达后未变，且「去掉出口清洗会变红」的那个测试**实测仍会红**。
 - **终端清洗改成了在出口做**（R6 finding 1）：诊断消息由「作者写的散文 + 别处来的值」拼成，
   而前几轮的做法是在**每个插值点**记得调 `text::quote`——标题清了、id 清了、19 个调用点都核过了，
   然后 R5 新加的「点名遗留文件」消息又漏了。所以现在 `stdio::write_diagnostic_line` 自己

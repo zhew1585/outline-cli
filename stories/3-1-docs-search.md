@@ -47,6 +47,10 @@ so that 不用切浏览器。
 - **collection 名称解析的取舍**：搜索结果只带 `collectionId`，终端里不可读。多花一次 list 请求换可读性，
   仅在 Table 模式（交互场景）执行；`--json` 是原始数据，不做解析也不注入合成字段。
   该请求失败只警告不失败——搜索本身已经成功了。
+- **合并 develop 后精选命令也吃 `--profile/--url/--config`**：`Session::open` 改收 `&Overrides`
+  并走 `Config::load`，与 `otl api` 同一条配置解析路径；`render::render` 现在要带响应 schema，
+  但精选命令那五个调用点只出 JSON（schema 永不被查），所以新增纯追加的 `render::render_json`，
+  而不是传一个看起来像疏漏的空 schema。
 - **截断必须能被调用方消费，不只是警告**（R1 finding 1 同源）：`call_rows` 返回 `Rows { items, truncation }`，
   `Rows::incomplete()` 把「用户要求的 `--limit`」与「CLI 自己放弃」分开。后者退出码 9——
   `otl docs search --json | jq` 的调用方只读 stdout，stderr 警告对它不存在。
