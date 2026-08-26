@@ -10,8 +10,22 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// An empty config directory, shared by every test in this binary.
+///
+/// Scrubbing `OUTLINE_CONFIG_DIR` is not enough: with it unset the CLI falls
+/// back to the real per-user config directory, and `otl` now looks for a
+/// credential file there before it will build a request channel. A developer
+/// with a stored session would get different results from these tests than
+/// CI does. Leaked in the process's lifetime on purpose - it must outlive
+/// every child command, and the OS reclaims it at exit.
+fn isolated_config_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
+}
+
 /// `otl` with every configuration input scrubbed: each test states its own
-/// layers, and the developer's real config file is never read.
+/// layers, and the developer's real config and credential files are never
+/// read.
 fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
     // Every OUTLINE_* variable, not just the four fixed ones: per-profile
@@ -22,6 +36,7 @@ fn otl() -> Command {
             cmd.env_remove(name);
         }
     }
+    cmd.env("OUTLINE_CONFIG_DIR", isolated_config_dir());
     cmd
 }
 
@@ -352,7 +367,13 @@ fn an_empty_config_override_pins_the_run_to_environment_variables() {
 }
 
 #[test]
-fn an_oauth_profile_reports_that_only_api_keys_are_wired_up() {
+fn an_oauth_profile_does_not_fall_back_to_a_per_profile_api_key() {
+    // Was "only api keys are wired up". OAuth is wired up now, and this is
+    // the behaviour that replaced it: `auth = "oauth"` takes its credential
+    // from the credential file only. The per-profile API key IS exported
+    // here, so a fallback would succeed - and would be authenticating as
+    // something other than what the profile asked for. The remedy named has
+    // to be the one that fills the credential file.
     let (_dir, config) =
         config_file("[profiles.work]\nurl = \"http://127.0.0.1:9\"\nauth = \"oauth\"\n");
     otl()
@@ -370,7 +391,7 @@ fn an_oauth_profile_reports_that_only_api_keys_are_wired_up() {
         .failure()
         .code(2)
         .stderr(predicate::str::contains("oauth"))
-        .stderr(predicate::str::contains("api-key"));
+        .stderr(predicate::str::contains("otl auth login"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -481,7 +502,22 @@ async fn a_matching_env_url_is_not_a_conflict() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
-    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+    // No CONFLICT is reported - that is what this test is about. The one
+    // thing on stderr is the plaintext-key notice, which now covers a
+    // profile-scoped variable too (it used to fire only for the global one,
+    // because it was decided by reading that variable directly).
+    assert!(
+        !stderr.contains("conflict") && !stderr.contains("deliberately not used"),
+        "a conflict was reported for a matching URL: {stderr}"
+    );
+    assert!(
+        stderr.contains("OUTLINE_API_KEY_WORK"),
+        "the notice does not name the variable the key came from: {stderr}"
+    );
+    assert!(
+        !stderr.contains("key-for-work"),
+        "the notice echoed the key: {stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

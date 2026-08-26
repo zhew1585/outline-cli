@@ -16,21 +16,30 @@
 # opt-level="s", fat LTO, codegen-units=1, strip="symbols", panic="abort"),
 # 2026-08:
 #
-#   this branch, which carries release config and no feature code:
+#   the release-config branch, carrying no feature code:
 #       2_567_312 B  (~2.45 MiB)   61% of the gate
-#   develop, now that the config/completions track has landed:
-#       2_800_112 B  (~2.67 MiB)   66% of the gate
+#   develop, after the config/completions, release and curated-command
+#   tracks landed:
+#       3_099_728 B  (~2.95 MiB)   73% of the gate
+#   develop, after the spec-sync track landed on top of those:
+#       3_215_728 B  (~3.06 MiB)   76% of the gate
+#   develop + epic2-auth (the last track), measured after the merge:
+#       3_431_568 B  (~3.27 MiB)   81% of the gate
 #
-#   still to merge, measured individually as deltas against the 2_567_312 B
-#   baseline:
-#       epic2-auth      +317_360 B
-#       epic3-commands  +283_168 B
-#       epic4-specsync  +116_400 B
+# The auth track cost +215_840 B once merged, against the +317_360 B its own
+# branch measured in isolation: most of what it adds (reqwest with the form
+# feature, base64, sha2) was already linked by the tracks that landed first,
+# and the merge also removed a duplicated browser-opener module and folded
+# the CLI's character-hazard table into the engine's. It also dropped a
+# second major of sha2: the spec cache asked for 0.10 and PKCE for 0.11, and
+# one hash crate compiled twice is duplicated code generation for nothing.
 #
-# Additive worst case therefore lands near 3.35 MiB on darwin (~84% of the
-# gate). x86_64-unknown-linux-musl runs roughly 9% larger because it
-# statically links libc, putting the largest shipped artifact near 3.66 MiB -
-# about 91% of this gate, i.e. inside the warning band below.
+# NOT measured here: x86_64-unknown-linux-musl statically links libc and ran
+# roughly 9% larger on the pre-merge branches, which projects the largest
+# shipped artifact near 3.57 MiB - about 89% of this gate, i.e. inside the
+# warning band below. That is a projection from a ratio, not a measurement;
+# the release workflow measures every target per artifact and will print the
+# real figure.
 #
 # That is deliberately tight, and it is why the warning band exists: the
 # squeeze becomes visible before it becomes a red build, so the response can
@@ -39,9 +48,10 @@
 # since the NFR2 promise itself (5 MB ~= 4.77 MiB) is only 14% above the
 # projected merged size. A gate at the promise would police nothing.
 #
-# After the feature branches merge, re-measure all four targets on develop
-# and update the numbers above. If the real figure is materially worse than
-# the projection, the fix is to find the growth - `cargo bloat`, a duplicated
+# The darwin figures above are now post-merge measurements. Re-measure the
+# other three targets on develop when the release workflow next runs and
+# replace the musl projection with the real number. If a figure is
+# materially worse than the projection, the fix is to find the growth - `cargo bloat`, a duplicated
 # dependency, a monomorphisation blowup - not to move the constant. Raising
 # it is a deliberate decision: update the measurements here in the same
 # commit and say which dependency bought the extra megabyte.

@@ -92,6 +92,38 @@ pub fn open(url: &str) -> Result<(), CliError> {
     launch(&Opener::from_env(), url)
 }
 
+/// Ask the desktop to open `url` and return WITHOUT waiting for it.
+///
+/// [`open`] waits for the opener to exit, which is what a one-shot "show me
+/// this document" wants: a helper that fails should be a failure. A browser
+/// login cannot wait. `$BROWSER` may name the browser itself rather than a
+/// helper - `BROWSER=firefox` is ordinary - and such a process does not exit
+/// until the browser window closes, so waiting here would mean the CLI never
+/// reaches the point where it listens for the redirect. The login flow
+/// prints the URL either way, so not waiting also costs nothing: a failure
+/// to launch is a notice, not an error.
+pub fn spawn(url: &str) -> Result<(), CliError> {
+    let opener = Opener::from_env();
+    Command::new(&opener.program)
+        .args(&opener.args)
+        // The URL is one argument, always last, never parsed by a shell.
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_child| ())
+        .map_err(|error| {
+            CliError::failure(anyhow!(
+                "could not launch {} to open the sign-in page ({}); \
+                 open this URL manually, or set {ENV_BROWSER} to a command \
+                 that opens a URL",
+                opener.program.to_string_lossy(),
+                error.kind()
+            ))
+        })
+}
+
 /// Spawn one opener for `url`.
 fn launch(opener: &Opener, url: &str) -> Result<(), CliError> {
     let status = Command::new(&opener.program)

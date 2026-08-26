@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use engine::{Client, Fetched, Truncation, TruncationCause, ValidationMode};
 use serde_json::Value;
 
-use crate::config::{Config, Overrides};
+use crate::config::Overrides;
 use crate::errors::map_engine_error;
 use crate::exit::CliError;
 use crate::ops;
@@ -55,18 +55,14 @@ impl Session {
     /// honour `--profile`, `--url` and `--config` exactly as `otl api`
     /// does, because they resolve configuration the same way.
     ///
+    /// Goes through [`crate::auth::open_client`], the one place a client is
+    /// built, so a curated command works with an OAuth session exactly as it
+    /// works with an API key - and so the transport rule and the credential
+    /// binding check cannot be skipped by entering through here instead.
+    ///
     /// Configuration problems are reported here, before any network I/O.
     pub fn open(overrides: &Overrides) -> Result<Self, CliError> {
-        let config = Config::load(overrides).map_err(CliError::usage)?;
-        let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
-        let origin = engine::base_url_origin(&config.base_url).ok_or_else(|| {
-            // Unreachable in practice: `Client::new` accepted the URL, so it
-            // parses. Kept as an error rather than an unwrap (no panics in
-            // library code).
-            CliError::usage(anyhow!(
-                "the configured Outline base URL has no usable origin"
-            ))
-        })?;
+        let (client, origin) = crate::auth::open_client(overrides)?;
         Ok(Self { client, origin })
     }
 

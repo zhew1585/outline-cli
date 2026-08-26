@@ -209,6 +209,21 @@ pub enum ConfigError {
         location: String,
     },
     /// The resolved authentication method has no implementation yet.
+    /// The credential file holds nothing for the selected profile under the
+    /// resolved authentication method.
+    ///
+    /// Distinct from [`Self::MissingApiKey`]: that one means "no variable is
+    /// exported", this one means "the file that `otl auth` writes has no
+    /// entry here", and the remedy is a different command.
+    MissingStoredCredential {
+        /// Selected profile, when one is in effect.
+        profile: Option<String>,
+        /// Which authentication method was resolved.
+        method: AuthMethod,
+        /// Absolute path of the credential file.
+        path: PathBuf,
+    },
+
     UnsupportedAuthMethod {
         /// The profile in effect, when one was selected.
         profile: Option<String>,
@@ -249,6 +264,11 @@ impl fmt::Display for ConfigError {
             Self::CredentialInConfigFile { path, location } => {
                 write_credential_in_file(f, path, location)
             }
+            Self::MissingStoredCredential {
+                profile,
+                method,
+                path,
+            } => write_missing_stored(f, profile.as_deref(), *method, path),
             Self::UnsupportedAuthMethod { profile, method } => {
                 write_unsupported_auth(f, profile.as_deref(), *method)
             }
@@ -256,11 +276,22 @@ impl fmt::Display for ConfigError {
     }
 }
 
+/// "There is no credential to use."
+///
+/// Names all THREE ways to supply one, not just the variable: two of them
+/// (`otl auth login`, `otl auth set-key`) put the credential in the
+/// owner-only credential file, which is the better place for it, and a user
+/// told only about the variable would export a long-lived key into their
+/// shell environment for want of knowing the alternative.
 fn write_missing_api_key(f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
         f,
-        "{ENV_API_KEY} is not set.\n\
-         Create an API key in Outline (Settings -> API) and set it, for example:\n\
+        "no credentials are available.\n\
+         Sign in with a browser:\n\
+         \x20 otl auth login\n\
+         or store an API key (Settings -> API in Outline):\n\
+         \x20 otl auth set-key\n\
+         or, for CI, set {ENV_API_KEY} in the environment:\n\
          \x20 export {ENV_API_KEY}=<your-api-key>"
     )
 }
@@ -465,8 +496,13 @@ fn write_missing_profile_key(
     let variable = sanitize_name(variable);
     write!(
         f,
-        "profile {:?} has no API key: {variable} is not set.\n\
-         Set it to the key for THAT instance, for example:\n\
+        "profile {:?} has no credentials: {variable} is not set, and \
+         nothing is stored for it.\n\
+         Sign in, or store a key, for THAT instance (both honour the \
+         selected profile):\n\
+         \x20 otl auth login\n\
+         \x20 otl auth set-key\n\
+         or set the variable, for CI:\n\
          \x20 export {variable}=<key-for-this-instance>",
         sanitize_name(profile)
     )?;
@@ -480,6 +516,33 @@ fn write_missing_profile_key(
         )?;
     }
     Ok(())
+}
+
+/// "The credential file has nothing for this profile."
+///
+/// Names the file so the user can see where it looked, and the command that
+/// puts something there. The path is scrubbed like any other foreign text:
+/// it can come from `OUTLINE_CONFIG_DIR`.
+fn write_missing_stored(
+    f: &mut fmt::Formatter<'_>,
+    profile: Option<&str>,
+    method: AuthMethod,
+    path: &Path,
+) -> fmt::Result {
+    let subject = match profile {
+        Some(name) => format!("profile {:?}", sanitize_name(name)),
+        None => "the default profile".to_string(),
+    };
+    let remedy = match method {
+        AuthMethod::Oauth => "otl auth login",
+        AuthMethod::ApiKey => "otl auth set-key",
+    };
+    write!(
+        f,
+        "no `{method}` credential is stored for {subject} in {}.\n\
+         Run `{remedy}` to store one.",
+        sanitize_path(path)
+    )
 }
 
 fn write_unsupported_auth(
@@ -517,6 +580,7 @@ impl ConfigError {
             Self::ConfigFileUnreadable { .. } => "ConfigFileUnreadable",
             Self::MalformedConfigFile { .. } => "MalformedConfigFile",
             Self::CredentialInConfigFile { .. } => "CredentialInConfigFile",
+            Self::MissingStoredCredential { .. } => "MissingStoredCredential",
             Self::UnsupportedAuthMethod { .. } => "UnsupportedAuthMethod",
         }
     }
@@ -538,6 +602,10 @@ impl fmt::Debug for ConfigError {
             Self::MissingProfileApiKey { global_set, .. } => {
                 write!(f, " {{ global_key_set: {global_set} }}")
             }
+            Self::MissingStoredCredential { method, .. } => f
+                .debug_struct(self.variant())
+                .field("method", method)
+                .finish_non_exhaustive(),
             Self::UnsupportedAuthMethod { method, .. } => {
                 write!(f, " {{ method: {method} }}")
             }

@@ -9,6 +9,8 @@
 //!   arguments (schema-driven type coercion).
 //! - [`client`]: the single request channel through which every HTTP call
 //!   must flow.
+//! - [`credential`]: the bearer credential the channel sends, and the
+//!   renew-and-replay hook it uses when the server rejects one.
 //! - [`error`]: typed engine errors.
 //! - [`fetch`]: the plain-document channel (one unauthenticated GET), used
 //!   to retrieve a spec; separate from the credential-carrying request
@@ -24,6 +26,7 @@
 
 pub mod body;
 pub mod client;
+pub mod credential;
 pub mod error;
 pub mod fetch;
 mod format;
@@ -32,14 +35,19 @@ pub mod paginate;
 pub mod retry;
 pub mod sanitize;
 mod scalar;
+pub mod text;
 pub mod throttle;
 
 pub use body::build_request_body;
-pub use client::{base_url_origin, is_valid_base_url, Client, ErrorDetail, DEFAULT_TIMEOUT};
+pub use client::{
+    base_url_origin, check_base_url, is_valid_base_url, Client, ErrorDetail, DEFAULT_TIMEOUT,
+};
+pub use credential::{CredentialError, CredentialFault, CredentialSource, StaticCredential};
 pub use error::{EngineError, TransportKind};
 pub use ir::{
     BodyMode, FieldSpec, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION,
 };
 pub use paginate::{Fetched, OffsetEcho, PaginationSpec, Truncation, TruncationCause};
 pub use retry::RetryPolicy;
+pub use text::{has_hazard, hazard, Hazard};
 pub use throttle::{Throttle, TokenBucket};

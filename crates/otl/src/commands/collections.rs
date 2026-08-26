@@ -131,6 +131,16 @@ struct Counts {
     capped: HashSet<String>,
 }
 
+impl Counts {
+    /// Record one collection's count, and whether it hit the walk cap.
+    fn record(&mut self, id: &str, count: &NodeCount) {
+        self.counted.insert(id.to_string(), count.nodes);
+        if count.capped {
+            self.capped.insert(id.to_string());
+        }
+    }
+}
+
 /// Build the human-readable table.
 fn table(collections: &[Value], counts: &Counts, no_counts: bool) -> String {
     let mut rows = fields::rows(collections, COLUMNS);
@@ -177,18 +187,17 @@ fn document_counts(session: &Session, collections: &[Value]) -> Counts {
         .filter_map(|collection| fields::string_at(collection, "/id"))
     {
         let args = [("id".to_string(), id.to_string())];
-        match session.call_data(DOCUMENTS_OPERATION, &args) {
-            // An unrecognized shape counts as unreadable, not as zero.
-            Ok(structure) => match count_nodes(&structure) {
-                Some(count) => {
-                    counts.counted.insert(id.to_string(), count.nodes);
-                    if count.capped {
-                        counts.capped.insert(id.to_string());
-                    }
-                }
-                None => unrecognized += 1,
-            },
-            Err(_) => failed += 1,
+        // An unrecognized shape counts as unreadable, not as zero. Both
+        // failure kinds are folded into `Option` here so the loop body stays
+        // one level deep; they are counted separately because the diagnostic
+        // below distinguishes them.
+        let counted = match session.call_data(DOCUMENTS_OPERATION, &args) {
+            Ok(structure) => count_nodes(&structure).ok_or(&mut unrecognized),
+            Err(_) => Err(&mut failed),
+        };
+        match counted {
+            Ok(count) => counts.record(id, &count),
+            Err(tally) => *tally += 1,
         }
     }
     if failed + unrecognized > 0 {

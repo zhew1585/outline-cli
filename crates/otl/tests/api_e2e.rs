@@ -10,19 +10,19 @@ use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
-use common::{no_cache_dir, CACHE_DIR_ENV};
+use common::isolate;
 
-/// `otl` command with Outline env scrubbed for deterministic tests.
+/// `otl` with every machine-dependent input shut off.
+///
+/// `common::isolate` covers the credential file, the user config file, the
+/// selected profile, the plaintext-key notice and the spec cache; this suite
+/// adds only the instance and credential variables it sets per test.
+/// Dispatch must come from the built-in spec, not a synced one.
 fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env_remove("OUTLINE_URL")
-        .env_remove("OUTLINE_API_KEY")
-        // Dispatch must come from the built-in spec, not a synced one.
-        .env(CACHE_DIR_ENV, no_cache_dir())
-        .env_remove("OUTLINE_PROFILE")
-        // Empty value = read no user config file, so the developer's own
-        // profiles cannot influence the assertions below (Story 4.1).
-        .env("OUTLINE_CONFIG", "");
+    isolate(&mut cmd)
+        .env_remove("OUTLINE_URL")
+        .env_remove("OUTLINE_API_KEY");
     cmd
 }
 
@@ -394,12 +394,17 @@ async fn closed_stdout_pipe_exits_quietly_without_panicking() {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
+        // A std Command, not assert_cmd's, because this test needs the raw
+        // pipe handles - so the isolation `common::isolate` applies is spelled
+        // out here.
         let mut child = Command::new(assert_cmd::cargo::cargo_bin("otl"))
             .env_remove("OUTLINE_URL")
             .env_remove("OUTLINE_API_KEY")
-            .env(CACHE_DIR_ENV, no_cache_dir())
             .env_remove("OUTLINE_PROFILE")
             .env("OUTLINE_CONFIG", "")
+            .env("OUTLINE_CONFIG_DIR", common::isolated_config_dir())
+            .env(common::CACHE_DIR_ENV, common::no_cache_dir())
+            .env("OUTLINE_NO_KEY_WARNING", "1")
             .env("OUTLINE_URL", uri)
             .env("OUTLINE_API_KEY", "test-key")
             .args(["api", "--json", "documents.list"])

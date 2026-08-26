@@ -11,33 +11,30 @@ use wiremock::matchers::{body_json, body_string, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
-use common::{no_cache_dir, CACHE_DIR_ENV};
+use common::isolate;
 
 /// Nothing listens here; validation must fail before any network attempt.
 const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 
 /// `otl` with valid-looking config pointing at a closed port.
+///
+/// `common::isolate` shuts off the credential file, the user config file, the
+/// selected profile, the plaintext-key notice and the spec cache - validation
+/// is asserted against the facets of the spec compiled into the binary.
 fn otl_offline() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env("OUTLINE_URL", CLOSED_PORT_URL)
-        .env("OUTLINE_API_KEY", "test-key")
-        // Validation is asserted against the built-in spec's facets.
-        .env(CACHE_DIR_ENV, no_cache_dir())
-        .env_remove("OUTLINE_PROFILE")
-        // Empty value = read no user config file (Story 4.1).
-        .env("OUTLINE_CONFIG", "");
+    isolate(&mut cmd)
+        .env("OUTLINE_URL", CLOSED_PORT_URL)
+        .env("OUTLINE_API_KEY", "test-key");
     cmd
 }
 
 /// `otl` pointed at a wiremock server.
 fn otl_online(uri: &str) -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env("OUTLINE_URL", uri)
-        .env("OUTLINE_API_KEY", "test-key")
-        .env(CACHE_DIR_ENV, no_cache_dir())
-        .env_remove("OUTLINE_PROFILE")
-        // Empty value = read no user config file (Story 4.1).
-        .env("OUTLINE_CONFIG", "");
+    isolate(&mut cmd)
+        .env("OUTLINE_URL", uri)
+        .env("OUTLINE_API_KEY", "test-key");
     cmd
 }
 

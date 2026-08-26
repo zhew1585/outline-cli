@@ -22,11 +22,19 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::credential::CredentialError;
 use crate::ir::ParamType;
 
 /// Errors produced by the engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// The credential source could not supply or renew a credential.
+    ///
+    /// Credential-free by construction: [`CredentialError`] carries only
+    /// authored text composed by the source itself.
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+
     /// The configured base URL could not be parsed or is not usable.
     ///
     /// Deliberately does not carry the offending URL: a malformed value may

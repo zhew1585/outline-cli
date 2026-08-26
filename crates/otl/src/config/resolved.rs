@@ -147,17 +147,26 @@ impl fmt::Debug for Settings {
 }
 
 /// Resolve everything but the secret, applying flag > env > file per key.
-pub fn resolve_settings(
-    overrides: &Overrides,
-    env: &EnvLayer,
-    loaded: &LoadedConfig,
-) -> Result<Settings, ConfigError> {
+/// Which profile is selected, and which layer selected it.
+///
+/// Split out of [`resolve_settings`] because it does NOT need a base URL:
+/// `otl auth logout` has to work when no instance is configured at all (the
+/// credential file holds every URL it uses), and it still needs to know
+/// which profile's credentials to remove. Sharing this with
+/// `resolve_settings` is what keeps the two answers from drifting.
+pub fn resolve_profile_name<'a>(
+    overrides: &'a Overrides,
+    env: &'a EnvLayer,
+    loaded: &'a LoadedConfig,
+) -> (Option<&'a str>, ProfileSource) {
     // `non_blank` on the flag as well as the env value: the two layers are
     // interchangeable everywhere else, so `--profile "  work  "` must not
     // mean something different from `OUTLINE_PROFILE="  work  "`.
-    let from_flag = non_blank(overrides.profile.as_deref());
-    let (requested, profile_source) = match from_flag {
-        Some(ref name) => (Some(name.as_str()), ProfileSource::Flag),
+    match non_blank(overrides.profile.as_deref()) {
+        Some(_) => (
+            overrides.profile.as_deref().map(str::trim),
+            ProfileSource::Flag,
+        ),
         None => match env.profile() {
             Some(name) => (Some(name), ProfileSource::Env),
             // A name read from the config file is FILE CONTENT, so it is
@@ -168,7 +177,15 @@ pub fn resolve_settings(
                 ProfileSource::DefaultProfile,
             ),
         },
-    };
+    }
+}
+
+pub fn resolve_settings(
+    overrides: &Overrides,
+    env: &EnvLayer,
+    loaded: &LoadedConfig,
+) -> Result<Settings, ConfigError> {
+    let (requested, profile_source) = resolve_profile_name(overrides, env, loaded);
     let from_file = profile_source == ProfileSource::DefaultProfile;
     let profile = match requested {
         Some(name) => Some(lookup_profile(name, loaded, from_file)?),

@@ -14,11 +14,12 @@ use std::io::Read;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{BodyMode, Client, EngineError, ErrorDetail, Fetched, ValidationMode};
+use engine::{BodyMode, EngineError, ErrorDetail, Fetched, ValidationMode};
 use serde_json::Value;
 
-use crate::config::{Config, Overrides};
-use crate::errors::{map_engine_error, map_engine_error_with_hint};
+use crate::auth;
+use crate::config::Overrides;
+use crate::errors::map_engine_error_with_hint;
 use crate::exit::CliError;
 use crate::ops;
 use crate::paging;
@@ -119,9 +120,11 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode, overrides: &Overrides) -> Result<(),
         Payload::Raw(_) => None,
     };
     check_limit_usage(cmd, &payload, pagination.is_some())?;
-    let config = Config::load(overrides).map_err(CliError::usage)?;
-
-    let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
+    // One place resolves configuration AND the credential for every command,
+    // and hands the request channel a source that renews itself. `otl api`
+    // must not build its own client: renewal, the transport rule and the
+    // instance binding all live behind this call (see `crate::auth`).
+    let client = auth::client(overrides)?;
     let detail = error_detail(cmd);
     let fetched = match (&payload, &pagination) {
         (Payload::KeyValue(args), Some(spec)) => {

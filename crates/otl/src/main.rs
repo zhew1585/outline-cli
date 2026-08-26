@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
+use otl::commands::auth::{self, AuthArgs};
 use otl::commands::collections::{self, CollectionsArgs};
 use otl::commands::completions::{self, CompletionsArgs};
 use otl::commands::docs::{self, DocsArgs};
@@ -57,6 +58,8 @@ impl Cli {
 enum Command {
     /// Call any API operation by name (output format unstable).
     Api(ApiArgs),
+    /// Sign in, sign out, and inspect stored credentials.
+    Auth(AuthArgs),
     /// Work with documents: search, view, create, update, export.
     Docs(DocsArgs),
     /// Work with collections.
@@ -73,6 +76,7 @@ fn main() -> std::process::ExitCode {
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
         Command::Api(args) => api::run(args, mode, &cli.overrides()),
+        Command::Auth(args) => auth::run(args, mode, &cli.overrides()),
         Command::Docs(args) => docs::run(args, mode, cli.json, &cli.overrides()),
         Command::Collections(args) => collections::run(args, mode, &cli.overrides()),
         Command::Spec(args) => spec::run(args, mode),

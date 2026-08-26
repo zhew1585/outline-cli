@@ -89,6 +89,60 @@ otl api documents.info id=not-a-uuid             # exits 2, no request sent
 otl api shares.create --body @share.json         # oneOf/anyOf bodies go through --body verbatim
 ```
 
+## Signing in
+
+An API key in the environment works everywhere and needs no setup, which is why the quick start uses it.
+For interactive use there is a browser flow, and for keys there is a place to put them that is not your
+shell history:
+
+```sh
+otl auth login                        # browser consent, OAuth 2.0 authorization code + PKCE
+otl auth login --client-id <id>       # when an admin pre-registered the application
+otl auth set-key < key.txt            # store an API key in the credential file (0600)
+otl auth info                         # which credential is in use, and where it lives
+otl auth logout                       # revoke and forget this profile's credentials
+otl auth logout --purge               # also delete the application otl registered for itself
+otl auth logout --force               # discard them even if the server could not be told
+```
+
+`otl auth login` discovers the instance's OAuth endpoints, registers `otl` as a public client if the
+instance allows it (otherwise it tells you exactly what an admin has to create), and catches the redirect
+on a loopback port. It opens the page with the platform's URL handler, or with `$BROWSER` when that is
+set, and prints the URL either way — a machine with no browser is a "copy this link", not a failure. Access tokens are then renewed inside the request channel, so no command ever fails
+because a token aged out. Outline rotates the refresh token on every use, so renewal takes an advisory
+file lock: concurrent `otl` processes refresh once between them rather than invalidating each other.
+
+`otl auth logout` needs no `OUTLINE_URL`: every server it contacts comes out of the credential file,
+anchored to the origin each credential recorded for itself. It exits non-zero if a server-side step did
+not happen, and — when a retry could still succeed — keeps the credentials rather than leaving you with a
+token that is live on the server and unrevocable from here. `--force` overrides that.
+
+When several credentials exist for a profile, the order is OAuth session, then the credential file's API
+key, then `OUTLINE_API_KEY`. Using the environment variable prints a one-time note about where plaintext
+in the environment tends to end up; `OUTLINE_NO_KEY_WARNING=1` silences it.
+
+Setting `auth = "oauth"` on a profile removes the last step: an environment variable cannot hold a
+renewable session, so a profile configured for browser login never quietly authenticates as whatever
+`OUTLINE_API_KEY` happens to be exported. A session stored by `otl auth login` is used either way — `auth`
+names the login flow, not a filter on what is already stored — and `otl auth info` reports what it shadows.
+
+Every `otl auth` subcommand resolves its instance and profile exactly as `otl api` does, so `--profile`,
+`--url`, `--config` and `default_profile` all apply to signing in and out as well. `otl auth logout` is
+the one exception, and only in one direction: it honours `--profile` but needs no URL at all.
+
+Four rules the OAuth flow will not bend on, because each protects a credential in flight and a warning
+after the fact protects nothing:
+
+- **TLS** for every command, not just sign-in, unless the host is a loopback IP literal. `http://` to
+  anything else is refused, and `localhost` does not count as loopback — it is a name, and a resolver can
+  point it elsewhere. Endpoints read back out of the credential file are re-checked before they are used.
+- **No redirects on credential-bearing requests.** A 307 or 308 replays the request body, and reqwest's
+  cross-origin header stripping does not cover bodies, so following one could post an authorization code
+  or refresh token to whoever the `Location` names.
+- **Discovered endpoints must be the instance's own**, matching its origin and its RFC 8414 `issuer`.
+- **Credentials are bound to the instance that issued them.** Pointing `OUTLINE_URL` at a different
+  instance without switching profile sends nothing at all, and adding a second instance's credentials to
+  the same profile is refused rather than merged. Use one profile per instance.
 ## Everyday commands
 
 Six polished commands cover the day-to-day work. Unlike `otl api`, their flags and output are a stable
@@ -142,7 +196,6 @@ Notes worth knowing:
   display: control sequences are replaced (a document body must not be able to set your clipboard or
   forge a hyperlink), and `$PAGER` takes over when the content does not fit on one screen, counting
   wrapped rows rather than lines.
-
 ## Keeping the spec current
 
 The spec is vendored into the binary, so a fresh install needs no network for anything but your own
@@ -267,7 +320,7 @@ default_profile = "work"
 
 [profiles.work]
 url = "https://outline.example.com"
-auth = "api-key"                      # "oauth" arrives with `otl auth login`
+auth = "api-key"                      # or "oauth", for `otl auth login`
 
 [profiles.personal]
 url = "https://notes.example.net"

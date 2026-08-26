@@ -19,32 +19,34 @@ use std::path::{Path, PathBuf};
 /// Maximum lines in one Rust file.
 const MAX_LINES: usize = 800;
 
+/// Size at which a file should be split before it becomes a problem.
+///
+/// Reported, never enforced. The failure mode this guard exists for is a
+/// file crossing the limit inside an otherwise unrelated commit, and by then
+/// the split is an interruption. Naming the files that are close makes it
+/// possible to do the split while it is still cheap.
+const ADVISORY_LINES: usize = 700;
+
 /// Files over the limit that predate this rule being enforced.
 ///
 /// Deliberately a list of exact paths with a stated reason, not a pattern:
 /// a new file cannot join it by accident, and shrinking one of these below
 /// the limit makes this test fail until the entry is removed - so the list
 /// can only get shorter.
-const GRANDFATHERED: &[(&str, &str)] = &[
-    (
-        "crates/engine/tests/pagination.rs",
-        "predates this guard; `crates/engine` is unchanged on this branch, so \
-         splitting it here would be an unrelated change in an unrelated crate",
-    ),
-    (
-        "crates/engine/tests/validation.rs",
-        "arrived over the limit from `develop` (799 -> 802 lines there, and \
+const GRANDFATHERED: &[(&str, &str)] = &[(
+    "crates/engine/tests/validation.rs",
+    "arrived over the limit from `develop` (799 -> 802 lines there, and \
          this guard does not exist on that branch, so nothing told anyone). \
          Two lines over, in a crate this branch does not touch: recorded so \
          it is visible and expires by itself, rather than split here as an \
          unrelated change",
-    ),
-];
+)];
 
 #[test]
 fn no_rust_file_is_longer_than_the_limit() {
     let mut violations = Vec::new();
     let mut exempt_but_short = Vec::new();
+    let mut approaching = Vec::new();
     for file in workspace_rust_files() {
         let lines = std::fs::read_to_string(&file)
             .map(|text| text.lines().count())
@@ -62,8 +64,17 @@ fn no_rust_file_is_longer_than_the_limit() {
             None if lines > MAX_LINES => {
                 violations.push(format!("  {relative}: {lines} lines"));
             }
+            None if lines > ADVISORY_LINES => {
+                approaching.push(format!("  {relative}: {lines} lines"));
+            }
             None => {}
         }
+    }
+    if !approaching.is_empty() {
+        eprintln!(
+            "note: approaching the {MAX_LINES}-line limit:\n{}",
+            approaching.join("\n")
+        );
     }
     assert!(
         violations.is_empty(),

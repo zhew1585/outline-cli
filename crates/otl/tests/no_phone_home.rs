@@ -30,9 +30,28 @@
 //! manifest or in `Cargo.lock` all fail here. Adding one means editing
 //! this file - which is the review these tests stand in for.
 //!
+//! # The third channel
+//!
+//! `project-context.md` names two channels; there are three, and the third
+//! is the documented exception rather than an oversight. RFC 6749 token,
+//! RFC 7591/7592 registration and RFC 7009 revocation requests cannot go
+//! through the engine's authenticated channel - they carry no bearer token,
+//! they are form-encoded rather than JSON, they are not described by the
+//! OpenAPI spec the engine dispatches from, and the whole point of one of
+//! them is to obtain the credential the engine would need. So `otl::auth`
+//! has its own HTTP client, and the rules below confine it the same way:
+//!
+//! - exactly ONE `.send()` in the crate (`auth/endpoint.rs`), so every
+//!   OAuth request is subject to the same TLS check, the same
+//!   `redirect::Policy::none()`, and the same error scrubbing;
+//! - other `auth` modules may NAME `reqwest` (a `&Client` parameter, a
+//!   `Url` parse) but cannot send, which is what the send-site rule
+//!   enforces and what makes the wider `reqwest` allowlist safe.
+//!
 //! The invariant they support (not replace) is the one in
-//! `project-context.md`: every outbound request goes through one of the
-//! engine's two channels, and only a command the user typed causes one.
+//! `project-context.md`, amended by the paragraph above: every outbound
+//! request goes through one of the three channels, and only a command the
+//! user typed causes one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -130,25 +149,88 @@ const CONFINED: &[Confined] = &[
             // One doc comment explaining why transport errors are not
             // printed; no code.
             "crates/otl/src/exit.rs",
+            // The OAuth channel (see "The third channel" above). These
+            // modules name `reqwest` - a `&Client` they were handed, a
+            // `Url` they parse - but only `endpoint.rs` may send, which the
+            // next rule is what actually enforces.
+            "crates/otl/src/auth/endpoint.rs",
+            "crates/otl/src/auth/metadata.rs",
+            "crates/otl/src/auth/oauth.rs",
+            "crates/otl/src/auth/dcr.rs",
+            "crates/otl/src/auth/login.rs",
+            "crates/otl/src/auth/client_acquisition.rs",
+            "crates/otl/src/auth/logout_remote.rs",
+            "crates/otl/src/auth/source.rs",
+            "crates/otl/src/auth/loopback.rs",
+            "crates/otl/src/auth/callback_request.rs",
+            "crates/otl/src/auth/transport.rs",
         ],
-        why: "HTTP belongs to the engine's two channels; no other module may \
-              speak to the network, in any shape",
+        why: "HTTP belongs to the engine's two channels and to the OAuth \
+              channel documented above; no other module may speak to the \
+              network, in any shape",
     },
     Confined {
         needle: ".send()",
-        allowed: &["crates/engine/src/client.rs", "crates/engine/src/fetch.rs"],
-        why: "all HTTP goes through the engine's two channels: the \
-              authenticated request channel and the plain-document fetch",
+        allowed: &[
+            "crates/engine/src/client.rs",
+            "crates/engine/src/fetch.rs",
+            // The OAuth channel's single send site. This is the rule that
+            // makes the `reqwest` allowlist above safe to be as wide as it
+            // is: a new OAuth request has to go through this one function,
+            // which applies the TLS check, disables redirects and scrubs
+            // the error - or fail here.
+            "crates/otl/src/auth/endpoint.rs",
+        ],
+        why: "all HTTP goes through one of the three channels: the \
+              authenticated request channel, the plain-document fetch, and \
+              the OAuth endpoint channel",
     },
+    // Sockets. The OAuth redirect (RFC 8252) is caught on a loopback
+    // listener, which is INBOUND: it originates no request and reaches no
+    // remote host, so it is not the thing these rules exist to stop. It is
+    // still confined, to the two modules that implement that one flow, so a
+    // socket cannot appear anywhere else under cover of "the callback
+    // server does it too".
+    //
+    // `TcpStream` is allowed in the same two files for two reasons: the
+    // server reads the accepted connection (a stream is what `accept`
+    // returns), and their `#[cfg(test)]` harnesses dial the listener to
+    // reproduce the byte-trickle and slot-exhaustion attacks.
+    //
+    // The send-site rule above does NOT bound these: a `TcpStream` has no
+    // `.send()`, so nothing there constrains an outbound `connect`. The
+    // backstop is `every_outbound_connect_is_to_the_loopback_callback`
+    // below, which requires every `TcpStream::connect` to name
+    // `CALLBACK_HOST` - plus the file confinement here, which keeps the
+    // question to two modules.
     Confined {
         needle: "std::net",
-        allowed: &[],
-        why: "a raw socket would bypass the request channels entirely",
+        allowed: &[
+            "crates/otl/src/auth/loopback.rs",
+            "crates/otl/src/auth/callback_request.rs",
+            // `IpAddr` only: the transport rule has to know whether a host
+            // is a loopback IP literal. No socket.
+            "crates/otl/src/auth/transport.rs",
+        ],
+        why: "a raw socket would bypass the request channels entirely; the \
+              loopback callback listener is inbound and is confined to the \
+              OAuth redirect flow",
+    },
+    Confined {
+        needle: "TcpListener",
+        allowed: &["crates/otl/src/auth/loopback.rs"],
+        why: "listening for connections belongs to the OAuth redirect flow \
+              alone; anywhere else it would be a service this CLI has no \
+              business running",
     },
     Confined {
         needle: "TcpStream",
-        allowed: &[],
-        why: "a raw socket would bypass the request channels entirely",
+        allowed: &[
+            "crates/otl/src/auth/loopback.rs",
+            "crates/otl/src/auth/callback_request.rs",
+        ],
+        why: "a raw socket would bypass the request channels entirely; the \
+              accepted loopback connection is the one exception",
     },
     Confined {
         needle: "UdpSocket",
@@ -159,7 +241,7 @@ const CONFINED: &[Confined] = &[
 
 /// Rules whose needle is expected to be absent everywhere, so the
 /// "not vacuous" check below must not demand a hit for them.
-const EXPECTED_ABSENT: &[&str] = &["std::net", "TcpStream", "UdpSocket"];
+const EXPECTED_ABSENT: &[&str] = &["UdpSocket"];
 
 #[test]
 fn network_entry_points_stay_confined() {
@@ -178,6 +260,62 @@ fn network_entry_points_stay_confined() {
             rule.why
         );
     }
+}
+
+/// The one constant an outbound `connect` may aim at.
+const LOOPBACK_HOST_CONST: &str = "CALLBACK_HOST";
+
+#[test]
+fn every_outbound_connect_is_to_the_loopback_callback() {
+    // Relaxing `std::net`/`TcpStream` for the OAuth redirect flow opened a
+    // hole the other rules do not close: `accept()` is inbound, but
+    // `TcpStream::connect` is outbound and has no `.send()` for the send-site
+    // rule to count. So it gets its own rule, and it is a rule about the
+    // ARGUMENT rather than the file: a connect may only aim at the loopback
+    // callback constant.
+    //
+    // Every current call is a test harness dialling its own listener. The
+    // rule is written so that a runtime one would have to name the same
+    // constant, which is a loopback IP literal (never the NAME `localhost`,
+    // which a resolver can point elsewhere - see `auth::transport`).
+    let mut offenders = Vec::new();
+    for (path, source) in runtime_sources() {
+        for (index, line) in source.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !line.contains("TcpStream::connect") && !line.contains("UdpSocket::bind") {
+                continue;
+            }
+            if !line.contains(LOOPBACK_HOST_CONST) {
+                offenders.push(format!("  {path}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these outbound connections do not aim at {LOOPBACK_HOST_CONST}:\n{}\n\
+         A socket that leaves this machine bypasses all three request \
+         channels and everything they enforce.",
+        offenders.join("\n")
+    );
+
+    // Not vacuous: there ARE connects, and the constant they name really is
+    // a loopback address rather than a hostname.
+    let connects: usize = runtime_sources()
+        .iter()
+        .map(|(_, source)| source.matches("TcpStream::connect").count())
+        .sum();
+    assert!(
+        connects > 0,
+        "no outbound connect found at all: the rule is looking at nothing"
+    );
+    assert_eq!(
+        otl::auth::loopback::CALLBACK_HOST,
+        "127.0.0.1",
+        "the callback host is no longer a loopback IP literal; a name can be \
+         resolved to another host, which is the whole reason this is pinned"
+    );
 }
 
 #[test]
@@ -454,6 +592,11 @@ fn each_channel_has_exactly_one_send() {
     for (file, expected) in [
         ("crates/engine/src/client.rs", 1),
         ("crates/engine/src/fetch.rs", 1),
+        // The OAuth channel. Counted here for the same reason as the other
+        // two: the value of "one send site" is that the TLS check, the
+        // disabled redirects and the error scrubbing are applied by
+        // construction rather than remembered at each call.
+        ("crates/otl/src/auth/endpoint.rs", 1),
     ] {
         let source = std::fs::read_to_string(workspace_root().join(file)).unwrap();
         let code: Vec<&str> = source
@@ -478,14 +621,19 @@ fn each_channel_has_exactly_one_send() {
     }
 
     // And nowhere else at all.
+    const SENDERS: &[&str] = &[
+        "crates/engine/src/client.rs",
+        "crates/engine/src/fetch.rs",
+        "crates/otl/src/auth/endpoint.rs",
+    ];
     for (path, source) in runtime_sources() {
-        if path.ends_with("client.rs") || path.ends_with("fetch.rs") {
+        if SENDERS.contains(&path.as_str()) {
             continue;
         }
         for api in NAMED_REQWEST_SENDS {
             assert!(
                 !source.contains(api),
-                "{path} uses {api:?}: only the engine's two channels may send"
+                "{path} uses {api:?}: only the three channels may send"
             );
         }
     }

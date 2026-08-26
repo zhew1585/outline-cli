@@ -8,11 +8,44 @@
 pub mod cache;
 pub mod export;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
+use tempfile::TempDir;
+
+/// An empty config directory, shared by every test in this binary.
+///
+/// Commands build their request channel through `otl::auth`, which looks for
+/// a credential file in the user's config directory. Without this, a test run
+/// would read the developer's real `credentials.toml` - and a stored session
+/// bound to a different instance is refused, so these tests would pass or
+/// fail depending on whose machine they ran on. Leaked in the process's
+/// lifetime on purpose: it has to outlive every child command, and the OS
+/// reclaims it when the test binary exits.
+///
+/// A real (empty) directory rather than an absent path, unlike
+/// [`no_cache_dir`]: an absent credential file and an unreadable one take
+/// different code paths, and "absent" is the one these tests want.
+pub fn isolated_config_dir() -> &'static Path {
+    static DIR: OnceLock<TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
+}
+
+/// Shut off every machine-dependent input, for a suite that builds its own
+/// [`Command`] rather than starting from [`otl`].
+///
+/// Same list as [`otl`] minus the instance and credential variables, which
+/// those suites set themselves.
+pub fn isolate(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("OUTLINE_PROFILE")
+        .env("OUTLINE_CONFIG", "")
+        .env("OUTLINE_CONFIG_DIR", isolated_config_dir())
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .env(CACHE_DIR_ENV, no_cache_dir())
+}
 
 /// Environment variable that relocates the spec cache.
 pub const CACHE_DIR_ENV: &str = "OTL_CACHE_DIR";
@@ -27,6 +60,10 @@ pub const CACHE_DIR_ENV: &str = "OTL_CACHE_DIR";
 /// - credentials and instance (`OUTLINE_URL`, `OUTLINE_API_KEY`);
 /// - the user config file and profile selection (`OUTLINE_CONFIG` empty
 ///   means "read no file at all", Story 4.1);
+/// - the CREDENTIAL file (`OUTLINE_CONFIG_DIR`, Story 2.6): every command
+///   now builds its request channel through `otl::auth`, which looks there
+///   before it will send anything, so a developer with a stored session
+///   would get different results from these tests than CI does;
 /// - the synced spec cache, which decides which operations exist at all
 ///   (Story 4.2) - pointed at a directory that cannot contain one;
 /// - and the output environment (`PAGER`, `BROWSER`).
@@ -38,7 +75,12 @@ pub fn otl() -> Command {
         .env("OUTLINE_CONFIG", "")
         .env(CACHE_DIR_ENV, no_cache_dir())
         .env_remove("PAGER")
-        .env_remove("BROWSER");
+        .env_remove("BROWSER")
+        .env("OUTLINE_CONFIG_DIR", isolated_config_dir())
+        // These tests authenticate with the environment key, and the notice
+        // about where a plaintext variable ends up is not what any of them
+        // is about. `auth_api_key.rs` owns asserting that it IS printed.
+        .env("OUTLINE_NO_KEY_WARNING", "1");
     cmd
 }
 

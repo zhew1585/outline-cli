@@ -73,16 +73,20 @@
 //!   [`sanitize_name`], because a TOML quoted key can carry ESC and newline
 //!   bytes straight into a terminal.
 
+mod credentials;
 mod error;
 mod file;
 mod release;
 mod resolved;
 mod secret;
 
+pub use credentials::{
+    select as select_credential_source, Source as CredentialSource, StoredCredential,
+};
 pub use error::{sanitize_name, sanitize_path, sanitize_text, ConfigError};
 pub use file::{config_dir, default_config_path, load_file, load_from, locate, CONFIG_FILE_NAME};
 pub use release::{release_token, BindingChecked, TokenSource};
-pub use resolved::{resolve_settings, ProfileSource, Settings, UrlSource};
+pub use resolved::{resolve_profile_name, resolve_settings, ProfileSource, Settings, UrlSource};
 pub use secret::EnvApiKey;
 
 use std::collections::BTreeMap;
@@ -617,12 +621,43 @@ impl Config {
         }
     }
 
+    /// Pair already-resolved settings with the credential they select.
+    ///
+    /// Two stores can hold a fixed key - the credential file and the
+    /// environment - and which one is used is decided by
+    /// [`select_credential_source`] from the resolved settings, not by the
+    /// caller. Either way the secret is obtained through [`release_token`],
+    /// so the binding check applies to a stored credential exactly as it
+    /// does to an environment variable; a [`TokenSource`] cannot be asked
+    /// for its secret any other way, because [`TokenSource::fetch`] takes
+    /// no settings and only the gate can produce a [`BindingChecked`].
+    ///
+    /// Settings are passed in rather than resolved here so that a caller
+    /// which has already resolved them (to apply the transport rule, say)
+    /// does not resolve them a second time: two reads of the same config
+    /// file can disagree if it changes in between, and the credential must
+    /// be released for the settings that were actually checked.
+    pub fn release(
+        settings: &Settings,
+        env: &EnvLayer,
+        stored: &StoredCredential<'_>,
+    ) -> Result<Self, ConfigError> {
+        let api_key = match credentials::select(settings, stored.is_present()) {
+            credentials::Source::CredentialFile => release_token(stored, settings)?,
+            credentials::Source::Environment => release_token(&EnvApiKey(env), settings)?,
+        };
+        Ok(Self::from_parts(settings, api_key))
+    }
+
     /// Full resolution: flags over environment over user config file.
-    pub fn load(overrides: &Overrides) -> Result<Self, ConfigError> {
+    ///
+    /// `stored` is whatever the credential file holds for the selected
+    /// profile. That file belongs to the `auth` module, which owns its
+    /// hygiene, so its contents are handed in rather than read here.
+    pub fn load(overrides: &Overrides, stored: &StoredCredential<'_>) -> Result<Self, ConfigError> {
         let env = EnvLayer::from_process();
         let loaded = load_file(overrides, &env)?;
         let settings = resolve_settings(overrides, &env, &loaded)?;
-        let api_key = release_token(&EnvApiKey(&env), &settings)?;
-        Ok(Self::from_parts(&settings, api_key))
+        Self::release(&settings, &env, stored)
     }
 }
