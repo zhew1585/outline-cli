@@ -33,7 +33,10 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 
 **Windows**: download `outline-cli-x86_64-pc-windows-msvc.msi` from the
 [latest release](https://github.com/weizhesafeheron/outline-cli/releases/latest) and run it. The MSI adds
-`otl` to `PATH` and uninstalls through Settings → Apps like any other Windows program.
+`otl` to `PATH` and uninstalls through Settings → Apps like any other Windows program. It is **not
+code-signed** — SmartScreen will warn on first run, and "More info → Run anyway" is the way past it.
+Signing needs a purchased certificate; until there is one, verify the download with the attestation
+below rather than trusting the publisher prompt.
 
 Prebuilt archives are attached to every release for these targets:
 
@@ -43,6 +46,14 @@ Prebuilt archives are attached to every release for these targets:
 | macOS (Intel) | `x86_64-apple-darwin` | |
 | Linux (x86-64) | `x86_64-unknown-linux-musl` | statically linked, no glibc version floor |
 | Windows (x86-64) | `x86_64-pc-windows-msvc` | also shipped as an MSI |
+
+**Verifying a download.** Every release archive carries a GitHub build attestation, so you can check an
+artifact was produced by this repository's release workflow rather than merely that it matches a checksum
+published alongside it:
+
+```sh
+gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo weizhesafeheron/outline-cli
+```
 
 **`otl` never checks for updates.** No telemetry, no update ping, no background spec fetch — the binary
 makes exactly the network requests your command implies. Upgrading is something you do: `brew upgrade`,
@@ -184,9 +195,20 @@ bash scripts/check-binary-size.sh                       # asserts the shipped bi
 Releasing is `git tag`: [`dist-workspace.toml`](dist-workspace.toml) is the single description of every
 distribution channel, and `.github/workflows/release.yml` is generated from it by
 [cargo-dist](https://axodotdev.github.io/cargo-dist) — edit the config and run `dist generate`, never the
-workflow. `release-guards.yml` runs the parts that can be checked before tagging: the binary-size budget
-on all three platforms (building the real musl target on Linux), `dist plan`, that the generated workflow
-is in sync, and that no updater artifact has crept into the release.
+workflow. (`crates/otl/wix/main.wxs` is the one generated file that is now hand-maintained; see the
+comment inside it.)
+
+Two things guard a release, and both are wired so that failing them actually stops one:
+
+- **`release-guards.yml`** runs as cargo-dist's plan-phase job, which every later job depends on. It
+  verifies the cargo-dist installer against a committed checksum before running it, checks that the
+  generated workflow is in sync, that every action is pinned to a commit SHA, that all six artifacts are
+  planned, that no updater has crept in, that the version can be expressed as an MSI, and that the
+  Homebrew tap and its token actually exist.
+- **The binary-size budget** runs *inside* dist's own build job (injected via
+  `.github/build-setup/release-build-setup.yml`), once per published target. Failing it fails that job,
+  which skips `host`, which skips `announce` — and the GitHub Release is created in `announce`, so
+  nothing is published. `binary-size.yml` runs the same script on pull requests for early feedback.
 
 CI runs the matrix on macOS, Linux, and Windows, guards the startup budget, and asserts that no
 YAML/OpenAPI parser ever enters the runtime dependency graph. Contract tests against a real workspace run
