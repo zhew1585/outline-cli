@@ -33,27 +33,28 @@
 # The cheap structural assertions run BEFORE it on purpose: they take under a
 # second, the size build takes minutes, and ordering them this way means a
 # size failure can never hide a broken gating chain behind it.
-- name: install musl cross toolchain (Linux release builds)
-  if: runner.os == 'Linux'
-  shell: bash
-  run: bash scripts/install-linux-musl-toolchain.sh
-
-
 # Belt and braces for the checks that protect the supply chain. The
 # preflight job (release-guards) is the primary gate and blocks `host`
 # properly now, but it does so through the same template machinery it is
 # asserting - so run the dependency-free assertions here too, on the one
-# lever that provably fails the build job. Linux only: these need python3,
-# which is not reliably on PATH under Git Bash on the Windows runner, and
-# one failing matrix leg already fails the job.
+# lever that provably fails the build job.
+#
+# These used to carry `if: runner.os == 'Linux'`, added when the release had
+# a Linux leg and Git Bash on the Windows runner could not be relied on for
+# python3. Narrowing to macOS turned that condition into a silent no-op: the
+# steps were still in the generated workflow, so
+# scripts/check-release-gating.sh still found them by name, while the
+# condition guaranteed they never ran. Exactly the "declaration exceeds
+# implementation" failure this project keeps paying for. The condition is
+# gone rather than retargeted at macOS, so it cannot rot again the next time
+# the platform set changes; every runner in the matrix has python3, and each
+# script fails closed with a clear message if one ever does not.
 - name: release gating and pinning assertions
-  if: runner.os == 'Linux'
   shell: bash
   run: |
     set -euo pipefail
     bash scripts/check-release-gating.sh
     bash scripts/check-action-pins.sh
-    bash scripts/check-msi-version.sh
 
 - name: binary size budget for the published target
   shell: bash
@@ -71,7 +72,7 @@
     for target in "${targets[@]}"; do
       echo "::group::binary size gate (${target})"
       # dist adds the target itself later; doing it here too is a no-op for
-      # a native target and required for the musl cross build.
+      # the native triple and required for the x86_64 cross-build.
       rustup target add "${target}"
       BINARY_SIZE_TARGET="${target}" bash scripts/check-binary-size.sh
       echo "::endgroup::"

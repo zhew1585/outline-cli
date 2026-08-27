@@ -19,93 +19,73 @@
 # ---------------------------------------------------------------------------
 # Why the budget is per target
 # ---------------------------------------------------------------------------
-# It used to be one 4 MiB number for all four published triples, calibrated on
+# It used to be one 4 MiB number for every published triple, calibrated on
 # aarch64-apple-darwin. CI then measured x86_64-unknown-linux-musl at
 # 4,523,120 B - 107% - and the gate went red on a build that had not
 # regressed at all. A single number is simultaneously too loose for the
-# smallest target and wrong for the largest.
+# smallest target and wrong for the largest, so budgets are per target.
 #
-# The 1.09 MB gap between those two triples was measured, not guessed. Three
-# controlled comparisons (2026-08, `--profile dist`, dist's own RUSTFLAGS):
+# Only macOS ships today (Story 4.7), so both budgets below are measured on
+# this machine and nothing is extrapolated. The former musl and msvc rows are
+# gone with their targets. What is worth keeping from that episode, because
+# whoever re-adds a platform will need it, is that targets are NOT
+# interchangeable and the differences are inherent rather than trimmable
+# (measured 2026-08, `--profile dist`, dist's own RUSTFLAGS):
 #
-#   musl vs glibc, arch held fixed (aarch64-linux):
-#       musl static 3,740,216 vs gnu dynamic 3,806,048  ->  musl is 65,832 B
-#       SMALLER. Statically linking musl libc is NOT what costs the megabyte;
-#       the obvious hypothesis is simply wrong.
 #   architecture, platform held fixed (x86_64 vs aarch64):
-#       on darwin      3,970,784 vs 3,431,568           ->  +15.7%
-#       on linux-musl  4,523,120 vs 3,740,216           ->  +20.9%
+#       on darwin      +15.7%      on linux-musl  +20.9%
 #   platform, architecture held fixed:
-#       aarch64  linux-musl vs darwin                   ->   +9.0%
-#       x86_64   musl vs darwin                         ->  +13.9%
-#       x86_64   musl vs windows-msvc                   ->  +20.4%
+#       aarch64  linux-musl vs darwin            +9.0%
+#       x86_64   musl vs darwin                 +13.9%
+#       x86_64   musl vs windows-msvc           +20.4%
 #
-# Neither term dominates: architecture costs +16-21% and platform +9-20%, and
-# they compound. (An earlier version of this comment called architecture "the
-# dominant term". That was drawn from the single darwin-arm64 -> musl-x86_64
-# path that caused the red build, and the Windows measurement showed it to be
-# too strong a claim.) What matters for the gate is that both are inherent:
-# neither is code that could be trimmed away.
+# Neither term dominates; they compound. Two counter-intuitive results worth
+# remembering: statically linked musl was *smaller* than dynamic glibc at
+# fixed architecture (3,740,216 vs 3,806,048), and Windows was the smallest
+# of the three x86_64 targets despite also linking its CRT statically - so
+# "static linking" was never the axis. Re-adding a target means measuring it,
+# not deriving it from these.
 #
-# Within one architecture the spread is large enough to be worth naming -
-# across the three published x86_64 targets it is 765,552 B, ordered
-# msvc 3,757,568 < darwin 3,970,784 < musl 4,523,120. Note that Windows is
-# the *smallest* of the three despite also linking its CRT statically, so
-# "static linking" is not the axis; ELF plus `-Clink-self-contained=yes` is
-# simply the most expensive combination we ship.
+# `cargo bloat` found nothing anomalous then and the dependency graph has not
+# changed shape since: .text was 2.4 MiB spread as otl 414K, std 363K,
+# aws-lc-sys 264K, rustls 249K, reqwest 162K, clap 124K.
 #
-# `cargo bloat` on the musl build agrees that nothing is anomalous - .text is
-# 2.4 MiB spread as otl 414K, std 363K, aws-lc-sys 264K, rustls 249K,
-# reqwest 162K, clap 124K, with no single unexpected entry.
-#
-# Fat LTO is confirmed in effect on the musl path too (cargo passes a bare
-# `-C lto`); building musl with dist's default thin LTO instead costs
-# +525,432 B, so that fix earns more here than on darwin.
+# Fat LTO is load-bearing: `[profile.dist]` inherits it from `[profile.release]`
+# rather than taking dist's default `lto = "thin"`, which measured +723,344 B
+# on darwin and +525,432 B on musl.
 #
 # ---------------------------------------------------------------------------
 # Measurements behind each budget
 # ---------------------------------------------------------------------------
 # `--profile dist` (= release: opt-level="s", fat LTO, codegen-units=1,
-# strip="symbols", panic="abort"), 2026-08, all five tracks merged, plus the
-# +33,040 B that Story 4.3 (`otl doctor`) adds once it lands:
+# strip="symbols", panic="abort"), 2026-08:
 #
-#   target                        measured    +doctor     budget    of budget
-#   aarch64-apple-darwin         3,431,568  3,464,608  3,750,000        91%
-#   x86_64-pc-windows-msvc       3,757,568  3,790,608  4,094,000        91%
-#   x86_64-apple-darwin          3,970,784  4,003,824  4,330,000        91%
-#   x86_64-unknown-linux-musl    4,523,120  4,556,160  4,920,000        91%
+#   target                        measured     budget    of budget
+#   aarch64-apple-darwin         3,464,608  3,750,000        92%
+#   x86_64-apple-darwin          4,007,712  4,330,000        92%
 #
-# All four are measured; none is provisional. The darwin pair was built
-# locally (the x86_64 one cross-compiled on an arm64 host), musl and
-# windows-msvc come from CI legs - MSVC cannot be linked off Windows, and
-# that leg reported 3,757,568 B twice on different commits, so the figure is
-# stable rather than a one-off.
+# Both built locally - the x86_64 one cross-compiled on an arm64 host, which
+# works because Apple's toolchain targets both slices. Every shipped target is
+# therefore measurable without CI, which was not true while musl shipped: that
+# figure came only from a CI leg, and the extrapolation standing in for it
+# locally was wrong by 0.74 MB. No number here is an extrapolation.
 #
-# (The doctor delta is the +33,040 B its implementer measured on darwin; on
-# x86_64 it will scale up with the same ~1.16-1.21 factor as everything else,
-# so read the x86_64 rows' +doctor column as a floor. The 8% headroom absorbs
-# either value.)
-#
-# The aarch64-linux numbers quoted in the comparisons above are from a
-# container and are deliberately NOT budgets: neither aarch64-linux triple is
-# published, so they exist only to hold a variable fixed.
-#
-# Every budget sits ~8% above its measurement, which is why all four read the
-# same 91% - the gate is equally strict everywhere, which is the whole point
-# of splitting it.
+# Budgets sit ~8% above measurement, which is why both read the same 92% - the
+# gate is equally strict on each, the point of splitting it.
 #
 # HEADROOM AGAINST THE PROMISE, stated plainly because it is the number a
 # future maintainer needs and it should not have to be recomputed:
 #
-#   x86_64-unknown-linux-musl is the largest artifact we ship, at 4,523,120 B.
+#   x86_64-apple-darwin is now the largest artifact we ship, at 4,007,712 B.
 #   NFR2 promises ~5 MB = 5,000,000 B.
-#   Remaining headroom: 476,880 B (9.5%). After `otl doctor` lands: ~443,840 B.
+#   Remaining headroom: 992,288 B (19.8%).
 #
-# That is the whole budget for every future feature, on the target that binds.
-# The musl regression budget (4,920,000) is set below the ceiling on purpose,
-# so the regression check can never authorise breaking the promise. If musl
-# needs to grow past ~4.9 MB, that is a product decision about NFR2 - raise it
-# deliberately, with the user, or trim; it is not a constant to bump here.
+# That is much roomier than it was, and the change is worth stating so nobody
+# carries over the old caution: while x86_64-unknown-linux-musl shipped it was
+# the binding target at 4,556,160 B, leaving only ~443,840 B (8.9%). Dropping
+# Linux roughly doubled the room. If Linux or Windows returns, the binding
+# target and this number change with it - re-measure rather than assuming this
+# figure still holds.
 #
 # Raising any budget is a deliberate act: update the measurement in the table
 # in the same commit, and say which dependency bought the space.
@@ -157,8 +137,6 @@ budget_for_target() {
     case "$1" in
         aarch64-apple-darwin) echo 3750000 ;;
         x86_64-apple-darwin) echo 4330000 ;;
-        x86_64-unknown-linux-musl) echo 4920000 ;;
-        x86_64-pc-windows-msvc) echo 4094000 ;;
         *) echo "" ;;
     esac
 }

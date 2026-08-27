@@ -2,9 +2,8 @@
 #
 # One config produces every distribution channel the spec asks for
 # (specs/spec-outline-cli/stack.md "分发"):
-#   * shell installer  -> curl | sh  (macOS + Linux)
+#   * shell installer  -> curl | sh
 #   * homebrew formula -> pushed to the tap named below
-#   * msi              -> Windows installer
 #
 # Phone-home policy (NFR4): `install-updater = false` on purpose. The
 # updater axodotdev ships would contact a release server behind the user's
@@ -18,9 +17,7 @@
 # rewrites `targets` with its own defaults, re-adding triples this project
 # deliberately does not ship. CI (.github/workflows/release-guards.yml)
 # verifies config and generated files agree via `dist generate --check`.
-#
-# `crates/otl/wix/main.wxs` is the exception: it started as dist output but
-# is now hand-maintained (see `allow-dirty` below).
+
 
 [workspace]
 members = ["cargo:."]
@@ -31,8 +28,11 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "homebrew", "msi"]
+# The installers to generate for each app. No `msi`: dist only builds one for
+# a Windows target, and none is published. No `powershell` either - it was
+# never enabled, and a PowerShell installer that fetches macOS archives would
+# be meaningless.
+installers = ["shell", "homebrew"]
 # Homebrew tap the generated formula is pushed to by the `homebrew` publish
 # job. Two prerequisites live outside this repository and NEITHER EXISTS YET
 # (2026-08):
@@ -53,15 +53,21 @@ installers = ["shell", "homebrew", "msi"]
 tap = "zhew1585/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
-# NFR3 - three first-class platforms. Linux ships musl so the binary is
-# statically linked and glibc-version independent; the two macOS triples
-# cover Apple Silicon and Intel. Keep this list in sync with the platform
-# matrix documented in README.md ("Install").
+#
+# macOS only, for now (Story 4.7). Both Apple triples ship: Intel Macs are
+# still in use, and dropping x86_64 would silently strand them.
+#
+# Deliberately NOT universal2-apple-darwin, which would look tidier: a fat
+# binary carries both slices, so it would measure ~7.5 MB against NFR2's
+# ~5 MB promise. Two thin artifacts keep the promise; one fat one breaks it.
+#
+# Keep this list in sync with the platform matrix in README.md ("Install")
+# and with the per-target budgets in scripts/check-binary-size.sh -
+# scripts/check-release-gating.sh asserts the latter and will fail if a
+# target is added here without a measured budget.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "x86_64-unknown-linux-musl",
-    "x86_64-pc-windows-msvc",
 ]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
@@ -158,22 +164,11 @@ post-announce-jobs = ["./attest-global-artifacts"]
 # section header here would swallow every key defined after it.
 github-custom-job-permissions = { attest-global-artifacts = { id-token = "write", attestations = "write", contents = "read" } }
 
-# Do not regenerate or diff the WiX definition: crates/otl/wix/main.wxs is
-# hand-maintained because it needs `AllowSameVersionUpgrades='yes'`, which
-# dist's template does not emit and no config key controls. Without it,
-# MSIs whose versions differ only in the SemVer prerelease (1.2.3-rc.1 ->
-# 1.2.3-rc.2 -> 1.2.3) are indistinguishable to Windows Installer - it
-# compares only the first three version fields - so the newer installer
-# would sit beside the older one instead of upgrading it.
-# The trade-off: package metadata changes (description, license) no longer
-# propagate into main.wxs automatically. release-guards.yml asserts the
-# settings that must never be lost.
-allow-dirty = ["msi"]
 
-# Extra steps injected into the `build-local-artifacts` job: the musl cross
-# toolchain, and the binary-size budget that must fail *that* job in order
-# to actually block a release. See the fragment's own header. The path is
-# resolved relative to .github/workflows/.
+# Extra steps injected into the `build-local-artifacts` job: the structural
+# assertions and the binary-size budget, both of which must fail *that* job
+# in order to actually block a release. See the fragment's own header. The
+# path is resolved relative to .github/workflows/.
 github-build-setup = "../build-setup/release-build-setup.yml"
 
 # Pin every action the generated workflow uses to an immutable commit rather
