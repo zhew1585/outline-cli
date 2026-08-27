@@ -58,11 +58,20 @@ use crate::stdio;
 const API_SUBCOMMAND: &str = "api";
 /// Id of that subcommand's operation positional.
 const OPERATION_ARG: &str = "operation";
-/// Reserved operation name that enumerates operations instead of calling
-/// one; it completes alongside the real names.
-const LIST_OPERATION: &str = "list";
-/// Summary shown for [`LIST_OPERATION`] in shells that display one.
-const LIST_SUMMARY: &str = "List every callable operation";
+/// The reserved operation names, with the summary shells that display one
+/// will show. They complete alongside the real names, because from the
+/// caller's side they are three things you can type in the same position.
+///
+/// The names come from `commands::api` rather than being spelled again
+/// here: a copy would let the completion script offer a word the parser no
+/// longer honours, or - worse - stop offering one it does.
+const RESERVED_OPERATIONS: &[(&str, &str)] = &[
+    (super::api::LIST_OPERATION, "List every callable operation"),
+    (
+        super::api::DESCRIBE_OPERATION,
+        "Describe one operation's parameters and response",
+    ),
+];
 /// Maximum length of a candidate description written into a script.
 const MAX_DESCRIPTION_CHARS: usize = 120;
 /// Comment marker for the coverage notice. `#` starts a line comment in
@@ -174,7 +183,9 @@ pub fn completes_operation_names(shell: Shell) -> bool {
 /// Names that are not [`is_safe_operation_name`] are dropped: a candidate
 /// that cannot be written safely is worth less than a script that misbehaves.
 fn operation_candidates() -> impl Iterator<Item = (&'static str, &'static str)> {
-    std::iter::once((LIST_OPERATION, LIST_SUMMARY))
+    RESERVED_OPERATIONS
+        .iter()
+        .copied()
         .chain(
             ops::OPS
                 .iter()

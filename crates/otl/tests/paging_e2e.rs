@@ -173,7 +173,6 @@ async fn missing_pagination_hint_does_not_stop_early() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_page_two_fails_instead_of_reporting_success() {
-    // 
     let server = MockServer::start().await;
     mount_page(&server, 0, 2, items(0..2)).await;
     Mock::given(method("POST"))

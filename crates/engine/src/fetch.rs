@@ -1,22 +1,50 @@
 //! The plain-document channel: unauthenticated GETs of a public document.
 //!
-//! This is NOT [`crate::client`]: a spec document lives on a third-party
-//! host the caller has no credentials for, and no bearer token is ever
-//! sent here. It still shares the RPC channel's primitives - the 429
-//! [`RetryPolicy`] and the shared [`Throttle`] - and has exactly one
-//! `.send()` of its own.
+//! # Why this is not [`crate::client`]
 //!
-//! Its errors are a separate type ([`FetchError`]): a document host is
-//! not the API, and the caller maps them on its own terms.
+//! The RPC channel exists for requests that carry the caller's bearer
+//! token to the API they are authenticated against. A spec document lives
+//! on a third-party host (a CDN, a mirror, a local file server) that the
+//! caller has no credentials for, so putting it through that channel would
+//! mean either sending the token to that host - a credential leak - or
+//! giving the channel a "sometimes omit the credential" mode, which is
+//! exactly the kind of conditional that makes a security-critical path
+//! unreviewable.
+//!
+//! # What it still shares
+//!
+//! Not sending a token is no excuse for behaving differently on the wire.
+//! This channel reuses the same primitives as the RPC channel, and it must
+//! keep doing so:
+//!
+//! - [`RetryPolicy`]: HTTP 429 is retried with `Retry-After` (or backoff
+//!   with jitter), and exhausting the budget is its own error, not a
+//!   generic HTTP failure;
+//! - [`Throttle`]: every attempt draws from the process-wide request
+//!   budget, so a fetch cannot burst past the rate the rest of the process
+//!   is pacing itself to;
+//! - one `.send()` in the module, so there is one place where a request is
+//!   made, classified, and retried.
+//!
+//! # What it deliberately does NOT share
+//!
+//! Its errors are a separate type ([`FetchError`]). A document host is not
+//! the API: reporting its 401 as "your API key is invalid" or its DNS
+//! failure as "check your instance URL" would be actively misleading. The
+//! caller maps [`FetchError`] on its own terms.
 //!
 //! A fetched body is UNTRUSTED input: size-capped and UTF-8 checked here,
 //! and validated by whoever parses it. An error response body is never
-//! echoed.
+//! echoed - a document host's error page is not a diagnostic.
 //!
-//! Redirects are followed (bounded by the client's own policy), so the
-//! host that ANSWERS need not be the host that was asked:
-//! [`FetchedDocument::origin`] carries the responding origin, re-validated
-//! on the way out.
+//! # Redirects
+//!
+//! Redirects are followed (bounded by the client's own policy), which
+//! means the host that ANSWERS need not be the host that was asked. A
+//! caller recording where a document came from must therefore be told the
+//! responding origin, not the requested one - so that is what
+//! [`FetchedDocument::origin`] carries, and it is re-validated on the way
+//! out. Nothing else changes: no credentials are sent to either host.
 
 use std::io::Read;
 use std::thread;
@@ -45,8 +73,12 @@ pub struct FetchedDocument {
     /// The body, UNTRUSTED: only its size and encoding have been checked.
     pub text: String,
     /// Origin (`scheme://host[:port]`) that answered, after any redirects,
-    /// or empty when it could not be determined - never the requested
-    /// origin, which may name a host that did not serve the document.
+    /// or empty when it could not be determined.
+    ///
+    /// Not the origin that was asked: a redirect can move the answer to
+    /// another host, and a record of "where this came from" that names the
+    /// wrong one is worse than no record - which is also why the unknown
+    /// case is EMPTY rather than a fallback to the requested origin.
     pub origin: String,
 }
 
@@ -185,8 +217,14 @@ impl DocumentFetch {
                 continue;
             }
             // Where the answer actually came from. Errors keep naming the
-            // origin that was ASKED; a successful document is labelled
-            // with the one that served it, empty when undeterminable.
+            // origin that was ASKED, which is the one the user typed and
+            // can act on; a successful document is labelled with the one
+            // that served it, which is the one the caller has to record.
+            //
+            // When that cannot be determined the label is EMPTY, never the
+            // requested origin: a caller recording provenance would then
+            // name a host that did not serve the document, which is a
+            // quiet lie. "Unknown" is worse to read and better to trust.
             let answered = answering_origin(&response).unwrap_or_default();
             if !status.is_success() {
                 return Err(FetchError::Status {
@@ -212,8 +250,8 @@ impl DocumentFetch {
             .map_err(|source| FetchError::Transport {
                 origin: origin.to_string(),
                 kind: TransportKind::classify(&source),
-                // reqwest errors embed the full request URL in their
-                // Display and Debug output; strip it before retention.
+                // reqwest errors embed the full request URL in Display AND
+                // Debug; strip it before the error is retained.
                 source: source.without_url(),
             })
     }
@@ -316,10 +354,15 @@ pub fn fetch_document(
 
 /// The origin that answered, taken from the response's final URL.
 ///
-/// Userinfo is stripped before the URL is checked, rather than making
-/// the check fail: a `Location` header may carry credentials (they are
-/// never sent, but they do appear in the final URL). `None` only when the
-/// final URL is not something this channel would have fetched at all.
+/// Userinfo is stripped before the URL is checked, rather than making the
+/// check fail: a `Location` header may carry credentials (they are never
+/// SENT - this channel sends none - but they do appear in the final URL),
+/// and refusing to name the host because of them would leave provenance
+/// unknown for a redirect that worked perfectly well.
+///
+/// `None` only when the final URL is not something this channel would have
+/// fetched at all. The caller must not substitute the requested origin for
+/// it: that would name a host that did not serve the document.
 fn answering_origin(response: &reqwest::blocking::Response) -> Option<String> {
     let mut url = response.url().clone();
     // Both setters fail only for URLs that cannot have userinfo (`file:`,

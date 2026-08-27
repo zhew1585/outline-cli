@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::{CompileError, CompiledField, CompiledParam, ScalarKind};
+use crate::{text, CompileError, CompiledField, CompiledParam, ScalarKind};
 
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
@@ -117,6 +117,11 @@ impl Walk<'_> {
             format: facets.format,
             minimum: facets.minimum,
             maximum: facets.maximum,
+            // SANITIZED, not validated, exactly like an operation summary:
+            // it is display-only text, nothing dispatches on it, and the
+            // same call folds it to one line and caps its length. There is
+            // deliberately no second entry point for this string.
+            description: text::sanitize_display(&facets.description),
         })
     }
 
@@ -205,6 +210,13 @@ fn merge_facets(schema: &Value, facets: &mut Facets) {
     if facets.format.is_empty() {
         if let Some(format) = schema.get("format").and_then(Value::as_str) {
             facets.format = format.to_string();
+        }
+    }
+    // First declaration wins, like enum and format: the property's own
+    // prose is more specific than the shared schema it refers to.
+    if facets.description.is_empty() {
+        if let Some(description) = schema.get("description").and_then(Value::as_str) {
+            facets.description = description.to_string();
         }
     }
     facets.minimum = facets
@@ -341,6 +353,11 @@ struct Facets {
     format: String,
     minimum: Option<f64>,
     maximum: Option<f64>,
+    /// Raw prose, sanitized by the caller. Collected through the same walk
+    /// as everything else so that a description one `$ref` down (the common
+    /// shared-parameter idiom) is found, rather than only the 244 of 259
+    /// that state it directly on the property.
+    description: String,
 }
 
 fn check_depth(depth: usize) -> Result<(), CompileError> {

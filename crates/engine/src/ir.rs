@@ -12,9 +12,15 @@ use serde::{Deserialize, Serialize};
 
 /// Schema version of the IR data structures.
 ///
-/// Any serialized IR must embed this version; a mismatch invalidates the
-/// whole artifact.
-pub const IR_SCHEMA_VERSION: u32 = 5;
+/// Any serialized IR (e.g. a future on-disk cache) must embed this version;
+/// a mismatch invalidates the whole artifact and forces a rebuild.
+///
+/// Version history: 2 added `OpSpec::summary`; 3 added
+/// `OpSpec::content_type`, `OpSpec::body_mode` and the `ParamSpec`
+/// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`);
+/// 4 added `ParamSpec::format`; 5 added `OpSpec::response_fields`;
+/// 6 added `ParamSpec::description`.
+pub const IR_SCHEMA_VERSION: u32 = 6;
 
 /// How strictly a request is validated against the IR before being sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +103,20 @@ pub struct ParamSpec {
     pub minimum: Option<f64>,
     /// Inclusive upper bound for numeric parameters, if any.
     pub maximum: Option<f64>,
+    /// One-line prose from the source schema, empty when absent.
+    ///
+    /// Carried for one reason, and it is not decoration: a schema may
+    /// declare no parameter required and still be unusable without one -
+    /// the constraint that says "give me exactly one of these two" is often
+    /// stated only in prose. A caller reading `required: false` on every
+    /// parameter would conclude that none is needed, which is worse than
+    /// having no information at all.
+    ///
+    /// Display-only text: nothing dispatches on it, so it is SANITIZED at
+    /// compile time (dangerous characters dropped, whitespace folded to one
+    /// line, length capped) rather than validated, exactly like
+    /// `OpSpec::summary`.
+    pub description: Cow<'static, str>,
 }
 
 /// One field of an operation's response payload.

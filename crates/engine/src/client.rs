@@ -2,8 +2,9 @@
 //!
 //! Every HTTP call made on behalf of the engine flows through the private
 //! [`Client::send`]: both the `key=value` path ([`Client::execute`]) and the
-//! raw-body passthrough ([`Client::execute_raw`]) funnel into it. Local
-//! validation, backoff, error mapping and token renewal all live here.
+//! raw-body passthrough ([`Client::execute_raw`]) funnel into it, so there
+//! is exactly one `.send()` in the crate. Local validation, backoff, error
+//! mapping and token renewal all live here (and only here).
 
 use std::fmt;
 use std::io::Read;
@@ -36,7 +37,7 @@ const MAX_ERROR_CODE_CHARS: usize = 64;
 /// Fallback message when an error response carries no usable text.
 const NO_ERROR_DETAILS: &str = "no error details in response body";
 /// Reason reported when a request cannot be assembled locally because a
-/// header value is not valid HTTP. Value-free by design.
+/// header value is not valid HTTP. Deliberately generic and value-free.
 const INVALID_HEADER_REASON: &str =
     "a header value contains characters that are not valid in HTTP \
      (for example a newline or a control character)";
@@ -50,8 +51,9 @@ const SERVER_MESSAGE_WITHHELD: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorDetail {
     /// Report the server's free-form message (sanitized, token-redacted).
+    ///
     /// Safe when every value in the request came from the caller's own
-    /// arguments.
+    /// arguments, and available as an explicit opt-in otherwise.
     #[default]
     Full,
     /// Report only the structured error code, never free-form text.
@@ -64,7 +66,8 @@ pub struct Client {
     http: reqwest::blocking::Client,
     base_url: String,
     /// `scheme://host[:port]` of the base URL - the only URL-derived text
-    /// this client ever puts into user-visible output.
+    /// this client ever puts into user-visible output (base URL paths can
+    /// carry secrets, e.g. token-in-path auth schemes).
     origin: String,
     /// Where the bearer credential comes from, and how it is renewed when
     /// the server rejects it.
@@ -78,7 +81,8 @@ pub struct Client {
 
 impl fmt::Debug for Client {
     /// Manual impl: the bearer credential must never appear in Debug
-    /// output, and the base URL is reduced to its origin.
+    /// output, and the base URL is reduced to its origin (a path can carry
+    /// secrets).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("origin", &self.origin)
@@ -134,11 +138,14 @@ impl Client {
         let parsed = validate_base_url(base_url)?;
         let http = reqwest::blocking::Client::builder()
             .timeout(timeout)
-            // Redirects are disabled: every request carries a bearer
-            // credential, and reqwest only strips the Authorization header
-            // when a redirect crosses a HOST, so a same-host redirect could
-            // leak it in plaintext. A 3xx is reported as an unexpected
-            // status.
+            // Redirects are disabled deliberately. Every request carries a
+            // bearer credential, and reqwest only strips the Authorization
+            // header when the redirect crosses a HOST: a same-host
+            // `https://` -> `http://` downgrade keeps it and would put the
+            // credential on the wire in plaintext. Request bodies are never
+            // stripped, and 307/308 replays them. An RPC API has no
+            // legitimate reason to redirect a POST, so a 3xx is reported as
+            // the unexpected status it is.
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| EngineError::ClientBuild(error.without_url()))?;
@@ -190,16 +197,19 @@ impl Client {
     /// Execute one RPC operation, auto-paginating per `spec` and capping
     /// the total fetched rows at `max_items` when given.
     ///
-    /// All pagination vocabulary comes from `spec`. Arguments are validated
-    /// and coerced exactly as in [`Client::execute`], then the descriptor's
-    /// offset and page-size parameters are set per page. If the caller's own
-    /// arguments already pin the page size, that is honored as manual
-    /// paging: exactly one page is fetched, and a full page is reported as
-    /// possibly truncated.
+    /// All pagination vocabulary comes from `spec`; the engine has no
+    /// convention of its own. Arguments are validated and coerced exactly
+    /// as in [`Client::execute`], then the descriptor's offset and page-size
+    /// parameters are set per page. If the caller's own arguments already
+    /// pin the page size, that is honored as manual paging: exactly one
+    /// page is fetched, and a full page is reported as possibly truncated.
     ///
     /// The returned [`Fetched::truncation`] is `Some` whenever the result
     /// may be incomplete; callers MUST surface it to the user - truncation
     /// is never silent.
+    ///
+    /// Raw bodies are deliberately not paginated: [`Client::execute_raw`]
+    /// sends what it was given, verbatim and once.
     pub fn execute_paged(
         &self,
         op: &OpSpec,
@@ -210,13 +220,15 @@ impl Client {
     ) -> Result<Fetched, EngineError> {
         // Everything local first: a malformed descriptor or offset must
         // fail before a single byte goes on the wire.
-        spec.validate()?;        let start = paginate::start_offset(spec, args)?;
+        spec.validate()?;
+        let start = paginate::start_offset(spec, args)?;
         let body = build_request_body(op, args, validation)?;
 
         if paginate::has_manual_page_size(spec, args) {
             let mut value = self.send(&op.path, encode(&body)?, ErrorDetail::Full)?;
-            // The single page goes through the same acceptance check as
-            // any auto-paginated page.
+            // The single page goes through the same acceptance check as any
+            // auto-paginated page, so the offset-hint and items-pointer
+            // invariants cannot be skipped on this branch.
             let accepted = paginate::accept_page(spec, &mut value, start, 1, 0)?;
             let truncation = paginate::manual_page_truncation(&accepted);
             let offset_unconfirmed = accepted.offset_unconfirmed;
@@ -241,16 +253,18 @@ impl Client {
 
     /// Execute one RPC operation with a caller-supplied raw JSON body.
     ///
-    /// The body must be valid JSON (checked locally) and is sent
-    /// byte-for-byte verbatim, bypassing `key=value` assembly and parameter
-    /// validation entirely.
+    /// The body must be valid JSON (checked locally, before any network
+    /// request) and is sent byte-for-byte verbatim, bypassing `key=value`
+    /// assembly and parameter validation entirely.
     ///
     /// A raw body may carry credentials this client knows nothing about,
-    /// and a server error response may quote the request it rejected, so
-    /// with [`ErrorDetail::CodeOnly`] the server's free-form text is
-    /// withheld and only its structured error code is reported.
-    /// [`ErrorDetail::Full`] is the caller's explicit opt-in to seeing text
-    /// that may echo the body.
+    /// and a server error response may quote the request it rejected.
+    /// There is no way to recognize such a quote after the fact - a secret
+    /// can be short, escaped differently, or overlap another value - so
+    /// the decision is categorical: with [`ErrorDetail::CodeOnly`] the
+    /// server's free-form text is withheld and only its structured error
+    /// code is reported. [`ErrorDetail::Full`] is the caller's explicit
+    /// opt-in to seeing text that may echo the body.
     pub fn execute_raw(
         &self,
         op: &OpSpec,
@@ -270,17 +284,23 @@ impl Client {
 
     /// The single wire path: POST a JSON payload and parse the response.
     ///
-    /// This is the only `.send()` in the engine, so every request shares
-    /// one set of headers, one error classification, one credential-hygiene
-    /// pipeline, and one renewal hook.
+    /// This is the only `.send()` in the engine. It carries both bodies
+    /// serialized from `key=value` arguments and raw caller-supplied bytes,
+    /// so every request shares one set of headers, one error
+    /// classification, one credential-hygiene pipeline, and one renewal
+    /// hook.
     ///
     /// Renewal: the credential source is consulted once per request, and -
     /// if the server answers HTTP 401 - asked exactly once for a renewed
     /// value, after which the request is replayed verbatim. At most one
-    /// replay happens per request.
+    /// replay happens per request, so a source that hands back a
+    /// still-rejected credential cannot spin the channel.
     ///
-    /// Redaction spans the whole request, not the current attempt: every
-    /// credential this request has used is passed to the hygiene pipeline.
+    /// Redaction spans the WHOLE request, not the current attempt: every
+    /// credential this request has used stays in `used` and is passed to
+    /// the hygiene pipeline. The server saw the first token, so the
+    /// response to the replay can echo it back - and a pipeline that only
+    /// knew the renewed value would print the old one verbatim.
     ///
     /// `detail` decides how much of a server error response may be
     /// surfaced (see [`Client::execute_raw`]).
@@ -407,9 +427,10 @@ impl Client {
     /// Classify a failure of `send()`.
     ///
     /// A builder failure never reached the network: the request could not
-    /// be assembled locally (e.g. a credential containing a newline). The
-    /// underlying error is not retained - a builder error may embed the
-    /// offending header value.
+    /// be assembled locally (an invalid header value, e.g. a credential
+    /// containing a newline). It must not be reported as a network problem,
+    /// and the underlying error is NOT retained - a builder error may embed
+    /// the offending header value.
     fn send_error(&self, source: reqwest::Error, secrets: &[&str]) -> EngineError {
         if source.is_builder() {
             return EngineError::InvalidRequest {
@@ -420,7 +441,9 @@ impl Client {
             origin: self.display_origin(secrets),
             kind: TransportKind::classify(&source),
             // reqwest errors embed the full request URL in their Display
-            // and Debug output; strip it before the error is retained.
+            // AND Debug output (reqwest docs warn about this explicitly);
+            // strip it before the error is retained so the stored source is
+            // credential-free by construction.
             source: source.without_url(),
         }
     }
@@ -428,8 +451,8 @@ impl Client {
     /// Classify a failure of reading/decoding a success response body.
     ///
     /// A body that times out or is cut mid-transfer is a TRANSPORT failure,
-    /// not malformed JSON, so callers can tell "retry may help" from "the
-    /// server sent something unparseable".
+    /// not malformed JSON: callers must be able to tell "retry may help"
+    /// from "the server sent something unparseable".
     fn body_error(&self, source: reqwest::Error, secrets: &[&str]) -> EngineError {
         if is_transport_failure(&source) {
             return EngineError::Transport {
@@ -446,7 +469,9 @@ impl Client {
     }
 
     /// The origin for error messages, passed through secret redaction as
-    /// defense in depth.
+    /// defense in depth (an origin should never contain a credential, but
+    /// no URL-derived text reaches output without going through the
+    /// pipeline).
     fn display_origin(&self, secrets: &[&str]) -> String {
         redact_all(&self.origin, secrets)
     }
@@ -583,12 +608,17 @@ struct ApiErrorParts {
 /// Pull best-effort typed error info out of an error response.
 ///
 /// The body read is capped at [`MAX_ERROR_BODY_BYTES`]; one extra byte is
-/// requested so a cap hit is detectable.
+/// requested so a cap hit is detectable, which makes the trailing fragment
+/// of a cut body droppable as a unit.
 ///
 /// With [`ErrorDetail::Full`] every extracted field goes through
-/// [`clean_server_text`], the credential-hygiene pipeline. With
-/// [`ErrorDetail::CodeOnly`] the free-form text is dropped entirely and
-/// only a code-shaped [`is_error_code`] value is reported.
+/// [`clean_server_text`], which owns the whole credential-hygiene pipeline
+/// (redaction before AND after normalization, smuggling check, length cap).
+///
+/// With [`ErrorDetail::CodeOnly`] the free-form text is dropped entirely
+/// and only a code-shaped [`is_error_code`] value is reported: server text
+/// may quote the request body, and no filter can reliably recognize a
+/// caller's own secret inside it after the fact.
 fn extract_error_parts(
     response: reqwest::blocking::Response,
     secrets: &[&str],
@@ -628,9 +658,12 @@ fn extract_error_parts(
 
 /// Pull the code and message out of an error body that may be shown.
 ///
-/// A body that PARSED is complete no matter how it was capped, so its
-/// fields are never cut mid-token; the fragment check still applies to
-/// every field.
+/// Whether a piece of text may itself be cut mid-way governs the cap-tail
+/// treatment. A body that PARSED is complete no matter how it was capped -
+/// JSON tolerates unlimited trailing whitespace, so a complete envelope can
+/// sit inside a capped body - and dropping the last word of a complete
+/// field would corrupt a legitimate diagnostic for no security gain. The
+/// fragment check still applies to every field either way.
 fn surfaced_parts(
     parsed: Option<&Value>,
     body: &str,
@@ -638,8 +671,8 @@ fn surfaced_parts(
     secrets: &[&str],
 ) -> ApiErrorParts {
     let Some(json) = parsed else {
-        // Raw text straight out of the body: the only text that a read cap
-        // can have cut mid-token.
+        // Raw text straight out of the body: this is the only text that a
+        // read cap can have cut mid-token.
         return ApiErrorParts {
             code: None,
             message: clean_server_text_for(body, secrets, capped, MAX_ERROR_MESSAGE_CHARS),
@@ -664,8 +697,11 @@ fn surfaced_parts(
 /// Describe an error response without repeating any free-form text.
 ///
 /// The structured error code is reported when the response carries one in
-/// a code-shaped field ([`is_error_code`]); the surviving code still goes
-/// through [`clean_server_text`] (and is re-checked afterwards).
+/// a code-shaped field ([`is_error_code`]); a server that puts prose - or
+/// a quoted request body - there is treated as having sent no code. The
+/// surviving code still goes through [`clean_server_text`] (and is
+/// re-checked afterwards) so that a code that smuggles our own bearer token
+/// is discarded rather than printed.
 fn withheld_parts(parsed: Option<&Value>, secrets: &[&str]) -> ApiErrorParts {
     let code = parsed
         .and_then(|json| json.get("error").or_else(|| json.get("code")))
@@ -681,6 +717,10 @@ fn withheld_parts(parsed: Option<&Value>, secrets: &[&str]) -> ApiErrorParts {
 
 /// Whether `text` has the shape of a machine-readable error code: a short
 /// run of ASCII alphanumerics and `_`, `-`, `.` separators.
+///
+/// Deliberately strict: it is what separates a stable code from arbitrary
+/// server text that might embed the request body. Being ASCII-only, a
+/// string that passes can carry no invisible characters either.
 fn is_error_code(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_ERROR_CODE_CHARS

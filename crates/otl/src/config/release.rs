@@ -10,11 +10,19 @@
 //! locked down in their own leaf modules: `config::resolved` owns
 //! [`Settings`] and is the only module that can build one, and
 //! `config::secret` owns the key storage and is the only module that can read
-//! a key out.
+//! a key out. An unforgeable proof token issued from forgeable state would
+//! prove nothing, and neither module's privacy would hold if the state lived
+//! in `config` itself, where every sibling could reach it.
 //!
 //! **This module must stay a leaf**: a submodule of it could mint
 //! [`BindingChecked`] without running the check. `config_isolation.rs`
 //! asserts that.
+//!
+//! The separation matters because the two questions have different answers.
+//! Bending precedence to make a profile's URL win would break the published
+//! configuration model for every user; refusing to release a credential to an
+//! instance its profile never named breaks nothing and is the only outcome
+//! that cannot be undone if it is wrong.
 //!
 //! # What the gate does and does not guarantee
 //!
@@ -23,22 +31,37 @@
 //! [`release_token`], because `fetch` receives no settings argument and the
 //! proof it does receive is bound to them.
 //!
-//! It is not a sandbox around a hostile source, nor does it prevent
-//! deliberate misuse by code that is already in the binary. The threat it
-//! guards against is the accidental one - a chaining or fallback source
-//! reaching for the wrong state, a new source forgetting a check it did not
-//! know existed. That failure mode is unrepresentable rather than merely
-//! discouraged.
+//! It is not a sandbox around a hostile source. A source that wanted to
+//! could resolve a DIFFERENT `Settings` of its own - [`super::resolve_settings`]
+//! is public - arrange for that one to pass the gate (an explicit `--url`
+//! redirect does), call [`release_token`] on it, and hand the resulting
+//! credential back to a caller who believes it asked about the first one.
+//! Nothing here prevents that, and nothing here could: it is equivalent to a
+//! source returning a credential it had hardcoded, and code inside the binary
+//! that wants to do that has simpler ways.
+//!
+//! The threat this gate is built for is the accidental one - a chaining or
+//! fallback source reaching for the wrong state, a new source forgetting a
+//! check it did not know existed. That failure mode is now unrepresentable
+//! rather than merely discouraged. Deliberate misuse by code that is already
+//! in the binary is out of scope, and saying so is more useful than implying
+//! otherwise.
 
 use super::{ConfigError, Settings, UrlSource};
 
 /// Proof that the credential-binding check has run FOR THESE SETTINGS.
 ///
-/// The proof carries the settings it approved, so it cannot be spent on a
-/// different proposition than the one that was checked: `fetch` receives
-/// no settings argument at all, only this, and reads the approved ones out
-/// of it. The field is private, so the token cannot be built outside this
-/// module, and the lifetime ties it to the settings it borrows.
+/// The proof carries the settings it approved, and that is the whole point:
+/// an unforgeable token saying only "a check ran" can be spent on a
+/// different proposition than the one that was checked. A source handed such
+/// a bare token could pass it, together with settings the gate had just
+/// refused, to another source's `fetch` - laundering one legitimate approval
+/// into a credential for an instance the gate said no to. Binding the two
+/// together makes that unrepresentable: `fetch` receives no settings
+/// argument at all, only this, and reads the approved ones out of it.
+///
+/// The field is private, so the token cannot be built outside this module,
+/// and the lifetime ties it to the settings it borrows.
 #[derive(Debug)]
 pub struct BindingChecked<'settings>(&'settings Settings);
 
@@ -53,8 +76,8 @@ impl<'settings> BindingChecked<'settings> {
 /// Where the secret comes from.
 ///
 /// The single interface point between profile resolution and credential
-/// storage: `secret::EnvApiKey` and the auth module's credential file are
-/// the two implementations.
+/// storage: v1 ships `secret::EnvApiKey`, and the Epic 2 credential file becomes a
+/// second implementation without any change above this line.
 pub trait TokenSource {
     /// The bearer token for the approved settings, or a readable
     /// configuration error.
@@ -72,8 +95,8 @@ pub trait TokenSource {
 /// Resolution has already applied flag > env > file for every key. This gate
 /// asks the separate question of whether the resolved ORIGIN is one the
 /// resolved CREDENTIAL belongs to, and refuses to release the secret when it
-/// is not. It is outside [`TokenSource`], so every source is covered by
-/// construction rather than by convention.
+/// is not. It is deliberately outside [`TokenSource`], so every present and
+/// future source is covered by construction rather than by convention.
 pub fn release_token(
     source: &impl TokenSource,
     settings: &Settings,

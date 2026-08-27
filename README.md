@@ -14,41 +14,34 @@ single-digit milliseconds.
 
 ## Install
 
-Releases are cut from git tags and publish one static binary per platform, plus a Homebrew formula, a
-shell installer, and a Windows MSI. There is no published release yet — the commands below are the
-contract the release pipeline implements, and they start working with the first tag.
+**macOS only, for now.** Releases are cut from git tags and publish one binary per Apple target, plus a
+Homebrew formula and a shell installer. Linux and Windows are not built or tested at the moment; the
+source still carries their platform branches, so re-adding them is a configuration change rather than a
+rewrite. There is no published release yet — the commands below are the contract the release pipeline
+implements, and they start working with the first tag.
 
-**Homebrew** (macOS and Linux):
+**Homebrew**:
 
 ```sh
 brew install zhew1585/tap/outline-cli
 ```
 
-**Shell installer** (macOS and Linux; installs into `$CARGO_HOME/bin`):
+**Shell installer** (installs into `$CARGO_HOME/bin`):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/zhew1585/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
 ```
 
-**Windows**: download `outline-cli-x86_64-pc-windows-msvc.msi` from the
-[latest release](https://github.com/zhew1585/outline-cli/releases/latest) and run it. The MSI adds
-`otl` to `PATH` and uninstalls through Settings → Apps like any other Windows program. It is **not
-code-signed** — SmartScreen will warn on first run, and "More info → Run anyway" is the way past it.
-Signing needs a purchased certificate; until there is one, verify the download with the attestation
-below rather than trusting the publisher prompt.
-
 Prebuilt archives are attached to every release for these targets:
 
 | Platform | Target triple | Notes |
 |----------|---------------|-------|
 | macOS (Apple Silicon) | `aarch64-apple-darwin` | |
-| macOS (Intel) | `x86_64-apple-darwin` | |
-| Linux (x86-64) | `x86_64-unknown-linux-musl` | statically linked, no glibc version floor |
-| Windows (x86-64) | `x86_64-pc-windows-msvc` | also shipped as an MSI |
+| macOS (Intel) | `x86_64-apple-darwin` | separate thin archive, not a universal binary |
 
-**Verifying a download.** Every release artifact — the per-platform archives, the MSI, and also the shell
-installer, the Homebrew formula and `sha256.sum` — carries a GitHub build attestation, so you can check
+**Verifying a download.** Every release artifact — both archives, and also the shell installer, the
+Homebrew formula and `sha256.sum` — carries a GitHub build attestation, so you can check
 it was produced by this repository's release workflow rather than merely that it matches a checksum
 published alongside it:
 
@@ -58,7 +51,7 @@ gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo zhew1585/ou
 
 **`otl` never checks for updates.** No telemetry, no update ping, no background spec fetch — the binary
 makes exactly the network requests your command implies. Upgrading is something you do: `brew upgrade`,
-re-run the shell installer, or install the newer MSI.
+or re-run the shell installer.
 
 **From source** (Rust stable, `rust-version` 1.85):
 
@@ -76,6 +69,7 @@ export OUTLINE_URL=https://outline.example.com
 export OUTLINE_API_KEY=...            # Settings → API in your Outline instance
 
 otl api list                          # every callable operation in the vendored spec
+otl api describe documents.info       # what it takes and what it returns
 otl api documents.info id=<doc-id>    # call any of them
 otl api documents.search query=deploy --json | jq '.[].title'
 ```
@@ -88,6 +82,43 @@ otl api documents.list limit=25 template=false   # native JSON number and boolea
 otl api documents.info id=not-a-uuid             # exits 2, no request sent
 otl api shares.create --body @share.json         # oneOf/anyOf bodies go through --body verbatim
 ```
+
+### Discovering what to call
+
+Both discovery commands are purely local — they read the operation table compiled into the binary (or
+the one `otl spec sync` installed) and send nothing.
+
+```sh
+otl api list                             # every operation: name, summary, path, content type, callable
+otl api describe documents.info          # one operation's full contract
+otl api documents.info --help            # the same thing, from the flag you would reach for
+otl api describe documents.list --json | jq '.parameters[] | {name, type, required, description}'
+```
+
+`describe` prints exactly what the CLI itself knows: every parameter with its type, whether it is
+required, whether it may be `null`, its `format`, its allowed values, its numeric bounds — the same
+facets local validation enforces and `--no-validate` skips — and the one-line description the OpenAPI
+document gives it, plus the response fields, the request path and content type, whether the operation
+paginates, and which table the answer came from (`built-in` or `synced`).
+
+The descriptions matter more than they look. Of the 109 operations that take parameters, **29 mark none
+of them required** — `documents.info` declares both `id` and `shareId` optional, and only the prose says
+"either the UUID or the urlId is acceptable". Without that line, `required: false` everywhere reads as
+"nothing has to be sent". 23 of the 29 carry prose that resolves it; the remaining 6 are as loose
+upstream as they look here, and `describe` does not invent a constraint the spec never stated.
+
+Both obey the usual dual-state rule: a terminal gets a readable rendering, a pipe or `--json` gets
+JSON. (Before 0.2, `otl api list` printed its tab-separated form into pipes as well, `--json` included.
+That was a bug, and `otl api` output is not covered by semver — a script that parsed those columns
+should read the JSON array now.)
+
+`list` deliberately stops at what is needed to *choose* an operation. A partial contract — parameter
+names with no types, no facets and no response shape — reads like the answer while being a fragment of
+one, so the contract is published in exactly one place and in full.
+
+`list` and `describe` are reserved words in the operation namespace, which is safe because every real
+operation name is `resource.method`. If a spec you sync ever declares an operation named `list` or
+`describe`, the reserved word still wins and `otl` says so on stderr rather than shadowing it silently.
 
 ## Signing in
 
@@ -205,11 +236,19 @@ requests. When upstream adds an endpoint you need before the next release:
 otl spec sync                          # fetch upstream, compile once, cache the IR
 otl spec sync --spec ./spec3.json      # or compile a local document (development override)
 otl api list                           # the new operations are here immediately
+otl api describe things.new            # and `describe` answers from the synced table, not the built-in one
 otl spec reset                         # go back to the spec built into this binary
 ```
 
 Nothing checks for spec updates on its own: `otl` never contacts the network unless a command you ran
 requires it.
+
+An `otl` upgrade can change the shape of the compiled operation table, and when it does, a cache written
+by the previous version is **discarded, not migrated**: interpreting an old table with new rules is a
+worse risk than rebuilding a file that is regenerable by definition. That is not an error — commands keep
+working on the spec built into the binary, and one stderr line says the cache was outdated and names
+`otl spec sync` as the fix. `otl doctor` reports it too. (0.2 does exactly this: the table now carries
+each parameter's description.)
 
 ## Checking your environment
 
@@ -446,16 +485,20 @@ and full-disk encryption.
 cargo test --workspace                                  # unit, wiremock, golden-file, and CLI tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-bash scripts/win-check.sh                               # lints for Windows from a Unix machine
+bash scripts/win-check.sh                               # lints the retained cfg(windows) source
 bash scripts/bench-startup.sh                           # asserts otl --help stays under 10ms
-bash scripts/check-binary-size.sh                       # asserts the shipped binary stays under 4 MiB
+bash scripts/check-binary-size.sh                       # per-target size budget (both Apple triples)
+bash scripts/check-all.sh                               # all of the above, with real exit statuses
 ```
 
-`win-check.sh` is the one that is easy to skip and expensive to skip. Three of the five commands above
-run for the machine you are on; a `#[cfg(unix)]` block leaves imports, `mut` bindings and whole
-functions unused on Windows, where CI runs the same clippy with `-D warnings` and turns each into a
-build failure. None of that is visible locally, so it has to be asked for — always after splitting or
-adding a file that carries a `cfg`.
+`win-check.sh` needs a word of explanation now that Windows is not shipped. Windows is not built, tested
+or published, but the `#[cfg(windows)]` branches and `tests/portability.rs` are deliberately kept so
+re-adding the platform is an edit rather than a rewrite — and macOS never compiles those branches, so
+without this they would rot unnoticed. A `#[cfg(unix)]` block leaves imports, `mut` bindings and whole
+functions unused on Windows, and `cargo test`/`cargo fmt` cannot see any of it; that is how two
+`doc_lazy_continuation` violations reached the tree before. It is clippy-only, so it needs no Windows
+machine, and it also runs in CI (`windows-source-lint`) rather than depending on anyone remembering the
+flag. Run it after splitting or adding a file that carries a `cfg`.
 
 Releasing is `git tag`: [`dist-workspace.toml`](dist-workspace.toml) is the single description of every
 distribution channel, and `.github/workflows/release.yml` is generated from it by
@@ -467,9 +510,8 @@ Two things guard a release, and both are wired so that failing them actually sto
 
 - **`release-guards.yml`** runs alongside the build matrix as one of dist's `local-artifacts-jobs`. It
   verifies the cargo-dist installer against a committed checksum before running it, checks that the
-  generated workflow is in sync and has not drifted from dist's WiX template, that every action is pinned
-  to a commit SHA, that all six artifacts are planned, that no updater has crept in, that the version can
-  be expressed as an MSI, and that the Homebrew tap and its token actually exist.
+  generated workflow is in sync, that every action is pinned to a commit SHA, that all four artifacts are
+  planned, that no updater has crept in, and that the Homebrew tap and its token actually exist.
 - **The binary-size budget** runs *inside* dist's own build job (injected via
   `.github/build-setup/release-build-setup.yml`), once per published target. `binary-size.yml` runs the
   same script on pull requests for early feedback.
@@ -481,9 +523,12 @@ skipped changes nothing. Failing `release-guards` or failing a build job skips `
 `scripts/check-release-gating.sh` asserts that chain against the generated workflow on every run, so a
 cargo-dist upgrade cannot quietly unhook it.
 
-CI runs the matrix on macOS, Linux, and Windows, guards the startup budget, and asserts that no
-YAML/OpenAPI parser ever enters the runtime dependency graph. Contract tests against a real workspace run
-only on pushes to `main`/`develop`, gated on repository secrets, and are skipped when those are absent.
+CI builds and tests on macOS — the only shipped platform — guards the startup budget there rather than on
+a machine nobody ships, lints the retained Windows source without a Windows runner, and asserts that no
+YAML/OpenAPI parser enters the runtime dependency graph of either shipped target (that graph is
+platform-specific, so the check names its targets instead of inheriting the runner's). Contract tests
+against a real workspace run only on pushes to `main`/`develop`, gated on repository secrets, and are
+skipped when those are absent.
 
 `scripts/test_oauth.py` is a stdlib-only probe for the OAuth flow (discovery, dynamic client
 registration, PKCE, loopback redirect, refresh, revocation) against a real instance:

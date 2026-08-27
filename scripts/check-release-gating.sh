@@ -154,6 +154,42 @@ require(
     "this gating check itself runs inside build-local-artifacts",
 )
 
+
+def step_blocks(job_body: str) -> list:
+    """Split a job body into its individual step blocks."""
+    blocks, current = [], None
+    for line in job_body.splitlines():
+        if line.startswith("      - "):
+            if current is not None:
+                blocks.append("\n".join(current))
+            current = [line]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+# Being present in the file is not the same as running. These steps used to
+# carry `if: runner.os == 'Linux'`, which became a silent no-op the moment
+# the release stopped having a Linux leg - the assertions above still found
+# them by name while the condition guaranteed they never executed. So assert
+# the gate steps are unconditional. Other steps in the job may legitimately
+# be platform-gated (a cross toolchain install, say); only the gates may not.
+for script in ("check-binary-size.sh", "check-release-gating.sh", "check-action-pins.sh"):
+    owning = [b for b in step_blocks(build_local) if script in b]
+    require(
+        len(owning) == 1,
+        f"exactly one build-local-artifacts step runs {script} (found {len(owning)})",
+    )
+    if len(owning) == 1:
+        conditioned = re.search(r"^\s+if:", owning[0], re.MULTILINE)
+        require(
+            conditioned is None,
+            f"the step running {script} is unconditional "
+            f"(a platform `if:` here disables the gate without removing it)",
+        )
+
 # 3. Least privilege for the only job that compiles the crate graph, i.e.
 #    that executes dependency build scripts. This block is emitted solely
 #    because `github-attestations-phase` is left at build-local-artifacts;

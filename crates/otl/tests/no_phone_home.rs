@@ -763,7 +763,15 @@ fn the_document_channel_exports_only_what_is_reviewed() {
 #[test]
 fn a_local_command_works_with_every_outbound_route_dead() {
     let cache = TempDir::new().unwrap();
-    for args in [vec!["api", "list"], vec!["--help"], vec!["--version"]] {
+    for args in [
+        vec!["api", "list"],
+        // The discovery pair from Story 4.6: both read the compiled table
+        // and nothing else, so both belong in this list.
+        vec!["api", "describe", "documents.info"],
+        vec!["api", "documents.info", "--help"],
+        vec!["--help"],
+        vec!["--version"],
+    ] {
         Command::cargo_bin("otl")
             .unwrap()
             .env("OTL_CACHE_DIR", cache.path())

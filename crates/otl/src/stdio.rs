@@ -109,9 +109,41 @@ pub fn scrub_terminal_controls(text: &str) -> String {
         .collect()
 }
 
+/// [`scrub_terminal_controls`], and then force the result onto ONE line.
+///
+/// For the human renderings that are built as a LIST of lines and joined:
+/// `otl doctor`'s report and every `otl auth` result. There, a foreign value
+/// that arrived with a newline - a profile name out of a config file, an
+/// account name from the server, a path from the environment - must not be
+/// able to add an entry and pose as another line's verdict.
+///
+/// The newline exception in [`scrub_terminal_controls`] exists because an
+/// authored diagnostic legitimately spans lines. That is a property of the
+/// MESSAGE, not of a value inside it, so the surfaces that assemble their own
+/// lines take this instead. Shared rather than copied per surface: the two
+/// that need it reached for it independently, and a second copy is how one of
+/// them ends up without the fold.
+pub fn scrub_to_one_line(text: &str) -> String {
+    scrub_terminal_controls(text).replace('\n', " ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_line_scrubbing_folds_a_forged_entry_back_into_its_line() {
+        // A profile name carrying a newline would otherwise read as a second
+        // entry in whatever list it was interpolated into.
+        let folded = scrub_to_one_line("profile: real\nmethod: forged");
+        assert!(!folded.contains('\n'), "{folded:?}");
+        assert!(folded.starts_with("profile: real"), "{folded:?}");
+        // And the hazards `scrub_terminal_controls` removes still go, each
+        // the way that function decided: a bidi override is DROPPED (it
+        // occupies no column, so a marker would widen the text) and a
+        // control becomes a space (it usually stands where one belongs).
+        assert_eq!(scrub_to_one_line("a\u{202e}b\u{1b}c"), "ab c");
+    }
 
     #[test]
     fn scrubbing_removes_terminal_control_sequences() {

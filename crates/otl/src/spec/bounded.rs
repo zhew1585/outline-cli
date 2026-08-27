@@ -90,7 +90,7 @@
 //! the bound; this list is how it is achieved.
 //!
 //! Both directions use the same rules: [`encode_table`] refuses to write
-//! anything [`decode_table`] would refuse to read.
+//! anything [`decode_ops`] would refuse to read.
 
 use std::mem::size_of;
 
@@ -259,7 +259,7 @@ fn meta_record_config() -> impl bincode::config::Config {
 
 /// Frame a table into the body of a cache file.
 ///
-/// Applies every rule [`decode_table`] applies, so a table that is written
+/// Applies every rule [`decode_ops`] applies, so a table that is written
 /// can always be read back.
 pub(super) fn encode_table(meta: &CacheMeta, ops: &[OpSpec]) -> Result<Vec<u8>, TableError> {
     check_table(ops)?;
@@ -315,13 +315,34 @@ pub(super) fn check_table(ops: &[OpSpec]) -> Result<(), TableError> {
     Ok(())
 }
 
-/// Decode a framed table, refusing anything that would cost more than the
-/// budgets allow.
-pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), TableError> {
+/// Decode the provenance record of a framed table, returning it and the
+/// cursor just after it.
+///
+/// The provenance record and the operations are decoded through SEPARATE
+/// entry points, and the split is not cosmetic: the operation records are
+/// `bincode`, which is positional and carries no field names, so decoding a
+/// table written for another `IR_SCHEMA_VERSION` reads one struct's bytes as
+/// another's. It usually errors - and would then be reported as a DAMAGED
+/// cache rather than an outdated one, which is a lie about what happened and
+/// sends the user looking for corruption - but with the right byte alignment
+/// it could also decode into a table that is merely wrong.
+///
+/// The provenance record is the first thing in the body and says which
+/// version wrote it, so the caller checks that BEFORE calling
+/// [`decode_ops`]. `crates/otl/tests/ir_upgrade.rs` drives a real v5 cache
+/// through that order.
+///
+/// This record is self-delimiting and length-bounded, so it can be read from
+/// a body whose remaining records this build may not understand at all.
+pub(super) fn decode_meta(body: &[u8]) -> Result<(CacheMeta, usize), TableError> {
     let mut cursor = 0usize;
     let meta_record = take_record(body, &mut cursor, MAX_META_RECORD_BYTES)?;
     let meta: CacheMeta = decode_record(meta_record, meta_record_config())?;
+    Ok((meta, cursor))
+}
 
+/// Decode the operation records that follow the provenance record.
+pub(super) fn decode_ops(body: &[u8], mut cursor: usize) -> Result<Vec<OpSpec>, TableError> {
     let count = take_len(body, &mut cursor)?;
     let mut footprint = check_declared_count(count, body.len().saturating_sub(cursor))?;
     let mut ops: Vec<OpSpec> = Vec::with_capacity(count);
@@ -343,7 +364,7 @@ pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Tabl
             body.len() - cursor
         )));
     }
-    Ok((meta, ops))
+    Ok(ops)
 }
 
 /// Vet a declared operation count before anything is reserved for it, and

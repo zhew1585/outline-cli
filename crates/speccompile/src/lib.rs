@@ -99,6 +99,9 @@ pub struct CompiledParam {
     pub minimum: Option<f64>,
     /// Inclusive upper bound for numeric parameters, if any.
     pub maximum: Option<f64>,
+    /// One-line prose from the source schema, already sanitized and capped;
+    /// empty when the schema declares none.
+    pub description: String,
 }
 
 /// One field of an operation's success response payload.

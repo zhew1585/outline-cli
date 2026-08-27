@@ -23,7 +23,7 @@ const API_PATH_PREFIX: &str = "/api";
 /// and never in the engine or the compiler.
 const ENVELOPE_DATA_PROPERTY: &str = "data";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 5;
+const IR_SCHEMA_VERSION: u32 = 6;
 
 fn main() {
     println!("cargo:rerun-if-changed=spec/spec3.json");
@@ -169,6 +169,11 @@ fn render_param(out: &mut String, param: &CompiledParam) {
         "                minimum: {}, maximum: {},",
         render_bound(param.minimum),
         render_bound(param.maximum)
+    );
+    let _ = writeln!(
+        out,
+        "                description: ::std::borrow::Cow::Borrowed({:?}),",
+        param.description
     );
     let _ = writeln!(out, "            }},");
 }

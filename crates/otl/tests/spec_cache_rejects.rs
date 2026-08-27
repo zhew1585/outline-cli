@@ -456,6 +456,7 @@ fn a_cache_whose_operations_decode_to_too_much_memory_is_refused() {
             format: String::new().into(),
             minimum: None,
             maximum: None,
+            description: String::new().into(),
         })
         .collect::<Vec<_>>()
         .into();
@@ -501,6 +502,7 @@ fn an_operation_packed_with_enum_containers_is_refused() {
             format: String::new().into(),
             minimum: None,
             maximum: None,
+            description: String::new().into(),
         })
         .collect::<Vec<_>>()
         .into();
@@ -653,6 +655,7 @@ fn each_resource_limit_reports_its_own_cause_and_remedy() {
             format: String::new().into(),
             minimum: None,
             maximum: None,
+            description: String::new().into(),
         })
         .collect::<Vec<_>>()
         .into();

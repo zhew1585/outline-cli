@@ -32,6 +32,7 @@ pub const fn param(name: &'static str, ty: ParamType) -> ParamSpec {
         format: Cow::Borrowed(""),
         minimum: None,
         maximum: None,
+        description: Cow::Borrowed(""),
     }
 }
 

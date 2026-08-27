@@ -13,6 +13,15 @@
 # Usage: bash scripts/check-all.sh [--windows] [--linux]
 #   --windows  also cross-check for x86_64-pc-windows-msvc (needs the target)
 #   --linux    also run the suite on real Linux in docker (needs docker)
+#
+# Only macOS ships (Story 4.7), so the two platform flags are no longer part
+# of any promise. `--windows` is kept because it is the ONLY thing that
+# type-checks the `#[cfg(windows)]` branches this repository deliberately
+# retains - macOS never compiles them - and it now also runs in CI
+# (ci.yml `windows-source-lint`) so it is an executed check rather than a
+# flag nobody remembers. `--linux` is kept for the same reason in reverse: it
+# is cheap, and it is how a Linux regression would be noticed before the
+# platform is re-added.
 set -uo pipefail
 
 # `|| exit` matters here for the same reason as the header above: without it a
@@ -51,10 +60,15 @@ run "cargo fmt --check" cargo fmt --all -- --check
 run "cargo clippy -D warnings" cargo clippy --workspace --all-targets -- -D warnings
 run "cargo test --workspace" cargo test --workspace
 run "cargo doc" cargo doc --workspace --no-deps
-run "binary size" bash scripts/check-binary-size.sh
+# Both shipped triples, because both are published and both are measurable
+# here. The x86_64 one is a cross-build; while musl shipped, its size could
+# only ever be measured in CI.
+run "binary size (aarch64-apple-darwin)" env BINARY_SIZE_TARGET=aarch64-apple-darwin bash scripts/check-binary-size.sh
+run "binary size (x86_64-apple-darwin)" env BINARY_SIZE_TARGET=x86_64-apple-darwin bash scripts/check-binary-size.sh
 
 if [ "$WITH_WINDOWS" = 1 ]; then
-  echo "windows cross-check:"
+  # Not a platform promise: this lints retained cfg(windows) source only.
+  echo "windows source lint (cfg(windows) branches macOS never compiles):"
   run "win-check.sh" bash scripts/win-check.sh
 fi
 

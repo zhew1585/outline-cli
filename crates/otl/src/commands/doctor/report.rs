@@ -25,9 +25,17 @@
 //! it for stderr. Doing it per call site is how a surface ends up with one
 //! forgotten interpolation.
 //!
-//! `--json` is exempt, for the reason stated in [`crate::text`]: JSON is the
-//! payload, not a rendering, and altering it to protect a terminal would
-//! corrupt the data a script consumes.
+//! **`--json` is NOT exempt either**, and the sentence that used to stand
+//! here saying it was is worth naming rather than deleting: it read "JSON is
+//! the payload, not a rendering". That is true of a SERVER RESPONSE, whose
+//! contract is to round-trip byte-for-byte
+//! ([`crate::render::render`], pinned by `render_golden`). It is not true of
+//! this report, which `otl` writes itself and which nothing round-trips - and
+//! the sentence sat two screens above an `emit` that had taken the exemption
+//! by analogy. Both go through the same values; the output STATE does not
+//! change what they are. So the JSON branch renders through
+//! [`crate::render::render_json_scrubbed`], and
+//! `the_json_report_is_scrubbed_too_because_otl_wrote_it` holds it there.
 
 use serde_json::{Map, Value};
 
@@ -183,12 +191,13 @@ impl Check {
 }
 
 /// One line of human output, with everything a terminal would execute
-/// removed.
+/// removed and the result forced onto ONE line.
 ///
-/// The line is also forced onto ONE line: a foreign value that arrived with
-/// a newline must not be able to pose as another check's verdict.
+/// [`stdio::scrub_to_one_line`] is the shared rule; the fold matters here
+/// because a foreign value that arrived with a newline must not be able to
+/// pose as another check's verdict.
 fn human_line(text: &str) -> String {
-    stdio::scrub_terminal_controls(text).replace('\n', " ")
+    stdio::scrub_to_one_line(text)
 }
 
 // --- fact values -------------------------------------------------------
@@ -312,14 +321,30 @@ impl Report {
 /// The one thing on stderr is the blocking finding, printed by `main` as the
 /// error that carries the exit code.
 pub fn emit(report: &Report, mode: OutputMode) -> Result<(), CliError> {
+    stdio::write_data_line(&rendered(report, mode)?)
+}
+
+/// The exact bytes [`emit`] writes, so a test can ask about them.
+///
+/// Split out rather than tested through stdout: the property that matters
+/// here is which RENDERER each state uses, and a test that reached for
+/// `render_json_scrubbed` itself would keep passing if this function stopped
+/// calling it.
+fn rendered(report: &Report, mode: OutputMode) -> Result<String, CliError> {
     match mode {
         OutputMode::Json => {
-            let rendered = render::render_json(&report.value()).map_err(|error| {
+            // `render_json_scrubbed`, not `render_json`: this object is one
+            // `otl` writes, not a server response to round-trip, so the
+            // `--json` exemption in `crate::text` does not reach it. The
+            // report interpolates a profile name, a path from the
+            // environment, an operation name from a fetched document and a
+            // server's error text - the same foreign values `human_line`
+            // scrubs on the other branch.
+            render::render_json_scrubbed(&report.value()).map_err(|error| {
                 CliError::failure(anyhow::anyhow!("failed to render the report: {error}"))
-            })?;
-            stdio::write_data_line(&rendered)
+            })
         }
-        OutputMode::Table => stdio::write_data_line(&report.lines().join("\n")),
+        OutputMode::Table => Ok(report.lines().join("\n")),
     }
 }
 
@@ -444,6 +469,36 @@ mod tests {
             lines.iter().all(|line| !line.contains('\n')),
             "a rendered line still contains a newline: {lines:?}"
         );
+    }
+
+    /// The same scrub, on the state the human rendering does not cover.
+    ///
+    /// This report is a document `otl` WRITES, not a server response, so the
+    /// `--json` exemption in `crate::text` does not reach it - it was
+    /// applied here by analogy, and R1 review called that out. The
+    /// assertion is on `rendered`, the function `emit` actually calls, so
+    /// reverting it to `render_json` turns this red.
+    #[test]
+    fn the_json_report_is_scrubbed_too_because_otl_wrote_it() {
+        use crate::text::has_hazard;
+
+        let hostile = "profile \u{1b}]52;c;cGF3bmVk\u{7}evil\u{202e}\u{200f}\u{061c}";
+        assert!(
+            has_hazard(hostile),
+            "the fixture carries no hazard: this test would be vacuous"
+        );
+        let report = Report {
+            checks: vec![Check::new("credentials", Status::Warn, hostile)
+                .fact("credential_file", hostile)
+                .detailed(vec![hostile.to_string()])],
+        };
+        let json = rendered(&report, OutputMode::Json).expect("rendered");
+        for line in json.lines() {
+            assert!(!has_hazard(line), "{line:?}");
+        }
+        // Still a usable document, not an empty one.
+        assert!(json.contains("credentials"), "{json}");
+        assert!(json.contains("profile"), "{json}");
     }
 
     #[test]
