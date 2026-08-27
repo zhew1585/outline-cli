@@ -175,22 +175,14 @@ fn list(args: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), 
     let rows = session.call_rows("comments.list", &request, args.limit)?;
     let incomplete = rows.incomplete().copied();
     let fetched = rows.items.len();
+    let mut dropped = Dropped::default();
     let filtered: Vec<Value> = rows
         .items
         .into_iter()
-        .filter(|comment| matches_parent(comment, args.parent.as_deref()))
-        .filter(|comment| matches_status(comment, args.status))
+        .filter(|comment| dropped.keeps(comment, args))
         .collect();
-    // `--limit` is counted by the pagination layer, which sees server rows;
-    // `--status` then drops some of them here. Without this line the stderr
-    // warning says "truncated after N items" while stdout shows fewer, and
-    // the two numbers cannot be reconciled by the reader.
-    if filtered.len() < fetched {
-        stdio::write_diagnostic_line(&format!(
-            "note: {} of {fetched} fetched comment(s) shown; the rest were \
-             dropped by the local --status filter",
-            filtered.len()
-        ));
+    if let Some(note) = dropped.note(filtered.len(), fetched) {
+        stdio::write_diagnostic_line(&note);
     }
     output::emit_server(&Value::Array(filtered), mode)?;
     match incomplete {
@@ -323,6 +315,56 @@ fn matches_parent(comment: &Value, parent: Option<&str>) -> bool {
     parent.is_none_or(|id| fields::string_at(comment, "/parentCommentId") == Some(id))
 }
 
+/// How many rows each local filter removed, and how to say so.
+///
+/// `--limit` is counted by the pagination layer, which sees SERVER rows,
+/// while these filters run afterwards - so without a note the stderr
+/// warning says "truncated after N items" while stdout shows fewer, and the
+/// two numbers cannot be reconciled. The counts are kept apart because the
+/// note names the filter responsible: an earlier version blamed `--status`
+/// for every drop, and printed that even when `--status` was not given and
+/// the parent filter had done it.
+#[derive(Default)]
+struct Dropped {
+    parent: usize,
+    status: usize,
+}
+
+impl Dropped {
+    /// Whether one comment survives both local filters, counting it against
+    /// the one that removed it.
+    fn keeps(&mut self, comment: &Value, args: &ListArgs) -> bool {
+        if !matches_parent(comment, args.parent.as_deref()) {
+            self.parent += 1;
+            return false;
+        }
+        if !matches_status(comment, args.status) {
+            self.status += 1;
+            return false;
+        }
+        true
+    }
+
+    /// The stderr note, or `None` when nothing was dropped.
+    fn note(&self, shown: usize, fetched: usize) -> Option<String> {
+        let mut filters = Vec::new();
+        if self.parent > 0 {
+            filters.push("--parent");
+        }
+        if self.status > 0 {
+            filters.push("--status");
+        }
+        if filters.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "note: {shown} of {fetched} fetched comment(s) shown; the rest \
+             were dropped by the local {} filter",
+            filters.join(" and ")
+        ))
+    }
+}
+
 fn matches_status(comment: &Value, status: Option<Status>) -> bool {
     let resolved = comment
         .get("resolvedAt")
@@ -342,6 +384,8 @@ fn push(request: &mut Vec<(String, String)>, name: &str, value: Option<&String>)
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -361,5 +405,45 @@ mod tests {
             &json!({ "resolvedAt": null }),
             Some(Status::Unresolved)
         ));
+    }
+
+    /// The note names the filter that actually dropped rows. Blaming
+    /// `--status` for a `--parent` drop was reproducible: it printed
+    /// "dropped by the local --status filter" on a run with no `--status`
+    /// at all.
+    #[test]
+    fn the_note_names_the_filter_that_dropped_the_rows() {
+        let parent_only = Dropped {
+            parent: 1,
+            status: 0,
+        };
+        let note = parent_only.note(1, 2).expect("a note");
+        assert!(note.contains("--parent"), "{note}");
+        assert!(!note.contains("--status"), "{note}");
+        assert!(note.contains("1 of 2"), "{note}");
+
+        let status_only = Dropped {
+            parent: 0,
+            status: 3,
+        };
+        let note = status_only.note(2, 5).expect("a note");
+        assert!(
+            note.contains("--status") && !note.contains("--parent"),
+            "{note}"
+        );
+
+        let both = Dropped {
+            parent: 1,
+            status: 1,
+        };
+        let note = both.note(1, 3).expect("a note");
+        assert!(note.contains("--parent and --status"), "{note}");
+    }
+
+    /// Nothing dropped, nothing said: the ordinary path leaves stderr empty.
+    #[test]
+    fn no_note_when_no_row_was_dropped() {
+        assert_eq!(Dropped::default().note(4, 4), None);
+        assert_eq!(Dropped::default().note(0, 0), None);
     }
 }
