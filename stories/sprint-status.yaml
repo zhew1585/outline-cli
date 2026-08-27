@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-08-25
-last_updated: 2026-08-26
+last_updated: 2026-08-27
 project: outline-cli (otl)
 project_key: NOKEY
 tracking_system: file-system
@@ -75,10 +75,12 @@ development_status:
   3-5-collections-list: done
   3-6-docs-export: done
   epic-3-retrospective: optional
-  epic-4: done
+  # Reopened: 4.6 was found by field-testing the discovery flow after 4.5 shipped.
+  epic-4: in-progress
   4-1-config-and-profiles: done
   4-2-spec-sync: done
   4-3-doctor: done
   4-4-shell-completions: done
   4-5-release-pipeline: done
+  4-6-agent-discovery: review
   epic-4-retrospective: optional

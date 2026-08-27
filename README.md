@@ -76,6 +76,7 @@ export OUTLINE_URL=https://outline.example.com
 export OUTLINE_API_KEY=...            # Settings → API in your Outline instance
 
 otl api list                          # every callable operation in the vendored spec
+otl api describe documents.info       # what it takes and what it returns
 otl api documents.info id=<doc-id>    # call any of them
 otl api documents.search query=deploy --json | jq '.[].title'
 ```
@@ -88,6 +89,38 @@ otl api documents.list limit=25 template=false   # native JSON number and boolea
 otl api documents.info id=not-a-uuid             # exits 2, no request sent
 otl api shares.create --body @share.json         # oneOf/anyOf bodies go through --body verbatim
 ```
+
+### Discovering what to call
+
+Both discovery commands are purely local — they read the operation table compiled into the binary (or
+the one `otl spec sync` installed) and send nothing.
+
+```sh
+otl api list                             # every operation: name, summary, path, content type, callable
+otl api describe documents.info          # one operation's full contract
+otl api documents.info --help            # the same thing, from the flag you would reach for
+otl api describe documents.list --json | jq '.parameters[] | select(.required)'
+```
+
+`describe` prints exactly what the CLI itself knows: every parameter with its type, whether it is
+required, whether it may be `null`, its `format`, its allowed values and its numeric bounds — the same
+facets local validation enforces and `--no-validate` skips — plus the response fields, the request path
+and content type, whether the operation paginates, and which table the answer came from (`built-in` or
+`synced`). It does **not** print the per-parameter prose from the OpenAPI document: that text is not
+compiled into the binary.
+
+Both obey the usual dual-state rule: a terminal gets a readable rendering, a pipe or `--json` gets
+JSON. (Before 0.2, `otl api list` printed its tab-separated form into pipes as well, `--json` included.
+That was a bug, and `otl api` output is not covered by semver — a script that parsed those columns
+should read the JSON array now.)
+
+`list` deliberately stops at what is needed to *choose* an operation. A partial contract — parameter
+names with no types, no facets and no response shape — reads like the answer while being a fragment of
+one, so the contract is published in exactly one place and in full.
+
+`list` and `describe` are reserved words in the operation namespace, which is safe because every real
+operation name is `resource.method`. If a spec you sync ever declares an operation named `list` or
+`describe`, the reserved word still wins and `otl` says so on stderr rather than shadowing it silently.
 
 ## Signing in
 
@@ -205,6 +238,7 @@ requests. When upstream adds an endpoint you need before the next release:
 otl spec sync                          # fetch upstream, compile once, cache the IR
 otl spec sync --spec ./spec3.json      # or compile a local document (development override)
 otl api list                           # the new operations are here immediately
+otl api describe things.new            # and `describe` answers from the synced table, not the built-in one
 otl spec reset                         # go back to the spec built into this binary
 ```
 

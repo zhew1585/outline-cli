@@ -8,20 +8,36 @@
 //! the vendored spec rejects (spec drift), and `--show-server-message`
 //! restores the server's error text for a `--body` request, which is
 //! withheld by default because it may quote the body.
+//!
+//! # Three jobs, three modules
+//!
+//! This module owns CALLING an operation. The other two are local-only and
+//! answer the questions a caller has before it can call anything:
+//!
+//! - [`list`] - which operations exist ([`LIST_OPERATION`]);
+//! - [`describe`] - what one operation takes and returns
+//!   ([`DESCRIBE_OPERATION`]).
+//!
+//! Both are reserved first positionals rather than clap subcommands; see
+//! [`reserved`] for why, and for what happens if a spec ever declares an
+//! operation by one of those names.
+
+mod describe;
+mod list;
+mod reserved;
 
 use std::fs::File;
 use std::io::Read;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{BodyMode, EngineError, ErrorDetail, Fetched, ValidationMode};
+use engine::{EngineError, ErrorDetail, Fetched, OpSpec, ValidationMode};
 use serde_json::Value;
 
 use crate::auth;
 use crate::config::Overrides;
 use crate::errors::map_engine_error_with_hint;
 use crate::exit::CliError;
-use crate::ops;
 use crate::paging;
 use crate::render::{self, OutputMode};
 use crate::session::{self, UNCONFIRMED_OFFSET_NOTICE};
@@ -38,12 +54,13 @@ const SHOW_MESSAGE_HINT: &str =
 const DEDICATED_COMMAND_HINT: &str =
     "it is not callable via `otl api`; a dedicated command is planned";
 
-/// Marker appended in `otl api list` to operations that cannot be called.
-const NOT_CALLABLE_MARKER: &str = "[not callable via api";
-
 /// Reserved word: `otl api list` enumerates operations instead of calling
-/// one. Safe because real operation names always contain a `.`.
-const LIST_OPERATION: &str = "list";
+/// one.
+pub(crate) const LIST_OPERATION: &str = "list";
+
+/// Reserved word: `otl api describe <operation>` prints one operation's
+/// full request/response contract instead of calling it.
+pub(crate) const DESCRIBE_OPERATION: &str = "describe";
 
 /// Maximum accepted size of a `--body` file.
 ///
@@ -52,15 +69,35 @@ const LIST_OPERATION: &str = "list";
 pub const MAX_BODY_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Arguments for `otl api`.
+///
+/// `disable_help_flag` plus the hand-rolled [`ApiArgs::help`] below is what
+/// makes `otl api documents.info --help` describe THAT operation. clap's own
+/// help flag is handled during parsing and prints the subcommand's help
+/// whatever else is on the line, so `otl api documents.info --help` used to
+/// print the generic `otl api` help - text that looks authoritative and says
+/// nothing about `documents.info`. For an agent probing the CLI that is
+/// worse than an error: an error makes it try something else, a plausible
+/// wrong answer does not.
 #[derive(Debug, Args)]
+#[command(disable_help_flag = true)]
 pub struct ApiArgs {
-    /// API operation name, e.g. `documents.info` (or `list` to enumerate
-    /// all operations).
-    pub operation: String,
+    /// API operation name, e.g. `documents.info`. Two reserved words:
+    /// `list` enumerates every operation, `describe <operation>` prints one
+    /// operation's parameters and response fields.
+    // `Option` only so `otl api --help` can be answered without a name;
+    // `required_unless_present` keeps it mandatory everywhere else, so every
+    // path that needs a name below is guaranteed one by clap.
+    #[arg(required_unless_present = "help")]
+    pub operation: Option<String>,
 
     /// Request parameters as `key=value` pairs.
     #[arg(value_name = "KEY=VALUE")]
     pub args: Vec<String>,
+
+    /// Describe the named operation (same as `otl api describe <operation>`),
+    /// or print this help when no operation is named.
+    #[arg(short, long, action = clap::ArgAction::SetTrue)]
+    pub help: bool,
 
     /// Raw JSON request body from a file (`--body @file.json`), sent
     /// verbatim. Mutually exclusive with `key=value` arguments.
@@ -100,26 +137,42 @@ enum Payload {
 /// before any network request.
 ///
 /// `overrides` carries the command-line configuration layer, which outranks
-/// the environment and the user config file key by key.
-pub fn run(cmd: &ApiArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
-    if cmd.operation == LIST_OPERATION {
-        return run_list(cmd);
+/// the environment and the user config file key by key. `root` builds the
+/// whole clap command on demand, and is only called to render `otl api
+/// --help`: passing the builder rather than the built command keeps the
+/// cost off every other invocation, and rendering from the REAL command
+/// tree is what keeps that help text identical to the one clap used to
+/// print (global flags included) instead of a second, drifting copy.
+///
+/// Three of the four paths below are purely local - `list`, `describe` and
+/// any form of `--help` need no configuration, no credential and no
+/// network - so they are resolved before [`auth::client`] is ever built.
+pub fn run(
+    cmd: &ApiArgs,
+    mode: OutputMode,
+    overrides: &Overrides,
+    root: fn() -> clap::Command,
+) -> Result<(), CliError> {
+    match reserved::dispatch(cmd, mode, root)? {
+        reserved::Next::Done => Ok(()),
+        reserved::Next::Call(op) => call(cmd, op, mode, overrides),
     }
-    let op = ops::find(&cmd.operation).ok_or_else(|| {
-        CliError::usage(anyhow!(
-            "unknown API operation {:?}; operation names follow the \
-             `resource.method` form, e.g. `documents.info` \
-             (run `otl api list` to see all operations)",
-            cmd.operation
-        ))
-    })?;
+}
+
+/// Call one operation over the network and print its response.
+fn call(
+    cmd: &ApiArgs,
+    op: &'static OpSpec,
+    mode: OutputMode,
+    overrides: &Overrides,
+) -> Result<(), CliError> {
     let payload = build_payload(cmd)?;
     // A raw --body is sent verbatim and once, so pagination never applies.
     let pagination = match &payload {
         Payload::KeyValue(_) => paging::spec_for(op),
         Payload::Raw(_) => None,
     };
-    check_limit_usage(cmd, &payload, pagination.is_some())?;
+    check_limit_usage(cmd, op, &payload, pagination.is_some())?;
     // One place resolves configuration AND the credential for every command,
     // and hands the request channel a source that renews itself. `otl api`
     // must not build its own client: renewal, the transport rule and the
@@ -154,7 +207,12 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode, overrides: &Overrides) -> Result<(),
 /// mean different things and would silently fight each other, so asking
 /// for both is a usage error rather than a guess. `--limit` on a `--body`
 /// call or on an operation that does not paginate would be a silent no-op.
-fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Result<(), CliError> {
+fn check_limit_usage(
+    cmd: &ApiArgs,
+    op: &OpSpec,
+    payload: &Payload,
+    paginated: bool,
+) -> Result<(), CliError> {
     if cmd.limit.is_none() {
         return Ok(());
     }
@@ -172,7 +230,7 @@ fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Resul
         return Err(CliError::usage(anyhow!(
             "--limit applies only to list operations called with key=value \
              arguments, and {:?} does not paginate here; drop --limit",
-            cmd.operation
+            op.name
         )));
     }
     Ok(())
@@ -293,37 +351,6 @@ fn hint_for(error: &EngineError, detail: ErrorDetail) -> Option<&'static str> {
         return Some(BODY_HINT);
     }
     None
-}
-
-/// Print every compiled operation as `name<TAB>summary`, one per line.
-/// Purely local: needs no configuration and touches no network.
-///
-/// Operations the generic client cannot call are listed too, but flagged
-/// with the content type they need.
-fn run_list(cmd: &ApiArgs) -> Result<(), CliError> {
-    let request_flags = cmd.body.is_some() || cmd.show_server_message || cmd.no_validate;
-    if !cmd.args.is_empty() || request_flags {
-        return Err(CliError::usage(anyhow!(
-            "`otl api list` takes no further arguments or request flags"
-        )));
-    }
-    let mut out = String::new();
-    for op in ops::table() {
-        out.push_str(&op.name);
-        out.push('\t');
-        out.push_str(&op.summary);
-        if op.body_mode == BodyMode::Unsupported {
-            out.push(' ');
-            out.push_str(NOT_CALLABLE_MARKER);
-            out.push_str(": requires ");
-            out.push_str(&op.content_type);
-            out.push(']');
-        }
-        out.push('\n');
-    }
-    // Never `print!` on the data path: a consumer that closes the pipe
-    // early (`otl api list | head -1`) must not turn into a panic.
-    stdio::write_data(&out)
 }
 
 /// Parse raw `key=value` CLI arguments; reject malformed ones fail-fast.

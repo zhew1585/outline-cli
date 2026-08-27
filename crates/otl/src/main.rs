@@ -78,7 +78,13 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {
-        Command::Api(args) => api::run(args, mode, &cli.overrides()),
+        // `Cli::command` is passed, not called: `otl api` renders its own
+        // help (so that `otl api <operation> --help` can describe THAT
+        // operation instead), and it renders it from the real command tree
+        // rather than a second copy. Building that tree costs nothing on
+        // every other invocation because the builder is only invoked when
+        // the help is actually wanted.
+        Command::Api(args) => api::run(args, mode, &cli.overrides(), Cli::command),
         Command::Auth(args) => auth::run(args, mode, &cli.overrides()),
         Command::Docs(args) => docs::run(args, mode, cli.json, &cli.overrides()),
         Command::Collections(args) => collections::run(args, mode, &cli.overrides()),

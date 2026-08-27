@@ -182,13 +182,13 @@ pub const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
 pub const FILE_READ_ALLOWLIST: &[Exception] = &[
     // The `--body @file.json` request body, named by the user (Story 1.3).
     Exception {
-        file: "crates/otl/src/commands/api.rs",
+        file: "crates/otl/src/commands/api/mod.rs",
         pattern: "File::open",
         context: "let file = File::open(path)",
         count: 1,
     },
     Exception {
-        file: "crates/otl/src/commands/api.rs",
+        file: "crates/otl/src/commands/api/mod.rs",
         pattern: "read_to_string",
         context: ".read_to_string(&mut raw)",
         count: 1,

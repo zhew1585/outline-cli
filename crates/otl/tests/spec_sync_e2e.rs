@@ -127,7 +127,7 @@ async fn a_synced_spec_replaces_the_built_in_one_entirely() {
     run(cache.path(), &["spec", "sync", "--url", &url]).await;
 
     let (stdout, _, _) = run(cache.path(), &["api", "list"]).await;
-    let listed = stdout.lines().count();
+    let listed = parse(&stdout).as_array().expect("a JSON listing").len();
     assert_eq!(listed, 2, "the whole table comes from the cache: {stdout}");
     // An operation the vendored spec has but this document does not is
     // gone: a sync is a replacement, not a merge.
@@ -455,8 +455,15 @@ async fn a_document_with_terminal_escapes_is_neutralized() {
         "escape reached stdout: {stdout:?}"
     );
     assert!(!stdout.contains('\u{7}'), "bell reached stdout: {stdout:?}");
-    // One operation, one line: the tab could not forge a second column set.
-    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    // One operation, one row: the tab could not forge a second entry, in
+    // either state. (The listing is JSON here, because assert_cmd captures
+    // stdout through a pipe; the tab is gone from the value itself, not
+    // merely escaped by the serializer.)
+    let rows = parse(&stdout);
+    let rows = rows.as_array().expect("a JSON listing");
+    assert_eq!(rows.len(), 1, "{stdout:?}");
+    let summary = rows[0]["summary"].as_str().unwrap_or_default();
+    assert!(!summary.contains('\t'), "tab survived: {summary:?}");
 
     let refused = r#"{"paths":{"/things.info":{"post":{"requestBody":{"content":
         {"application/json":{"schema":{"type":"object","properties":

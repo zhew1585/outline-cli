@@ -1,4 +1,17 @@
-//! `otl api list` end-to-end tests (Story 1.2).
+//! `otl api list` end-to-end tests (Story 1.2, dual state from Story 4.6).
+//!
+//! The listing is purely local, so every case here runs without an instance
+//! URL, without a credential and without a network.
+//!
+//! # Why these assert JSON
+//!
+//! `assert_cmd` captures stdout through a pipe, so these runs are exactly
+//! the non-TTY state the CLI contract describes: `--json` is the default
+//! whenever stdout is not a terminal. Until Story 4.6 this command printed
+//! its terminal form there instead - including when `--json` was passed
+//! explicitly - which is the bug this file now pins shut. The terminal form
+//! is unit-tested in `commands::api::list`, because no integration test can
+//! give the child process a TTY.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -34,70 +47,114 @@ fn spec_op_count() -> usize {
         .count()
 }
 
-#[test]
-fn api_list_prints_one_line_per_spec_operation_without_config() {
-    // Listing is a purely local operation: no OUTLINE_URL / OUTLINE_API_KEY
-    // needed, no network touched.
-    let output = otl().args(["api", "list"]).output().unwrap();
+/// Run `otl api list ...` and parse stdout as the JSON array it must be.
+fn listing(args: &[&str]) -> Vec<Value> {
+    let output = otl().args(["api", "list"]).args(args).output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
-
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines.len(),
-        spec_op_count(),
-        "line count != spec operation count"
-    );
-    // Every line is `name<TAB>summary` with a non-empty summary.
-    for line in &lines {
-        let (name, summary) = line.split_once('\t').unwrap_or_else(|| {
-            panic!("line without tab separator: {line:?}");
-        });
-        assert!(name.contains('.'), "malformed op name: {name:?}");
-        assert!(!summary.trim().is_empty(), "empty summary for {name}");
-    }
+    serde_json::from_str::<Value>(&stdout)
+        .unwrap_or_else(|error| panic!("stdout is not JSON ({error}): {stdout}"))
+        .as_array()
+        .expect("the listing is a JSON array")
+        .clone()
 }
 
 #[test]
-fn api_list_includes_known_operation_with_summary() {
-    otl()
-        .args(["api", "list"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("documents.info"))
-        .stdout(predicate::str::contains("Retrieve a document"))
-        .stdout(predicate::str::contains("collections.list"));
+fn api_list_prints_one_object_per_spec_operation_without_config() {
+    let rows = listing(&[]);
+    assert_eq!(rows.len(), spec_op_count(), "row count != operation count");
+    for row in &rows {
+        let name = row["name"].as_str().expect("every row names an operation");
+        assert!(name.contains('.'), "malformed op name: {name:?}");
+        assert!(
+            row["summary"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty()),
+            "empty summary for {name}"
+        );
+        assert!(
+            row["path"].as_str().is_some_and(|p| p.starts_with('/')),
+            "missing path for {name}"
+        );
+    }
+}
+
+/// The whole point of the fix: the explicit flag and the pipe default agree,
+/// and neither of them prints the terminal form.
+#[test]
+fn the_explicit_json_flag_and_the_pipe_default_agree() {
+    let default = otl().args(["api", "list"]).output().unwrap().stdout;
+    let explicit = otl()
+        .args(["api", "list", "--json"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(default, explicit, "--json changed a non-TTY listing");
+    let text = String::from_utf8_lossy(&default);
+    assert!(
+        !text.lines().next().unwrap_or_default().contains('\t'),
+        "a pipe still got the tab-separated terminal form: {text:.120}"
+    );
+}
+
+#[test]
+fn api_list_includes_known_operations_with_their_summary() {
+    let rows = listing(&[]);
+    let info = rows
+        .iter()
+        .find(|row| row["name"] == "documents.info")
+        .expect("documents.info missing");
+    assert_eq!(info["summary"], "Retrieve a document");
+    assert_eq!(info["path"], "/api/documents.info");
+    assert!(rows.iter().any(|row| row["name"] == "collections.list"));
 }
 
 #[test]
 fn api_list_flags_operations_that_are_not_callable() {
     // documents.import needs multipart/form-data: it is still listed, but
     // flagged so nobody scripts against it expecting a JSON call.
-    let output = otl().args(["api", "list"]).output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .find(|line| line.starts_with("documents.import\t"))
+    let rows = listing(&[]);
+    let import = rows
+        .iter()
+        .find(|row| row["name"] == "documents.import")
         .expect("documents.import missing from listing");
-    assert!(
-        line.contains("multipart/form-data"),
-        "unflagged line: {line}"
-    );
-    assert!(line.contains("not callable"), "unflagged line: {line}");
+    assert_eq!(import["callable"], false, "{import}");
+    assert_eq!(import["body_mode"], "unsupported", "{import}");
     // Ordinary operations carry no flag.
-    let info = stdout
-        .lines()
-        .find(|line| line.starts_with("documents.info\t"))
+    let info = rows
+        .iter()
+        .find(|row| row["name"] == "documents.info")
         .expect("documents.info missing");
-    assert!(!info.contains("not callable"), "false flag: {info}");
+    assert_eq!(info["callable"], true, "{info}");
+    assert_eq!(info["body_mode"], "key_value", "{info}");
 }
 
 #[test]
 fn api_list_rejects_extra_arguments() {
     otl()
         .args(["api", "list", "id=x"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicate::str::is_empty());
+}
+
+/// Flags that shape a request describe something that will not happen here.
+#[test]
+fn api_list_rejects_request_flags() {
+    for flag in ["--no-validate", "--show-server-message"] {
+        otl()
+            .args(["api", "list", flag])
+            .assert()
+            .failure()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("sends no request"));
+    }
+    otl()
+        .args(["api", "list", "--limit", "5"])
         .assert()
         .failure()
         .code(2)
