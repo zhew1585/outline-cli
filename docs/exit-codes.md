@@ -9,14 +9,14 @@ The single source of truth in code is the `ExitCode` enum in `crates/otl/src/exi
 |------|---------|----------|
 | 0 | Success | Command completed normally |
 | 1 | Generic failure | Invalid JSON in a response, unexpected internal error, HTTP status outside 4xx/5xx, failure writing to stdout other than a closed pipe, a fetched OpenAPI document that cannot be compiled, a spec cache that cannot be written or deleted, a fetched document that is too large or not UTF-8 |
-| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, unsupported shell for `completions`, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, invalid base URL, API key that cannot be sent as an HTTP header (e.g. it contains a newline), local parameter-validation failure (unknown/missing/complex parameter, value violating its schema facets, inexact number, oversized or invalid `--body` file, operation requiring a non-JSON body or a `oneOf`/`anyOf` request body), user-config-file problem, missing or ambiguous profile credential (both below), no credential configured for the active profile, unusable credential file (permissions too open, not a regular file, owned by another user, malformed, unknown format version, unreadable, unwritable, contended lock), credential directory writable by other users, stored credentials that belong to a different instance than the one being addressed, a non-loopback instance or OAuth endpoint reached over plaintext `http://`, no loopback callback port available, an instance that does not offer dynamic client registration, a superseded client registration that could not be removed before replacing it, a write that would mix two instances' credentials in one profile, a stored OAuth endpoint that is not TLS-protected or no longer belongs to the instance in use, a login abandoned because a concurrent one finished first, unusable `otl spec sync` source (a `--spec` file that is missing, unreadable, oversized, not a regular file, or not a usable OpenAPI document; a `--url` that is not a plain `http`/`https` URL) |
+| 2 | Usage or configuration error | Unknown subcommand or flag, malformed `key=value` argument, unknown API operation, unsupported shell for `completions`, missing `OUTLINE_URL` / `OUTLINE_API_KEY`, invalid base URL, API key that cannot be sent as an HTTP header (e.g. it contains a newline), local parameter-validation failure (unknown/missing/complex parameter, value violating its schema facets, inexact number, oversized or invalid `--body` file, operation requiring a non-JSON body or a `oneOf`/`anyOf` request body), user-config-file problem, missing or ambiguous profile credential (both below), no credential configured for the active profile, unusable credential file (permissions too open, not a regular file, owned by another user, malformed, unknown format version, unreadable, unwritable, contended lock), credential directory writable by other users, stored credentials that belong to a different instance than the one being addressed, a non-loopback instance or OAuth endpoint reached over plaintext `http://`, no loopback callback port available, an instance that does not offer dynamic client registration, a superseded client registration that could not be removed before replacing it, a write that would mix two instances' credentials in one profile, a stored OAuth endpoint that is not TLS-protected or no longer belongs to the instance in use, a login abandoned because a concurrent one finished first, unusable `otl spec sync` source (a `--spec` file that is missing, unreadable, oversized, not a regular file, or not a usable OpenAPI document; a `--url` that is not a plain `http`/`https` URL), `otl skill install` with no skills directory to write to, or refusing every target it had (another skill's `SKILL.md` without `--force`, or a path that is not a regular file) |
 | 3 | API request rejected | 4xx other than auth, not-found, and exhausted rate limits: validation error (400), a 429 that was not retried to exhaustion, a 4xx from an OAuth endpoint that is not 401/403/429 |
 | 4 | Authentication or permission error | Invalid or expired API key (401), operation forbidden for this key (403), a stored OAuth session that can no longer be refreshed, a refresh whose rotated tokens could not be saved, authorization denied at the consent screen, a callback whose `state` did not match, a browser redirect that never arrived, OAuth metadata pointing an endpoint at another host, OAuth metadata whose `issuer` does not identify the instance it came from |
 | 5 | Resource not found | Unknown document, collection, or other resource (404), spec document missing at its source URL (404) |
 | 6 | Server error | Outline instance failed to process the request (5xx), spec host failed to serve the document (5xx) |
 | 7 | Network error | DNS failure, connection refused, TLS failure, request timeout, response body that times out or is cut mid-transfer, unreachable spec source |
 | 8 | Rate limited | The server kept answering HTTP 429 until the retry budget was exhausted; retry later |
-| 9 | Partial failure | A command finished, but its result is incomplete: `otl docs export` could not write every document, a curated list command could not fetch every row, or `otl auth logout` could not complete a server-side step |
+| 9 | Partial failure | A command finished, but its result is incomplete: `otl docs export` could not write every document, a curated list command could not fetch every row, `otl auth logout` could not complete a server-side step, or `otl skill install` installed into some of its targets and not others |
 
 Notes:
 
@@ -99,6 +99,15 @@ Notes:
   - **If a credential written by another process survived** — a concurrent refresh landing a rotated session inside the revocation window — it is reported and the exit code is 9. That session was never revoked, so `revoked` is `false` and the command does not claim to have signed out. Deleting another process's session is never the answer; run `otl auth logout` again to revoke and remove it.
 - `otl auth logout` never requires `OUTLINE_URL`, and never applies the transport rule to it. Everything it contacts comes out of the credential file, anchored to the origin each credential recorded for itself. That is deliberate: cleanup has to work precisely when the configuration is missing, wrong, or predates a rule, and the alternative is a user deleting the file by hand and orphaning a DCR registration for good.
 - A client registration stranded on the server (created, then neither saveable nor deletable) exits **1**: it is neither a local configuration problem nor retryable, and only an administrator can clear it.
+- `otl skill install` writes a local file and introduces no exit code of its own either. Nothing to write
+  to at all (no agent skills directory, and no `--dir`) is a usage error (2), like any other invocation
+  that cannot be carried out. A target it refuses - another skill's `SKILL.md` without `--force`, or a
+  path that is not a regular file, which `--force` deliberately does NOT override - is also 2 when it
+  refused every target, and **9** when it wrote some and refused others, because what was installed is
+  real and something asked for did not happen. A write that fails outright is a plain failure (1). The
+  skill check in `otl doctor` never blocks: a stale or absent skill stops nothing, so it is a warning or
+  an `ok`, never a problem.
+
 - `otl doctor` introduces **no exit code of its own**, and that is the point: it answers "is this
   environment usable?", so it exits with the code the first blocking finding *would have produced in any
   other command*. 0 means nothing is blocking. 2 is something to fix locally (an unusable config file, a
@@ -109,13 +118,14 @@ Notes:
   channel) - 1 covers a 200 carrying something that is not JSON, exactly as it would for `otl api`. Code
   9 is not reachable: `doctor` produces no partial result. Five rules go with that:
   - **First, not worst.** The checks run in dependency order - config file, instance URL, credential
-    file, chosen credential, reachability, local spec, online spec - and the FIRST blocking one decides
+    file, chosen credential, reachability, local spec, online spec, agent skill - and the FIRST blocking one decides
     the code. An earlier problem is both the cause of what follows and the thing to fix first: reporting
     the numerically highest code instead would point a user at a network failure that is really a missing
     `OUTLINE_URL`.
   - **A warning is never blocking.** A spec cache that had to be discarded, a local table behind the
     online one, an unreachable spec host, a plaintext key in the environment, a credential DIRECTORY other
-    users can write to around a sound owner-only file: all are reported, none changes the exit code,
+    users can write to around a sound owner-only file, an installed agent skill whose version is not this
+    binary's: all are reported, none changes the exit code,
     because none of them stops `otl` from working. In particular a spec host is a third party the CLI
     consults only when asked, so its 404 or its firewall must never make `otl doctor` call a working
     environment broken. A `--spec-url` value the fetch channel refuses locally is *not* in this group: it

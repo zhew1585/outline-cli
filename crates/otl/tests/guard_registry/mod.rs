@@ -361,4 +361,27 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
         context: ".read_to_string(&mut raw)",
         count: 1,
     },
+    // The installed copy of the agent skill, so `otl skill install` and
+    // `otl doctor` can say whether it is the current one. The path is
+    // `<skills dir>/<skill name>/SKILL.md`, and both halves of it are
+    // constrained: the directory comes from `--dir`, `OUTLINE_SKILL_DIR` or
+    // `directories`, and the rest is compiled in - so it cannot name the
+    // vendored spec. The file type is checked on `symlink_metadata` before
+    // the read, and a non-regular file is refused rather than followed.
+    //
+    // One read, on one line, which both patterns in `FORBIDDEN_FILE_READS`
+    // match ("read_to_string" and "fs::read"); each is registered with its
+    // own count so a second read added here still fails.
+    Exception {
+        file: "crates/otl/src/commands/skill/targets.rs",
+        pattern: "read_to_string",
+        context: "match std::fs::read_to_string(&path)",
+        count: 1,
+    },
+    Exception {
+        file: "crates/otl/src/commands/skill/targets.rs",
+        pattern: "fs::read",
+        context: "match std::fs::read_to_string(&path)",
+        count: 1,
+    },
 ];

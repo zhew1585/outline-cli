@@ -264,18 +264,20 @@ otl doctor --json | jq '.checks[]'     # machine-readable, one object per check
 otl doctor --spec-url <url>            # compare against a mirror instead of upstream
 ```
 
-Seven checks in dependency order: which config file and profile are in effect, the instance URL, the
+Eight checks in dependency order: which config file and profile are in effect, the instance URL, the
 credential file (where it is, whether its permissions are sound, which kinds each profile holds — never
 the credentials themselves), the credential a request would actually send, whether the instance answers,
-which operation table this binary dispatches from, and how that table differs from the online API
+which operation table this binary dispatches from, how that table differs from the online API
 description — operations you are missing, operations upstream has withdrawn, and operations upstream has
-deprecated while this build still offers them.
+deprecated while this build still offers them — and last, whether the agent skill installed on this
+machine still matches this binary.
 
 `otl doctor` invents no exit code. It prints the whole report, then exits with the code the first
 blocking finding would have produced in any other command: **0** when nothing is blocking, **2** for
 something to fix locally, **4** when the instance rejected the credential, and **1**/**3**/**5**/**6**/**7**/**8**
 for whatever the instance did to the probe. Warnings — a discarded spec cache, a table behind upstream, an
-unreachable spec host, a credential directory other users can write to around a sound `0600` file — are
+unreachable spec host, a credential directory other users can write to around a sound `0600` file, an
+agent skill installed at an older version — are
 reported and leave the exit code at 0, because none of them stops `otl` from working. Both requests happen
 only because you typed the command, and `--offline` skips them.
 
@@ -463,6 +465,29 @@ a header comment, so an installed file never over-claims.
 Completion scripts are executable code, so candidate text is constrained rather than trusted: an
 operation name must be a plain `resource.method` token (ASCII letters, digits, `.`, `_`, `-`) or it is
 not written at all, and the build fails outright if the vendored spec ever contains one that is not.
+
+## The agent skill
+
+An agent driving `otl` has to learn three things no single `--help` page states: which commands are
+stable, how to read an operation's contract without calling it, and what to do about the environment when
+a command exits 2 or 4. That document ships inside the binary and installs as a skill:
+
+```sh
+otl skill install                      # every agent skills directory that exists under your home
+otl skill install --dir ~/.claude/skills   # or one you name (OUTLINE_SKILL_DIR does the same)
+otl skill show                         # print the document itself
+```
+
+Without `--dir`, the targets are the skills directories of the agents already installed here
+(`~/.claude`, `~/.codex`, and the agent-agnostic `~/.agents`); a directory for an agent you do not run is
+never created. Installing is a local file copy — nothing is fetched, no credential is needed, and the
+document is the one compiled into this binary, so its version is the version of the CLI it describes.
+
+The document carries that version in its own frontmatter, which is the single place it is authored, and
+`otl doctor`'s `skill` check compares each installed copy against it: `ok` when they match or when none
+is installed, `warn` (never blocking) when a copy is behind, was edited, or is not this skill at all. Its
+own document is the only thing an install overwrites — another skill's `SKILL.md` needs `--force`, and a
+symlink or a directory at that path is refused whatever the flags say.
 
 ## Credential handling
 

@@ -1,9 +1,10 @@
 //! `otl doctor` - one command that says whether this environment works.
 //!
-//! Seven checks, in dependency order: the config file, the instance URL, the
+//! Eight checks, in dependency order: the config file, the instance URL, the
 //! credential file, the credential that would be sent, whether the instance
-//! answers, which operation table is in use, and how that table differs from
-//! the online API description.
+//! answers, which operation table is in use, how that table differs from the
+//! online API description, and - last, because it gates nothing - whether
+//! the agent skill installed on this machine matches this binary.
 //!
 //! # It answers a question, so it has an exit code
 //!
@@ -47,6 +48,7 @@
 mod checks;
 mod credentials;
 mod drift;
+mod skill;
 // Public so that the golden-file test can render a SYNTHETIC report: the
 // real one is a function of the machine it runs on (paths, operation
 // counts, clocks), and a golden file over that would pin a developer's
@@ -137,6 +139,9 @@ fn examine(args: &DoctorArgs, overrides: &Overrides) -> Report {
         args.spec_url.as_deref(),
         cached_hash.as_deref(),
     ));
+    // Last, and local: the agent skill gates nothing, so a finding about it
+    // must never precede one that explains why a command failed.
+    all.push(skill::check());
     Report { checks: all }
 }
 
@@ -172,6 +177,7 @@ mod tests {
                 Check::new("connectivity", Status::Ok, ""),
                 Check::new("local-spec", Status::Ok, ""),
                 Check::new("online-spec", Status::Ok, ""),
+                Check::new("skill", Status::Ok, ""),
             ],
         };
         let mut keys: Vec<&str> = report.checks.iter().map(|check| check.key).collect();

@@ -13,6 +13,7 @@ use otl::commands::collections::{self, CollectionsArgs};
 use otl::commands::completions::{self, CompletionsArgs};
 use otl::commands::docs::{self, DocsArgs};
 use otl::commands::doctor::{self, DoctorArgs};
+use otl::commands::skill::{self, SkillArgs};
 use otl::commands::spec::{self, SpecArgs};
 use otl::config::Overrides;
 use otl::exit::ExitCode;
@@ -69,6 +70,8 @@ enum Command {
     Spec(SpecArgs),
     /// Check this environment: credentials, instance, and spec drift.
     Doctor(DoctorArgs),
+    /// Install the agent skill that ships with this binary, or print it.
+    Skill(SkillArgs),
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
     Completions(CompletionsArgs),
 }
@@ -91,6 +94,7 @@ fn main() -> std::process::ExitCode {
         Command::Collections(args) => collections::run(args, mode, &cli.overrides()),
         Command::Spec(args) => spec::run(args, mode),
         Command::Doctor(args) => doctor::run(args, mode, &cli.overrides()),
+        Command::Skill(args) => skill::run(args, mode),
         Command::Completions(args) => completions::run(args, Cli::command()),
     };
     match result {
