@@ -51,7 +51,7 @@ pub fn run(args: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(
     };
     let rows = session.call_rows(operation, &request, args.limit)?;
     let incomplete = rows.incomplete().copied();
-    output::emit(&Value::Array(rows.items), mode)?;
+    output::emit_server(&Value::Array(rows.items), mode)?;
     match incomplete {
         Some(truncation) => Err(session::incomplete_error(
             "the document listing",

@@ -66,7 +66,7 @@ fn list(args: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), 
     }
     let rows = Session::open(overrides)?.call_rows("users.list", &request, args.limit)?;
     let incomplete = rows.incomplete().copied();
-    output::emit(&Value::Array(rows.items), mode)?;
+    output::emit_server(&Value::Array(rows.items), mode)?;
     match incomplete {
         Some(truncation) => Err(session::incomplete_error("the user listing", &truncation)),
         None => Ok(()),

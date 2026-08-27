@@ -61,6 +61,43 @@ async fn location_is_returned_without_following_it() {
     assert!(target.received_requests().await.unwrap().is_empty());
 }
 
+/// The Location comes back exactly as the server sent it.
+///
+/// It is signed, so re-serializing it is not harmless: `Url::to_string`
+/// lowercases the host, drops a default port and normalizes
+/// percent-encoding, any of which can invalidate the signature the storage
+/// host will check. Validation must not rewrite what it validates.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_location_is_returned_byte_for_byte() {
+    let server = MockServer::start().await;
+    // Non-canonical on purpose: default port spelled out, mixed-case host,
+    // and an already-encoded path and query.
+    let signed = "https://Storage.Example:443/private/f%2Fo%20o?sig=a%2Bb&x=1";
+    Mock::given(method("POST"))
+        .and(path("/api/attachments.redirect"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", signed))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let result = tokio::task::spawn_blocking(move || {
+        Client::new(&base_url, "secret-token")?.execute_redirect_location(
+            &redirect_op(),
+            &[("id".to_string(), "attachment-id".to_string())],
+            ValidationMode::Strict,
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.unwrap(),
+        signed,
+        "the signed Location was rewritten on the way out"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn location_must_be_an_absolute_http_url() {
     let server = MockServer::start().await;

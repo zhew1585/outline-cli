@@ -88,6 +88,15 @@ impl Session {
     /// Call an operation with a complete JSON body and return its `data`
     /// payload. This is for curated commands whose stable flags construct a
     /// complex request that the scalar `key=value` path cannot represent.
+    ///
+    /// `ErrorDetail::CodeOnly`, matching `otl api --body` rather than the
+    /// `key=value` path: a server error message may quote the request body,
+    /// and a raw body here carries whatever the user put in it - a
+    /// ProseMirror document from `--data`, comment prose from `--text`. The
+    /// structured error code still reaches the user, and the exit code is
+    /// unaffected. `otl api --body --show-server-message` is the documented
+    /// opt-in for seeing the text; a curated command deliberately does not
+    /// grow a flag for it.
     pub fn call_raw_data(&self, operation: &str, body: &Value) -> Result<Value, CliError> {
         let op = self.operation(operation)?;
         let encoded = serde_json::to_string(body).map_err(|error| {
@@ -95,7 +104,7 @@ impl Session {
         })?;
         let mut envelope = self
             .client
-            .execute_raw(op, &encoded, ErrorDetail::Full)
+            .execute_raw(op, &encoded, ErrorDetail::CodeOnly)
             .map_err(map_engine_error)?;
         Ok(take_data(&mut envelope))
     }

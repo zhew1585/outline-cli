@@ -41,7 +41,9 @@ enum Status {
 /// Arguments for `otl comments list`.
 #[derive(Debug, Args)]
 #[command(after_long_help = "API contract:
-  This command uses comments.list.
+  This command uses comments.list. --offset and --limit are sent to it;
+  --status is applied here, on resolvedAt, because the operation's own
+  statusFilter is an array that key=value arguments cannot express.
 
   Inspect it with:
     otl api describe comments.list --json")]
@@ -54,12 +56,17 @@ struct ListArgs {
     #[arg(long, value_name = "ID")]
     parent: Option<String>,
     /// Filter by thread resolution status.
+    ///
+    /// Applied locally, on each comment's `resolvedAt`: the operation's own
+    /// `statusFilter` is an array, which `key=value` arguments cannot
+    /// express. Combined with --limit that means the server counts rows
+    /// before this filter does, so fewer than --limit may come back.
     #[arg(long, value_enum)]
     status: Option<Status>,
-    /// Skip this many matching comments.
+    /// Skip this many comments, server-side.
     #[arg(long, default_value_t = 0)]
     offset: usize,
-    /// Return at most this many matching comments.
+    /// Stop after this many comments (a warning says so on stderr).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     limit: Option<u64>,
 }
@@ -97,12 +104,14 @@ struct CreateArgs {
     otl api describe comments.resolve --json
     otl api describe comments.unresolve --json
 
-  comments.list, comments.resolve and comments.unresolve are missing from
-  some published API descriptions, so these subcommands always dispatch
-  from the definitions built into this binary. `otl api describe` reads the
-  effective table, which means it can report one of them as unknown after
-  an `otl spec sync` whose document omits it - while this command keeps
-  working.")]
+  comments.resolve and comments.unresolve are absent from the published API
+  description, and comments.list is there but without the parentCommentId
+  and statusFilter parameters this surface needs (see spec/VENDOR.md), so
+  these subcommands always dispatch from the definitions built into this
+  binary. `otl api describe` reads the EFFECTIVE table instead, so after an
+  `otl spec sync` it can report resolve/unresolve as unknown operations,
+  and describe comments.list without those parameters, while these
+  subcommands keep working.")]
 struct UpdateArgs {
     id: String,
     /// Replace the comment with plain text. Markdown punctuation is kept
@@ -146,21 +155,22 @@ fn list(args: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), 
     push(&mut request, "documentId", args.document.as_ref());
     push(&mut request, "collectionId", args.collection.as_ref());
     push(&mut request, "parentCommentId", args.parent.as_ref());
-    let rows = session.call_rows("comments.list", &request, None)?;
+    if args.offset > 0 {
+        request.push(("offset".to_string(), args.offset.to_string()));
+    }
+    // `--limit` is handed to the pagination layer, not applied afterwards:
+    // that is what makes it bound the number of requests as well as the
+    // number of rows, and it is what produces the documented "truncated
+    // because you asked" warning on stderr instead of a silent cut.
+    let rows = session.call_rows("comments.list", &request, args.limit)?;
     let incomplete = rows.incomplete().copied();
     let filtered = rows
         .items
         .into_iter()
         .filter(|comment| matches_parent(comment, args.parent.as_deref()))
         .filter(|comment| matches_status(comment, args.status))
-        .skip(args.offset)
-        .take(
-            args.limit
-                .and_then(|limit| usize::try_from(limit).ok())
-                .unwrap_or(usize::MAX),
-        )
         .collect();
-    output::emit(&Value::Array(filtered), mode)?;
+    output::emit_server(&Value::Array(filtered), mode)?;
     match incomplete {
         Some(truncation) => Err(session::incomplete_error(
             "the comment listing",
@@ -180,7 +190,7 @@ fn create(args: &CreateArgs, mode: OutputMode, overrides: &Overrides) -> Result<
     push(&mut request, "anchorPrefix", args.anchor_prefix.as_ref());
     push(&mut request, "anchorSuffix", args.anchor_suffix.as_ref());
     let result = Session::open(overrides)?.call_data("comments.create", &request)?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }
 
 fn update(args: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
@@ -196,26 +206,63 @@ fn update(args: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<
             session.call_raw_data("comments.update", &json!({ "id": args.id, "data": data }))?,
         );
     }
-    let status_result = if args.resolve {
-        Some(session.call_data("comments.resolve", &[("id".to_string(), args.id.clone())])?)
-    } else if args.unresolve {
-        Some(session.call_data("comments.unresolve", &[("id".to_string(), args.id.clone())])?)
-    } else {
-        None
-    };
+    let status_result = apply_status_change(&session, args, content_result.as_ref(), mode)?;
     let result = match (content_result, status_result) {
         (Some(content), Some(status)) => json!({ "comment": content, "status": status }),
         (Some(content), None) => content,
         (None, Some(status)) => status,
         (None, None) => Value::Null,
     };
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
+}
+
+/// Resolve or reopen the thread, if that was asked for.
+///
+/// `content` is the result of the content change that has ALREADY been sent,
+/// when there was one. That is what makes the failure path a partial result
+/// rather than a failure: the new content is committed on the server, so
+/// reporting a wholesale failure would both hide a change the user made and
+/// invite a retry that applies it twice. The content is printed, and the
+/// error carries code 9 - "what you got is real, and some of it is missing".
+fn apply_status_change(
+    session: &Session,
+    args: &UpdateArgs,
+    content: Option<&Value>,
+    mode: OutputMode,
+) -> Result<Option<Value>, CliError> {
+    let Some((operation, label)) = status_change(args) else {
+        return Ok(None);
+    };
+    let request = [("id".to_string(), args.id.clone())];
+    let error = match session.call_data(operation, &request) {
+        Ok(value) => return Ok(Some(value)),
+        Err(error) => error,
+    };
+    let Some(content) = content else {
+        return Err(error);
+    };
+    output::emit_server(content, mode)?;
+    Err(CliError::partial(anyhow!(
+        "the comment content was updated, but {label} failed: {error}"
+    )))
+}
+
+/// The status operation this invocation asks for, with the words the report
+/// uses for it.
+fn status_change(args: &UpdateArgs) -> Option<(&'static str, &'static str)> {
+    if args.resolve {
+        return Some(("comments.resolve", "resolving the thread"));
+    }
+    if args.unresolve {
+        return Some(("comments.unresolve", "reopening the thread"));
+    }
+    None
 }
 
 fn delete(args: &DeleteArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     let result = Session::open(overrides)?
         .call_data("comments.delete", &[("id".to_string(), args.id.clone())])?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }
 
 fn comment_data(args: &UpdateArgs) -> Result<Option<Value>, CliError> {
