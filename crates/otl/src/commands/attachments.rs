@@ -27,7 +27,26 @@ enum AttachmentsCommand {
   form. It uploads nothing itself.
 
   Inspect it with:
-    otl api describe attachments.create --json")]
+    otl api describe attachments.create --json
+
+JSON shape:
+  The attachments.create payload, verbatim:
+
+    {
+      \"uploadUrl\": \"...\",     // send the bytes here yourself
+      \"mode\": \"...\",          // how to send them (POST form vs PUT)
+      \"form\": { ... },         // fields to include with a POST
+      \"headers\": { ... },      // headers to include with a PUT
+      \"maxUploadSize\": 26214400,
+      \"url\": \"...\",           // the attachment's URL on the instance
+      \"attachment\": { \"name\", \"url\", \"contentType\", \"size\",
+                       \"documentId\", \"userId\" }
+    }
+
+  `.attachment.url` is the reference to embed in a document body, and only
+  after the upload has actually happened - this command uploads nothing.
+  Do NOT send the Outline credential to `.uploadUrl`: it is pre-signed and
+  belongs to the storage host.")]
 struct CreateArgs {
     /// Filename including extension.
     #[arg(long)]

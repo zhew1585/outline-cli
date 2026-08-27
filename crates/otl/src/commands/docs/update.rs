@@ -45,7 +45,13 @@ impl EditMode {
   This command uses documents.update.
 
   Inspect it with:
-    otl api describe documents.update --json")]
+    otl api describe documents.update --json
+
+JSON shape:
+  The documents.update document, verbatim - the same shape `otl docs
+  create --json` returns, with `.revision` bumped. A terminal instead gets
+  the labelled essentials, which is a summary of the same object and not a
+  separate contract.")]
 pub struct UpdateArgs {
     /// Document id (UUID or the short urlId from its URL).
     pub id: String,

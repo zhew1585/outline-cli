@@ -35,7 +35,13 @@ enum UsersCommand {
   This command uses users.list.
 
   Inspect it with:
-    otl api describe users.list --json")]
+    otl api describe users.list --json
+
+JSON shape:
+  A JSON array of users.list rows, verbatim: `.[0].id`, `.[0].name`,
+  `.[0].email`, `.[0].role`. `--status` maps to the operation's `filter`
+  parameter and is applied by the server, so --limit counts rows that
+  already passed it.")]
 struct ListArgs {
     /// Search names or email addresses.
     #[arg(long)]

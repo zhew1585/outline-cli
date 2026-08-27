@@ -40,7 +40,28 @@ pub enum Resource {
     otl api describe collections.info --json
     otl api describe collections.documents --json
     otl api describe users.info --json
-    otl api describe attachments.redirect --json")]
+    otl api describe attachments.redirect --json
+
+JSON shape:
+  One shape per resource, and two of the four are objects this CLI
+  composes rather than anything a single operation returned:
+
+    document   -> the documents.info document, verbatim
+                  (.id, .title, .text, .url, ...)
+    collection -> { collection, documents }  <- COMPOSED
+                  .collection is the collections.info collection;
+                  .documents is the collections.documents navigation tree,
+                  an array of { id, title, url, children[] } nested to any
+                  depth.
+    user       -> the users.info user, verbatim (.id, .name, .email,
+                  .role). current_user/self/me answers from auth.info
+                  instead, and the `user` object is unwrapped out of it, so
+                  both spellings return the SAME shape.
+    attachment -> { id, signedUrl }          <- COMPOSED
+                  .signedUrl is the storage host's short-lived Location,
+                  returned WITHOUT being followed and without the Outline
+                  credential ever reaching that host. Fetch it with a plain
+                  unauthenticated GET.")]
 pub struct FetchArgs {
     /// Resource kind to retrieve.
     #[arg(value_enum)]

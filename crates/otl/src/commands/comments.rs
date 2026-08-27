@@ -47,10 +47,24 @@ enum Status {
   statusFilter is an array that key=value arguments cannot express.
 
   Inspect it with:
-    otl api describe comments.list --json")]
+    otl api describe comments.list --json
+
+JSON shape:
+  A JSON array of comments.list rows, verbatim: `.[0].id`,
+  `.[0].documentId`, `.[0].parentCommentId` (null on a thread's first
+  comment), `.[0].resolvedAt` (null while the thread is open), and
+  `.[0].anchorText` for an inline comment. The body is ProseMirror under
+  `.[0].data`, not markdown - there is no `.text` field to read.
+
+  --status filters this array locally, so a row that was fetched and then
+  dropped is gone from it; a note on stderr says how many.")]
 struct ListArgs {
+    /// Document whose comments to list (UUID or urlId). One of --document
+    /// or --collection is required.
     #[arg(long, value_name = "ID", required_unless_present = "collection")]
     document: Option<String>,
+    /// Collection whose comments to list, across all of its documents. One
+    /// of --document or --collection is required.
     #[arg(long, value_name = "ID", required_unless_present = "document")]
     collection: Option<String>,
     /// Return only replies beneath this parent comment.
@@ -78,19 +92,42 @@ struct ListArgs {
   This command uses comments.create.
 
   Inspect it with:
-    otl api describe comments.create --json")]
+    otl api describe comments.create --json
+
+JSON shape:
+  The comments.create comment, verbatim - the same shape a row of
+  `otl comments list --json` has. `.id` is what `--parent` takes for a
+  reply and what `otl comments update`/`delete` take.")]
 struct CreateArgs {
+    /// Document to comment on (UUID or urlId).
     #[arg(long, value_name = "ID")]
     document: String,
-    #[arg(long)]
+    /// Comment body, as plain text.
+    ///
+    /// Markdown punctuation is kept literally: this becomes plain
+    /// ProseMirror paragraphs, one per blank-line-separated block. There is
+    /// no rich-content flag on `create`; `otl comments update --data FILE`
+    /// is where a ProseMirror document can be supplied.
+    #[arg(long, value_name = "TEXT")]
     text: String,
+    /// Reply beneath this comment instead of starting a new thread (the
+    /// parent comment's id).
     #[arg(long, value_name = "ID")]
     parent: Option<String>,
-    #[arg(long)]
+    /// Anchor the comment to this exact substring of the document body,
+    /// making it an inline comment instead of a document comment.
+    ///
+    /// The FIRST occurrence in the document wins, so a phrase that repeats
+    /// needs --anchor-prefix and/or --anchor-suffix to say which one.
+    #[arg(long, value_name = "TEXT")]
     anchor_text: Option<String>,
-    #[arg(long, requires = "anchor_text")]
+    /// Text immediately preceding --anchor-text, used to pick between
+    /// several occurrences of it. Requires --anchor-text.
+    #[arg(long, value_name = "TEXT", requires = "anchor_text")]
     anchor_prefix: Option<String>,
-    #[arg(long, requires = "anchor_text")]
+    /// Text immediately following --anchor-text, used to pick between
+    /// several occurrences of it. Requires --anchor-text.
+    #[arg(long, value_name = "TEXT", requires = "anchor_text")]
     anchor_suffix: Option<String>,
 }
 
@@ -112,8 +149,23 @@ struct CreateArgs {
   binary. `otl api describe` reads the EFFECTIVE table instead, so after an
   `otl spec sync` it can report resolve/unresolve as unknown operations,
   and describe comments.list without those parameters, while these
-  subcommands keep working.")]
+  subcommands keep working.
+
+JSON shape:
+  This command can send two requests, so its output says which ran:
+
+    --text/--data alone        -> the updated comment, verbatim
+    --resolve/--unresolve alone-> the comment with its new .resolvedAt
+    both together              -> { comment, status } - the content result
+                                  and the resolution result, in that order
+
+  When the content change succeeds and the resolution then fails, the
+  content result is still printed and the exit code is 9: the edit is
+  committed on the server, so retrying the whole command would apply it
+  twice.")]
 struct UpdateArgs {
+    /// Comment id. --resolve and --unresolve act on the top-level thread
+    /// this comment belongs to, not on the comment alone.
     id: String,
     /// Replace the comment with plain text. Markdown punctuation is kept
     /// literally; use --data for rich ProseMirror content.
@@ -145,8 +197,14 @@ struct UpdateArgs {
   This command uses comments.delete.
 
   Inspect it with:
-    otl api describe comments.delete --json")]
+    otl api describe comments.delete --json
+
+JSON shape:
+  { \"success\": true }. A failure never reaches stdout; check the exit
+  code.")]
 struct DeleteArgs {
+    /// Comment id. Deleting a thread's first comment deletes its replies
+    /// with it.
     id: String,
 }
 

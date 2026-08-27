@@ -27,7 +27,13 @@ const OPERATION: &str = "documents.create";
   This command uses documents.create.
 
   Inspect it with:
-    otl api describe documents.create --json")]
+    otl api describe documents.create --json
+
+JSON shape:
+  The documents.create document, verbatim: `.id` is the new document's id
+  and `.url` its path on the instance. A terminal instead gets the labelled
+  essentials (id, title, updated, revision, url, status), which is a
+  summary of the same object and not a separate contract.")]
 pub struct CreateArgs {
     /// Document title. Without it Outline derives one from the body.
     #[arg(long, value_name = "TITLE")]

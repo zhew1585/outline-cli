@@ -80,7 +80,20 @@ enum CollectionsCommand {
 
   Inspect them with:
     otl api describe collections.list --json
-    otl api describe collections.documents --json")]
+    otl api describe collections.documents --json
+
+JSON shape:
+  A JSON array of collections.list rows, verbatim: `.[0].id`, `.[0].name`.
+
+  THE DOCUMENT COUNTS ARE NOT IN THE JSON. They are counted by this CLI
+  from collections.documents, and the API cannot confirm them, so they
+  appear only in the human table - a script never receives a number the
+  server did not say. --no-counts therefore changes nothing in --json mode
+  except that it is already the behaviour: the extra request per collection
+  is not made either way.
+
+  To count in a script, walk the tree yourself:
+    otl fetch collection <ID> --json | jq '[.documents | .. | .id? // empty] | length'")]
 pub struct ListArgs {
     /// Filter collections by name.
     #[arg(long)]
@@ -102,7 +115,11 @@ pub struct ListArgs {
   This command uses collections.create.
 
   Inspect it with:
-    otl api describe collections.create --json")]
+    otl api describe collections.create --json
+
+JSON shape:
+  The collections.create collection, verbatim: `.id` is the new
+  collection's id, and it is what `--collection` takes everywhere else.")]
 pub struct CreateArgs {
     /// Collection name.
     #[arg(long)]
@@ -124,17 +141,27 @@ pub struct CreateArgs {
   This command uses collections.update.
 
   Inspect it with:
-    otl api describe collections.update --json")]
+    otl api describe collections.update --json
+
+JSON shape:
+  The collections.update collection, verbatim - the same shape
+  `otl collections create --json` returns. At least one of --name,
+  --description, --icon or --color must be given; with none of them this
+  exits 2 without sending anything.")]
 pub struct UpdateArgs {
     /// Collection ID.
     id: String,
-    #[arg(long)]
+    /// New collection name.
+    #[arg(long, value_name = "NAME")]
     name: Option<String>,
-    #[arg(long)]
+    /// New markdown description.
+    #[arg(long, value_name = "DESCRIPTION")]
     description: Option<String>,
-    #[arg(long)]
+    /// New emoji or named Outline icon.
+    #[arg(long, value_name = "ICON")]
     icon: Option<String>,
-    #[arg(long)]
+    /// New hex icon color, for example '#3366FF'.
+    #[arg(long, value_name = "COLOR")]
     color: Option<String>,
 }
 
@@ -152,7 +179,15 @@ pub struct UpdateArgs {
   spec/VENDOR.md), so --archive always dispatches from the definition built
   into this binary. `otl api describe` reads the effective table instead, so
   after an `otl spec sync` it can report collections.archive as an unknown
-  operation while --archive keeps working.")]
+  operation while --archive keeps working.
+
+JSON shape:
+  Two shapes, because the two operations answer differently:
+
+    otl collections delete ID --json           -> { \"success\": true }
+    otl collections delete ID --archive --json -> the archived collection,
+                                                  verbatim (.id,
+                                                  .archivedAt, ...)")]
 pub struct DeleteArgs {
     /// Collection ID.
     id: String,

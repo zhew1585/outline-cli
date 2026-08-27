@@ -41,7 +41,18 @@ const COLLECTION_COLUMN: usize = 1;
 
 /// Arguments for `otl docs search`.
 #[derive(Debug, Args)]
-#[command(after_long_help = "API contracts:
+#[command(after_long_help = "JSON shape:
+  A JSON array of documents.search rows, verbatim:
+
+    [ { context, ranking, document }, ... ]
+
+  The document itself is nested: `.[0].document.id`, not `.[0].id`.
+  `context` is the matching excerpt and `ranking` the server's score. The
+  collection labels the table shows are NOT added to the JSON - resolve
+  `.[].document.collectionId` against `otl collections list --json`
+  instead.
+
+API contracts:
   Results come from documents.search. In table mode, collection labels may
   also use collections.list.
 

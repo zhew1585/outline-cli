@@ -113,6 +113,37 @@ pub struct LogoutArgs {
 
 /// Arguments for `otl auth info`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contract:
+  Without --offline this command makes one auth.info probe, to name the
+  account and workspace the stored credential actually belongs to. With
+  --offline it contacts nothing.
+
+  Inspect it with:
+    otl api describe auth.info --json
+
+JSON shape:
+  An object this CLI authors, not a server payload. Every string in it is
+  scrubbed, and NO field ever carries a credential:
+
+    profile                        active profile name
+    instance                       base URL a request would go to, or null
+    instance_problem               why it is null, or null
+    method                         \"api-key\" / \"oauth\" / null
+    available                      credential kinds this profile could use
+    plaintext_key_in_environment   the key is visible in the environment
+    scope, account, expires_in_seconds, renewable
+                                   from the probe; null when --offline
+    credential_file                path
+    credential_file_exists         bool
+    credential_file_permissions    human-readable, e.g. \"0600\"
+    credential_file_usable         false means a command would refuse
+    credential_directory           path
+    credential_directory_mode      Unix mode, or null on Windows
+    credential_directory_problem   why it is unsound, or null
+    resolution_error               why no credential resolved, or null
+
+  `otl doctor --json` answers the same questions inside a wider report; use
+  this one when the credential is the whole question.")]
 pub struct InfoArgs {
     /// Do not contact the instance; report stored state only.
     #[arg(long)]

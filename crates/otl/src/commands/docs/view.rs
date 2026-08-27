@@ -33,7 +33,22 @@ const OPERATION: &str = "documents.info";
   This command uses documents.info.
 
   Inspect it with:
-    otl api describe documents.info --json")]
+    otl api describe documents.info --json
+
+JSON shape:
+  This command's datum is markdown, so stdout is NOT JSON unless --json is
+  spelled out - a pipe gets the markdown bytes, not an object.
+
+    otl docs view ID              -> markdown (pager on a terminal)
+    otl docs view ID --raw        -> markdown, byte for byte
+    otl docs view ID --json       -> the documents.info document, verbatim
+                                     (.id, .title, .text, .url, ...)
+    otl docs view ID --web --json -> { id, title, url }, this CLI's own
+                                     object: the absolute URL it opened,
+                                     not the server's relative .url
+
+  --raw and --json are mutually exclusive: one prints the body, the other
+  prints the metadata.")]
 pub struct ViewArgs {
     /// Document id (UUID or the short urlId from its URL).
     pub id: String,

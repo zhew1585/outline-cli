@@ -20,7 +20,21 @@ const LIST_OPERATION: &str = "documents.list";
 
   Inspect them with:
     otl api describe documents.list --json
-    otl api describe documents.search --json")]
+    otl api describe documents.search --json
+
+JSON shape:
+  A JSON array of the rows the operation returned, verbatim. THE TWO
+  OPERATIONS RETURN DIFFERENT ROWS, so this command has two shapes:
+
+    otl docs list --json          -> [ <document>, ... ]
+                                     .[0].id, .[0].title
+    otl docs list QUERY --json    -> [ { context, ranking, document }, ... ]
+                                     .[0].document.id, .[0].document.title
+
+  A `jq` path written against one silently yields null against the other.
+  `otl docs search QUERY --json` is the same command as the second form and
+  always has the search shape, so prefer it when a query is involved and
+  keep this one for the query-less listing.")]
 pub struct ListArgs {
     /// Optional full-text query. Without it, recently updated documents are
     /// returned.

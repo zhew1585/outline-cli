@@ -46,7 +46,28 @@ const MAX_LISTED_FAILURES: usize = 20;
 
   Inspect them with:
     otl api describe documents.list --json
-    otl api describe documents.info --json")]
+    otl api describe documents.info --json
+
+JSON shape:
+  The markdown files are the output; --json prints a summary of the run,
+  an object this CLI authors rather than anything the server sent:
+
+    {
+      \"out\": \"./backup\",            // directory written into
+      \"complete\": true,              // every enumerated document written
+      \"enumeration_truncated\": false,// the CLI's page cap cut the listing
+      \"limit_reached\": false,        // --limit cut it, because you asked
+      \"durable\": true,               // writes were flushed to disk;
+                                      // null = this platform cannot confirm
+      \"stray\": [],                   // pre-existing files left in place
+      \"exported\": 42,                // files written
+      \"failed\": [ { \"id\", \"label\", \"reason\" } ]
+    }
+
+  The test for \"this backup is usable\" is `complete == true && durable !=
+  false`. A `durable` of null is not a failure. In `failed[]`, `id` is null
+  for a listing row that never had one, so a retry script can act on the
+  entries where `id != null` and report the rest.")]
 pub struct ExportArgs {
     /// Collection to export (its id).
     #[arg(long, value_name = "ID")]

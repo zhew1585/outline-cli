@@ -14,7 +14,13 @@ use crate::session::Session;
   This command uses documents.move.
 
   Inspect it with:
-    otl api describe documents.move --json")]
+    otl api describe documents.move --json
+
+JSON shape:
+  The documents.move payload, verbatim. It reports the destination rather
+  than the moved document: `.documents[]` and `.collections[]` are the
+  entities the move touched. Confirm the document's new home with
+  `otl fetch document <ID>` if you need the document object itself.")]
 pub struct MoveArgs {
     /// Document UUID or urlId.
     id: String,
@@ -39,7 +45,17 @@ pub struct MoveArgs {
 
   Inspect them with:
     otl api describe documents.delete --json
-    otl api describe documents.archive --json")]
+    otl api describe documents.archive --json
+
+JSON shape:
+  Two shapes, because the two operations answer differently:
+
+    otl docs delete ID --json           -> { \"success\": true }
+    otl docs delete ID --archive --json -> the archived document, verbatim
+                                           (.id, .archivedAt, ...)
+
+  Neither is an error path: a failure never reaches stdout at all. Check
+  the exit code.")]
 pub struct DeleteArgs {
     /// Document UUID or urlId.
     id: String,
