@@ -26,15 +26,15 @@ mod describe;
 mod list;
 mod reserved;
 
-use std::fs::File;
-use std::io::Read;
+use std::path::Path;
 
 use anyhow::anyhow;
 use clap::Args;
 use engine::{EngineError, ErrorDetail, Fetched, OpSpec, ValidationMode};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::auth;
+use crate::commands::input;
 use crate::config::Overrides;
 use crate::errors::map_engine_error_with_hint;
 use crate::exit::CliError;
@@ -53,6 +53,10 @@ const SHOW_MESSAGE_HINT: &str =
 /// Hint appended when an operation cannot be called generically at all.
 const DEDICATED_COMMAND_HINT: &str =
     "it is not callable via `otl api`; a dedicated command is planned";
+
+/// Outline's one RPC-style operation whose success response is a redirect
+/// rather than JSON.
+const REDIRECT_OPERATION: &str = "attachments.redirect";
 
 /// Reserved word: `otl api list` enumerates operations instead of calling
 /// one.
@@ -180,6 +184,9 @@ fn call(
     let client = auth::client(overrides)?;
     let detail = error_detail(cmd);
     let fetched = match (&payload, &pagination) {
+        (Payload::KeyValue(args), None) if op.name == REDIRECT_OPERATION => client
+            .execute_redirect_location(op, args, validation_mode(cmd))
+            .map(|location| Fetched::complete(json!({ "data": { "signedUrl": location } }))),
         (Payload::KeyValue(args), Some(spec)) => {
             client.execute_paged(op, args, validation_mode(cmd), spec, cmd.limit)
         }
@@ -284,43 +291,13 @@ fn load_body_file(value: &str) -> Result<String, CliError> {
             "--body expects `@` followed by a file path, e.g. --body @file.json"
         )));
     };
-    let raw = read_capped(path)?;
+    let raw = input::read_utf8(Path::new(path), "--body", MAX_BODY_FILE_BYTES)?;
     // Validate without materializing a Value tree: the bytes are sent as
     // they are, so only well-formedness matters here.
     if let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(&raw) {
         return Err(CliError::usage(anyhow!(
             "--body file {path:?} is not valid JSON: {error}"
         )));
-    }
-    Ok(raw)
-}
-
-/// Read a file, refusing anything over [`MAX_BODY_FILE_BYTES`].
-///
-/// The metadata size is checked first (cheap rejection) and the read is
-/// bounded as well, so a file that grows between the two - or one whose
-/// reported size is unreliable, such as a pipe - cannot exhaust memory.
-fn read_capped(path: &str) -> Result<String, CliError> {
-    let io_error = |error: std::io::Error| {
-        CliError::usage(anyhow!("cannot read --body file {path:?}: {error}"))
-    };
-    let too_large = || {
-        CliError::usage(anyhow!(
-            "--body file {path:?} is too large: the limit is {MAX_BODY_FILE_BYTES} bytes"
-        ))
-    };
-    let file = File::open(path).map_err(io_error)?;
-    let metadata = file.metadata().map_err(io_error)?;
-    if metadata.is_file() && metadata.len() > MAX_BODY_FILE_BYTES {
-        return Err(too_large());
-    }
-    let mut raw = String::new();
-    let read = file
-        .take(MAX_BODY_FILE_BYTES + 1)
-        .read_to_string(&mut raw)
-        .map_err(io_error)?;
-    if read as u64 > MAX_BODY_FILE_BYTES {
-        return Err(too_large());
     }
     Ok(raw)
 }

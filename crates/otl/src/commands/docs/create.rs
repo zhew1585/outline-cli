@@ -33,6 +33,10 @@ pub struct CreateArgs {
     #[arg(long, value_name = "TITLE")]
     pub title: Option<String>,
 
+    /// Emoji or named Outline icon.
+    #[arg(long)]
+    pub icon: Option<String>,
+
     /// Collection to create the document in (its id).
     #[arg(long, value_name = "ID")]
     pub collection: Option<String>,
@@ -76,6 +80,9 @@ fn request_args(cmd: &CreateArgs, text: String) -> Vec<(String, String)> {
     if let Some(title) = &cmd.title {
         args.push(("title".to_string(), title.clone()));
     }
+    if let Some(icon) = &cmd.icon {
+        args.push(("icon".to_string(), icon.clone()));
+    }
     if let Some(collection) = &cmd.collection {
         args.push(("collectionId".to_string(), collection.clone()));
     }
@@ -101,6 +108,7 @@ mod tests {
     fn args(collection: Option<&str>, parent: Option<&str>, draft: bool) -> CreateArgs {
         CreateArgs {
             title: Some("Notes".to_string()),
+            icon: None,
             collection: collection.map(str::to_string),
             parent: parent.map(str::to_string),
             file: None,

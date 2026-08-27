@@ -146,6 +146,9 @@ const CONFINED: &[Confined] = &[
             "crates/engine/src/client.rs",
             "crates/engine/src/error.rs",
             "crates/engine/src/fetch.rs",
+            // Response decoding for the authenticated channel. It receives
+            // the response from client.rs and has no send site of its own.
+            "crates/engine/src/redirect.rs",
             // One doc comment explaining why transport errors are not
             // printed; no code.
             "crates/otl/src/exit.rs",

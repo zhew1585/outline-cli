@@ -7,10 +7,10 @@ contract. `otl` compiles that spec into a static table at build time and interpr
 means **every** endpoint is callable without hand-written per-endpoint code, and cold start stays in
 single-digit milliseconds.
 
-> **Status: work in progress.** The engine (Epic 1) is complete: authentication with an API key, the
-> generic `otl api` escape hatch, schema validation, dual-state output, auto-pagination, and rate-limit
-> backoff. Multi-workspace profiles and shell completions are in place too. OAuth login and the six
-> polished day-to-day commands are next. Command surfaces may still change before 1.0.
+> **Status: pre-1.0.** The generic API engine, OAuth/API-key authentication,
+> multi-workspace profiles, shell completions, agent discovery, and the stable
+> day-to-day commands below are implemented. Command surfaces may still change
+> before 1.0.
 
 ## Install
 
@@ -186,13 +186,15 @@ after the fact protects nothing:
   the same profile is refused rather than merged. Use one profile per instance.
 ## Everyday commands
 
-Six polished commands cover the day-to-day work. Unlike `otl api`, their flags and output are a stable
-(semver) contract. Each command's `--help` names the underlying API operation and the corresponding
-`otl api describe <operation> --json` command when you need the complete request and response shape.
+Polished commands cover the day-to-day work. Unlike `otl api`, their flags and
+output are a stable (semver) contract. Each command's `--help` names the
+underlying API operation when you need the complete request and response shape.
 
 ```sh
 otl collections list                          # name / id / document count, every page fetched
 otl docs search deploy                        # title / collection / updated / matching snippet
+otl docs list                                 # recently updated documents
+otl docs list deploy --collection <id>        # unified list/search workflow
 otl docs search deploy --json | jq '.[].document.id'
 
 otl docs view <doc-id>                        # markdown; $PAGER on a terminal, plain in a pipe
@@ -203,9 +205,40 @@ cat notes.md | otl docs create --title Notes --collection <collection-id>
 otl docs create --title Notes --collection <collection-id> --file notes.md   # equivalent
 otl docs update <doc-id> --title "New title"
 cat revised.md | otl docs update <doc-id>
+printf '\nMore notes\n' | otl docs update <doc-id> --mode append
+printf 'new wording' | otl docs update <doc-id> --mode patch --find-text 'old wording'
+otl docs move <doc-id> --parent <parent-id> --index 0
+otl docs delete <doc-id>                      # trash
+otl docs delete <doc-id> --archive            # archive
 
 otl docs export --collection <collection-id> --out ./backup
+
+otl fetch document https://outline.example.com/doc/runbook-abc123
+otl fetch collection <collection-id>          # metadata plus full document tree
+otl fetch user current_user
+otl fetch attachment <attachment-id>          # short-lived signed download URL
+
+otl collections create --name Engineering --icon 🛠️ --color '#3366FF'
+otl collections update <id> --description 'Team knowledge base'
+otl collections delete <id> --archive
+
+otl comments list --document <id> --status unresolved
+otl comments create --document <id> --text 'Looks good'
+otl comments update <id> --resolve
+otl comments delete <id>
+
+otl attachments create --name image.png --content-type image/png --size 12345
+otl users list --status active --role member --query jane
 ```
+
+`attachments create` returns the pre-signed POST/PUT inputs and the stable
+attachment URL. It does not upload local bytes; send them directly to the
+returned storage URL. `fetch attachment` handles Outline's authenticated 302
+response without forwarding the bearer token to storage.
+
+Comment updates accept `--text` for plain text (Markdown punctuation remains
+literal) or `--data FILE` for a complete ProseMirror JSON document. Resolve and
+unresolve use Outline's dedicated application API routes.
 
 Notes worth knowing:
 

@@ -1650,6 +1650,63 @@
         "operationId": "collectionsGroupMemberships"
       }
     },
+    "/collections.archive": {
+      "post": {
+        "tags": [
+          "Collections"
+        ],
+        "summary": "Archive a collection",
+        "description": "Archive a collection and all documents within it.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Collection"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "operationId": "collectionsArchive"
+      }
+    },
     "/collections.delete": {
       "post": {
         "tags": [
@@ -2129,6 +2186,120 @@
         "operationId": "commentsDelete"
       }
     },
+    "/comments.resolve": {
+      "post": {
+        "tags": [
+          "Comments"
+        ],
+        "summary": "Resolve a comment thread",
+        "description": "Resolve a top-level comment thread.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Comment"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "operationId": "commentsResolve"
+      }
+    },
+    "/comments.unresolve": {
+      "post": {
+        "tags": [
+          "Comments"
+        ],
+        "summary": "Unresolve a comment thread",
+        "description": "Reopen a resolved top-level comment thread.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Comment"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "operationId": "commentsUnresolve"
+      }
+    },
     "/comments.list": {
       "post": {
         "tags": [
@@ -2159,6 +2330,22 @@
                         "type": "string",
                         "format": "uuid",
                         "description": "Filter to a specific collection"
+                      },
+                      "parentCommentId": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Filter to replies beneath a parent comment"
+                      },
+                      "statusFilter": {
+                        "type": "array",
+                        "description": "Comment resolution statuses to include.",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "resolved",
+                            "unresolved"
+                          ]
+                        }
                       },
                       "includeAnchorText": {
                         "type": "boolean",

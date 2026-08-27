@@ -52,6 +52,7 @@ unicode-segmentation = { workspace = true }
 # endpoints are the documented exception to the single request channel, so
 # this crate needs its own HTTP client for them.
 reqwest = { workspace = true }
+url = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 fs4 = { workspace = true }

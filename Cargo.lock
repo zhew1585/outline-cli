@@ -1195,6 +1195,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "wiremock",
 ]
 

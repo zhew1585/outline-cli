@@ -5,7 +5,7 @@
 //! rather than sending an empty update.
 
 use anyhow::anyhow;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 
 use crate::config::Overrides;
@@ -18,6 +18,26 @@ use super::detail;
 
 /// The compiled operation this command drives.
 const OPERATION: &str = "documents.update";
+
+/// How an incoming body changes existing document content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EditMode {
+    Replace,
+    Append,
+    Prepend,
+    Patch,
+}
+
+impl EditMode {
+    fn api_value(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Append => "append",
+            Self::Prepend => "prepend",
+            Self::Patch => "patch",
+        }
+    }
+}
 
 /// Arguments for `otl docs update`.
 #[derive(Debug, Args)]
@@ -34,10 +54,26 @@ pub struct UpdateArgs {
     #[arg(long, value_name = "TITLE")]
     pub title: Option<String>,
 
+    /// New emoji or named Outline icon.
+    #[arg(long, conflicts_with = "clear_icon")]
+    pub icon: Option<String>,
+
+    /// Remove the document icon.
+    #[arg(long, conflicts_with = "icon")]
+    pub clear_icon: bool,
+
     /// Read the new body from this file instead of standard input (takes
     /// precedence: standard input is not read at all when this is given).
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
+
+    /// Body edit mode; omitted means replace.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub mode: Option<EditMode>,
+
+    /// Existing text to replace when --mode patch is used.
+    #[arg(long, value_name = "TEXT")]
+    pub find_text: Option<String>,
 
     /// Publish the document if it is still a draft.
     #[arg(long)]
@@ -72,23 +108,59 @@ fn request_args(cmd: &UpdateArgs, body: Option<Body>) -> Result<Vec<(String, Str
             )));
         }
     }
-    if body.is_none() && cmd.title.is_none() && !cmd.publish {
+    if body.is_none()
+        && cmd.title.is_none()
+        && cmd.icon.is_none()
+        && !cmd.clear_icon
+        && !cmd.publish
+    {
         return Err(CliError::usage(anyhow!(
-            "nothing to update: pass --title, --publish, or a new body on \
-             standard input or via --file"
+            "nothing to update: pass --title, --icon, --clear-icon, --publish, \
+             or a new body on standard input or via --file"
         )));
     }
+    validate_edit_mode(cmd, body.is_some())?;
     let mut args = vec![("id".to_string(), cmd.id.clone())];
     if let Some(title) = &cmd.title {
         args.push(("title".to_string(), title.clone()));
     }
+    if let Some(icon) = &cmd.icon {
+        args.push(("icon".to_string(), icon.clone()));
+    } else if cmd.clear_icon {
+        args.push(("icon".to_string(), "null".to_string()));
+    }
     if let Some(body) = body {
         args.push(("text".to_string(), body.text));
+        if let Some(mode) = cmd.mode {
+            args.push(("editMode".to_string(), mode.api_value().to_string()));
+        }
+        if let Some(find) = &cmd.find_text {
+            args.push(("findText".to_string(), find.clone()));
+        }
     }
     if cmd.publish {
         args.push(("publish".to_string(), "true".to_string()));
     }
     Ok(args)
+}
+
+fn validate_edit_mode(cmd: &UpdateArgs, has_body: bool) -> Result<(), CliError> {
+    if (cmd.mode.is_some() || cmd.find_text.is_some()) && !has_body {
+        return Err(CliError::usage(anyhow!(
+            "--mode and --find-text require a new body on standard input or via --file"
+        )));
+    }
+    if cmd.mode == Some(EditMode::Patch) && cmd.find_text.is_none() {
+        return Err(CliError::usage(anyhow!(
+            "--mode patch requires --find-text"
+        )));
+    }
+    if cmd.find_text.is_some() && cmd.mode != Some(EditMode::Patch) {
+        return Err(CliError::usage(anyhow!(
+            "--find-text is only valid with --mode patch"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -102,7 +174,11 @@ mod tests {
         UpdateArgs {
             id: "doc-1".to_string(),
             title: title.map(str::to_string),
+            icon: None,
+            clear_icon: false,
             file: None,
+            mode: None,
+            find_text: None,
             publish,
         }
     }
@@ -147,6 +223,30 @@ mod tests {
     fn publish_alone_is_enough() {
         let built = request_args(&cmd(None, true), None).unwrap();
         assert_eq!(value(&built, "publish"), Some("true"));
+    }
+
+    #[test]
+    fn append_and_patch_modes_reach_the_api() {
+        let mut append = cmd(None, false);
+        append.mode = Some(EditMode::Append);
+        let built = request_args(&append, body("more")).unwrap();
+        assert_eq!(value(&built, "editMode"), Some("append"));
+
+        let mut patch = cmd(None, false);
+        patch.mode = Some(EditMode::Patch);
+        patch.find_text = Some("old".to_string());
+        let built = request_args(&patch, body("new")).unwrap();
+        assert_eq!(value(&built, "editMode"), Some("patch"));
+        assert_eq!(value(&built, "findText"), Some("old"));
+    }
+
+    #[test]
+    fn patch_requires_find_text_and_a_body() {
+        let mut patch = cmd(None, false);
+        patch.mode = Some(EditMode::Patch);
+        assert!(request_args(&patch, body("new")).is_err());
+        patch.find_text = Some("old".to_string());
+        assert!(request_args(&patch, None).is_err());
     }
 
     #[test]

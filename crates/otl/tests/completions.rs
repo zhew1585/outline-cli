@@ -297,7 +297,15 @@ fn candidate_tokens_in_a_script_are_all_allow_listed() {
     // one the filter accepts. Checked on fish, whose appended rules put each
     // candidate in a `-a "<name>"` argument that can be extracted exactly.
     let script = script_for("fish");
-    let offered: Vec<&str> = script
+    // Clap also emits ordinary enum values for curated commands (for
+    // example `fetch document`); those are not operation-shaped tokens and
+    // intentionally use a different grammar. Restrict this assertion to the
+    // IR-driven section appended by our generator.
+    let operation_section = script
+        .split("# Operation candidates from the compiled IR table")
+        .nth(1)
+        .expect("fish script has the IR candidate section");
+    let offered: Vec<&str> = operation_section
         .lines()
         .filter_map(|line| line.split(" -a \"").nth(1))
         .filter_map(|rest| rest.split('"').next())

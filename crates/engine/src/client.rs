@@ -1,10 +1,8 @@
 //! The single request channel.
 //!
-//! Every HTTP call made on behalf of the engine flows through the private
-//! [`Client::send`]: both the `key=value` path ([`Client::execute`]) and the
-//! raw-body passthrough ([`Client::execute_raw`]) funnel into it, so there
-//! is exactly one `.send()` in the crate. Local validation, backoff, error
-//! mapping and token renewal all live here (and only here).
+//! Every authenticated HTTP call flows through one private request loop, so
+//! the crate has exactly one `.send()`. Validation, backoff, error mapping,
+//! redirect policy, and token renewal live here.
 
 use std::fmt;
 use std::io::Read;
@@ -21,6 +19,7 @@ use crate::credential::{CredentialSource, StaticCredential};
 use crate::error::{is_transport_failure, EngineError, TransportKind};
 use crate::ir::{OpSpec, ValidationMode};
 use crate::paginate::{self, Fetched, PaginationSpec};
+use crate::redirect::{self, ResponseData, ResponseKind};
 use crate::retry::RetryPolicy;
 use crate::sanitize::{clean_server_text_for, redact_all, REDACTED};
 use crate::throttle::Throttle;
@@ -138,14 +137,9 @@ impl Client {
         let parsed = validate_base_url(base_url)?;
         let http = reqwest::blocking::Client::builder()
             .timeout(timeout)
-            // Redirects are disabled deliberately. Every request carries a
-            // bearer credential, and reqwest only strips the Authorization
-            // header when the redirect crosses a HOST: a same-host
-            // `https://` -> `http://` downgrade keeps it and would put the
-            // credential on the wire in plaintext. Request bodies are never
-            // stripped, and 307/308 replays them. An RPC API has no
-            // legitimate reason to redirect a POST, so a 3xx is reported as
-            // the unexpected status it is.
+            // Never replay credentials or bodies to redirect targets. The
+            // one supported 302 contract exposes its validated Location to
+            // the caller without requesting it; every other 3xx is an error.
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| EngineError::ClientBuild(error.without_url()))?;
@@ -173,12 +167,8 @@ impl Client {
 
     /// Execute one RPC operation with `key=value` arguments.
     ///
-    /// Arguments are validated against the operation's parameter specs and
-    /// coerced to their declared JSON types locally - any validation error
-    /// is returned before a single byte goes on the wire. Then sends
-    /// `POST {base}{op.path}` and returns the parsed JSON response. The
-    /// operation path comes from the IR verbatim; the engine imposes no
-    /// URL convention of its own.
+    /// Arguments are validated and coerced against the parameter specs before
+    /// sending `POST {base}{op.path}`. The path comes from the IR verbatim.
     pub fn execute(
         &self,
         op: &OpSpec,
@@ -192,6 +182,30 @@ impl Client {
         // Every value came from the caller's own command line, so server
         // error text may be surfaced in full (sanitized and token-free).
         self.send(&op.path, bytes, ErrorDetail::Full)
+    }
+
+    /// Return a validated absolute `Location` from an expected HTTP 302.
+    /// The signed target is never requested by this client.
+    pub fn execute_redirect_location(
+        &self,
+        op: &OpSpec,
+        args: &[(String, String)],
+        validation: ValidationMode,
+    ) -> Result<String, EngineError> {
+        let body = build_request_body(op, args, validation)?;
+        let bytes = encode(&body)?;
+        match self.send_response(
+            &op.path,
+            bytes,
+            ErrorDetail::Full,
+            ResponseKind::RedirectLocation,
+        )? {
+            ResponseData::RedirectLocation(location) => Ok(location),
+            ResponseData::Json(_) => Err(self.unexpected_response(
+                "the endpoint returned JSON where a redirect was required",
+                &[],
+            )),
+        }
     }
 
     /// Execute one RPC operation, auto-paginating per `spec` and capping
@@ -310,16 +324,34 @@ impl Client {
         body: Vec<u8>,
         detail: ErrorDetail,
     ) -> Result<Value, EngineError> {
+        match self.send_response(op_path, body, detail, ResponseKind::Json)? {
+            ResponseData::Json(value) => Ok(value),
+            ResponseData::RedirectLocation(_) => Err(self.unexpected_response(
+                "the endpoint returned a redirect where JSON was required",
+                &[],
+            )),
+        }
+    }
+
+    /// Shared credential-renewal loop for JSON and redirect responses.
+    fn send_response(
+        &self,
+        op_path: &str,
+        body: Vec<u8>,
+        detail: ErrorDetail,
+        response_kind: ResponseKind,
+    ) -> Result<ResponseData, EngineError> {
         let url = format!("{}{}", self.base_url, op_path);
         let mut used = vec![self.credential.bearer()?];
         let mut renewed = false;
         loop {
             let secrets = borrow(&used);
             let current = secrets.last().copied().unwrap_or_default();
-            let rejected = match self.send_once(&url, &body, current, &secrets, detail)? {
-                Outcome::Value(value) => return Ok(value),
-                Outcome::Unauthorized(response) => response,
-            };
+            let rejected =
+                match self.send_once(&url, &body, current, &secrets, detail, response_kind)? {
+                    Outcome::Response(response) => return Ok(response),
+                    Outcome::Unauthorized(response) => response,
+                };
             if !renewed {
                 if let Some(fresh) = self.credential.renew(current)? {
                     used.push(fresh);
@@ -346,6 +378,7 @@ impl Client {
         token: &str,
         secrets: &[&str],
         detail: ErrorDetail,
+        response_kind: ResponseKind,
     ) -> Result<Outcome, EngineError> {
         let mut attempt: u32 = 0;
         loop {
@@ -368,14 +401,41 @@ impl Client {
             if status == StatusCode::UNAUTHORIZED {
                 return Ok(Outcome::Unauthorized(response));
             }
-            if !status.is_success() {
-                return Err(api_error(response, secrets, detail));
-            }
-            return response
-                .json()
-                .map(Outcome::Value)
-                .map_err(|source| self.body_error(source, secrets));
+            return self.decode_response(response, secrets, detail, response_kind);
         }
+    }
+
+    /// Decode one non-401, non-429 response according to its contract.
+    fn decode_response(
+        &self,
+        response: reqwest::blocking::Response,
+        secrets: &[&str],
+        detail: ErrorDetail,
+        kind: ResponseKind,
+    ) -> Result<Outcome, EngineError> {
+        let status = response.status();
+        if kind == ResponseKind::RedirectLocation && status == StatusCode::FOUND {
+            let location = redirect::location(&response).ok_or_else(|| {
+                self.unexpected_response(
+                    "the redirect did not contain a usable absolute HTTP(S) Location header",
+                    secrets,
+                )
+            })?;
+            return Ok(Outcome::Response(ResponseData::RedirectLocation(location)));
+        }
+        if !status.is_success() {
+            return Err(api_error(response, secrets, detail));
+        }
+        if kind == ResponseKind::RedirectLocation {
+            return Err(self.unexpected_response(
+                "the endpoint did not return the expected HTTP 302 redirect",
+                secrets,
+            ));
+        }
+        response
+            .json()
+            .map(|value| Outcome::Response(ResponseData::Json(value)))
+            .map_err(|source| self.body_error(source, secrets))
     }
 
     /// Absorb one HTTP 429: sleep out the advised delay and report the next
@@ -475,6 +535,13 @@ impl Client {
     fn display_origin(&self, secrets: &[&str]) -> String {
         redact_all(&self.origin, secrets)
     }
+
+    fn unexpected_response(&self, reason: &str, secrets: &[&str]) -> EngineError {
+        EngineError::UnexpectedResponse {
+            origin: self.display_origin(secrets),
+            reason: reason.to_string(),
+        }
+    }
 }
 
 /// Borrow every credential in play as a slice of `&str`.
@@ -484,8 +551,8 @@ fn borrow(used: &[String]) -> Vec<&str> {
 
 /// What one trip to the server produced.
 enum Outcome {
-    /// A success response, parsed.
-    Value(Value),
+    /// A successful response decoded according to the operation contract.
+    Response(ResponseData),
     /// HTTP 401, response intact so the caller can either renew the
     /// credential and replay, or report the server's own message.
     Unauthorized(reqwest::blocking::Response),

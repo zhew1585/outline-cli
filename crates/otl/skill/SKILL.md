@@ -1,7 +1,7 @@
 ---
 name: outline-cli
 description: Work with an Outline knowledge base from the shell using the `otl` CLI - search, read, create, update and export documents and collections, call any Outline API operation by name, and discover each operation's request and response contract offline. Use when the user mentions Outline, a wiki/knowledge-base document, an Outline URL or document id, or when `otl` is installed and the task involves reading or writing docs. Also use when `otl` reports an authentication, configuration or exit-code failure and the user needs to be guided through authorization.
-version: 1.0.0
+version: 1.1.0
 metadata:
   produced_by: outline-cli (otl)
   install: otl skill install
@@ -26,7 +26,7 @@ the copy installed here and says when to re-run `otl skill install`.
 2. **Parse `--json`, never the table.** `--json` is already the default
    whenever stdout is not a terminal, so piping gives you JSON. The table
    layout is for humans and is not a contract; `otl api` output shape is
-   explicitly unstable, the six curated commands are semver-stable.
+   explicitly unstable, while curated commands are semver-stable.
 3. **Never read, print, echo or copy a credential.** Do not open
    `credentials.toml`, do not paste an API key into a command line, do not put
    one in a file you create. `otl` reads secrets itself; `otl auth set-key`
@@ -158,7 +158,7 @@ otl auth logout                  # forget this profile's credentials, revoke on 
 otl auth logout --purge          # also delete the application otl registered for itself
 ```
 
-## 3. The six stable commands
+## 3. Stable Outline workflows
 
 Their flags and output are a semver contract. Every one names its underlying
 operation in `--help`.
@@ -169,6 +169,8 @@ otl collections list --no-counts                  # skip one request per collect
 
 otl docs search "deploy runbook"                  # full-text search
 otl docs search "runbook" --collection <ID> --limit 20
+otl docs list                                      # recent documents
+otl docs list "runbook" --collection <ID> --limit 20
 
 otl docs view <ID>                                # markdown to a pager
 otl docs view <ID> --raw                          # straight to stdout
@@ -177,13 +179,45 @@ otl docs view <ID> --web                          # open in a browser
 otl docs create --title "Notes" --collection <ID> < body.md
 otl docs create --title "Notes" --file body.md --draft
 otl docs update <ID> --title "New title" --file body.md --publish
+printf '\nMore notes\n' | otl docs update <ID> --mode append
+printf 'new wording' | otl docs update <ID> --mode patch --find-text 'old wording'
+otl docs move <ID> --collection <ID> --parent <ID> --index 0
+otl docs delete <ID>                               # trash
+otl docs delete <ID> --archive                     # archive
 
 otl docs export --collection <ID> --out ./backup  # one markdown file per document
 otl docs export --collection <ID> --out ./backup --overwrite --limit 100
+
+otl fetch document <ID-or-URL>
+otl fetch collection <ID-or-URL>                   # metadata + full tree
+otl fetch user current_user
+otl fetch attachment <ID-or-URL>                   # signed download URL
+
+otl collections create --name "Engineering" --icon "🛠️" --color '#3366FF'
+otl collections update <ID> --description "Team knowledge base"
+otl collections delete <ID> --archive
+
+otl comments list --document <ID> --status unresolved
+otl comments create --document <ID> --text "Looks good"
+otl comments update <ID> --resolve                  # or --unresolve
+otl comments delete <ID>
+
+otl attachments create --name image.png --content-type image/png --size 12345
+otl users list --status active --role member --query jane
 ```
 
 Document ids: a UUID, or the short `urlId` from a document URL. Both work
 wherever `<ID>` appears.
+
+`fetch` also accepts a full Outline URL and extracts its final identifier.
+Collection fetches combine metadata with the complete navigation tree. An
+attachment fetch returns a short-lived signed URL without forwarding the
+Outline bearer credential to the storage host.
+
+`attachments create` only obtains the pre-signed POST/PUT inputs; upload the
+bytes directly to the returned storage URL. For comment updates, `--text`
+creates plain ProseMirror paragraphs and keeps Markdown punctuation literal;
+use `--data FILE` when rich comment formatting must be preserved.
 
 `--limit N` is a truncation you asked for: it warns on stderr and exits **0**.
 The CLI's own pagination cap being reached is different - that exits **9**.

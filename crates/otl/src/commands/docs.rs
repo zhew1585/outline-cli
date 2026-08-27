@@ -14,6 +14,8 @@ mod create;
 mod detail;
 mod dir;
 mod export;
+mod lifecycle;
+mod list;
 mod outdir;
 mod search;
 mod target;
@@ -37,6 +39,8 @@ pub struct DocsArgs {
 /// The curated document subcommands.
 #[derive(Debug, Subcommand)]
 enum DocsCommand {
+    /// List recent documents, or search when a query is supplied.
+    List(list::ListArgs),
     /// Search documents by full-text query.
     Search(search::SearchArgs),
     /// Print a document's markdown.
@@ -47,6 +51,10 @@ enum DocsCommand {
     Update(update::UpdateArgs),
     /// Export a whole collection to local markdown files.
     Export(export::ExportArgs),
+    /// Move or reorder a document.
+    Move(lifecycle::MoveArgs),
+    /// Move a document to trash, or archive it.
+    Delete(lifecycle::DeleteArgs),
 }
 
 /// Run the requested `otl docs` subcommand.
@@ -62,10 +70,13 @@ pub fn run(
     overrides: &Overrides,
 ) -> Result<(), CliError> {
     match &args.command {
+        DocsCommand::List(args) => list::run(args, mode, overrides),
         DocsCommand::Search(args) => search::run(args, mode, overrides),
         DocsCommand::View(args) => view::run(args, mode, json_requested, overrides),
         DocsCommand::Create(args) => create::run(args, mode, overrides),
         DocsCommand::Update(args) => update::run(args, mode, overrides),
         DocsCommand::Export(args) => export::run(args, mode, overrides),
+        DocsCommand::Move(args) => lifecycle::move_document(args, mode, overrides),
+        DocsCommand::Delete(args) => lifecycle::delete_document(args, mode, overrides),
     }
 }

@@ -17,6 +17,7 @@ use anyhow::anyhow;
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
+use crate::commands::output;
 use crate::config::Overrides;
 use crate::exit::CliError;
 use crate::fields::{self, Column, COMPUTED};
@@ -63,6 +64,12 @@ pub struct CollectionsArgs {
 enum CollectionsCommand {
     /// List every collection with its id and document count.
     List(ListArgs),
+    /// Create a collection.
+    Create(CreateArgs),
+    /// Update collection metadata.
+    Update(UpdateArgs),
+    /// Delete a collection, or archive it and its documents.
+    Delete(DeleteArgs),
 }
 
 /// Arguments for `otl collections list`.
@@ -75,6 +82,10 @@ enum CollectionsCommand {
     otl api describe collections.list --json
     otl api describe collections.documents --json")]
 pub struct ListArgs {
+    /// Filter collections by name.
+    #[arg(long)]
+    pub query: Option<String>,
+
     /// Stop after N collections (a warning says so on stderr).
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     pub limit: Option<u64>,
@@ -85,6 +96,45 @@ pub struct ListArgs {
     pub no_counts: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct CreateArgs {
+    /// Collection name.
+    #[arg(long)]
+    name: String,
+    /// Markdown description.
+    #[arg(long)]
+    description: Option<String>,
+    /// Emoji or named Outline icon.
+    #[arg(long)]
+    icon: Option<String>,
+    /// Hex icon color.
+    #[arg(long)]
+    color: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Collection ID.
+    id: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    icon: Option<String>,
+    #[arg(long)]
+    color: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// Collection ID.
+    id: String,
+    /// Archive the collection and its documents instead of deleting them.
+    #[arg(long)]
+    archive: bool,
+}
+
 /// Run the requested `otl collections` subcommand.
 pub fn run(
     args: &CollectionsArgs,
@@ -93,13 +143,21 @@ pub fn run(
 ) -> Result<(), CliError> {
     match &args.command {
         CollectionsCommand::List(args) => list(args, mode, overrides),
+        CollectionsCommand::Create(args) => create(args, mode, overrides),
+        CollectionsCommand::Update(args) => update(args, mode, overrides),
+        CollectionsCommand::Delete(args) => delete(args, mode, overrides),
     }
 }
 
 /// Run `otl collections list`.
 fn list(cmd: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     let session = Session::open(overrides)?;
-    let collections = session.call_rows(LIST_OPERATION, &[], cmd.limit)?;
+    let request = cmd
+        .query
+        .as_ref()
+        .map(|query| vec![("query".to_string(), query.clone())])
+        .unwrap_or_default();
+    let collections = session.call_rows(LIST_OPERATION, &request, cmd.limit)?;
     if mode == OutputMode::Json {
         // Raw server rows: no synthetic count field, so a script never sees
         // a value the API cannot confirm.
@@ -125,6 +183,48 @@ fn list(cmd: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), C
             truncation,
         )),
         None => Ok(()),
+    }
+}
+
+fn create(cmd: &CreateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let mut request = vec![("name".to_string(), cmd.name.clone())];
+    push_optional(&mut request, "description", cmd.description.as_ref());
+    push_optional(&mut request, "icon", cmd.icon.as_ref());
+    push_optional(&mut request, "color", cmd.color.as_ref());
+    let result = Session::open(overrides)?.call_data("collections.create", &request)?;
+    output::emit(&result, mode)
+}
+
+fn update(cmd: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    if cmd.name.is_none() && cmd.description.is_none() && cmd.icon.is_none() && cmd.color.is_none()
+    {
+        return Err(CliError::usage(anyhow!(
+            "nothing to update: pass --name, --description, --icon, or --color"
+        )));
+    }
+    let mut request = vec![("id".to_string(), cmd.id.clone())];
+    push_optional(&mut request, "name", cmd.name.as_ref());
+    push_optional(&mut request, "description", cmd.description.as_ref());
+    push_optional(&mut request, "icon", cmd.icon.as_ref());
+    push_optional(&mut request, "color", cmd.color.as_ref());
+    let result = Session::open(overrides)?.call_data("collections.update", &request)?;
+    output::emit(&result, mode)
+}
+
+fn delete(cmd: &DeleteArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
+    let operation = if cmd.archive {
+        "collections.archive"
+    } else {
+        "collections.delete"
+    };
+    let result =
+        Session::open(overrides)?.call_data(operation, &[("id".to_string(), cmd.id.clone())])?;
+    output::emit(&result, mode)
+}
+
+fn push_optional(request: &mut Vec<(String, String)>, name: &str, value: Option<&String>) {
+    if let Some(value) = value {
+        request.push((name.to_string(), value.clone()));
     }
 }
 

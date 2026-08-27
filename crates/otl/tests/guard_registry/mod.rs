@@ -180,17 +180,18 @@ pub const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
 /// fails the guard, because its line will not match the registered context
 /// and its count will not match either.
 pub const FILE_READ_ALLOWLIST: &[Exception] = &[
-    // The `--body @file.json` request body, named by the user.
+    // User-selected command input files (`--body @file.json` and comment
+    // ProseMirror data). One reviewed, bounded reader owns both call sites.
     Exception {
-        file: "crates/otl/src/commands/api/mod.rs",
+        file: "crates/otl/src/commands/input.rs",
         pattern: "File::open",
         context: "let file = File::open(path)",
         count: 1,
     },
     Exception {
-        file: "crates/otl/src/commands/api/mod.rs",
+        file: "crates/otl/src/commands/input.rs",
         pattern: "read_to_string",
-        context: ".read_to_string(&mut raw)",
+        context: ".read_to_string(&mut text)",
         count: 1,
     },
     // The `--spec <PATH>` document, likewise named by the user.
