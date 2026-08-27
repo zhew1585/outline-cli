@@ -41,6 +41,13 @@ const COLLECTION_COLUMN: usize = 1;
 
 /// Arguments for `otl docs search`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contracts:
+  Results come from documents.search. In table mode, collection labels may
+  also use collections.list.
+
+  Inspect them with:
+    otl api describe documents.search --json
+    otl api describe collections.list --json")]
 pub struct SearchArgs {
     /// Full-text search query.
     pub query: String,

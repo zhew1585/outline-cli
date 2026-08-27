@@ -71,6 +71,38 @@ pub(crate) fn check_text(op: &CompiledOp) -> Result<(), CompileError> {
             return Err(unsafe_text("response field format", UNSAFE_TEXT_REASON));
         }
     }
+    check_field_nesting(op)?;
+    Ok(())
+}
+
+/// Validate the pre-order encoding before it enters generated code or a
+/// runtime cache. This also guarantees recursive presentation is bounded.
+fn check_field_nesting(op: &CompiledOp) -> Result<(), CompileError> {
+    let invalid = || CompileError::UnsafeText {
+        operation: op.name.clone(),
+        field: "response field nesting",
+        reason: "it is not a bounded pre-order tree",
+    };
+    let mut containers = Vec::new();
+    for (index, field) in op.response_fields.iter().enumerate() {
+        let depth = usize::from(field.depth);
+        if depth > crate::schema::MAX_SCHEMA_DEPTH
+            || (index == 0 && depth != 0)
+            || depth > containers.len()
+        {
+            return Err(invalid());
+        }
+        containers.truncate(depth);
+        if depth > 0
+            && !matches!(
+                containers.get(depth - 1),
+                Some(crate::FieldContainer::Object | crate::FieldContainer::Array)
+            )
+        {
+            return Err(invalid());
+        }
+        containers.push(field.container);
+    }
     Ok(())
 }
 

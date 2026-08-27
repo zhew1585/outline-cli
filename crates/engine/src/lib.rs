@@ -45,7 +45,8 @@ pub use client::{
 pub use credential::{CredentialError, CredentialFault, CredentialSource, StaticCredential};
 pub use error::{EngineError, TransportKind};
 pub use ir::{
-    BodyMode, FieldSpec, OpSpec, ParamSpec, ParamType, ValidationMode, IR_SCHEMA_VERSION,
+    BodyMode, FieldContainer, FieldSpec, OpSpec, ParamSpec, ParamType, ValidationMode,
+    IR_SCHEMA_VERSION,
 };
 pub use paginate::{Fetched, OffsetEcho, PaginationSpec, Truncation, TruncationCause};
 pub use retry::RetryPolicy;

@@ -91,6 +91,13 @@ fn field_to_ir(field: &CompiledField) -> FieldSpec {
         format: field.format.clone().into(),
         nullable: field.nullable,
         read_only: field.read_only,
+        depth: field.depth,
+        container: match field.container {
+            spec_compile::FieldContainer::None => engine::ir::FieldContainer::None,
+            spec_compile::FieldContainer::Object => engine::ir::FieldContainer::Object,
+            spec_compile::FieldContainer::Array => engine::ir::FieldContainer::Array,
+            spec_compile::FieldContainer::Union => engine::ir::FieldContainer::Union,
+        },
     }
 }
 
@@ -273,6 +280,26 @@ fn check_field_text(op: &OpSpec) -> Result<(), String> {
         if !is_display_safe(&field.format, spec_compile::MAX_FORMAT_BYTES) {
             return unsafe_text("response field format");
         }
+    }
+    let mut containers = Vec::new();
+    for (index, field) in op.response_fields.iter().enumerate() {
+        let depth = usize::from(field.depth);
+        if depth > spec_compile::MAX_SCHEMA_DEPTH
+            || (index == 0 && depth != 0)
+            || depth > containers.len()
+        {
+            return unsafe_text("response field nesting");
+        }
+        containers.truncate(depth);
+        if depth > 0
+            && !matches!(
+                containers.get(depth - 1),
+                Some(engine::ir::FieldContainer::Object | engine::ir::FieldContainer::Array)
+            )
+        {
+            return unsafe_text("response field nesting");
+        }
+        containers.push(field.container);
     }
     Ok(())
 }

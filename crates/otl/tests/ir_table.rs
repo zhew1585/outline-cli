@@ -362,6 +362,7 @@ fn find_returns_none_for_unknown_operation() {
 fn response_field_names(op: &engine::OpSpec) -> Vec<&str> {
     op.response_fields
         .iter()
+        .filter(|field| field.depth == 0)
         .map(|field| field.name.as_ref())
         .collect()
 }
@@ -454,15 +455,59 @@ fn most_operations_carry_a_compiled_response_shape() {
 #[test]
 fn response_fields_never_repeat_a_name() {
     for op in ops::OPS {
-        let mut names = response_field_names(op);
-        let total = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(
-            names.len(),
-            total,
-            "{} has duplicate response fields",
-            op.name
-        );
+        let mut sibling_names: Vec<Vec<&str>> = Vec::new();
+        for field in op.response_fields.iter() {
+            let depth = usize::from(field.depth);
+            sibling_names.truncate(depth + 1);
+            if sibling_names.len() == depth {
+                sibling_names.push(Vec::new());
+            }
+            let names = &mut sibling_names[depth];
+            assert!(
+                !names.contains(&field.name.as_ref()),
+                "{} has duplicate response field {} at depth {depth}",
+                op.name,
+                field.name
+            );
+            names.push(field.name.as_ref());
+        }
+    }
+}
+
+#[test]
+fn nested_response_fields_are_compiled_for_every_operation_generically() {
+    let search = ops::find("documents.search").unwrap();
+    let document = search
+        .response_fields
+        .iter()
+        .position(|field| field.depth == 0 && field.name == "document")
+        .expect("search result has document");
+    assert_eq!(
+        search.response_fields[document].container,
+        engine::FieldContainer::Object
+    );
+    assert!(
+        search.response_fields[document + 1..]
+            .iter()
+            .take_while(|field| field.depth > 0)
+            .any(|field| field.depth == 1 && field.name == "id"),
+        "documents.search must expose document.id"
+    );
+
+    // The invariant is checked across the entire generated table, not just
+    // the motivating search operation.
+    for op in ops::OPS {
+        let mut previous = 0;
+        for (index, field) in op.response_fields.iter().enumerate() {
+            assert!(usize::from(field.depth) <= spec_compile::MAX_SCHEMA_DEPTH);
+            assert!(index != 0 || field.depth == 0, "{} starts nested", op.name);
+            assert!(
+                field.depth <= previous + 1,
+                "{} jumps from depth {previous} to {}",
+                op.name,
+                field.depth
+            );
+            previous = field.depth;
+        }
     }
 }

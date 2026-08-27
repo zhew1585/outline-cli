@@ -1,6 +1,6 @@
 //! The migration path across an `IR_SCHEMA_VERSION` bump.
 //!
-//! Story 4.6 takes the IR from 5 to 6 (`ParamSpec::description`), which
+//! Recursive response descriptors take the IR from 6 to 7, which
 //! invalidates every cache `otl spec sync` has written on a user's machine.
 //! That is expected and by design - a cache is regenerable - but "expected"
 //! only counts if the four things a user then does actually work. This file
@@ -17,7 +17,7 @@
 //! is no way to ask the current types for the previous layout, and a test
 //! that wrote a CURRENT record and only lowered the version number in the
 //! metadata would prove nothing about the case that actually occurs - the
-//! bytes would still decode. So the v5 structs are mirrored below, field for
+//! bytes would still decode. So the v6 structs are mirrored below, field for
 //! field and variant for variant, and serialized with the same encoder.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -34,11 +34,11 @@ use common::cache::{push_record, record, write_body, FORMAT_VERSION, MAGIC};
 use common::isolate;
 
 /// The IR schema version this story replaced.
-const PREVIOUS_IR_SCHEMA_VERSION: u32 = 5;
+const PREVIOUS_IR_SCHEMA_VERSION: u32 = 6;
 
-// --- the v5 layout, mirrored ------------------------------------------------
+// --- the v6 layout, mirrored ------------------------------------------------
 //
-// Same field order and same variant order as `engine::ir` had at version 5.
+// Same field order and same variant order as `engine::ir` had at version 6.
 // `Cow<'static, str>` encodes as a string and `Cow<'static, [T]>` as a
 // sequence, so these produce byte-identical records to what that build wrote.
 
@@ -64,7 +64,7 @@ enum OldBodyMode {
     Unsupported,
 }
 
-/// v5 `ParamSpec`: everything the current one has EXCEPT `description`.
+/// v6 `ParamSpec`, before response fields gained recursive metadata.
 #[derive(Serialize)]
 struct OldParamSpec {
     name: String,
@@ -75,6 +75,7 @@ struct OldParamSpec {
     format: String,
     minimum: Option<f64>,
     maximum: Option<f64>,
+    description: String,
 }
 
 #[derive(Serialize)]
@@ -113,6 +114,7 @@ fn old_op() -> OldOpSpec {
             format: "uuid".to_string(),
             minimum: None,
             maximum: None,
+            description: "Thing identifier".to_string(),
         }],
         response_fields: vec![OldFieldSpec {
             name: "id".to_string(),
@@ -124,7 +126,7 @@ fn old_op() -> OldOpSpec {
     }
 }
 
-/// Write a cache in the v5 shape into a fresh cache directory.
+/// Write a cache in the v6 shape into a fresh cache directory.
 fn previous_version_cache() -> TempDir {
     let dir = TempDir::new().unwrap();
     let mut meta =
@@ -174,11 +176,11 @@ fn a_cache_from_the_previous_ir_version_is_outdated_not_damaged() {
     assert_eq!(code, 0, "an old cache must never brick a command: {stderr}");
 
     // The whole point of decoding the provenance record before the operation
-    // records: `bincode` is positional, so reading v5 operations as v6 would
+    // records: `bincode` is positional, so reading v6 operations as v7 would
     // fail somewhere in the middle and be reported as corruption.
     assert!(stderr.contains("outdated"), "{stderr}");
     assert!(!stderr.contains("damaged"), "{stderr}");
-    assert!(stderr.contains("IR schema version 5"), "{stderr}");
+    assert!(stderr.contains("IR schema version 6"), "{stderr}");
     assert!(stderr.contains("spec sync"), "no remedy named: {stderr}");
 
     // The built-in table took over: the old cache's operation is gone and

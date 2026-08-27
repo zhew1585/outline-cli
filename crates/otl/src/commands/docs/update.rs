@@ -21,6 +21,11 @@ const OPERATION: &str = "documents.update";
 
 /// Arguments for `otl docs update`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contract:
+  This command uses documents.update.
+
+  Inspect it with:
+    otl api describe documents.update --json")]
 pub struct UpdateArgs {
     /// Document id (UUID or the short urlId from its URL).
     pub id: String,

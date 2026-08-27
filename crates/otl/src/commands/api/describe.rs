@@ -58,7 +58,7 @@
 
 use serde_json::{json, Value};
 
-use engine::{BodyMode, FieldSpec, OpSpec, ParamSpec};
+use engine::{BodyMode, FieldContainer, FieldSpec, OpSpec, ParamSpec};
 
 use crate::exit::CliError;
 use crate::ops;
@@ -170,7 +170,7 @@ fn as_json(op: &OpSpec) -> Value {
         "paginates": paging::spec_for(op).is_some(),
         "source": source(),
         "parameters": Value::Array(op.params.iter().map(param_json).collect()),
-        "response_fields": Value::Array(op.response_fields.iter().map(field_json).collect()),
+        "response_fields": Value::Array(response_fields_json(&op.response_fields)),
     })
 }
 
@@ -192,14 +192,49 @@ fn param_json(param: &ParamSpec) -> Value {
 }
 
 /// One response field, in the source schema's own declaration order.
-fn field_json(field: &FieldSpec) -> Value {
+fn field_json(field: &FieldSpec, fields: Vec<Value>) -> Value {
     json!({
         "name": field.name.as_ref(),
         "type": field.ty.to_string(),
+        "container": container_name(field.container),
         "format": optional(&field.format),
         "nullable": field.nullable,
         "read_only": field.read_only,
+        "fields": Value::Array(fields),
     })
+}
+
+/// Rebuild the public recursive tree from the cache-safe pre-order list.
+fn response_fields_json(fields: &[FieldSpec]) -> Vec<Value> {
+    let mut index = 0;
+    fields_at_depth(fields, &mut index, 0)
+}
+
+fn fields_at_depth(fields: &[FieldSpec], index: &mut usize, depth: u8) -> Vec<Value> {
+    let mut values = Vec::new();
+    while let Some(field) = fields.get(*index) {
+        if field.depth != depth {
+            break;
+        }
+        *index += 1;
+        let children = match fields.get(*index) {
+            Some(next) if next.depth == depth.saturating_add(1) => {
+                fields_at_depth(fields, index, depth + 1)
+            }
+            _ => Vec::new(),
+        };
+        values.push(field_json(field, children));
+    }
+    values
+}
+
+fn container_name(container: FieldContainer) -> Option<&'static str> {
+    match container {
+        FieldContainer::None => None,
+        FieldContainer::Object => Some("object"),
+        FieldContainer::Array => Some("array"),
+        FieldContainer::Union => Some("union"),
+    }
 }
 
 /// Which table this description came from.
@@ -225,13 +260,13 @@ fn as_text(op: &OpSpec) -> String {
         "parameters",
         op.params
             .iter()
-            .map(|p| (p.name.as_ref(), param_line(p), p.description.to_string())),
+            .map(|p| (p.name.as_ref(), param_line(p), p.description.to_string(), 0)),
     ));
     blocks.push(block(
         "response fields",
         op.response_fields
             .iter()
-            .map(|f| (f.name.as_ref(), field_line(f), String::new())),
+            .map(|f| (f.name.as_ref(), field_line(f), String::new(), f.depth)),
     ));
     blocks.join("\n\n")
 }
@@ -270,10 +305,13 @@ fn source_note() -> String {
 /// a sentence appended to `string, optional, format=uuid` buries the facets
 /// a caller is scanning for, and prose is the one value here that can be
 /// 200 characters long.
-fn block<'a>(title: &str, rows: impl Iterator<Item = (&'a str, String, String)>) -> String {
+fn block<'a>(title: &str, rows: impl Iterator<Item = (&'a str, String, String, u8)>) -> String {
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for (name, line, prose) in rows {
-        pairs.push((format!("  {}", safe(name)), line));
+    for (name, line, prose, depth) in rows {
+        pairs.push((
+            format!("  {}{}", "  ".repeat(depth.into()), safe(name)),
+            line,
+        ));
         if !prose.is_empty() {
             pairs.push((String::new(), safe(&prose)));
         }
@@ -340,6 +378,9 @@ fn facets(
 /// One response field as `<type>[, facet...]`.
 fn field_line(field: &FieldSpec) -> String {
     let mut parts = vec![field.ty.to_string()];
+    if let Some(container) = container_name(field.container) {
+        parts.push(container.to_string());
+    }
     if field.nullable {
         parts.push("nullable".to_string());
     }
@@ -419,7 +460,15 @@ mod tests {
             .iter()
             .find(|field| field["name"] == "id")
             .expect("the document response has an `id`");
-        for key in ["name", "type", "format", "nullable", "read_only"] {
+        for key in [
+            "name",
+            "type",
+            "container",
+            "format",
+            "nullable",
+            "read_only",
+            "fields",
+        ] {
             assert!(id.get(key).is_some(), "field facet {key} missing: {id}");
         }
     }

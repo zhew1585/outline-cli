@@ -8,7 +8,7 @@
 
 use std::fs;
 
-use engine::ir::{FieldSpec, OpSpec, ParamSpec, ParamType};
+use engine::ir::{FieldContainer, FieldSpec, OpSpec, ParamSpec, ParamType};
 use otl::spec::cache;
 use tempfile::TempDir;
 
@@ -38,11 +38,22 @@ fn response_fields_survive_the_round_trip() {
     let mut op = op("documents.info", "/api/documents.info");
     op.response_fields = vec![
         FieldSpec {
+            name: "owner".to_string().into(),
+            ty: ParamType::Json,
+            format: String::new().into(),
+            nullable: false,
+            read_only: true,
+            depth: 0,
+            container: FieldContainer::Object,
+        },
+        FieldSpec {
             name: "id".to_string().into(),
             ty: ParamType::String,
             format: "uuid".to_string().into(),
             nullable: false,
             read_only: true,
+            depth: 1,
+            container: FieldContainer::None,
         },
         FieldSpec {
             name: "title".to_string().into(),
@@ -50,6 +61,8 @@ fn response_fields_survive_the_round_trip() {
             format: String::new().into(),
             nullable: true,
             read_only: false,
+            depth: 0,
+            container: FieldContainer::None,
         },
     ]
     .into();
@@ -62,7 +75,12 @@ fn response_fields_survive_the_round_trip() {
         .iter()
         .map(|field| field.name.as_ref())
         .collect();
-    assert_eq!(names, ["id", "title"]);
+    assert_eq!(names, ["owner", "id", "title"]);
+    assert_eq!(loaded.ops[0].response_fields[1].depth, 1);
+    assert_eq!(
+        loaded.ops[0].response_fields[0].container,
+        FieldContainer::Object
+    );
 }
 
 #[test]

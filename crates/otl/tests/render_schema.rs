@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use engine::{FieldSpec, ParamType};
+use engine::{FieldContainer, FieldSpec, ParamType};
 use otl::render::{render, OutputMode};
 use serde_json::{json, Value};
 
@@ -34,6 +34,8 @@ fn field(
         format: std::borrow::Cow::Borrowed(format),
         nullable,
         read_only,
+        depth: 0,
+        container: FieldContainer::None,
     }
 }
 

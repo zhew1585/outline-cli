@@ -71,7 +71,7 @@ export OUTLINE_API_KEY=...            # Settings → API in your Outline instanc
 otl api list                          # every callable operation in the vendored spec
 otl api describe documents.info       # what it takes and what it returns
 otl api documents.info id=<doc-id>    # call any of them
-otl api documents.search query=deploy --json | jq '.[].title'
+otl api documents.search query=deploy --json | jq '.[].document.title'
 ```
 
 Arguments are `key=value` pairs coerced to the types the spec declares, and validated locally before any
@@ -93,13 +93,17 @@ otl api list                             # every operation: name, summary, path,
 otl api describe documents.info          # one operation's full contract
 otl api documents.info --help            # the same thing, from the flag you would reach for
 otl api describe documents.list --json | jq '.parameters[] | {name, type, required, description}'
+otl api describe documents.search --json | jq '.response_fields[] | select(.name == "document") | .fields'
 ```
 
 `describe` prints exactly what the CLI itself knows: every parameter with its type, whether it is
 required, whether it may be `null`, its `format`, its allowed values, its numeric bounds — the same
 facets local validation enforces and `--no-validate` skips — and the one-line description the OpenAPI
-document gives it, plus the response fields, the request path and content type, whether the operation
-paginates, and which table the answer came from (`built-in` or `synced`).
+document gives it, plus the recursively nested response fields, the request path and content type,
+whether the operation paginates, and which table the answer came from (`built-in` or `synced`). Complex
+response fields report a `container` (`object`, `array`, or `union`) and nested `fields`; array fields'
+children describe one array item. Union alternatives are not merged into a shape the server does not
+guarantee.
 
 The descriptions matter more than they look. Of the 109 operations that take parameters, **29 mark none
 of them required** — `documents.info` declares both `id` and `shareId` optional, and only the prose says
@@ -177,7 +181,8 @@ after the fact protects nothing:
 ## Everyday commands
 
 Six polished commands cover the day-to-day work. Unlike `otl api`, their flags and output are a stable
-(semver) contract.
+(semver) contract. Each command's `--help` names the underlying API operation and the corresponding
+`otl api describe <operation> --json` command when you need the complete request and response shape.
 
 ```sh
 otl collections list                          # name / id / document count, every page fetched

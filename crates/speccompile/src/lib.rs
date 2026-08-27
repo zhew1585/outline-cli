@@ -122,6 +122,25 @@ pub struct CompiledField {
     pub nullable: bool,
     /// Whether the schema marks the field `readOnly`.
     pub read_only: bool,
+    /// Nesting level in the response item, encoded as a pre-order flat
+    /// list. Top-level fields are zero; a child is exactly one level deeper
+    /// than its parent.
+    pub depth: u8,
+    /// Shape of a complex response field. Scalars use [`FieldContainer::None`].
+    pub container: FieldContainer,
+}
+
+/// Container shape of a response field whose scalar kind is JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldContainer {
+    /// A scalar, or a schema whose complex shape is not declared.
+    None,
+    /// An object; following entries at the next depth are its properties.
+    Object,
+    /// An array; following entries at the next depth are properties of one item.
+    Array,
+    /// A `oneOf`/`anyOf` union. Alternatives are intentionally not merged.
+    Union,
 }
 
 /// One compiled RPC operation.
@@ -465,6 +484,41 @@ mod tests {
         assert_eq!(op.params[1].name, "count");
         assert_eq!(op.params[1].ty, ScalarKind::Integer);
         assert!(!op.params[1].required);
+    }
+
+    #[test]
+    fn response_fields_recurse_through_objects_refs_and_array_items() {
+        let raw = serde_json::json!({
+            "paths": {"/things.list": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": {"type": "object", "properties": {
+                    "result": {"$ref": "#/components/schemas/Result"},
+                    "choice": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+                }}}
+            }}}}}},
+            "components": {"schemas": {"Result": {"type": "object", "properties": {
+                "id": {"type": "string", "format": "uuid"},
+                "items": {"type": "array", "items": {"type": "object", "properties": {
+                    "code": {"type": "integer"}
+                }}}
+            }}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let fields = &compiled.ops[0].response_fields;
+        let shape: Vec<(&str, u8, FieldContainer)> = fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.depth, field.container))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("result", 0, FieldContainer::Object),
+                ("id", 1, FieldContainer::None),
+                ("items", 1, FieldContainer::Array),
+                ("code", 2, FieldContainer::None),
+                ("choice", 0, FieldContainer::Union),
+            ]
+        );
     }
 
     /// The `deprecated` flag is read per operation, strictly as the JSON

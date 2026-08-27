@@ -11,7 +11,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use spec_compile::{BodyKind, CompiledField, CompiledOp, CompiledParam, ScalarKind};
+use spec_compile::{
+    BodyKind, CompiledField, CompiledOp, CompiledParam, FieldContainer, ScalarKind,
+};
 
 /// Outline URL convention: every RPC path lives under this prefix. This is
 /// an Outline-specific rule, so it is applied here (the otl layer), never
@@ -23,7 +25,7 @@ const API_PATH_PREFIX: &str = "/api";
 /// and never in the engine or the compiler.
 const ENVELOPE_DATA_PROPERTY: &str = "data";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 6;
+const IR_SCHEMA_VERSION: u32 = 7;
 
 fn main() {
     println!("cargo:rerun-if-changed=spec/spec3.json");
@@ -133,7 +135,22 @@ fn render_field(out: &mut String, field: &CompiledField) {
         "                nullable: {}, read_only: {},",
         field.nullable, field.read_only
     );
+    let _ = writeln!(out, "                depth: {},", field.depth);
+    let _ = writeln!(
+        out,
+        "                container: engine::ir::FieldContainer::{},",
+        field_container_variant(field.container)
+    );
     let _ = writeln!(out, "            }},");
+}
+
+fn field_container_variant(container: FieldContainer) -> &'static str {
+    match container {
+        FieldContainer::None => "None",
+        FieldContainer::Object => "Object",
+        FieldContainer::Array => "Array",
+        FieldContainer::Union => "Union",
+    }
 }
 
 fn render_param(out: &mut String, param: &CompiledParam) {

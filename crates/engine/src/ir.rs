@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 /// `OpSpec::content_type`, `OpSpec::body_mode` and the `ParamSpec`
 /// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`);
 /// 4 added `ParamSpec::format`; 5 added `OpSpec::response_fields`;
-/// 6 added `ParamSpec::description`.
-pub const IR_SCHEMA_VERSION: u32 = 6;
+/// 6 added `ParamSpec::description`; 7 added recursive response-field
+/// descriptors (`FieldSpec::depth` and `FieldSpec::container`).
+pub const IR_SCHEMA_VERSION: u32 = 7;
 
 /// How strictly a request is validated against the IR before being sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -139,6 +140,26 @@ pub struct FieldSpec {
     /// Whether the schema marks the field as server-generated
     /// (`readOnly`).
     pub read_only: bool,
+    /// Nesting level in a pre-order flat list. Top-level fields are zero.
+    /// This representation keeps untrusted cache decoding non-recursive;
+    /// consumers may reconstruct a tree after the usual bounds checks.
+    pub depth: u8,
+    /// Shape of a complex field, including whether children describe an
+    /// object directly or one item of an array.
+    pub container: FieldContainer,
+}
+
+/// Container shape of one response field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldContainer {
+    /// Scalar, or an otherwise undeclared complex shape.
+    None,
+    /// Object whose properties follow at the next depth.
+    Object,
+    /// Array whose item properties follow at the next depth.
+    Array,
+    /// `oneOf`/`anyOf`; alternatives are not unsafely merged.
+    Union,
 }
 
 /// A single RPC operation.
