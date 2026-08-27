@@ -69,8 +69,33 @@ _This file contains critical rules and patterns that AI agents must follow when 
 
 - 所有输出遵守双态：stdout 为数据（人类可读或 --json），stderr 为诊断/警告/进度；非 TTY 自动去色去分页。
 - 退出码表是公共 API：新增错误类型必须登记退出码文档，已发布退出码不得改义。
+  `docs/exit-codes.md` 是唯一来源，README 与 `crates/otl/skill/SKILL.md` 里的表都是它的生成块
+  （`crates/otl/tests/exit_code_tables.rs`，`UPDATE_EXIT_CODE_TABLES=1` 重写）。新增码要同时填
+  **Agent summary** 列——skill 的表由 `Meaning: Agent summary` 拼出，只写 Meaning 等于没写。
+- 终止性错误在 JSON 态是 stderr 上的对象 `{"error":{exit_code,code,message}}`（`src/failure.rs`），
+  `code` 即 `ExitCode::name()`，不是第二套分类法。clap 自己的用法错误与非终止警告仍是散文，因此
+  调用方只能把退出码当成"一定存在"的事实。
 - 精选命令的 flag 与输出格式变更受 semver 约束；`otl api` 输出明示不稳定。
+  `otl api list --json` / `describe --json` 的 `curated_command` 字段是两者之间的反向索引，表在
+  `crates/otl/src/commands/api/curated.rs`，由 `tests/curated_index.rs` 双向钉住。
 - 分页永不静默截断：截断必有 stderr 警告。
+
+### `--help` 与 SKILL 是契约，不是文档（都有机器守着）
+
+- **每个 `#[arg]` 都必须有文档注释。** 空 doc comment 照样编译、照样出现在 `--help` 里、后面什么都
+  没有——读者比"这个 flag 不存在"更糟，因为它看起来是有说明的。`tests/help_coverage.rs` 遍历
+  `otl::cli::Cli` 的整棵命令树断言这一点。
+- **每个会打印数据的命令都必须在 `after_long_help` 里声明 `JSON shape:` 段。** 脚本绑定的是形状，
+  而形状恰恰是过去没人写的部分：`otl docs list` 有两种形状（带 query 走 documents.search，元素是
+  `{context, ranking, document}`；不带走 documents.list，元素直接是 document），四个命令返回自己
+  拼的对象而非 operation 的对象。同一个测试守这条；例外要进 `NO_DATA_OUTPUT` /
+  `DOCUMENTED_ELSEWHERE` 并写明理由。
+- **`Cli` 定义住在 `crates/otl/src/cli.rs`（库里）而不是 `main.rs`**，就是为了让上面这些测试能用
+  `CommandFactory` 遍历真正发布的那棵树。测试里另写一份副本 = 守着副本。
+- **SKILL.md 里出现的每条命令行都必须真实存在。** `tests/skill_surface.rs` 抽出所有 fenced 代码块
+  里的 `otl …` 行，逐个核对子命令路径、flag 名、value-enum 取值，以及它提到的每个 `OUTLINE_*` 变量。
+  注意它用 `Cli::command()` 之后必须 `build()`：未 build 的树上 `--json` 这类 global flag 只挂在
+  root，也没有 `--help`/`--version`。
 
 ### Development Workflow Rules
 
@@ -92,8 +117,9 @@ _This file contains critical rules and patterns that AI agents must follow when 
   服务端）都掺了外来文本，没有任何东西 round-trip 它们，一律走 `render::render_json_scrubbed`；
   human 形态若是「自己拼的行列表」，逐行过 `stdio::scrub_to_one_line`（外来值不得伪造出一行）。
   三处都曾按「`--json` 就是 payload」类推而漏掉清洗，且是分三轮审查才找齐的
-  （describe 设计时、doctor 在 4.6 R1、auth 在 4.6 R2）。**目前没有守卫测试**，所以新增一个自撰
-  JSON 输出时，用哪个渲染器是必须显式回答的问题。已知的知情例外只有一个：
+  （describe 设计时、doctor 在 4.6 R1、auth 在 4.6 R2）。守卫是
+  `crates/otl/tests/authored_json.rs` 的登记表：新增任一渲染器的调用点都必须在 `EXEMPT` /
+  `SCRUBBED` / `RENDER` 里登记并写明理由，否则测试当场红。已知的知情例外只有一个：
   `otl docs export --json` 逐字携带 document id（Story 3.6 的决定，脚本要拿它重试）。
 - 不要实现非目标清单里的东西（pull/push 同步、TUI、watch、MCP、device flow、离线队列）。
 - DCR 注册后必须持久化 registration_access_token。丢了服务器上就删不掉了。
@@ -113,5 +139,7 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - 保持精简，只留 agent 会漏的内容。
 - 技术栈变化时更新；定期清理已成常识的规则。
 
-Last Updated: 2026-08-27 (Story 4.6: `--json` 清洗豁免的范围收窄为「服务器响应」，自撰 JSON 必须 scrub)
+Last Updated: 2026-08-27 (agent surface: `--help` 与 SKILL.md 纳入机器守卫，新增 `JSON shape:` 段、
+`curated_command` 反向索引、JSON 态结构化错误；`Cli` 迁入 `src/cli.rs`)
+Previous: 2026-08-27 (Story 4.6: `--json` 清洗豁免的范围收窄为「服务器响应」，自撰 JSON 必须 scrub)
 Previous: 2026-08-26 (Story 4.3: 运行时 OpenAPI 解析例外的归属从「命令」改述为「模块」，doctor 复用同一入口且不写缓存)

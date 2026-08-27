@@ -1,7 +1,7 @@
 ---
 name: outline-cli
 description: Work with an Outline knowledge base from the shell using the `otl` CLI - search, read, create, update and export documents and collections, call any Outline API operation by name, and discover each operation's request and response contract offline. Use when the user mentions Outline, a wiki/knowledge-base document, an Outline URL or document id, or when `otl` is installed and the task involves reading or writing docs. Also use when `otl` reports an authentication, configuration or exit-code failure and the user needs to be guided through authorization.
-version: 1.1.0
+version: 1.2.0
 metadata:
   produced_by: outline-cli (otl)
   install: otl skill install
@@ -27,22 +27,31 @@ the copy installed here and says when to re-run `otl skill install`.
    whenever stdout is not a terminal, so piping gives you JSON. The table
    layout is for humans and is not a contract; `otl api` output shape is
    explicitly unstable, while curated commands are semver-stable.
-3. **Never read, print, echo or copy a credential.** Do not open
+3. **Read the shape before you write the jq.** `otl <command> --help` ends in
+   a `JSON shape:` section that states exactly what that command prints. It
+   is not always the operation's own object, and one command (`otl docs
+   list`) has two shapes. Section 4 below is the summary; the help is the
+   authority.
+4. **Never read, print, echo or copy a credential.** Do not open
    `credentials.toml`, do not paste an API key into a command line, do not put
    one in a file you create. `otl` reads secrets itself; `otl auth set-key`
    takes the key on **stdin**. Every `otl` surface (including `doctor` and
    `auth info`) is built to never print one back.
-4. **Check the exit code**, not the wording. The codes are a published
-   contract (table at the end). Code 9 means *partial* - the output is real
-   but incomplete; never report it as success.
-5. **Ask the user for anything interactive.** `otl auth login` opens a browser
+5. **Check the exit code**, not the wording. The codes are a published
+   contract (table at the end). In `--json` mode the failure is also an
+   object on **stderr** - see section 8. Code 9 means *partial*: the output
+   is real but incomplete; never report it as success.
+6. **Ask the user for anything interactive.** `otl auth login` opens a browser
    and waits for a redirect. Prefer `otl auth login --no-browser` and hand the
    printed URL to the user rather than trying to complete a consent screen.
-6. **Do not retry rate limits by hand.** The CLI backs off on 429 internally;
+7. **Do not retry rate limits by hand.** The CLI backs off on 429 internally;
    exit code 8 means the budget was already exhausted.
-7. **Discover contracts, do not guess field names.** `otl api describe
+8. **Discover contracts, do not guess field names.** `otl api describe
    <operation> --json` is the single machine-readable contract for both `otl
    api` and the curated commands. Read it instead of assuming a JSON path.
+9. **Prefer the curated command when there is one.** `otl api list --json` and
+   `otl api describe --json` both carry a `curated_command` field naming it.
+   Those commands are semver-stable; `otl api` output is not.
 
 ## 1. Is this environment usable?
 
@@ -71,6 +80,9 @@ order they are reported:
 `status: "warn"` never blocks: the environment works. Only `problem` does, and
 the first `problem` in that order is the one to fix - everything after it was
 measured in a broken environment.
+
+`otl auth info --offline --json` answers the credential half alone; `otl auth
+info --help` lists every field it returns.
 
 ## 2. Authorization, driven by what is actually on this machine
 
@@ -110,6 +122,8 @@ otl auth set-key            # or interactively, when a human is at the terminal
 # OAuth (authorization code + PKCE), stored and refreshed by otl:
 otl auth login --no-browser # prints the URL to open; --profile scopes it
 otl auth login --client-id <ID>   # when an admin registered the application
+otl auth login --scope "read"     # default is "read write"
+otl auth login --timeout 300      # seconds to wait for the redirect
 ```
 
 An API key can also stay in the environment, and is then scoped to the profile
@@ -156,30 +170,39 @@ Cleanup, when asked for it:
 ```sh
 otl auth logout                  # forget this profile's credentials, revoke on the server
 otl auth logout --purge          # also delete the application otl registered for itself
+otl auth logout --force          # discard locally even if the server could not be told
 ```
+
+`logout` exits 9 when a server-side step did not happen. By default it then
+KEEPS the local credentials, because they are the only thing that makes a retry
+possible; `--force` is the opt-out and means "these tokens stay live until they
+expire".
 
 ## 3. Stable Outline workflows
 
 Their flags and output are a semver contract. Every one names its underlying
-operation in `--help`.
+operation and its JSON shape in `--help`.
 
 ```sh
-otl collections list                              # id, name, document count
+otl collections list                              # id and name (see section 4 on counts)
+otl collections list --query "eng" --limit 20
 otl collections list --no-counts                  # skip one request per collection
 
 otl docs search "deploy runbook"                  # full-text search
 otl docs search "runbook" --collection <ID> --limit 20
 otl docs list                                      # recent documents
-otl docs list "runbook" --collection <ID> --limit 20
+otl docs list "runbook" --collection <ID>          # same as `docs search`, different JSON
 
 otl docs view <ID>                                # markdown to a pager
-otl docs view <ID> --raw                          # straight to stdout
+otl docs view <ID> --raw                          # markdown straight to stdout
+otl docs view <ID> --json                         # the document object instead
 otl docs view <ID> --web                          # open in a browser
 
 otl docs create --title "Notes" --collection <ID> < body.md
-otl docs create --title "Notes" --file body.md --draft
+otl docs create --title "Notes" --file body.md --draft --icon "📓"
 otl docs update <ID> --title "New title" --file body.md --publish
-printf '\nMore notes\n' | otl docs update <ID> --mode append
+otl docs update <ID> --clear-icon
+printf '\nMore notes\n' | otl docs update <ID> --mode append   # or prepend
 printf 'new wording' | otl docs update <ID> --mode patch --find-text 'old wording'
 otl docs move <ID> --collection <ID> --parent <ID> --index 0
 otl docs delete <ID>                               # trash
@@ -190,20 +213,23 @@ otl docs export --collection <ID> --out ./backup --overwrite --limit 100
 
 otl fetch document <ID-or-URL>
 otl fetch collection <ID-or-URL>                   # metadata + full tree
-otl fetch user current_user
+otl fetch user current_user                        # or self, me, or a user id
 otl fetch attachment <ID-or-URL>                   # signed download URL
 
 otl collections create --name "Engineering" --icon "🛠️" --color '#3366FF'
 otl collections update <ID> --description "Team knowledge base"
 otl collections delete <ID> --archive
 
-otl comments list --document <ID> --status unresolved
+otl comments list --document <ID> --status unresolved --offset 0
+otl comments list --collection <ID>                 # one of --document/--collection required
 otl comments create --document <ID> --text "Looks good"
+otl comments create --document <ID> --text "typo" --anchor-text "recieve"
+otl comments create --document <ID> --text "agreed" --parent <COMMENT-ID>
 otl comments update <ID> --resolve                  # or --unresolve
 otl comments delete <ID>
 
 otl attachments create --name image.png --content-type image/png --size 12345
-otl users list --status active --role member --query jane
+otl users list --status active --role member --query jane --limit 50
 ```
 
 Document ids: a UUID, or the short `urlId` from a document URL. Both work
@@ -212,12 +238,15 @@ wherever `<ID>` appears.
 `fetch` also accepts a full Outline URL and extracts its final identifier.
 Collection fetches combine metadata with the complete navigation tree. An
 attachment fetch returns a short-lived signed URL without forwarding the
-Outline bearer credential to the storage host.
+Outline bearer credential to the storage host - fetch that URL with a plain
+unauthenticated request.
 
-`attachments create` only obtains the pre-signed POST/PUT inputs; upload the
-bytes directly to the returned storage URL. For comment updates, `--text`
-creates plain ProseMirror paragraphs and keeps Markdown punctuation literal;
-use `--data FILE` when rich comment formatting must be preserved. A rejected
+`attachments create` only obtains the pre-signed upload inputs; upload the
+bytes directly to the returned storage URL. Inline comments are made with
+`--anchor-text` (plus `--anchor-prefix` / `--anchor-suffix` when the phrase
+repeats); replies with `--parent`. For comment updates, `--text` creates plain
+ProseMirror paragraphs and keeps Markdown punctuation literal; use `--data
+FILE` when rich comment formatting must be preserved. A rejected
 `--text`/`--data` request reports only its error code, because the server may
 quote the body back - add `--show-server-message` when you need the server's
 explanation of what it did not like.
@@ -225,15 +254,67 @@ explanation of what it did not like.
 `--limit N` is a truncation you asked for: it warns on stderr and exits **0**.
 The CLI's own pagination cap being reached is different - that exits **9**.
 
-`otl docs export --json` summarizes with `complete`, `limit_reached`,
-`enumeration_truncated` and `durable`. The test for "this backup is usable" is
-`complete == true && durable != false` - `durable: null` means "this platform
-cannot confirm a flush", not "it failed".
+## 4. What each command actually prints
 
-## 4. Any operation, and its contract
+`otl <command> --help` ends in a `JSON shape:` section, and that is the
+authority. Four shapes are worth knowing before you write a single `jq`,
+because in each one the obvious guess is wrong.
+
+**`otl docs list` has two shapes.** It dispatches to two operations:
 
 ```sh
-otl api list                                  # every operation, with a `callable` flag
+otl docs list --json          # -> [ <document>, ... ]                .[0].id
+otl docs list QUERY --json    # -> [ {context, ranking, document} ]   .[0].document.id
+otl docs search QUERY --json  # -> identical to the second form
+```
+
+A path written for one silently yields `null` against the other. Use `otl docs
+search` whenever there is a query, and keep `otl docs list` for the
+query-less listing.
+
+**`otl collections list --json` carries no document count.** The counts in the
+human table are computed by the CLI from `collections.documents`, and the API
+cannot confirm them, so the JSON is the raw `collections.list` rows and nothing
+else. `--no-counts` therefore changes nothing in JSON mode. To count in a
+script, walk the tree:
+
+```sh
+otl fetch collection <ID> --json | jq '[.documents | .. | .id? // empty] | length'
+```
+
+**Some commands compose an object rather than returning the operation's own.**
+
+```sh
+otl fetch collection <ID> --json   # -> { collection, documents }
+otl fetch attachment <ID> --json   # -> { id, signedUrl }
+otl docs view <ID> --web --json    # -> { id, title, url }
+otl comments update <ID> --text T --resolve --json   # -> { comment, status }
+```
+
+Everything else - `docs view --json`, `docs create`, `docs update`, `docs
+move`, `collections create/update`, `comments list/create`, `users list`,
+`attachments create`, `fetch document`, `fetch user` - returns the operation's
+own object or array, verbatim. Delete commands return `{"success": true}`;
+their `--archive` variants return the archived entity instead.
+
+**`otl docs export --json` is a run summary, not documents.** The markdown
+files are the output. The summary is:
+
+```json
+{ "out": "./backup", "complete": true, "enumeration_truncated": false,
+  "limit_reached": false, "durable": true, "stray": [], "exported": 42,
+  "failed": [ { "id": "...", "label": "...", "reason": "..." } ] }
+```
+
+The test for "this backup is usable" is `complete == true && durable != false`
+- `durable: null` means "this platform cannot confirm a flush", not "it
+failed". In `failed[]`, `id` is `null` for a listing row that never had one, so
+retry the entries where `id != null` and report the rest.
+
+## 5. Any operation, and its contract
+
+```sh
+otl api list                                  # every operation, with `callable` and `curated_command`
 otl api describe documents.search --json      # one operation's full contract
 otl api documents.info id=<ID>                # call it: key=value pairs
 otl api documents.list --limit 50             # auto-pagination, capped
@@ -254,6 +335,7 @@ checks when the vendored table disagrees with your instance).
   "callable": true,
   "paginates": true,
   "source": "built-in",
+  "curated_command": "otl docs search",
   "parameters": [{"name": "query", "type": "string", "required": false, "description": "..."}],
   "response_fields": [{"name": "document", "type": "json", "container": "object",
     "fields_omitted": false, "fields": [
@@ -264,6 +346,10 @@ checks when the vendored table disagrees with your instance).
 
 Read it like this:
 
+- `curated_command` is the semver-stable command that covers this operation,
+  or `null`. When it is not null, use it: `otl api` output is explicitly
+  unstable. `otl api list --json` carries the same field, so one local call
+  tells you which of the 116 operations already have a stable front door.
 - `parameters[].required` is often `false` even when one of several is needed -
   the `description` is where that is stated, so read the prose.
 - `response_fields` is **recursive**. `container` is `object`, `array`, `union`
@@ -289,14 +375,21 @@ otl docs search "runbook" --json | jq -r '.[0].document.id'
 otl docs view "$(otl docs search "runbook" --json | jq -r '.[0].document.id')" --raw
 ```
 
-Curated commands keep the operation's own item shape in `--json`, so the
-contract above is also their output contract.
+A few operations a curated command drives are **absent from the published API
+description** and exist only in the table built into this binary:
+`collections.archive`, `comments.resolve`, `comments.unresolve`, and the
+`parentCommentId` / `statusFilter` parameters of `comments.list`. The curated
+commands always dispatch from the built-in definitions, so after an `otl spec
+sync` those commands keep working while `otl api describe` - which reads the
+EFFECTIVE table - can report them as unknown.
 
-## 5. Keeping the operation table current
+## 6. Keeping the operation table current
 
 ```sh
 otl spec sync            # fetch the upstream API description, compile, use it now
 otl spec sync --url <U>  # a mirror or an internal copy
+otl spec sync --spec <F> # compile a local OpenAPI file instead of fetching
+otl spec sync --force    # rewrite the cache even when nothing changed
 otl spec reset           # go back to the table built into the binary
 ```
 
@@ -304,25 +397,25 @@ Nothing here happens on its own: `otl` performs no background fetch and no
 update check. `otl doctor`'s `online-spec` check is what reports drift, and it
 only runs when you type it.
 
-## 6. This skill
+## 7. This skill
 
 ```sh
 otl skill install        # install or upgrade this document for the agents on this machine
-otl skill install --dir <SKILLS_ROOT>   # a specific skills directory
+otl skill install --dir <SKILLS_ROOT>   # a specific skills directory (OUTLINE_SKILL_DIR does the same)
+otl skill install --force               # replace a SKILL.md belonging to another skill
 otl skill show           # print this document to stdout
 ```
 
 `otl doctor` reports the `skill` check, and it never blocks. `ok` means every
 installed copy matches this binary - or that none is installed, which is not a
 fault. `warn` means a copy is out of step: behind, edited locally, declaring no
-version, another skill occupying the path (`otl skill install --force`
-replaces it), or a path that cannot hold a copy. `skipped` means this machine
-has no agent skills directory at all, so there was nothing to compare. Each
-entry in `installed[]` carries its own `state` (`current`, `behind`, `edited`,
-`undeclared`, `absent`, `foreign`, `unusable`) and its own `remedy`, so act on
-those rather than on the summary.
+version, another skill occupying the path, or a path that cannot hold a copy.
+`skipped` means this machine has no agent skills directory at all, so there was
+nothing to compare. Each entry in `installed[]` carries its own `state`
+(`current`, `behind`, `edited`, `undeclared`, `absent`, `foreign`, `unusable`)
+and its own `remedy`, so act on those rather than on the summary.
 
-## 7. Global flags, and the rest of the surface
+## 8. Global flags, failures, and the rest of the surface
 
 Every command accepts these, and they outrank the environment, which outranks
 the config file, key by key:
@@ -334,6 +427,20 @@ the config file, key by key:
 --config <FILE>       # OUTLINE_CONFIG; an empty value means "read no config file at all"
 ```
 
+**Failures are structured too.** In JSON mode a terminating error is an object
+on **stderr**, while stdout stays empty:
+
+```json
+{ "error": { "exit_code": 2, "code": "usage", "message": "OUTLINE_URL is not set.\n..." } }
+```
+
+`code` is the name of the same numeric class in the table below. Two things do
+not follow this shape, so never assume the object is there: argument errors
+caught by the argument parser itself (an unknown flag, a missing required
+option) stay prose, and warnings that do not end the command - a truncation
+notice, the plaintext-key notice - are prose on stderr as well. The exit code
+is the fact that is always present.
+
 The commands not covered above:
 
 ```sh
@@ -342,23 +449,28 @@ otl auth info --offline               # stored state only
 otl --version
 ```
 
-`otl <command> --help` is authoritative for flags, and `otl api <operation>
---help` prints that operation's contract rather than generic help.
+`otl <command> --help` is authoritative for flags and for JSON shapes, and
+`otl api <operation> --help` prints that operation's contract rather than
+generic help.
 
-## 8. Exit codes (published contract)
+## 9. Exit codes (published contract)
+
+<!-- BEGIN GENERATED EXIT CODES (from docs/exit-codes.md; see tests/exit_code_tables.rs) -->
 
 | Code | Meaning |
 |---|---|
-| 0 | Success. Also a closed stdout pipe (`otl ... \| head`), which is normal completion |
+| 0 | Success: also a closed stdout pipe (`otl ... \| head`), which is normal completion |
 | 1 | Generic failure: a response that is not JSON, an internal error |
 | 2 | Usage or configuration error: bad flag, unknown operation, missing `OUTLINE_URL`, local validation failure, config-file problem, credential file permissions too open, plaintext `http://` |
-| 3 | API request rejected (4xx that is not auth, not-found or exhausted rate limits) |
+| 3 | API request rejected: a 4xx that is not auth, not-found or exhausted rate limits |
 | 4 | Authentication or permission error: authenticate again |
-| 5 | Resource not found (404) |
-| 6 | Server error (5xx) |
+| 5 | Resource not found: the document, collection or other resource does not exist |
+| 6 | Server error: the instance failed to process the request |
 | 7 | Network error: the request may never have arrived |
-| 8 | Rate limited until the retry budget was exhausted; retry later |
+| 8 | Rate limited: the retry budget was exhausted, so retry later |
 | 9 | Partial failure: what you got is real, and some of it is missing |
+
+<!-- END GENERATED EXIT CODES -->
 
 Full text, including every case that maps to each code:
 `docs/exit-codes.md` in the `otl` repository.

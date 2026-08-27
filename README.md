@@ -89,12 +89,22 @@ Both discovery commands are purely local — they read the operation table compi
 the one `otl spec sync` installed) and send nothing.
 
 ```sh
-otl api list                             # every operation: name, summary, path, content type, callable
+otl api list                             # every operation: name, summary, path, content type, callable, curated command
 otl api describe documents.info          # one operation's full contract
 otl api documents.info --help            # the same thing, from the flag you would reach for
 otl api describe documents.list --json | jq '.parameters[] | {name, type, required, description}'
 otl api describe documents.search --json | jq '.response_fields[] | select(.name == "document") | .fields'
+otl api list --json | jq -r '.[] | select(.curated_command) | "\(.name)\t\(.curated_command)"'
 ```
+
+Both also answer the question that comes before "how do I call this": **is there already a stable
+command for it?** 26 of the 116 operations have one, and until they said so, a list of 116 names
+answered "how do I reach this" with `otl api` — the less stable of the two paths, chosen because the
+more stable one was invisible from there. `curated_command` names it (`"otl docs search"`,
+`"otl docs delete --archive"`) or is `null`; the text state carries the same fact as a
+`[stable command: ...]` marker, because neither state may say less than the other.
+`crates/otl/tests/curated_index.rs` keeps the index honest in both directions: every command it names
+must exist, and every operation a curated command's own `--help` names must be in it.
 
 `describe` prints exactly what the CLI itself knows: every parameter with its type, whether it is
 required, whether it may be `null`, its `format`, its allowed values, its numeric bounds — the same
@@ -188,9 +198,11 @@ after the fact protects nothing:
 ## Everyday commands
 
 Polished commands cover the day-to-day work. Unlike `otl api`, their flags and
-output are a stable (semver) contract. Each command's `--help` names the
-underlying API operation(s) and the corresponding `otl api describe <operation> --json`
-command, for when you need the complete request and response shape.
+output are a stable (semver) contract. Each command's `--help` ends in two
+sections: `API contract(s):` names the underlying operation(s) and the
+`otl api describe <operation> --json` that prints their full request and
+response shape, and `JSON shape:` states what *that command* writes to stdout —
+which is not always the operation's own object.
 
 ```sh
 otl collections list                          # name / id / document count, every page fetched
@@ -251,6 +263,23 @@ Notes worth knowing:
 - **`docs view` is markdown-first.** A pipe gets the document body, not JSON — the body *is* the data
   here. Ask for `--json` explicitly to get the document object. Every other command follows the usual
   rule (JSON whenever stdout is not a terminal).
+- **`docs list` returns two different shapes**, because it dispatches to two operations. Without a
+  query it lists `documents.list` rows (`.[].id`); with one it returns `documents.search` hits, where
+  the document is nested (`.[].document.id`). A `jq` path written for one yields `null` against the
+  other, so reach for `docs search` whenever there is a query and keep `docs list` for the query-less
+  listing. Both spellings issue the same `documents.search` request.
+- **`collections list --json` carries no document count.** The count in the table is computed here by
+  walking `collections.documents` once per collection; the API never states it, so it is not put into
+  a payload a script would treat as data. `--no-counts` accordingly changes nothing in JSON mode — the
+  extra requests are not made either way. To count in a script, walk the tree:
+  `otl fetch collection <id> --json | jq '[.documents | .. | .id? // empty] | length'`.
+- **Four commands compose an object** rather than returning the operation's own: `fetch collection`
+  (`{collection, documents}`), `fetch attachment` (`{id, signedUrl}`), `docs view --web --json`
+  (`{id, title, url}`) and `comments update` when it both edits and resolves (`{comment, status}`).
+  Delete commands answer `{"success": true}`, and their `--archive` variants answer with the archived
+  entity. Everything else is the operation's own object or array, verbatim. Each command's
+  `JSON shape:` section says which it is, and `crates/otl/tests/help_coverage.rs` fails the build if
+  a data-printing command stops saying.
 - **`docs create` publishes** when you give it a `--collection` or `--parent`, because a draft is
   invisible to everyone else; `--draft` opts out. Without a destination Outline cannot publish at all,
   and the command says so.
@@ -405,7 +434,7 @@ Full detail, including which errors map to which code, is in
 [docs/exit-codes.md](docs/exit-codes.md) — the table there is the source of truth and this one is
 checked against it by `cargo test`, so the two cannot drift.
 
-<!-- BEGIN GENERATED EXIT CODES: regenerate with `UPDATE_README_EXIT_CODES=1 cargo test -p outline-cli --test readme_exit_codes` -->
+<!-- BEGIN GENERATED EXIT CODES: regenerate with `UPDATE_EXIT_CODE_TABLES=1 cargo test -p outline-cli --test exit_code_tables` -->
 
 | Code | Meaning |
 |------|---------|
@@ -423,6 +452,19 @@ checked against it by `cargo test`, so the two cannot drift.
 <!-- END GENERATED EXIT CODES -->
 
 A closed stdout pipe is not a failure: `otl ... | head -1` exits **0**.
+
+In JSON mode the failure is also an object on **stderr**, while stdout stays empty:
+
+```json
+{ "error": { "exit_code": 2, "code": "usage", "message": "OUTLINE_URL is not set.\n..." } }
+```
+
+`code` is the name of the same numeric class, not a second taxonomy — renaming one is exactly as
+breaking as changing what a number means. Two things deliberately keep the prose form: argument
+errors caught by the argument parser itself (an unknown flag, a missing required option), whose
+usage synopsis and suggestion are the useful part, and warnings that do not end the command (a
+truncation notice, the plaintext-key notice). So a caller must not assume the object is always
+there — the exit code is the fact that always is.
 
 ## Configuration and profiles
 
@@ -540,6 +582,23 @@ Its own document is the only thing an install overwrites. Another skill's `SKILL
 document path that is not a regular file, and a `<skills dir>/outline-cli` that is a symlink, are refused
 whatever the flags say — that directory is one this command creates, so a link there would redirect a
 write it believes is local. The skills directory above it may be a symlink: that one is yours.
+
+The document is a contract with something that will not question it: an agent reads it *instead of*
+experimenting, so a line that has gone stale is an instruction rather than a typo. Three tests hold it
+to the binary, and each of them exists because the corresponding mistake had already been made:
+
+- `crates/otl/tests/skill_surface.rs` extracts every `otl …` line from its fenced code blocks and
+  checks the subcommand path, every flag and every value-enum against the real command tree, plus
+  every `OUTLINE_*` variable it names against the source. It exists because a hand review found the
+  document claiming that `collections list --json` prints a document count, and that every curated
+  command returns "the operation's own item shape" — both true when written, and neither noticed by
+  anything for as long as they were not.
+- `crates/otl/tests/exit_code_tables.rs` generates its exit-code table from `docs/exit-codes.md`,
+  which is the same source `README.md`'s copy comes from. Before that, the skill's table was the one
+  copy nothing compared to anything.
+- `crates/otl/tests/help_coverage.rs` is upstream of both: it requires every argument in the tree to
+  carry help text, and every data-printing command to declare its `JSON shape:`. A document can only
+  be accurate about a surface that describes itself.
 
 ## Credential handling
 
