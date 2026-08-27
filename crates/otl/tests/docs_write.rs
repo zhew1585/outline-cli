@@ -15,17 +15,25 @@ const COLLECTION: &str = "11111111-1111-4111-8111-111111111111";
 
 const NOTES: &str = "# Notes\n\nsomething worth keeping\n";
 
-/// A created/updated document as the API answers it.
+/// A created/updated document as the API answers it - body included, which
+/// is what the write receipt has to drop.
 fn document() -> Value {
     json!({
         "id": "doc-new",
         "title": "Notes",
         "url": "/doc/notes-xyz789",
+        "urlId": "xyz789",
         "updatedAt": "2026-08-26T08:00:00.000Z",
         "revision": 1,
         "publishedAt": "2026-08-26T08:00:00.000Z",
+        "text": BODY_THE_SERVER_ECHOES,
+        "data": { "type": "doc", "content": [] },
+        "updatedBy": { "id": "user-1", "name": "Ada" },
     })
 }
+
+/// The stored body, as Outline echoes it back on every write.
+const BODY_THE_SERVER_ECHOES: &str = "# Notes\n\nthe whole stored page\n";
 
 /// Mount one operation answering with [`document`].
 async fn server_for(operation: &str) -> MockServer {
@@ -296,6 +304,68 @@ async fn update_sends_a_new_body_from_stdin() {
     assert!(output.status.success(), "{:?}", output);
     let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(parsed["revision"], json!(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_write_receipt_does_not_echo_the_document_body() {
+    // An agent appending one line to a large page used to get the whole
+    // page back, and had to hold it in context to read the revision.
+    let server = server_for("documents.update").await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "update", "doc-1", "--mode", "append", "--json"])
+            .write_stdin("one more line\n")
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        !stdout.contains("the whole stored page"),
+        "the receipt echoed the body back:\n{stdout}"
+    );
+    let parsed: Value = serde_json::from_str(&stdout).unwrap();
+    // Identity survives; the body and the nested actor do not.
+    assert_eq!(parsed["id"], json!("doc-new"));
+    assert_eq!(parsed["revision"], json!(1));
+    assert_eq!(parsed["urlId"], json!("xyz789"));
+    for dropped in ["text", "data", "updatedBy"] {
+        assert!(
+            parsed.get(dropped).is_none(),
+            "{dropped} survived: {stdout}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_verbatim_response_is_still_one_command_away() {
+    // The receipt is a projection, so the escape hatch is part of the
+    // contract: `otl api` forwards the same operation unfiltered.
+    let server = server_for("documents.update").await;
+    let uri = server.uri();
+    let output = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "api",
+                "documents.update",
+                "id=doc-1",
+                "title=Renamed",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("the whole stored page"),
+        "otl api must still round-trip the response:\n{stdout}"
+    );
 }
 
 #[test]

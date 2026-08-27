@@ -76,8 +76,8 @@ struct Reviewed {
 
 /// The verbatim renderer's reviewed call sites.
 ///
-/// Four of the five are the same case: the value handed to `render_json` is
-/// server rows or a server document, forwarded unchanged. The fifth is not,
+/// Three of the four are the same case: the value handed to `render_json` is
+/// server rows or a server document, forwarded unchanged. The fourth is not,
 /// and says so.
 const EXEMPT: &[Reviewed] = &[
     Reviewed {
@@ -97,12 +97,6 @@ const EXEMPT: &[Reviewed] = &[
     },
     Reviewed {
         file: "crates/otl/src/commands/docs/view.rs",
-        context: "render::render_json(document)",
-        count: 1,
-        why: "SERVER RESPONSE. A single server document, forwarded whole.",
-    },
-    Reviewed {
-        file: "crates/otl/src/commands/docs/detail.rs",
         context: "render::render_json(document)",
         count: 1,
         why: "SERVER RESPONSE. A single server document, forwarded whole.",
@@ -176,8 +170,8 @@ const RENDER: &[Reviewed] = &[
 /// quietly stop scrubbing.
 ///
 /// The guard would otherwise be one-sided: it notices a new `render_json`
-/// but not an existing `render_json_scrubbed` being downgraded. Each of
-/// these three cost a review round to find.
+/// but not an existing `render_json_scrubbed` being downgraded. The first
+/// three entries here each cost a review round to find.
 const SCRUBBED: &[Reviewed] = &[
     Reviewed {
         file: "crates/otl/src/commands/auth/output.rs",
@@ -218,6 +212,24 @@ const SCRUBBED: &[Reviewed] = &[
         why: "AUTHORED. What `otl skill install` did, carrying paths derived \
               from the environment and the `name` frontmatter of a SKILL.md \
               that some other tool wrote.",
+    },
+    Reviewed {
+        file: "crates/otl/src/commands/docs/detail.rs",
+        context: "render::render_json_scrubbed(&receipt(document))",
+        count: 1,
+        why: "AUTHORED, and it used to be the other kind. `otl docs \
+              create`/`update` answered with the stored document forwarded \
+              whole, which was a genuine round-trip and correctly exempt. It \
+              now answers with a PROJECTION of it - identity fields only, so \
+              that appending one line to a 46 KB page stops returning 46 KB. \
+              The projection is what moves this entry: the exemption's \
+              premise is that the output round-trips the response byte for \
+              byte, and a subset does not. Nothing downstream can diff or \
+              replay this value against the server, so the argument that \
+              made scrubbing skippable is gone, while `title` - third-party \
+              text an agent will read - is still in it. The verbatim \
+              response is still available, from `otl docs view --json` and \
+              `otl api documents.update`, both of which stay exempt.",
     },
     Reviewed {
         file: "crates/otl/src/failure.rs",

@@ -48,10 +48,19 @@ impl EditMode {
     otl api describe documents.update --json
 
 JSON shape:
-  The documents.update document, verbatim - the same shape `otl docs
-  create --json` returns, with `.revision` bumped. A terminal instead gets
-  the labelled essentials, which is a summary of the same object and not a
-  separate contract.")]
+  A write receipt, not the stored document - the same shape `otl docs
+  create --json` returns, with `.revision` bumped:
+
+    { id, collectionId, parentDocumentId, title, url, urlId,
+      revision, createdAt, updatedAt, publishedAt }
+
+  Fields the server did not send are absent. The body is deliberately NOT
+  echoed back: an append to a large page would otherwise return the whole
+  page. For the full response use `otl docs view ID --json` (the document,
+  read back) or `otl api documents.update id=ID ...` (the raw operation).
+
+  A terminal instead gets the labelled essentials, which is a summary of
+  the same receipt and not a separate contract.")]
 pub struct UpdateArgs {
     /// Document id (UUID or the short urlId from its URL).
     pub id: String,

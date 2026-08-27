@@ -30,10 +30,19 @@ const OPERATION: &str = "documents.create";
     otl api describe documents.create --json
 
 JSON shape:
-  The documents.create document, verbatim: `.id` is the new document's id
-  and `.url` its path on the instance. A terminal instead gets the labelled
-  essentials (id, title, updated, revision, url, status), which is a
-  summary of the same object and not a separate contract.")]
+  A write receipt, not the stored document:
+
+    { id, collectionId, parentDocumentId, title, url, urlId,
+      revision, createdAt, updatedAt, publishedAt }
+
+  `.id` is the new document's id and `.url` its path on the instance;
+  fields the server did not send are absent. The body is deliberately NOT
+  echoed back - you supplied it. For the full response use `otl docs view
+  ID --json` or `otl api documents.create ...`.
+
+  A terminal instead gets the labelled essentials (id, title, updated,
+  revision, url, status), which is a summary of the same receipt and not a
+  separate contract.")]
 pub struct CreateArgs {
     /// Document title. Without it Outline derives one from the body.
     #[arg(long, value_name = "TITLE")]
