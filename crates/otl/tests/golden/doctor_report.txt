@@ -11,5 +11,7 @@
 [warn]     online-spec: 2 missing, 0 withdrawn upstream, 1 deprecated upstream
            missing here (run `otl spec sync` to get them): things.brandNew, things.other
            deprecated online, still callable here: things.old
+[warn]     skill: version 1.0.0; 1 installed copy does not match it (run `otl skill install`)
+           /home/u/.claude/skills/outline-cli/SKILL.md (Claude Code): version 0.9.0, this binary ships 1.0.0
 
-1 problem(s), 2 warning(s); exit code 2. A warning does not stop otl from working.
+1 problem(s), 3 warning(s); exit code 2. A warning does not stop otl from working.

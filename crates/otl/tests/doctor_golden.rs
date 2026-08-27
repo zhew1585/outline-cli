@@ -96,6 +96,16 @@ fn mixed_report() -> Report {
                     .to_string(),
                 "deprecated online, still callable here: things.old".to_string(),
             ]),
+            Check::new(
+                "skill",
+                Status::Warn,
+                "version 1.0.0; 1 installed copy does not match it (run `otl skill install`)",
+            )
+            .detailed([
+                "/home/u/.claude/skills/outline-cli/SKILL.md (Claude Code): version 0.9.0, \
+                 this binary ships 1.0.0"
+                    .to_string(),
+            ]),
         ],
     }
 }

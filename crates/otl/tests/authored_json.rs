@@ -158,6 +158,14 @@ const SCRUBBED: &[Reviewed] = &[
               summaries, enum values, formats and parameter prose, all of \
               it third-party text an agent will feed to a model.",
     },
+    Reviewed {
+        file: "crates/otl/src/commands/skill/mod.rs",
+        context: "render::render_json_scrubbed(&json(outcomes))",
+        count: 1,
+        why: "AUTHORED. What `otl skill install` did, carrying paths derived \
+              from the environment and the `name` frontmatter of a SKILL.md \
+              that some other tool wrote.",
+    },
 ];
 
 /// Workspace root: `crates/otl` -> `crates` -> root.

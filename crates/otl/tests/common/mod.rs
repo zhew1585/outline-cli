@@ -36,6 +36,23 @@ pub fn isolated_config_dir() -> &'static Path {
     DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
 }
 
+/// An empty skills directory, shared by every test in this binary.
+///
+/// `otl doctor` reports which agent skill is installed under the user's home
+/// directory, and `otl skill install` writes there. Without this, both would
+/// read (and one would WRITE to) the developer's real `~/.claude/skills`:
+/// the doctor check would say "up to date" on a machine that had run
+/// `otl skill install` and "not installed" on CI, and a test run would
+/// modify the developer's agent configuration. Empty, so the deterministic
+/// answer is "not installed".
+pub fn isolated_skill_dir() -> &'static Path {
+    static DIR: OnceLock<TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
+}
+
+/// Environment variable that relocates the agent skills directory.
+pub const SKILL_DIR_ENV: &str = "OUTLINE_SKILL_DIR";
+
 /// Shut off every machine-dependent input, for a suite that builds its own
 /// [`Command`] rather than starting from [`otl`].
 ///
@@ -47,6 +64,7 @@ pub fn isolate(cmd: &mut Command) -> &mut Command {
         .env("OUTLINE_CONFIG_DIR", isolated_config_dir())
         .env("OUTLINE_NO_KEY_WARNING", "1")
         .env(CACHE_DIR_ENV, no_cache_dir())
+        .env(SKILL_DIR_ENV, isolated_skill_dir())
 }
 
 /// Environment variable that relocates the spec cache.
@@ -68,6 +86,8 @@ pub const CACHE_DIR_ENV: &str = "OTL_CACHE_DIR";
 ///   would get different results from these tests than CI does;
 /// - the synced spec cache, which decides which operations exist at all
 ///   - pointed at a directory that cannot contain one;
+/// - the agent skills directory (`OUTLINE_SKILL_DIR`), which `otl doctor`
+///   reports on and `otl skill install` writes to;
 /// - and the output environment (`PAGER`, `BROWSER`).
 pub fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
@@ -82,7 +102,8 @@ pub fn otl() -> Command {
         // These tests authenticate with the environment key, and the notice
         // about where a plaintext variable ends up is not what any of them
         // is about. `auth_api_key.rs` owns asserting that it IS printed.
-        .env("OUTLINE_NO_KEY_WARNING", "1");
+        .env("OUTLINE_NO_KEY_WARNING", "1")
+        .env(SKILL_DIR_ENV, isolated_skill_dir());
     cmd
 }
 
