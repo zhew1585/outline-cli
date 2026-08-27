@@ -1,4 +1,4 @@
-//! Local parameter validation and body assembly (Story 1.3).
+//! Local parameter validation and body assembly.
 //!
 //! Every validation failure must occur before any network request; the
 //! closed-port tests prove it (a network attempt would surface as a

@@ -1,4 +1,4 @@
-//! Story 2.5: API key management and credential precedence.
+//! API key management and credential precedence.
 //!
 //! Three credentials can exist at once - an OAuth session, a key in the
 //! credential file, and a key in the environment - and exactly one of them
@@ -340,12 +340,10 @@ async fn auth_info_names_the_method_in_use_and_what_it_shadows() {
     // What the release gate would hand over, in precedence order. The
     // credential FILE's two entries, session first.
     //
-    // The exported `OUTLINE_API_KEY` is deliberately NOT in this list, and
-    // that changed with R6 [N1]: `available` used to be assembled by reading
-    // the global variable directly, which is the same read that made
-    // `auth info` send a global key to a profile's instance. It now lists
-    // only credentials the gate would actually release for these settings -
-    // and a profile-scoped setup would not release this one at all - so the
+    // The exported `OUTLINE_API_KEY` is deliberately NOT in this list:
+    // `available` lists only credentials the gate would actually release
+    // for these settings, and a profile-scoped setup would not release this
+    // one at all - so the
     // exported key is reported as an observation on its own field below.
     let available: Vec<&str> = report["available"]
         .as_array()
@@ -410,11 +408,10 @@ fn seed_session_for(dir: &Path, issuer: &str) {
 
 #[test]
 fn set_key_for_another_instance_is_refused_rather_than_merged() {
-    // The R1 regression: `set-key` used to rewrite `profile.origin` to the
-    // new instance while leaving the old one's OAuth session in place. The
-    // profile then LOOKED bound to B, but OAuth outranks an API key - so
-    // the next request sent A's access token to B, and on expiry refreshed
-    // at A and sent that to B too.
+    // `set-key` must not rewrite `profile.origin` to the new instance
+    // while leaving the old one's OAuth session in place: the profile
+    // would LOOK bound to B, but OAuth outranks an API key, so the next
+    // request would send A's access token to B.
     use std::io::Write;
     use std::process::Stdio;
 
@@ -594,8 +591,9 @@ async fn a_foreign_client_registration_alone_does_not_block_an_environment_key()
 
 #[test]
 fn a_remote_plaintext_instance_is_refused_for_ordinary_api_calls() {
-    // The R1 gap: only `auth login` checked transport, so `otl api` against
-    // http://remote-host put the bearer token on the wire in the clear.
+    // Transport is checked for ordinary API calls too, not just `auth
+    // login`: against http://remote-host the bearer token would go on the
+    // wire in the clear.
     let dir = tempfile::tempdir().unwrap();
     let output = otl(dir.path(), "http://docs.example.invalid")
         .env("OUTLINE_API_KEY", ENV_KEY)

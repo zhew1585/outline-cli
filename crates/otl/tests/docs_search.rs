@@ -1,4 +1,4 @@
-//! Story 3.1: `otl docs search <query>`.
+//! `otl docs search <query>`.
 //!
 //! Table rendering is golden-file tested next to the code (the table only
 //! appears on a TTY, which a piped test process cannot be). What is tested

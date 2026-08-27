@@ -1,23 +1,18 @@
 //! The credential container, and the only code that can read out of it.
 //!
-//! # Why this is a leaf module
-//!
 //! Rust privacy is module-tree wide, so declaring the key fields private in
 //! `config` would leave them readable by `config` itself and by every
-//! module beside this one - including a future `config::credentials`. The
-//! credential-release gate would then be decorative: anything in the tree
-//! could take the key without asking it.
+//! module beside this one. The credential-release gate would then be
+//! decorative.
 //!
 //! [`EnvKeys`] therefore declares its fields here, in a module with no
 //! children. `config` can CONSTRUCT one (from the process environment, or
 //! from explicit values in a test) and can ask how many entries it holds,
-//! but has no way to read a key out. Writing a secret in is not a
-//! disclosure - the caller already has it; reading one out is, and that path
-//! exists only in [`EnvApiKey::fetch`], which cannot be called without the
-//! proof token the gate issues.
+//! but has no way to read a key out. The only read path is
+//! [`EnvApiKey::fetch`], which cannot be called without the proof token
+//! the gate issues.
 //!
-//! **This module must stay a leaf**, for the same reason `resolved` must;
-//! `config_isolation.rs` asserts it.
+//! **This module must stay a leaf**; `config_isolation.rs` asserts it.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -83,21 +78,17 @@ impl EnvKeys {
     }
 }
 
-/// The v1 token source: an API key from the environment.
+/// The environment token source: an API key from the environment.
 ///
 /// A credential belongs to ONE instance, and a profile names an instance, so
 /// the two are resolved from the same scope:
 ///
-/// - no profile in effect: the global `OUTLINE_API_KEY` (the Epic 1 path,
-///   unchanged);
+/// - no profile in effect: the global `OUTLINE_API_KEY`;
 /// - profile in effect: `OUTLINE_API_KEY_<PROFILE>` and nothing else.
 ///
-/// The second rule deliberately does NOT fall back to the global variable.
-/// Falling back is what would send the key for the workspace whose variable
-/// happens to be exported to whichever instance the selected profile points
-/// at - a silent cross-origin credential disclosure produced by nothing more
-/// than `--profile`. Refusing is recoverable (the error names the variable to
-/// set); a key already sent to the wrong server is not.
+/// The second rule does NOT fall back to the global variable: falling back
+/// would send one workspace's key to whichever instance the selected
+/// profile points at.
 pub struct EnvApiKey<'layer>(pub &'layer EnvLayer);
 
 impl TokenSource for EnvApiKey<'_> {

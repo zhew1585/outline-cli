@@ -1,10 +1,9 @@
 //! What a compiled operation may contain.
 //!
-//! Split out of `lib.rs` because it is one concern with one reason to
-//! exist: every rule here exists because the value it checks ends up
-//! somewhere it can do harm - a request path joined onto a base URL, a name
-//! written into a shell completion script, a summary or a column header
-//! printed to a terminal.
+//! Every rule here exists because the value it checks ends up somewhere
+//! it can do harm - a request path joined onto a base URL, a name written
+//! into a shell completion script, a summary or a column header printed
+//! to a terminal.
 //!
 //! The path rules are the load-bearing ones. A request URL is
 //! `base_url + path` concatenated as text, so a path that starts a new
@@ -58,10 +57,9 @@ pub(crate) fn check_text(op: &CompiledOp) -> Result<(), CompileError> {
             return Err(unsafe_text("parameter enum value", UNSAFE_TEXT_REASON));
         }
     }
-    // Response field names and formats are printed too - as table column
-    // HEADERS, which is about as good a place to inject an escape as
-    // exists - so they are held to the same rule as everything else that
-    // reaches a terminal.
+    // Response field names and formats are printed too (as table column
+    // headers), so they are held to the same rule as everything else
+    // that reaches a terminal.
     if op.response_fields.len() > MAX_RESPONSE_FIELDS {
         return Err(unsafe_text("response field list", TOO_MANY_RESPONSE_FIELDS));
     }
@@ -93,12 +91,9 @@ pub(crate) fn check_identifiers(
     if let Err(reason) = check_path(&op.path) {
         return Err(unsafe_id("path", reason));
     }
-    // The binding between the two, established HERE rather than assumed by
-    // the consumer. Name and path are derived from the same document path,
-    // so they must agree - but only if that document path began with `/`.
-    // A path written `things.delete` (no leading slash) would otherwise be
-    // swallowed by the prefix into `/apithings.delete`, which passes the
-    // character rules above while dispatching somewhere nobody asked for.
+    // The binding between the two, established here rather than assumed
+    // by the consumer: a document path without a leading slash would be
+    // swallowed by the prefix and dispatch somewhere nobody asked for.
     if op.path != format!("{}/{}", options.path_prefix, op.name) {
         return Err(unsafe_id("path", PATH_BINDING_RULE));
     }

@@ -407,13 +407,11 @@ fn finish(
 /// Check the offset the server reports against the one requested.
 ///
 /// Returns whether the page had to be accepted unconfirmed (no report,
-/// under [`OffsetEcho::ValidateIfPresent`]).
-///
-/// A report that exists but contradicts the request - or is there in a form
-/// that cannot be compared - is always fatal: advancing by the received
-/// count would then skip or duplicate rows, and wrong data must never be
-/// presented as a result. A report that is simply absent is tolerated
-/// unless the descriptor declares it [`OffsetEcho::Required`].
+/// under [`OffsetEcho::ValidateIfPresent`]). A report that exists but
+/// contradicts the request - or cannot be compared - is fatal: advancing
+/// by the received count would skip or duplicate rows. A report that is
+/// simply absent is tolerated unless the descriptor declares it
+/// [`OffsetEcho::Required`].
 fn check_offset_echo(
     spec: &PaginationSpec,
     response: &Value,

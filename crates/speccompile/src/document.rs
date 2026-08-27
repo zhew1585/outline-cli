@@ -1,34 +1,18 @@
 //! Bounded parsing of an untrusted OpenAPI document.
 //!
-//! # Why a byte limit on the download is not a memory limit
-//!
-//! A JSON document expands when it is parsed. `[0,0,0,...]` costs two
-//! bytes per element on the wire and about forty in a `serde_json::Value`
-//! tree; a 16 MiB document of that shape was measured at 367 MB of
-//! resident memory. Capping the DOWNLOAD therefore does not do what the
-//! cap says it does - it moves the out-of-memory threshold, it does not
-//! remove it - and every later limit (the IR, the cache) applies to
-//! something that only exists after this parse has already happened.
-//!
-//! # What this module does
-//!
-//! Two things, in the order that matters:
+//! A JSON document expands when it is parsed (`[0,0,0,...]` costs about
+//! two bytes per element on the wire and forty in a `serde_json::Value`
+//! tree), so a cap on the DOWNLOAD is not a memory limit. Instead:
 //!
 //! 1. **Only what the compiler reads is materialized.** The top level
 //!    keeps `paths` and `components`; every other key is consumed with
-//!    `IgnoredAny`, which parses without building anything. The measured
-//!    367 MB case is entirely made of such a key.
+//!    `IgnoredAny`, which parses without building anything.
 //! 2. **What IS materialized is charged against a budget.** Each value
 //!    charges its own approximate heap cost as it is built, and parsing
-//!    stops the moment the total passes [`MAX_PARSED_BYTES`] - not after,
-//!    the way a size check on the finished tree would.
+//!    stops the moment the total passes [`MAX_PARSED_BYTES`].
 //!
-//! The charge is an estimate of heap cost, not a measurement of it. The
-//! REAL peak is asserted by `crates/otl/tests/memory_bounds.rs`, which
-//! runs a heap profiler over exactly these paths - including the 16 MiB
-//! document that was measured at 367 MB before this module existed.
-//! Prose arithmetic about allocation has been wrong here twice; the
-//! numbers live in a test now.
+//! The charge is an estimate; the real peak is asserted by
+//! `crates/otl/tests/memory_bounds.rs`.
 
 use std::cell::Cell;
 use std::fmt;
@@ -39,13 +23,9 @@ use serde_json::{Map, Value};
 use crate::CompileError;
 
 /// Ceiling on the estimated heap cost of the parts of a document that are
-/// kept.
-///
-/// A real API description of the size this CLI vendors charges about
-/// 2 MiB against it, so the headroom is roughly twelvefold, while a
-/// document engineered to expand is refused long before it becomes
-/// interesting. (Measured figures live in the consumer's own tests; this
-/// crate names no service.)
+/// kept. A real API description of the size this CLI vendors charges about
+/// 2 MiB against it; a document engineered to expand is refused long
+/// before it becomes interesting.
 pub const MAX_PARSED_BYTES: usize = 24 * 1024 * 1024;
 
 /// Approximate cost of one `Value` node, whatever it holds.

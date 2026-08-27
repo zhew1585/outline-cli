@@ -225,8 +225,7 @@ fn probe(instance: &Instance, resolved: Resolved) -> Check {
 /// spec rejected (nothing sent), while `Failure` is both a client that could
 /// not be built (nothing sent) and a response that was not JSON (sent, and
 /// answered). Only a transport failure is allowed to say "could not be
-/// reached": `docs/exit-codes.md` says code 7 is the one that may never have
-/// arrived.
+/// reached": exit code 7 is the one that may never have arrived.
 fn outcome_summary(code: ExitCode, answered: bool) -> &'static str {
     match (answered, code) {
         (false, ExitCode::Network) => "the instance could not be reached",

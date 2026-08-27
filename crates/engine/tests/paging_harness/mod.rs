@@ -20,7 +20,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 pub const OFFSET_PARAM: &str = "from";
 pub const LIMIT_PARAM: &str = "count";
 
-/// A parameter spec with no schema facets (facets are story 1.2/1.3's
+/// A parameter spec with no schema facets
 /// concern; these tests are about paging).
 pub const fn param(name: &'static str, ty: ParamType) -> ParamSpec {
     ParamSpec {

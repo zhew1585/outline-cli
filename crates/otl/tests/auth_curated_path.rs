@@ -1,4 +1,4 @@
-//! Story 2.5 / develop integration: the curated commands resolve their
+//! Integration: the curated commands resolve their
 //! credential through the same path as `otl api`.
 //!
 //! Before the integration they did not. `otl docs ...` and
@@ -231,11 +231,11 @@ async fn a_curated_command_refuses_a_credential_from_another_instance() {
 }
 
 // ---------------------------------------------------------------------------
-// `otl auth info` releases its credential through the same gate as everything
-// else (R6 [N1]).
+// `otl auth info` releases its credential through the same gate as
+// everything else.
 //
-// `auth info` resolved the instance through config but the CREDENTIAL through
-// a path of its own, whose environment branch read `OUTLINE_API_KEY`
+// `auth info` resolves the instance through config and the CREDENTIAL
+// through the same gate, whose environment branch reads `OUTLINE_API_KEY`
 // directly. The config gate deliberately refuses that fallback when a profile
 // is in effect - a profile scopes its key to `OUTLINE_API_KEY_<PROFILE>`,
 // because falling back to the global one sends one workspace's key to another

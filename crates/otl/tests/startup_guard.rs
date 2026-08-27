@@ -1,4 +1,4 @@
-//! Startup guards (Story 1.8): the vendored OpenAPI spec is compiled to a
+//! Startup guards: the vendored OpenAPI spec is compiled to a
 //! static IR table by `build.rs`, so the runtime never reads or parses it.
 //!
 //! The invariant is enforced in three layers, each closing what the others
@@ -29,7 +29,7 @@
 //! carries no path or copy of it, and the process still works with no spec
 //! reachable from where it runs.
 //!
-//! Story 4.2 note: `otl spec sync` DOES parse an OpenAPI document at run
+//! Note: `otl spec sync` DOES parse an OpenAPI document at run
 //! time - that is its whole job, and SPEC.md carves it out explicitly. It
 //! never touches the vendored file though: the document arrives from the
 //! network (or from a path the user typed), is compiled once, and is stored
@@ -186,14 +186,14 @@ fn otl_cmd(dir: &Path, bin: &Path) -> Command {
         // the developer's machine must not stand in for it.
         .env(CACHE_DIR_ENV, no_cache_dir())
         .env_remove("OUTLINE_PROFILE")
-        // Empty value = read no user config file (Story 4.1).
+        // Empty value = read no user config file.
         .env("OUTLINE_CONFIG", "");
     cmd
 }
 
 /// How the vendored spec is named when it is READ from disk: the file name
 /// alone is not enough evidence, because the upstream URL ends in the same
-/// file name and `spec sync` legitimately carries that URL (Story 4.2). A
+/// file name and `spec sync` legitimately carries that URL. A
 /// path fragment cannot appear in that URL.
 const SPEC_PATH_MARKER: &str = "spec/spec3.json";
 /// Distinctive text from the vendored spec's `info.description`: present if

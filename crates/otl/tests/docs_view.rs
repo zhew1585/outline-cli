@@ -1,4 +1,4 @@
-//! Story 3.2: `otl docs view <id>`.
+//! `otl docs view <id>`.
 //!
 //! The pager path itself needs a terminal, which a test process piping
 //! stdout does not have; that decision is unit-tested in `pager`. What is

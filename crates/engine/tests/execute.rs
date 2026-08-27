@@ -277,7 +277,7 @@ async fn reflected_bearer_token_is_redacted_from_error_message() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_prefix_cut_by_body_cap_is_redacted() {
-    // Reviewer PoC: 8180 bytes of padding followed by the token. The 8 KiB
+    // 8180 bytes of padding followed by the token. The 8 KiB
     // body cap cuts the token mid-way, leaving only its prefix at the end
     // of the capped text, where an exact replacement cannot match. Any
     // trailing token prefix (>= 4 chars) must still be redacted.
@@ -364,7 +364,7 @@ async fn token_smuggled_through_control_chars_is_discarded() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_smuggled_through_invisible_characters_is_discarded() {
-    // Re-review PoC: U+200B ZERO WIDTH SPACE is neither is_control() nor
+    // U+200B ZERO WIDTH SPACE is neither is_control() nor
     // is_whitespace(), so category-based stripping missed it while a reader
     // sees the token unbroken. Also covers ZWJ and a variation selector.
     let token = "reflected-secret-token";
@@ -419,7 +419,7 @@ async fn token_smuggled_through_invisible_characters_is_discarded() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn complete_json_envelope_in_a_capped_body_is_not_mangled() {
-    // Re-review PoC: JSON tolerates unlimited trailing whitespace, so a
+    // JSON tolerates unlimited trailing whitespace, so a
     // COMPLETE envelope can sit inside a body that hit the read cap. Its
     // fields must not get the cut-fragment treatment.
     let envelope = r#"{"error":"validation_error","message":"document not found"}"#;
@@ -456,7 +456,7 @@ async fn complete_json_envelope_in_a_capped_body_is_not_mangled() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_fragment_behind_capped_whitespace_is_discarded() {
-    // Re-review PoC: the cap lands on whitespace, so a single trailing-run
+    // the cap lands on whitespace, so a single trailing-run
     // drop leaves the 2-char token fragment sitting behind it.
     let token = "reflected-secret-token";
     let body = format!("{}re\n{}", "\n".repeat(8189), &token[2..]);

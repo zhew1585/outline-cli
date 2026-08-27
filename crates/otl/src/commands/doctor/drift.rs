@@ -1,14 +1,14 @@
 //! The two spec checks: which operation table this CLI dispatches from, and
-//! how it differs from what the online API declares (FR23).
+//! how it differs from what the online API declares.
 //!
 //! # Almost nothing here can fail a `doctor` run
 //!
 //! Every finding about a spec is a warning, with ONE exception stated at the
 //! end. That is a decision rather than an oversight:
 //!
-//! - a spec cache that cannot be used is documented as *not* an error
-//!   (`docs/exit-codes.md`): the CLI discards it and falls back to the spec
-//!   compiled into the binary, so the environment still works;
+//! - a spec cache that cannot be used is documented as *not* an error:
+//!   the CLI discards it and falls back to the spec compiled into the
+//!   binary, so the environment still works;
 //! - the online document lives on a third-party host that has nothing to do
 //!   with the user's instance. A firewall that blocks it, or a 404 on a
 //!   moved file, must not make `otl doctor` report an unusable environment -
@@ -133,13 +133,12 @@ pub fn online_spec(offline: bool, url: Option<&str>, cached_hash: Option<&str>) 
 
 /// The check for a comparison that could not be made.
 ///
-/// Two quite different reasons land here, and folding them together was a
-/// real defect: **the user's own flag being wrong** is not a third party's
+/// Two quite different reasons land here, and folding them together would
+/// be a defect: **the user's own flag being wrong** is not a third party's
 /// failure. `--spec-url not-a-url` never reaches any host - the fetch
-/// refuses it locally - and `docs/exit-codes.md` classes exactly that as a
-/// usage error (exit 2) for `otl spec sync`. It must not become a warning
-/// here, or a CI job cannot tell "the spec source is down" from "I typed the
-/// flag wrong".
+/// refuses it locally - and that is classed as a usage error (exit 2) for
+/// `otl spec sync`. It must not become a warning here, or a CI job cannot
+/// tell "the spec source is down" from "I typed the flag wrong".
 ///
 /// So the split is made on the code the fetch domain already assigned:
 /// `ExitCode::Usage` is only ever `FetchError::InvalidUrl`, i.e. nothing was

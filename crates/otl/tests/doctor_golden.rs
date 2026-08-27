@@ -1,4 +1,4 @@
-//! Golden-file test for `otl doctor`'s human rendering (Story 4.3).
+//! Golden-file test for `otl doctor`'s human rendering.
 //!
 //! Per project rule, all output rendering is covered by golden files.
 //! Regenerate with: `OTL_UPDATE_GOLDEN=1 cargo test -p outline-cli --test

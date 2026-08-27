@@ -73,11 +73,8 @@ pub fn write_diagnostic_line(text: &str) {
 /// cursor or repaint the screen. None of that belongs in a diagnostic.
 ///
 /// The scrub is at the SINK on purpose. Doing it per call site means every
-/// new message that interpolates a foreign value has to remember, and the
-/// history of this crate is that eventually one does not: titles were
-/// quoted, then ids were found unquoted, then - once those were fixed - a
-/// newly added message interpolated a filename raw. Putting it here makes
-/// the property hold for messages that do not exist yet.
+/// new message that interpolates a foreign value has to remember; putting
+/// it here makes the property hold for every message, present or future.
 ///
 /// Newlines survive, because a diagnostic legitimately spans lines (the
 /// export summary lists one failure per line) and collapsing those would

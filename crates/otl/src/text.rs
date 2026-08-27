@@ -5,14 +5,9 @@
 //! diagnostics (a profile name, a path), table cells (a document title from
 //! the server), completion descriptions (an operation summary) and the
 //! diagnostic stream itself (a document id, a file name, an error from the
-//! server). Each was given its own filter, and each round of review found
-//! one of them behind the others - control characters everywhere, then bidi
-//! and zero-width characters in the diagnostics only, while the same
-//! override reaching a table cell reversed the rest of the row; then, once
-//! all of those were fixed, a newly added message interpolated a file name
-//! with no filter at all.
+//! server).
 //!
-//! So the CLASSIFICATION lives here once, as an exhaustive enum. A surface
+//! The CLASSIFICATION lives here once, as an exhaustive enum. A surface
 //! chooses how to render each hazard, because the right answer differs -
 //! a diagnostic wants a visible marker, a data cell wants honest width - but
 //! no surface can be unaware of a category, because [`hazard`] returns one
@@ -20,18 +15,13 @@
 //!
 //! # The table is the whole `Cf` category, and it lives in the engine
 //!
-//! Reviews found the hand-picked version of this list short three times
-//! running: first `U+202E`, then `U+061C` and the `U+206A..U+206F` block,
-//! then `U+070F`, `U+0600..U+0605` and the `U+13430` block. A partial list
-//! reads as complete, so the surviving table covers every assigned
+//! A partial list reads as complete, so the table covers every assigned
 //! `General_Category=Cf` codepoint (Unicode 15.1) plus `U+00AD` and
 //! `U+180E`.
 //!
 //! That table is [`engine::text`], not this module, because the engine
-//! scrubs server text on its way to stderr and needs the same answer. It
-//! was reaching a DIFFERENT one - it classified by rendered width, so the
-//! 27 `Cf` codepoints a terminal gives a column to survived its scrub while
-//! this module dropped them. One table cannot disagree with itself.
+//! scrubs server text on its way to stderr and needs the same answer:
+//! one table cannot disagree with itself.
 //!
 //! # `--json` is a deliberate exemption
 //!

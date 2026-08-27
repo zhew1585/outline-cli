@@ -7,36 +7,22 @@
 //! error CONSTRUCTION time so that every error field is credential-free by
 //! construction (see [`crate::error`]).
 //!
-//! Two rules do the heavy lifting, both deliberately CATEGORICAL rather
-//! than lists of known-bad characters:
+//! Two rules do the heavy lifting, both categorical rather than lists of
+//! known-bad characters:
 //!
 //! 1. **Visibility.** A character is kept only if it renders as something.
 //!    Zero-width codepoints (combining marks, ZWSP/ZWJ, soft hyphen, BOM,
 //!    variation selectors, tag characters, ...) are dropped and control
-//!    characters become spaces. Nothing invisible ever reaches stderr, so
-//!    what a reader sees is what the text actually is.
+//!    characters become spaces.
 //! 2. **Skeleton FRAGMENT comparison.** The candidate text and the secret
-//!    are both reduced to lowercase alphanumerics only - every separator,
-//!    visible or not, is discarded. If ANY window of
+//!    are both reduced to lowercase alphanumerics only. If ANY window of
 //!    [`MIN_SECRET_FRAGMENT_CHARS`] consecutive skeleton characters of the
 //!    secret appears anywhere in the text's skeleton, the field is
-//!    discarded wholesale. This is what makes the rule "no fragment, ever"
-//!    rather than "no whole token": a prefix in the middle of a sentence, a
-//!    slice from the middle of the token, and any interleaving of the above
-//!    are all caught by one check.
+//!    discarded wholesale.
 //!
-//! Why a *fragment* and not the whole secret: a server that can echo four
-//! characters of a token at a time is an oracle. Repeated across requests,
-//! fragments reassemble. So the bar is set at the shortest fragment worth
-//! protecting, and the cost - occasionally discarding an innocent
-//! diagnostic that happens to contain four matching characters - is
-//! accepted. The exit code and HTTP status survive regardless.
-//!
-//! The remaining ordering is still load-bearing: redact exact occurrences
-//! first (so ordinary echoes keep a readable message), then normalize, then
-//! redact again, then apply the fragment check, and only then cap length.
-//! Doing the fragment check before exact redaction would discard every
-//! honest message that quotes a token in full.
+//! The ordering is load-bearing: redact exact occurrences first (so
+//! ordinary echoes keep a readable message), then normalize, then redact
+//! again, then apply the fragment check, and only then cap length.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -67,12 +53,10 @@ pub fn clean_server_text(raw: &str, secret: &str, may_be_truncated: bool, cap: u
 
 /// [`clean_server_text`] against EVERY secret a request carried.
 ///
-/// One request can involve more than one credential: the channel replaces a
-/// rejected token with a renewed one and replays, so the response to the
-/// replay may echo either. A pipeline that only knows the current value
-/// would print the previous one verbatim. Every secret still in play must
-/// therefore be passed here, and each is applied in turn - a single
-/// fragment match from any of them discards the text.
+/// One request can involve more than one credential (the channel replaces
+/// a rejected token with a renewed one and replays), so every secret still
+/// in play must be passed here; a single fragment match from any of them
+/// discards the text.
 pub fn clean_server_text_for(
     raw: &str,
     secrets: &[&str],
@@ -194,12 +178,8 @@ fn normalize(raw: &str) -> String {
             // Control characters and whitespace read as gaps.
             (Some(Hazard::Control), _) | (_, None) => Some(' '),
             _ if c.is_whitespace() => Some(' '),
-            // Renders as nothing, or renders as something other than what it
-            // is. TWO rules, not one, because neither contains the other:
-            // width catches a combining mark stacked onto a neighbour, which
-            // is not a format character; `hazard` catches the 27 `Cf`
-            // codepoints a terminal gives a column to, which width lets
-            // through. Whichever fires, the character does not go out.
+            // Renders as nothing, or renders as something other than what
+            // it is: neither rule contains the other, so both are checked.
             (Some(_), _) | (_, Some(0)) => None,
             _ => Some(c),
         })
@@ -214,20 +194,14 @@ fn normalize(raw: &str) -> String {
 
 /// Whether ANY fragment of the secret survives in `text`.
 ///
-/// The categorical backstop described in the module docs. Both sides are
-/// reduced to skeletons, so every interleaving a server might invent -
-/// invisible characters, punctuation, spacing, case changes - collapses
-/// away first. Then every window of [`MIN_SECRET_FRAGMENT_CHARS`]
-/// consecutive skeleton characters of the secret is looked for in the text.
+/// Both sides are reduced to skeletons, so every interleaving a server
+/// might invent (invisible characters, punctuation, spacing, case changes)
+/// collapses away first. Then every window of
+/// [`MIN_SECRET_FRAGMENT_CHARS`] consecutive skeleton characters of the
+/// secret is looked for in the text, not just the whole skeleton.
 ///
-/// Windows, not just the whole skeleton: a prefix sitting in the MIDDLE of a
-/// sentence, or a slice taken from the middle of the token, are both
-/// recoverable credential material and neither contains the full skeleton.
-/// A server that can echo one fragment can echo the next one on the next
-/// request.
-///
-/// Secrets whose whole skeleton is shorter than one window are skipped, so
-/// a two-character "secret" cannot blank out every diagnostic.
+/// Secrets whose whole skeleton is shorter than one window are skipped,
+/// so a two-character "secret" cannot blank out every diagnostic.
 fn leaks_fragment(text: &str, secret: &str) -> bool {
     let fragments: Vec<char> = skeleton(secret).chars().collect();
     if fragments.len() < MIN_SECRET_FRAGMENT_CHARS {
@@ -317,11 +291,8 @@ mod tests {
 
     #[test]
     fn normalize_drops_every_format_character_not_just_the_zero_width_ones() {
-        // The scrub used to classify by RENDERED WIDTH alone, and a terminal
-        // gives a column to 27 of the `Cf` codepoints - so these survived
-        // into stderr while the CLI's own scrub dropped them. Enumerated
-        // rather than sampled: the point is that the two layers now read the
-        // same table, so a codepoint one drops cannot be one the other keeps.
+        // A terminal gives a column to 27 of the `Cf` codepoints, so width
+        // alone does not drop them; the `hazard` rule must catch them too.
         let ranges: &[(u32, u32)] = &[
             (0x0600, 0x0605),
             (0x06dd, 0x06dd),
@@ -368,8 +339,8 @@ mod tests {
 
     #[test]
     fn capped_text_drops_fragment_behind_trailing_whitespace() {
-        // Re-review PoC: the cut lands on whitespace, so the fragment sits
-        // one run further in and a single drop would miss it.
+        // The cut lands on whitespace, so the fragment sits one run further
+        // in and a single drop would miss it.
         let cleaned = clean_server_text("\n\n\nre\n", TOKEN, true, CAP);
         assert_eq!(cleaned, REDACTED);
         assert!(!cleaned.contains("re"), "fragment survived: {cleaned:?}");
@@ -391,9 +362,7 @@ mod tests {
 
     #[test]
     fn discards_a_prefix_fragment_sitting_in_the_middle_of_a_sentence() {
-        // The reported gap: the truncated-tail logic only ever looked at
-        // the END of the text, so a prefix followed by ordinary words went
-        // through untouched.
+        // A prefix followed by ordinary words, not at the end of the text.
         for raw in [
             "token reflec is not valid, please retry",
             "prefix reflected-sec suffix",

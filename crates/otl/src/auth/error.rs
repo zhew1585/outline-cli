@@ -197,11 +197,10 @@ impl StoreError {
     /// and `otl doctor` grades a directory problem as a warning and then
     /// READS the file, because the read path checks the open descriptor
     /// rather than the directory around it. Printing the refusal there is
-    /// the report contradicting itself - which is the defect R1 fixed in the
-    /// exit code, the field names and the summary, and left in this text.
+    /// the report contradicting itself.
     ///
-    /// Exhaustive on purpose: a new variant has to say which of the two it
-    /// is, rather than inherit a `Display` that may carry a verdict.
+    /// Exhaustive: a new variant has to say which of the two it is, rather
+    /// than inherit a `Display` that may carry a verdict.
     pub fn condition(&self) -> String {
         match self {
             // The three the directory check can produce. Same facts as
@@ -652,8 +651,8 @@ mod tests {
 
     #[test]
     fn a_locally_refused_stored_endpoint_is_permanent() {
-        // R4 [N3]: these were classified as retryable, so logout advised
-        // retrying something the same local rule refuses every time.
+        // These are classified as permanent: retrying would be advised
+        // only to hit the same local refusal every time.
         let permanent: Vec<OAuthError> = vec![
             OAuthError::InsecureTransport {
                 what: "the stored client management URI",

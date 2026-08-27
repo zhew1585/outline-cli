@@ -486,9 +486,9 @@ mod tests {
 
     #[test]
     fn identity_labels_only_land_on_the_session_this_login_wrote() {
-        // R3 [32]: `record_identity` runs after a full `auth.info` round
-        // trip, so a concurrent login can replace the session in between.
-        // Labelling whatever is on disk would make `otl auth info` report
+        // `record_identity` runs after a full `auth.info` round trip, so
+        // a concurrent login can replace the session in between;
+        // labelling whatever is on disk would make `otl auth info` report
         // the wrong account for the token actually in use.
         let dir = tempfile::tempdir().unwrap();
         let store = CredentialStore::at(dir.path().to_path_buf());

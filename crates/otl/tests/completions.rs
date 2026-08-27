@@ -1,4 +1,4 @@
-//! Story 4.4: `otl completions <shell>` emits an IR-driven completion
+//! `otl completions <shell>` emits an IR-driven completion
 //! script on stdout, with diagnostics kept on stderr.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -194,7 +194,7 @@ fn a_closed_stdout_pipe_does_not_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Generated scripts are executable text (R1 finding 4).
+// Generated scripts are executable text.
 //
 // An operation name reaches bash's `opts=` string, zsh's `_arguments` value
 // list and fish's `-a` argument. A name carrying a quote, `$(...)`, a
@@ -308,7 +308,7 @@ fn candidate_descriptions_carry_no_control_characters() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-shell coverage is stated, not implied (R1 finding 5).
+// Per-shell coverage is stated, not implied.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -376,10 +376,9 @@ fn a_shell_that_claims_operation_names_actually_carries_them() {
 
 #[test]
 fn the_public_module_documentation_matches_the_delivered_coverage() {
-    // R2-5 / R3-7 / R4-4 / R5-2. Each round found the check too weak in a new
-    // direction; the last was a MIXED sentence - "powershell does not
-    // complete operation names, but elvish does" classified as a denial as a
-    // whole, so the affirmative second clause was never examined.
+    // The last gap was a MIXED sentence - "powershell does not complete
+    // operation names, but elvish does" - which classifies as a denial as
+    // a whole, so the affirmative second clause was never examined.
     //
     // Two granularities, because the two questions need different ones:
     //
@@ -430,19 +429,19 @@ fn the_coverage_check_catches_drift_in_every_direction() {
     let denial = "bash, zsh, fish do not complete operation names";
     let mixed = "powershell does not complete operation names, but elvish does";
 
-    // R3's over-claim: an affirmative clause naming an uncovered shell.
+    // Over-claim: an affirmative clause naming an uncovered shell.
     assert!(clauses(over_claim)
         .into_iter()
         .any(|c| affirms_completion(c) && shell_names(false).iter().any(|s| c.contains(s))));
 
-    // R4's denial: a denying clause naming a covered shell. A comma list
-    // splits across clauses, so the check needs one such clause, not one
-    // naming all three.
+    // Denial: a denying clause naming a covered shell. A comma list splits
+    // across clauses, so the check needs one such clause, not one naming
+    // all three.
     assert!(clauses(denial)
         .into_iter()
         .any(|c| is_denial(c) && shell_names(true).iter().any(|s| c.contains(s))));
 
-    // R5's mixed sentence: the SECOND clause affirms for an uncovered shell,
+    // Mixed sentence: the SECOND clause affirms for an uncovered shell,
     // even though the sentence as a whole reads as a denial.
     assert!(
         is_denial(mixed),
@@ -455,7 +454,7 @@ fn the_coverage_check_catches_drift_in_every_direction() {
         "the mixed sample's affirmative clause is not detected"
     );
 
-    // R6: every other way of joining the two halves. ` - ` matters most,
+    // Every other way of joining the two halves. ` - ` matters most,
     // being this module's own house style for joining clauses.
     for joiner in [
         " and ",
@@ -609,9 +608,9 @@ fn shell_names(with_operations: bool) -> Vec<&'static str> {
 
 #[test]
 fn candidate_descriptions_carry_no_bidi_or_invisible_characters() {
-    // R6 finding 9: descriptions filtered `is_control()` only, so a summary
-    // carrying U+202E would reorder the fish completion menu for the same
-    // reason an ESC byte would recolour it.
+    // Descriptions filtered `is_control()` only, so a summary carrying
+    // U+202E would reorder the fish completion menu for the same reason an
+    // ESC byte would recolour it.
     let script = script_for("fish");
     for ch in [
         '\u{202e}', '\u{202a}', '\u{2066}', '\u{2069}', '\u{200f}', '\u{200e}', '\u{61c}',

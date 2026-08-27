@@ -1,4 +1,4 @@
-//! Story 4.1: what a configuration diagnostic may contain.
+//! What a configuration diagnostic may contain.
 //!
 //! Two rules, tested from every direction the reviews have found:
 //!
@@ -418,12 +418,12 @@ fn a_missing_profile_key_diagnostic_stays_bounded() {
 }
 
 // ---------------------------------------------------------------------------
-// Recovery advice names an action the user can actually take (R6 finding 6).
+// Recovery advice names an action the user can actually take.
 //
 // A profile can be selected three ways, and only one of them is undone by
 // "drop --profile". Telling a user with `default_profile` in their config
 // file to drop a flag they never typed is the one path where a working
-// Epic-1 setup breaks and the instruction it gets is unavailable.
+// env-only setup breaks and the instruction it gets is unavailable.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -481,8 +481,7 @@ fn the_missing_profile_key_error_names_the_layer_that_selected_the_profile() {
 }
 
 // ---------------------------------------------------------------------------
-// The flag and the variable normalize the same value the same way
-// (R6 finding 8).
+// The flag and the variable normalize the same value the same way.
 // ---------------------------------------------------------------------------
 
 #[test]

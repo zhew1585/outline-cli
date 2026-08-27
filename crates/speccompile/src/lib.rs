@@ -2,23 +2,22 @@
 //!
 //! The output is a plain data table: one [`CompiledOp`] per operation,
 //! carrying its request path and the scalar parameters of its JSON body.
-//! There is deliberately no per-endpoint code generation.
+//! There is no per-endpoint code generation.
 //!
-//! Two callers share this crate, which is the whole reason it exists:
+//! Two callers share this crate:
 //!
 //! - a build script, which renders the table as Rust source compiled into
 //!   the binary (the built-in IR);
 //! - `spec sync` at run time, which compiles a freshly fetched document
 //!   and caches the result.
 //!
-//! Both therefore agree by construction, and the runtime path parses a
-//! spec exactly once - never at startup.
-//!
-//! The IR types here MIRROR `engine::ir` without depending on it (see
-//! `Cargo.toml` for why). The mapping between the two is a single
-//! exhaustive conversion in the `otl` crate, and a parity test asserts
-//! that build-time and run-time compilation of the same document produce
+//! Both therefore agree by construction. A parity test asserts that
+//! build-time and run-time compilation of the same document produce
 //! identical tables.
+//!
+//! The IR types here MIRROR `engine::ir` without depending on it. The
+//! mapping between the two is a single exhaustive conversion in the `otl`
+//! crate.
 //!
 //! # Untrusted input
 //!
@@ -104,10 +103,9 @@ pub struct CompiledParam {
 
 /// One field of an operation's success response payload.
 ///
-/// Mirrors `engine::ir::FieldSpec`. Declaration order is preserved (see
-/// `Cargo.toml` for the `preserve_order` note): it is the schema's own
-/// statement of which fields matter most, and a renderer ranks columns by
-/// it.
+/// Mirrors `engine::ir::FieldSpec`. Declaration order is preserved: it is
+/// the schema's own statement of which fields matter most, and a renderer
+/// ranks columns by it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledField {
     /// Field name as it appears in the JSON response.
@@ -138,8 +136,7 @@ pub struct CompiledOp {
     /// How the request body may be supplied.
     pub body_mode: BodyKind,
     /// Request-body parameters, in the order the document declares them
-    /// (`preserve_order` is on). Deterministic either way, which is what
-    /// the build-time/run-time parity rests on.
+    /// (`preserve_order` is on), so output is deterministic.
     pub params: Vec<CompiledParam>,
     /// Fields of one item of the success response payload, in the order the
     /// source schema declares them. Empty when the document describes no
@@ -147,12 +144,10 @@ pub struct CompiledOp {
     pub response_fields: Vec<CompiledField>,
     /// Whether the document marks the operation `deprecated`.
     ///
-    /// Read here and deliberately NOT carried into the runtime IR: the IR is
-    /// a dispatch table, a deprecation bit would change its schema version
-    /// (invalidating every user's cache), and the one consumer that needs
-    /// the flag - `otl doctor`, comparing the online API against the local
-    /// table - compiles the fetched document itself and can read it from
-    /// there. A deprecated operation still dispatches exactly as before.
+    /// Not carried into the runtime IR (a new bit would change its schema
+    /// version and invalidate every user's cache); `otl doctor`, the one
+    /// consumer that needs the flag, compiles the fetched document itself
+    /// and can read it from there.
     pub deprecated: bool,
 }
 
@@ -168,17 +163,10 @@ pub struct CompiledSpec {
 pub struct CompileOptions {
     /// Prefix prepended to every document path (e.g. `/api`), expressing a
     /// service's URL convention. Empty to use document paths verbatim.
-    ///
-    /// This is where a service-specific convention enters; the compiler
-    /// itself knows no service.
     pub path_prefix: String,
     /// Property of a success response that holds the payload (e.g. `data`),
     /// for services that wrap their responses in an envelope. Empty when
     /// the response schema IS the payload.
-    ///
-    /// Also service-specific, and for the same reason it lives here rather
-    /// than in the compiler: the compiler knows about OpenAPI, not about
-    /// anybody's envelope.
     pub envelope_data_property: String,
 }
 
@@ -215,10 +203,6 @@ pub enum CompileError {
     },
     /// The document is valid JSON, and too large to parse within the
     /// budget.
-    ///
-    /// Separate from [`CompileError::NotJson`] on purpose: the input is
-    /// well-formed, so telling the reader it is malformed sends them
-    /// looking for a syntax error that does not exist.
     #[error(
         "it is {} of JSON that expands to more than the {} this parser will hold \
          (charged {} before stopping); check that the document is an API \
@@ -271,9 +255,9 @@ pub enum CompileError {
     DepthExceeded,
     /// An operation name or path is not safe to use.
     ///
-    /// The hard case: a path that escapes its base URL (`//host`, `@host`,
-    /// a scheme, a `..` segment) would send the caller's bearer token to
-    /// another origin once joined onto the base URL.
+    /// A path that escapes its base URL (`//host`, `@host`, a scheme, a
+    /// `..` segment) would send the caller's bearer token to another
+    /// origin once joined onto the base URL.
     #[error("operation {operation:?} has an unusable {field}: {reason}")]
     UnsafeIdentifier {
         /// The offending operation, as named by the document.
@@ -285,12 +269,9 @@ pub enum CompileError {
     },
     /// A string with meaning (a parameter name, content type, format or
     /// enum value) carries characters a terminal would execute, or is
-    /// implausibly long.
-    ///
-    /// Such text cannot be silently rewritten the way a summary can: it is
-    /// matched against user input or sent on the wire, so the document is
-    /// rejected instead. The offending value is deliberately NOT echoed -
-    /// printing it is exactly the attack.
+    /// implausibly long. Such text cannot be silently rewritten the way a
+    /// summary can, so the document is rejected instead; the offending
+    /// value is not echoed.
     #[error(
         "operation {operation:?} has an unusable {field}: {reason} \
          (the value is not shown: printing it is the attack)"
@@ -310,9 +291,8 @@ pub enum CompileError {
 /// The input is treated as untrusted throughout, starting with the parse:
 /// only the parts this compiler reads are materialized, and they are
 /// charged against a budget as they are built (see [`document`]). There is
-/// deliberately no entry point that takes an already-parsed
-/// `serde_json::Value` - that would be a way to skip the one limit that
-/// bounds memory before any other limit exists.
+/// no entry point that takes an already-parsed `serde_json::Value`, which
+/// would bypass that limit.
 pub fn compile_json(raw: &str, options: &CompileOptions) -> Result<CompiledSpec, CompileError> {
     let document = document::parse(raw, MAX_PARSED_BYTES)?;
     compile(&document, options)
@@ -421,8 +401,7 @@ fn request_body<'a>(
 /// The result is SANITIZED, not validated: control characters (terminal
 /// escapes, row-forging tabs and newlines, bidi overrides) are dropped and
 /// the length is capped. Nothing dispatches on a summary, so dropping
-/// characters cannot change behaviour - whereas rejecting the whole
-/// document because one description contains a stray byte would.
+/// characters cannot change behaviour.
 fn extract_summary(post: &Value) -> String {
     let raw = post
         .get("summary")

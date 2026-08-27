@@ -1,4 +1,4 @@
-//! Story 1.7: 429 backoff inside the single request channel.
+//! 429 backoff inside the single request channel.
 //!
 //! Real waits are kept tiny: tests inject a `RetryPolicy` with millisecond
 //! backoff, and the only real `Retry-After` wait is a single second.

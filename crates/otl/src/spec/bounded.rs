@@ -353,8 +353,7 @@ pub(super) fn decode_table(body: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Tabl
 /// allocation: more than the format allows, more than the bytes that
 /// ACTUALLY remain could encode (a short body declaring thousands of
 /// operations is simply lying), and more memory than the budget allows for
-/// the table's own `Vec` - 8192 slots of `OpSpec` is a megabyte, and it
-/// used to be invisible to the very budget that exists to bound it.
+/// the table's own `Vec` (8192 slots of `OpSpec` is a megabyte).
 fn check_declared_count(count: usize, remaining: usize) -> Result<usize, TableError> {
     if count > MAX_CACHED_OPS {
         return Err(TableError::TooManyOperations {

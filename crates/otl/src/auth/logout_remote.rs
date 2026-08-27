@@ -6,9 +6,8 @@
 //!
 //! - Every request is anchored to the origin the CREDENTIAL recorded for
 //!   itself - a session's token endpoint, a registration's instance - never
-//!   to `OUTLINE_URL`. Anchoring on the environment refused to revoke A's
-//!   tokens because the shell pointed at B, while the local half deleted
-//!   them anyway.
+//!   to `OUTLINE_URL`, so a shell pointed at another instance cannot make
+//!   revocation miss the instance that issued the tokens.
 //! - A failure is classified by whether a retry could ever succeed
 //!   ([`OAuthError::is_permanent`]), because that decides both the wording
 //!   and whether the caller keeps the credentials for another attempt.
@@ -225,9 +224,8 @@ mod tests {
     }
     #[test]
     fn revocation_is_anchored_to_the_session_not_to_the_environment() {
-        // The R3 finding: anchoring on OUTLINE_URL refused to revoke A's
-        // tokens because the shell pointed at B - while still deleting them
-        // locally. The session records its own issuer; that is the anchor.
+        // The session records its own issuer; that is the anchor, not any
+        // ambient URL.
         let stored = OAuthSession {
             revocation_endpoint: Some(format!("{ORIGIN}/oauth/revoke")),
             ..session()

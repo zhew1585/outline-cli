@@ -1,4 +1,4 @@
-//! Story 3.5: `otl collections list`.
+//! `otl collections list`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

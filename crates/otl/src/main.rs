@@ -74,7 +74,8 @@ enum Command {
 }
 
 fn main() -> std::process::ExitCode {
-    // clap itself exits with code 2 on usage errors, matching docs/exit-codes.md.
+    // clap itself exits with code 2 on usage errors, matching the
+    // documented exit-code table.
     let cli = Cli::parse();
     let mode = render::resolve_mode(cli.json, std::io::stdout().is_terminal());
     let result = match &cli.command {

@@ -204,13 +204,10 @@ pub fn usable_origin(base_url: &str) -> Result<String, AuthError> {
 /// Refuse to add credentials for `origin` to a profile that already belongs
 /// to a different instance.
 ///
-/// The read-side check ([`source`]) refuses to USE mismatched credentials.
-/// This is the other half: it stops the mismatched state from being created
-/// at all. Without it a write can rewrite `profile.origin` and leave the
-/// previous instance's higher-priority credentials in place, which is
-/// exactly the state the read-side check was built to catch - and the state
-/// it would then wrongly accept, since the profile-level binding now
-/// "matches".
+/// The read-side check ([`source`]) refuses to USE mismatched credentials;
+/// this stops the mismatched state from being created at all. Without it a
+/// write can rewrite `profile.origin` and leave the previous instance's
+/// higher-priority credentials in place.
 ///
 /// Must be called INSIDE the credential transaction as well as before any
 /// network work: another process can bind the profile in between.
@@ -248,11 +245,8 @@ pub fn ensure_bindable(
 /// `otl auth logout` uses this: every URL it talks to comes out of the
 /// credential file, so requiring `OUTLINE_URL` - and putting it through the
 /// transport rule - would make cleanup impossible in exactly the states
-/// that need cleaning up most: no instance configured, the wrong one
-/// configured, or a plaintext value stored before that rule existed. The
-/// only alternative left to a user then is deleting the file by hand, which
-/// takes the `registration_access_token` with it and orphans the DCR
-/// registration for good.
+/// that need cleaning up most: no instance configured, or the wrong one
+/// configured.
 pub fn open_store_without_instance(
     overrides: &Overrides,
 ) -> Result<(String, CredentialStore), AuthError> {
@@ -302,10 +296,9 @@ pub struct StoreContext {
 
 /// The credential a command will authenticate with.
 ///
-/// Deliberately opaque and deliberately not `Clone`: the only thing that can
-/// be done with one is [`Resolved::into_client`], which consumes it. There is
-/// no accessor that hands the secret back, so a future command cannot
-/// "just read the key" and route it somewhere the gate never saw.
+/// Opaque and not `Clone`: the only thing that can be done with one is
+/// [`Resolved::into_client`], which consumes it. There is no accessor that
+/// hands the secret back.
 enum Credential {
     /// A renewable OAuth session. Goes into the engine as a
     /// `CredentialSource` so refresh happens inside the request channel.
@@ -317,10 +310,9 @@ enum Credential {
 
 /// A credential the gate has approved, plus the non-secret summary of it.
 ///
-/// Returned by [`resolve_credential`], which is the ONE place a credential
-/// is chosen. `otl api`, the curated commands and `otl auth info` all come
-/// through here; before this, `auth info` had its own path and released a
-/// global environment key that `otl api` refused on the same configuration.
+/// Returned by [`resolve_credential`], the ONE place a credential is
+/// chosen: `otl api`, the curated commands and `otl auth info` all come
+/// through here.
 pub struct Resolved {
     credential: Credential,
     /// Everything `otl auth info` prints. Contains no secret.
@@ -357,14 +349,7 @@ impl fmt::Debug for Resolved {
 
 /// Choose the credential for `instance`, applying every rule exactly once.
 ///
-/// # Why this is one function and not three
-///
-/// "Credentials must not cross instances" has now been fixed three times on
-/// three different paths: the read path (R1), the write path (R2), and
-/// `otl auth info`'s live identity check (R6). Each fix was correct and each
-/// one left the other paths to be found later, because each path did its own
-/// resolution. So the paths are gone: there is one, and the rules are stated
-/// here once.
+/// This is the single resolution path every command goes through:
 ///
 /// 1. **Instance binding.** [`check_binding`] refuses a stored credential
 ///    another instance issued, before anything is chosen.
@@ -375,11 +360,9 @@ impl fmt::Debug for Resolved {
 /// 3. **A fixed key comes from the config gate and nowhere else.** Which
 ///    store supplies it - the credential file or the environment - and
 ///    whether the environment may supply it at all for these settings is
-///    [`config::Config::release`]'s decision. That is the rule
-///    `auth info` used to bypass: it read `OUTLINE_API_KEY` directly, while
-///    the gate scopes a profile's key to `OUTLINE_API_KEY_<PROFILE>` and
-///    refuses to fall back, because falling back sends one workspace's key
-///    to another workspace's server.
+///    [`config::Config::release`]'s decision: the gate scopes a profile's
+///    key to `OUTLINE_API_KEY_<PROFILE>` and refuses to fall back, because
+///    falling back sends one workspace's key to another workspace's server.
 pub fn resolve_credential(
     instance: &Instance,
     store: &CredentialStore,
@@ -410,8 +393,7 @@ pub fn resolve_credential(
         config::CredentialSource::Environment => {
             // Warned here, where the key is CHOSEN: once per command run
             // rather than once per request, and only for a key the gate
-            // actually released - which is also how the warning learns WHICH
-            // variable to name, since a selected profile has its own.
+            // actually released.
             warn_about_env_key(&env_key_variable(instance.settings()));
             available.push(Method::EnvApiKey);
             Method::EnvApiKey
@@ -428,9 +410,7 @@ pub fn resolve_credential(
 /// Config owns the naming rule (`OUTLINE_API_KEY_<PROFILE>`, or the global
 /// variable when no profile is in effect); this asks it rather than
 /// reconstructing it, so the warning cannot name a variable the gate would
-/// not have read. A profile whose name has no usable variable form cannot
-/// have released a key from the environment at all, so the fallback is only
-/// reachable if that rule changes.
+/// not have read.
 fn env_key_variable(settings: &Settings) -> String {
     settings
         .profile()
@@ -552,7 +532,7 @@ fn string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
 /// Map an authentication failure to a documented exit code.
 ///
 /// The split that matters to a script: exit 4 means "authenticate again",
-/// exit 2 means "fix something locally". See `docs/exit-codes.md`.
+/// exit 2 means "fix something locally".
 pub fn map_auth_error(error: AuthError) -> CliError {
     match error {
         // The engine's own mapper, because it composes the hint text as well
@@ -570,8 +550,8 @@ pub fn map_auth_error(error: AuthError) -> CliError {
 ///
 /// The borrowing half of [`map_auth_error`], for `otl doctor`: a report has
 /// to state the code a failure WOULD have produced while keeping the error
-/// to print. Deliberately not a second table - each arm delegates to the
-/// same classifier `map_auth_error` uses, so the two cannot drift.
+/// to print. Each arm delegates to the same classifier `map_auth_error`
+/// uses, so the two cannot drift.
 pub fn exit_code_of(error: &AuthError) -> ExitCode {
     match error {
         AuthError::Engine(inner) => crate::errors::engine_exit_code(inner),
@@ -608,8 +588,7 @@ fn oauth_exit_code(error: &OAuthError) -> ExitCode {
         | OAuthError::ConcurrentLogin { .. } => ExitCode::Usage,
         // A registration exists on the server that nothing can remove. Not
         // a local configuration problem, and not something a retry fixes:
-        // it needs an administrator, so it gets the generic failure code
-        // rather than pretending to be actionable here.
+        // it needs an administrator, so it gets the generic failure code.
         OAuthError::OrphanedRegistration { .. } => ExitCode::Failure,
         OAuthError::Transport { .. } => ExitCode::Network,
         OAuthError::Endpoint { status, .. } => match status {

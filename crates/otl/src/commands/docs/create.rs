@@ -1,4 +1,4 @@
-//! `otl docs create` (story 3.3).
+//! `otl docs create`.
 //!
 //! The body comes from a pipe (`cat notes.md | otl docs create ...`) or from
 //! `--file`; the two are equivalent, and `--file` wins when both are on the

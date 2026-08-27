@@ -1,4 +1,4 @@
-//! Story 3.6: `otl docs export` - what ends up in the exported tree, and
+//! `otl docs export` - what ends up in the exported tree, and
 //! how the run accounts for it.
 //!
 //! Robustness and hostile-input cases live in `docs_export_safety.rs`; the
@@ -332,11 +332,9 @@ async fn server_that_never_runs_out(row_id: &str) -> MockServer {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_enumeration_stopped_by_the_page_cap_is_not_a_successful_backup() {
-    // The regression this exists for: the pagination cap used to produce a
-    // stderr warning and exit 0, so an automated backup of a collection
-    // larger than the cap was recorded as complete. The files that WERE
-    // written are kept - they are real - but the exit code and the JSON
-    // summary both have to say the copy is partial.
+    // The pagination cap must not be recorded as a successful backup: the
+    // files that WERE written are kept - they are real - but the exit code
+    // and the JSON summary both have to say the copy is partial.
     let server = server_that_never_runs_out("d1").await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("export");
@@ -389,8 +387,8 @@ async fn an_enumeration_stopped_by_the_page_cap_is_not_a_successful_backup() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_with_no_markdown_body_is_a_failure_not_an_empty_file() {
-    // `documents.info` answering without `text` used to produce a file
-    // holding only the title heading, counted as exported, exit 0.
+    // `documents.info` answering without `text` must be a failure, not a
+    // file holding only the title heading counted as exported.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(request_path("/api/documents.list"))
@@ -612,7 +610,7 @@ async fn a_duplicate_row_is_not_counted_as_a_failure() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_collection_of_only_unusable_rows_does_not_claim_to_be_empty() {
-    // Two contradictory diagnostics used to appear together: "this
+    // Two contradictory diagnostics must not appear together: "this
     // collection has no documents to export" and a list of documents that
     // could not be exported.
     let server = MockServer::start().await;

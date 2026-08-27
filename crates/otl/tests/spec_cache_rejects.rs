@@ -1,4 +1,4 @@
-//! The on-disk IR cache (Story 4.2): every rejection path.
+//! The on-disk IR cache: every rejection path.
 //!
 //! Nothing here touches the real cache directory: every case works on a
 //! `tempfile::TempDir`. Fixtures live in `common/cache.rs`; see that file

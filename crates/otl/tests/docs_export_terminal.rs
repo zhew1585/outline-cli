@@ -1,4 +1,4 @@
-//! Story 3.6: `otl docs export` - what reaches the TERMINAL.
+//! `otl docs export` - what reaches the TERMINAL.
 //!
 //! Document titles, document ids, file names and paths all end up in
 //! diagnostics, and all of them are written by someone other than the

@@ -201,8 +201,7 @@ impl TempNames {
     /// `RandomState` takes its key from the operating system, so two runs -
     /// and two processes - produce unrelated sequences. The counter only
     /// makes names unique WITHIN a run; the key is what makes them
-    /// unguessable, which is the property the old `pid`-plus-counter scheme
-    /// lacked.
+    /// unguessable.
     pub fn new() -> Self {
         Self {
             state: RandomState::new(),
@@ -400,12 +399,11 @@ mod tests {
 
     #[test]
     fn the_destination_never_exists_empty() {
-        // The regression this replaced: claiming the name with an empty
-        // file first meant a crash in that window left a zero-byte
-        // `Document.md` behind, which a later run would then refuse to
-        // overwrite. Nothing may exist at the destination until the content
-        // is complete, so at every point there is either no destination or
-        // a whole document.
+        // Nothing may exist at the destination until the content is
+        // complete: at every point there is either no destination or a
+        // whole document, so a crash in the middle cannot leave a
+        // zero-byte file behind that a later run would refuse to
+        // overwrite.
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
         let mut namer = names();
@@ -473,10 +471,9 @@ mod tests {
 
     #[test]
     fn a_pre_existing_file_is_never_deleted_by_cleanup() {
-        // The regression: cleanup used to remove the temporary path
-        // whether or not this call had created it, so an attacker who
-        // guessed the (pid-based) name and put a file there got it
-        // deleted. Ownership now comes from `create_new` succeeding.
+        // Cleanup removes only the temporary path this call created;
+        // ownership comes from `create_new` succeeding, so a file that
+        // already existed is never deleted.
         let dir = tempfile::tempdir().unwrap();
         let target = Dir::open(dir.path().to_path_buf()).unwrap();
         let bystander = dir.path().join("someone-elses-file");

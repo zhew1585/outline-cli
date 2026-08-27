@@ -16,11 +16,11 @@ use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-// --- Re-review findings ---------------------------------------------------
+// --- edge cases -----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn contradicting_offset_echo_is_always_an_error() {
-    // Re-review finding 1 (PoC): the server ignores the requested offset
+    // The server ignores the requested offset
     // and echoes a non-numeric hint, so "advance by received" cannot be
     // trusted. Merging [0,1] with [0] would silently duplicate a row.
     let server = MockServer::start().await;
@@ -95,7 +95,7 @@ async fn ignored_offset_echo_means_the_engine_trusts_its_counter() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_page_warns_when_the_server_clamps_below_the_request() {
-    // Re-review finding 2 PoC A: limit=1000, server applies 25 and says so.
+    // limit=1000, server applies 25 and says so.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(body_partial_json(json!({ LIMIT_PARAM: 1000 })))
@@ -124,7 +124,7 @@ async fn manual_page_warns_when_the_server_clamps_below_the_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_page_warns_when_no_applied_size_hint_is_available() {
-    // Re-review finding 2 PoC B / part (c): with no trustworthy applied
+    // with no trustworthy applied
     // size, silence would be a silent truncation - warn conservatively.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -198,7 +198,7 @@ fn validate(spec: &PaginationSpec) -> Result<(), EngineError> {
 
 #[test]
 fn invalid_json_pointers_are_rejected_before_any_request() {
-    // Re-review finding 3: strict RFC 6901, checked locally.
+    // strict RFC 6901, checked locally.
     let cases = [
         "result/rows",    // no leading slash
         "/result/~2rows", // invalid escape
@@ -262,7 +262,7 @@ fn valid_pointers_including_escapes_and_root_are_accepted() {
 
 #[test]
 fn stale_metadata_pointer_overlapping_the_items_pointer_is_rejected() {
-    // Re-review finding 4: metadata removal must never be able to delete
+    // metadata removal must never be able to delete
     // the merged rows. Equal, ancestor and descendant all overlap.
     for stale in ["/result/rows", "/result", "", "/result/rows/0"] {
         let spec = PaginationSpec {
@@ -280,7 +280,7 @@ fn stale_metadata_pointer_overlapping_the_items_pointer_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_metadata_removal_follows_rfc_6901_array_indexes() {
-    // Re-review finding 4: array indexes must not be parsed leniently -
+    // array indexes must not be parsed leniently -
     // `00` is not a valid RFC 6901 index and must remove nothing.
     let server = MockServer::start().await;
     Mock::given(method("POST"))

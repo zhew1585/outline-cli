@@ -8,14 +8,7 @@
 //!
 //! # A session, and nothing else
 //!
-//! This provider used to serve any of the three credential kinds, choosing
-//! between them by precedence - and its environment branch read
-//! `OUTLINE_API_KEY` directly, which meant every caller that went through it
-//! bypassed the config gate's rule that a profile-scoped credential must
-//! come from `OUTLINE_API_KEY_<PROFILE>`. `otl auth info` did exactly that,
-//! and sent a global key that `otl api` refused on the same configuration.
-//!
-//! So the split is now by CAPABILITY rather than by preference: a session is
+//! The split is by CAPABILITY rather than by preference: a session is
 //! the only credential that renews, and renewing is the only reason a
 //! credential needs to live behind a `CredentialSource` at all. A fixed key
 //! needs no state and no lock, so it goes to the engine as a plain string -
@@ -549,15 +542,10 @@ mod tests {
 
     #[test]
     fn the_file_is_the_only_thing_available_reports() {
-        // The environment used to be discovered here, by reading
-        // OUTLINE_API_KEY directly - which is how `auth info` came to send a
-        // global key that the config gate refuses for a selected profile.
-        // This function now answers about the FILE and cannot see the
+        // This function answers about the FILE and cannot see the
         // environment at all; `credential_paths.rs` pins that structurally
         // (no module under `auth` may name the variable) and
-        // `auth_curated_path.rs` pins the behaviour end to end. Setting the
-        // variable HERE would prove less than either, and would mutate
-        // process state that the other tests in this binary share.
+        // `auth_curated_path.rs` pins the behaviour end to end.
         assert!(available(None).is_empty());
         assert_eq!(
             available(Some(&bound(Some("stored"), None))),

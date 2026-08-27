@@ -1,4 +1,4 @@
-//! `otl collections list` (story 3.5).
+//! `otl collections list`.
 //!
 //! The list itself is auto-paginated, so a workspace with more collections
 //! than one page still comes back whole.

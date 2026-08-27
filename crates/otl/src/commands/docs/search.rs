@@ -1,4 +1,4 @@
-//! `otl docs search <query>` (story 3.1).
+//! `otl docs search <query>`.
 //!
 //! Human output is a four-column table - title, collection, last change,
 //! matching snippet - built by naming fields, not by writing a renderer.

@@ -1,4 +1,4 @@
-//! Contract smoke test against a real Outline workspace (Story 1.8).
+//! Contract smoke test against a real Outline workspace.
 //!
 //! Ignored by default so `cargo test` never touches the network. The CI
 //! contract job runs it with `-- --ignored` and injects credentials via the
@@ -24,8 +24,8 @@ fn contract_credentials() -> Option<(String, String)> {
 }
 
 // The smoke uses `documents.search` because the current IR table only
-// compiles the documents.* subset (Story 1.1 MVP slice). Once the
-// full-endpoint IR lands (Story 1.2), switch this to `auth.info` for a
+// compiles the documents.* subset. Once the
+// full-endpoint IR lands, switch this to `auth.info` for a
 // cheaper, side-effect-free identity check.
 #[test]
 #[ignore = "contract test: needs OUTLINE_TEST_URL / OUTLINE_TEST_API_KEY"]

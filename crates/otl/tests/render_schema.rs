@@ -1,4 +1,4 @@
-//! Story 1-5b: schema-driven table columns.
+//! Schema-driven table columns.
 //!
 //! The schema supplies the column RANKING, which is a property of the
 //! operation; the payload decides which of the ranked fields are shown, since
@@ -198,11 +198,10 @@ fn schema_columns_are_stable_for_responses_carrying_the_same_fields() {
 
 #[test]
 fn a_sparse_response_shows_the_fields_it_has_not_empty_columns() {
-    // R1 finding 6: `nullable: false` is not `required`, and the vendored
-    // spec declares no `required` list for any response schema. Selecting
-    // columns from the schema alone gave `[{"id":"d1","icon":"..."}]` four
-    // columns, three of them empty in every row, with the one real field
-    // squeezed out by the column cap.
+    // `nullable: false` is not `required`, and the vendored spec declares
+    // no `required` list for any response schema. Selecting columns from the
+    // schema alone gave four columns, three of them empty in every row, with
+    // the one real field squeezed out by the column cap.
     let schema = document_schema();
     let sparse = json!([{ "id": "d1", "icon": "flame" }]);
     let header = header_of(&sparse, &schema);
@@ -389,7 +388,7 @@ fn the_compiled_ir_drives_real_operations() {
 
 #[test]
 fn columns_that_are_null_in_every_row_are_not_shown() {
-    // R2 finding 4: presence of a key is not content. `icon`, `color` and
+    // Presence of a key is not content. `icon`, `color` and
     // `publishedAt` are legitimately nullable and can be present-but-null in
     // every row; each would take one of the four slots and render blank,
     // pushing out a field that does have something to show.
@@ -430,7 +429,7 @@ fn blank_strings_do_not_earn_a_column_but_false_and_zero_do() {
 /// An INDEPENDENT reimplementation of the property under test, deliberately
 /// not reading the rendered table: a blank middle column shifts every later
 /// value left, so `split_whitespace().nth(i)` cannot tell which column a cell
-/// belongs to (R3 finding 6 called that out, correctly).
+/// belongs to.
 fn visible_in_payload(payload: &Value, key: &str) -> bool {
     payload
         .as_array()
@@ -475,9 +474,9 @@ fn no_selected_column_is_ever_blank_in_every_row() {
 
 #[test]
 fn invisible_values_do_not_crowd_out_visible_ones() {
-    // R3 finding 6: `has_content` judged the RAW string, so a high-priority
-    // field holding "\u{1b}" or "\u{200b}" counted as content, filled a
-    // column with nothing, and pushed a real value past the four-column cap.
+    // `has_content` judges the RAW string, so a high-priority field
+    // holding "\u{1b}" or "\u{200b}" counts as content, fills a column
+    // with nothing, and pushes a real value past the four-column cap.
     let schema = document_schema();
     let payload = json!([
         {
@@ -532,10 +531,10 @@ fn a_payload_whose_schema_fields_are_all_null_falls_back_to_the_data() {
 
 #[test]
 fn the_data_driven_fallback_also_requires_content() {
-    // R4 finding 2: the content filter was only on the schema path. When the
-    // schema contributes nothing - which is exactly when every ranked field
-    // was blank - the fallback re-selected those same blank fields by name
-    // priority and pushed the one field with data past the column cap.
+    // The content filter is on the schema path; when the schema
+    // contributes nothing, the fallback must not re-select those same blank
+    // fields by name priority and push the one field with data past the
+    // column cap.
     let schema = document_schema();
     let payload = json!([{
         "id": null,

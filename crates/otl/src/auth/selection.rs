@@ -18,12 +18,10 @@ pub const ENV_NO_KEY_WARNING: &str = "OUTLINE_NO_KEY_WARNING";
 
 /// The one-time warning about keeping an API key in the environment.
 ///
-/// `{variable}` is the variable the key actually came from. Naming it matters
-/// now that the warning also covers a profile-scoped key: it used to fire
-/// only for the global `OUTLINE_API_KEY`, because it was decided by a direct
-/// read of that one variable, and stayed silent for
-/// `OUTLINE_API_KEY_<PROFILE>` - which has exactly the same exposure and is
-/// the variable a CI setup is most likely to use.
+/// `{variable}` is the variable the key actually came from - the global
+/// `OUTLINE_API_KEY` or a profile-scoped `OUTLINE_API_KEY_<PROFILE>`,
+/// which has exactly the same exposure and is the variable a CI setup is
+/// most likely to use.
 const ENV_KEY_WARNING: &str = "warning: authenticating with the API key in \
      {variable}. An environment variable is readable by every process \
      you start and tends to end up in shell history, CI logs and crash \
@@ -62,8 +60,7 @@ impl Method {
 ///
 /// Built by [`crate::auth::resolve_credential`], the one place a credential
 /// is chosen, so the report cannot describe a different decision from the one
-/// that was made. It used to be built by the provider, which is why a fixed
-/// key had no report at all when the provider stopped serving one.
+/// that was made.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// The method actually in use.
@@ -135,18 +132,12 @@ impl Snapshot {
 /// Which credentials the CREDENTIAL FILE holds for a profile, in precedence
 /// order.
 ///
-/// The file only. An environment key used to be discovered here, by reading
-/// `OUTLINE_API_KEY` directly, and that was a hole: config scopes an
-/// environment key to the selected profile (`OUTLINE_API_KEY_<PROFILE>`) and
-/// deliberately refuses to fall back to the global variable, because falling
-/// back is what sends one workspace's key to another workspace's server.
-/// This function had no notion of a profile-scoped variable, so every caller
-/// that went through it got the global one - which is how `otl auth info`
-/// came to send a key that `otl api`, on the same configuration, refused.
-///
-/// So the environment is not this module's business at all. It is a config
-/// STORE, reachable only through the release gate, and
-/// [`crate::auth::resolve_credential`] is the one place the two are combined.
+/// The file only: config scopes an environment key to the selected profile
+/// (`OUTLINE_API_KEY_<PROFILE>`) and refuses to fall back to the global
+/// variable, because falling back is what sends one workspace's key to
+/// another workspace's server. That decision belongs to the config gate, not
+/// here; [`crate::auth::resolve_credential`] is the one place the two are
+/// combined.
 pub fn available(profile: Option<&ProfileCredentials>) -> Vec<Method> {
     let mut methods = Vec::new();
     if profile.is_some_and(|p| p.oauth.is_some()) {

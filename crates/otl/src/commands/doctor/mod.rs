@@ -1,5 +1,4 @@
-//! `otl doctor` - one command that says whether this environment works
-//! (Story 4.3, FR23).
+//! `otl doctor` - one command that says whether this environment works.
 //!
 //! Seven checks, in dependency order: the config file, the instance URL, the
 //! credential file, the credential that would be sent, whether the instance
@@ -11,8 +10,8 @@
 //! `otl doctor` exits **0** when nothing is blocking and **the code the
 //! first blocking finding would have produced in any other command**
 //! otherwise: 2 for something to fix locally, 4 for "authenticate again", 7
-//! for a network failure, and so on (`docs/exit-codes.md`). No new code is
-//! introduced and no code changes meaning.
+//! for a network failure, and so on. No new code is introduced and no code
+//! changes meaning.
 //!
 //! Three consequences worth stating, because each is a decision:
 //!
@@ -42,9 +41,8 @@
 //!   than the fetcher, so the codebase still has exactly three places that
 //!   send a request.
 //!
-//! `--offline` skips both. Nothing here runs on any other command's path, so
-//! NFR4 (no phone home) is untouched: `otl doctor` is a command, not a
-//! background check.
+//! `--offline` skips both. Nothing here runs on any other command's path:
+//! `otl doctor` is a command, not a background check.
 
 mod checks;
 mod credentials;

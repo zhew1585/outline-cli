@@ -1,4 +1,4 @@
-//! Story 3.6: `otl docs export` - what reaches the FILESYSTEM.
+//! `otl docs export` - what reaches the FILESYSTEM.
 //!
 //! File names that must not escape the output directory, symlinks, atomic
 //! placement, durability, and validation of `--out`. The cases about
@@ -234,9 +234,9 @@ async fn no_temporary_files_are_left_behind() {
 async fn a_write_that_cannot_be_placed_leaves_the_old_content_alone() {
     // A directory sits where a document's file has to go, so the final
     // rename cannot succeed. The point is what does NOT happen: the
-    // existing entry is not emptied first (the old `truncate(true)` would
-    // have destroyed a previous backup before discovering the failure), and
-    // no partial file is left behind.
+    // existing entry is not emptied first (a truncate would destroy a
+    // previous backup before discovering the failure), and no partial file
+    // is left behind.
     let server = server_with(vec![row("a", "Alpha", None)]).await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("export");
@@ -278,10 +278,10 @@ async fn a_write_that_cannot_be_placed_leaves_the_old_content_alone() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_symlink_at_the_destination_is_replaced_not_written_through() {
-    // With `--overwrite`, a symlink where a document's file goes used to be
-    // a check-then-open race. Writing a fresh temp file and renaming it over
-    // the destination closes it structurally: `rename` replaces the link
-    // itself, so the file it pointed at is never touched.
+    // With `--overwrite`, writing a fresh temp file and renaming it over
+    // the destination closes the check-then-open race structurally:
+    // `rename` replaces the link itself, so the file it pointed at is
+    // never touched.
     use std::os::unix::fs::symlink;
 
     let server = server_with(vec![row("a", "Alpha", None)]).await;
@@ -687,10 +687,10 @@ async fn ordinary_content_still_gets_the_ordinary_not_empty_message() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_output_path_that_steps_out_of_a_new_directory_is_refused() {
-    // `--out a/../b` used to succeed and leave an empty `a/` behind: the
-    // components are created one at a time, so `a` gets made and then
-    // stepped out of. Collapsing `..` lexically instead would be wrong when
-    // a component is a symlink, so this is refused rather than rewritten.
+    // `--out a/../b` would leave an empty `a/` behind: the components
+    // are created one at a time, so `a` gets made and then stepped out of.
+    // Collapsing `..` lexically instead would be wrong when a component is
+    // a symlink, so this is refused rather than rewritten.
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let uri = server.uri();

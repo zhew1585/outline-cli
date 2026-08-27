@@ -1,4 +1,4 @@
-//! `otl api list` end-to-end tests (Story 1.2).
+//! `otl api list` end-to-end tests.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

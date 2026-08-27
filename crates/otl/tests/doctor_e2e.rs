@@ -1,4 +1,4 @@
-//! End-to-end `otl doctor`: the ENVIRONMENT half (Story 4.3).
+//! End-to-end `otl doctor`: the ENVIRONMENT half.
 //!
 //! Config file, instance URL, credential file, the credential a request
 //! would carry, and whether the instance answers. The spec half - which
@@ -285,10 +285,9 @@ async fn an_unparsable_config_file_exits_two_from_the_configuration_check() {
 /// A world-writable DIRECTORY around a sound 0600 file is a WARNING, the run
 /// exits 0, and the credential in that file is used as usual.
 ///
-/// This is the R1 decision, and the test exists so it cannot be quietly
-/// reverted: `require_regular_owned` checks the OPEN descriptor for the
+/// `require_regular_owned` checks the OPEN descriptor for the
 /// caller's own uid, so another user cannot plant a file this CLI would read;
-/// the file is unreadable to them anyway; and Story 2.6 deliberately does not
+/// the file is unreadable to them anyway; and the CLI does not
 /// re-permission an existing directory. What is left is nuisance, not a
 /// confidentiality or integrity failure - and a warning never changes the
 /// exit code, which is right because no other command fails in this state
@@ -325,8 +324,8 @@ async fn a_writable_directory_around_a_sound_file_is_a_warning() {
         problem.contains("0777"),
         "the actual mode must be reported: {credentials}"
     );
-    // R2 F1: the text has to agree with what the run then DOES. "refusing to
-    // use it" is true of the write path, which is where that sentence comes
+    // The text has to agree with what the run then DOES: "refusing to use
+    // it" is true of the write path, which is where that sentence comes
     // from; the read path this check describes does not look at the
     // directory at all, and `connectivity` below used the file.
     assert!(
@@ -420,10 +419,9 @@ async fn an_instance_answering_with_something_other_than_json_exits_one() {
 /// that path, and every read of it fails. The report must not call the path
 /// empty and healthy while the credential check refuses it.
 ///
-/// The two checks used to disagree here: `permissions()` followed the link,
-/// got `NotFound`, and reported "file does not exist yet / nothing stored
-/// yet", while `read_checked`'s `O_NOFOLLOW` open failed and made
-/// `credential` a problem.
+/// The two checks agree: `permissions()` uses `symlink_metadata` (no link
+/// following) and `read_checked` opens `O_NOFOLLOW`, so a dangling link is
+/// a file problem in both.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dangling_credential_symlink_is_reported_as_a_file_problem() {

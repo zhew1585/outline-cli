@@ -4,14 +4,12 @@
 //! Precedence is **flag > env > config file, per key**: the env supplying a
 //! base URL does not discard the selected profile's authentication method.
 //! Every layer is captured as plain data ([`Overrides`], [`EnvLayer`],
-//! [`ConfigFile`]) so that [`resolve_settings`] is a pure function - tests
-//! never mutate the process environment and never read the real user file.
+//! [`ConfigFile`]) so that [`resolve_settings`] is a pure function.
 //!
-//! Credentials are deliberately NOT part of this file. Resolution stops at
-//! the base URL and the authentication *method*; the secret itself comes
-//! from a [`TokenSource`], the single interface point where the credential
-//! file (Epic 2) plugs in. A credential found in the config file is a hard
-//! error: the config file is meant to be shareable and committable, the
+//! Credentials are NOT part of this file. Resolution stops at the base URL
+//! and the authentication *method*; the secret itself comes from a
+//! [`TokenSource`]. A credential found in the config file is a hard error:
+//! the config file is meant to be shareable and committable, the
 //! credential file is not.
 //!
 //! # Credentials are scoped to their instance
@@ -25,11 +23,8 @@
 //!   falling back would send one workspace's key to another workspace's
 //!   server. See [`EnvApiKey`].
 //! - the credential is only RELEASED once it is bound to the origin the
-//!   request will use. Resolution itself is untouched - `OUTLINE_URL` is a
-//!   normal env layer for the base URL, and flag > env > file holds for
-//!   every key - but between resolution and handing the secret to the
-//!   request channel there is one gate, [`release_token`], which refuses to
-//!   release a profile's credential to an origin that profile never named.
+//!   request will use, via [`release_token`], which refuses to release a
+//!   profile's credential to an origin that profile never named.
 //!
 //! The binding rules, applied only when a profile is in effect:
 //!
@@ -46,32 +41,25 @@
 //! server receiving the credential.
 //!
 //! The gate lives at the credential-release boundary rather than inside a
-//! [`TokenSource`], and three things together make it structural rather than
-//! a convention an implementation has to remember:
-//!
-//! - [`TokenSource::fetch`] demands a `BindingChecked`, whose only field is
-//!   private, so [`release_token`] is the only way to reach any source;
-//! - [`Settings`] has private fields and no public constructor, so the input
-//!   the gate decides from can only come out of [`resolve_settings`]. A
-//!   caller who could build one by hand would simply claim
-//!   `UrlSource::Flag`;
-//! - [`EnvLayer`]'s secret fields are private with no accessor, so the key
-//!   cannot be read around the gate either.
-//!
-//! A future credential-file source inherits all of it without opting in.
+//! [`TokenSource`], and is structural: [`TokenSource::fetch`] demands a
+//! `BindingChecked`, whose only field is private, so [`release_token`] is
+//! the only way to reach any source; [`Settings`] has private fields and
+//! no public constructor, so the input the gate decides from can only come
+//! out of [`resolve_settings`]; [`EnvLayer`]'s secret fields are private
+//! with no accessor.
 //!
 //! # Nothing from the config file is echoed back
 //!
-//! Two rules, because a user who wrongly puts a secret in the config file
-//! must not see it again in a diagnostic, a log or a Debug rendering:
+//! A user who wrongly puts a secret in the config file must not see it
+//! again in a diagnostic, a log or a Debug rendering:
 //!
-//! - config-file diagnostics are built only from text this module owns plus
-//!   a line number (see `file::parse_reason`); no parser-produced text
-//!   reaches the output, since `toml`'s messages interpolate the offending
-//!   value for unknown enum variants and type mismatches;
+//! - config-file diagnostics are built only from text this module owns
+//!   plus a line number (see `file::parse_reason`), never from
+//!   parser-produced text, since `toml`'s messages interpolate the
+//!   offending value;
 //! - every name that does reach a diagnostic goes through
-//!   [`sanitize_name`], because a TOML quoted key can carry ESC and newline
-//!   bytes straight into a terminal.
+//!   [`sanitize_name`], because a TOML quoted key can carry ESC and
+//!   newline bytes straight into a terminal.
 
 mod credentials;
 mod error;
@@ -129,11 +117,11 @@ const MAX_PROFILE_VAR_CHARS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthMethod {
-    /// Bearer API key (the Epic 1 path; `OUTLINE_API_KEY` in v1).
+    /// Bearer API key (`OUTLINE_API_KEY` / the credential file).
     #[default]
     #[serde(alias = "api_key", alias = "apikey")]
     ApiKey,
-    /// Browser OAuth 2.0 (`otl auth login`, Epic 2).
+    /// Browser OAuth 2.0 (`otl auth login`).
     Oauth,
 }
 
@@ -254,10 +242,8 @@ impl fmt::Debug for Overrides {
 ///
 /// The fields are private and there is no accessor for the secrets: a
 /// credential is obtainable only through [`release_token`], which applies
-/// the binding check first. Public fields would have made that gate
-/// decorative, since a caller could read the key straight out of this
-/// struct. The non-secret parts are readable through [`EnvLayer::profile`],
-/// [`EnvLayer::url`] and [`EnvLayer::config_path`].
+/// the binding check first. The non-secret parts are readable through
+/// [`EnvLayer::profile`], [`EnvLayer::url`] and [`EnvLayer::config_path`].
 #[derive(Clone, Default)]
 pub struct EnvLayer {
     /// `OUTLINE_PROFILE`.
@@ -267,9 +253,7 @@ pub struct EnvLayer {
     /// `OUTLINE_CONFIG`.
     config_path: Option<PathBuf>,
     /// The API keys, in a container this module cannot read out of - see
-    /// `secret::EnvKeys`. Holding them opaquely is what keeps the
-    /// credential-release gate meaningful for everything in this module
-    /// tree, not just for other crates.
+    /// `secret::EnvKeys`.
     keys: secret::EnvKeys,
 }
 
@@ -419,16 +403,9 @@ pub fn profile_api_key_suffix(env_name: &str, case_insensitive: bool) -> Option<
 /// ASCII alphanumerics are upper-cased and every other character becomes
 /// `_`, so `work` -> `WORK` and `self-hosted` -> `SELF_HOSTED`.
 ///
-/// `None` when the name cannot be expressed as an environment variable name,
-/// which is either of:
-///
-/// - no ASCII alphanumeric at all, so the suffix would be meaningless;
-/// - longer than the 64-character cap (`MAX_PROFILE_VAR_CHARS`). The
-///   variable name is advice the
-///   user has to act on, and it is bounded at the SOURCE rather than
-///   truncated when printed: a truncated name would be advice to set a
-///   variable that is not the one being read, and some platforms cap
-///   variable-name length anyway.
+/// `None` when the name cannot be expressed as an environment variable
+/// name: no ASCII alphanumeric at all, or longer than the 64-character cap
+/// ([`MAX_PROFILE_VAR_CHARS`]).
 pub fn api_key_var_suffix(profile: &str) -> Option<String> {
     if profile.chars().count() > MAX_PROFILE_VAR_CHARS {
         return None;
@@ -533,12 +510,10 @@ impl fmt::Debug for Config {
 
 /// Whether a profile name is set, without disclosing it.
 ///
-/// Debug output is an unbounded machine surface: it lands in logs, panic
-/// messages and error chains. A profile name is config-file (or flag)
-/// content, so a user who put a secret there - `default_profile =
-/// "<token>"`, `[profiles.<token>]` - must not have it copied into all of
-/// those. Names appear only in `Display`, where the user needs them to fix
-/// their own file and where they are sanitized and length-capped.
+/// Debug output is an unbounded machine surface (logs, panic messages,
+/// error chains); a user who put a secret in a profile name must not have
+/// it copied there. Names appear only in `Display`, where they are
+/// sanitized and length-capped.
 fn redacted_name(name: Option<&str>) -> &'static str {
     match name {
         Some(_) => REDACTED,
@@ -623,20 +598,16 @@ impl Config {
 
     /// Pair already-resolved settings with the credential they select.
     ///
-    /// Two stores can hold a fixed key - the credential file and the
-    /// environment - and which one is used is decided by
-    /// [`select_credential_source`] from the resolved settings, not by the
-    /// caller. Either way the secret is obtained through [`release_token`],
-    /// so the binding check applies to a stored credential exactly as it
-    /// does to an environment variable; a [`TokenSource`] cannot be asked
-    /// for its secret any other way, because [`TokenSource::fetch`] takes
-    /// no settings and only the gate can produce a [`BindingChecked`].
+    /// Which store holds the key (the credential file or the environment)
+    /// is decided by [`select_credential_source`] from the resolved
+    /// settings. Either way the secret is obtained through
+    /// [`release_token`], so the binding check applies to a stored
+    /// credential exactly as it does to an environment variable.
     ///
     /// Settings are passed in rather than resolved here so that a caller
-    /// which has already resolved them (to apply the transport rule, say)
-    /// does not resolve them a second time: two reads of the same config
-    /// file can disagree if it changes in between, and the credential must
-    /// be released for the settings that were actually checked.
+    /// which has already resolved them does not resolve them a second
+    /// time: two reads of the same config file can disagree if it changes
+    /// in between.
     pub fn release(
         settings: &Settings,
         env: &EnvLayer,

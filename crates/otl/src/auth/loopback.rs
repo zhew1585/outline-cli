@@ -172,14 +172,12 @@ impl CallbackServer {
     /// connection occupies one short-lived thread and nothing else, and the
     /// real redirect is handled the moment it arrives.
     ///
-    /// Concurrency alone was not enough, though, and the two gaps are worth
-    /// naming because both reproduced the original symptom by another
-    /// route. A per-READ timeout let a peer drip-feed bytes and hold a
-    /// handler indefinitely, so the thread pool never freed - fixed by
-    /// budgeting the request line as a whole ([`REQUEST_BUDGET`]). And when
-    /// the pool was full, connections were DROPPED unread - and the
-    /// connection over the limit can be the callback - fixed by serving
-    /// those inline instead ([`CallbackServer::serve`]).
+    /// Two further rules keep that true: a per-READ timeout would let a
+    /// peer drip-feed bytes and hold a handler indefinitely, so the
+    /// request line is budgeted as a whole ([`REQUEST_BUDGET`]); and when
+    /// the pool is full, connections are served inline rather than dropped
+    /// unread ([`CallbackServer::serve`]), because the connection over the
+    /// limit can be the callback.
     ///
     /// What holds now: a flood can delay the callback, bounded by the
     /// kernel's listen backlog times [`SATURATED_REQUEST_BUDGET`], but it
@@ -408,12 +406,10 @@ mod tests {
 
     #[test]
     fn a_saturating_flood_of_trickling_peers_cannot_block_the_redirect() {
-        // R4 [N1], the reviewer's attack. Concurrency fixed head-of-line
-        // blocking but the handler cap reintroduced the same consequence:
-        // over the cap a connection was dropped UNREAD, and the real
-        // callback can be the connection over the cap. Combined with a
-        // per-read (rather than total) timeout, a byte-trickling peer held
-        // a slot indefinitely, so the cap never freed.
+        // Over the handler cap a connection would be dropped UNREAD, and
+        // the real callback can be the connection over the cap. Combined
+        // with a per-read (rather than total) timeout, a byte-trickling
+        // peer would hold a slot indefinitely, so the cap would never free.
         //
         // More peers than MAX_LIVE_HANDLERS on purpose: the previous test
         // used 8, which by construction never reached the cap branch at
@@ -499,17 +495,13 @@ mod tests {
 
     #[test]
     fn stalled_connections_cannot_starve_the_real_redirect() {
-        // The R3 finding, reproduced. With a serial reader, a peer that
-        // completes a handshake and then sends NOTHING held the single
-        // reader for its whole read window; the browser's redirect waited
-        // behind it. At a 10s window, 24 silent connections consumed a 240s
-        // login - from any unprivileged local process, since 127.0.0.1
-        // accepts from every user on the machine.
-        //
-        // The reviewer's harness showed 3 stalled connections defeating a
-        // 25s budget. This asserts the opposite now holds, with a budget
-        // far smaller than the stalled connections would previously have
-        // consumed.
+        // With a serial reader, a peer that completes a handshake and then
+        // sends NOTHING would hold the single reader for its whole read
+        // window; the browser's redirect would wait behind it. At a 10s
+        // window, 24 silent connections would consume a 240s login - from
+        // any unprivileged local process, since 127.0.0.1 accepts from
+        // every user on the machine. This asserts the redirect is served
+        // promptly despite the stalled peers.
         use std::io::Write as _;
         use std::net::TcpStream;
 
@@ -553,11 +545,9 @@ mod tests {
 
     #[test]
     fn a_stalled_connection_cannot_outlive_the_announced_timeout() {
-        // Reported: the per-connection read timeout was a flat 10s and the
-        // deadline was only checked when `accept` would have blocked, so a
-        // peer that kept connections ready could stretch a 240s login to
-        // roughly 64 x 10s. Clamping each connection to the time remaining
-        // makes the announced timeout the real bound.
+        // Each connection's read timeout is clamped to the time remaining,
+        // so the announced timeout is the real bound: a peer that keeps
+        // connections ready cannot stretch a login.
         use std::net::TcpStream;
 
         let server = CallbackServer::bind_ephemeral().expect("loopback bind");
@@ -577,8 +567,8 @@ mod tests {
             matches!(error, OAuthError::CallbackTimeout { .. }),
             "expected a timeout, got {error:?}"
         );
-        // Generous, but far below the old flat per-connection timeout: the
-        // point is that one silent peer cannot add 10s to the wait.
+        // Generous, but well below a flat per-connection timeout: the
+        // point is that one silent peer cannot add seconds to the wait.
         assert!(
             elapsed < budget + REQUEST_BUDGET,
             "a stalled connection extended the wait to {elapsed:?}, well past \
@@ -588,10 +578,9 @@ mod tests {
 
     #[test]
     fn stray_connections_do_not_consume_the_login() {
-        // A local peer opening and closing sockets used to burn the whole
-        // connection budget and fail the login outright. Only the deadline
-        // may end the wait, so after several stray connections the listener
-        // is still willing to serve the real redirect.
+        // Only the deadline may end the wait, so after several stray
+        // connections the listener is still willing to serve the real
+        // redirect.
         use std::io::Write as _;
         use std::net::TcpStream;
 

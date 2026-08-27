@@ -1,4 +1,4 @@
-//! CLI parameter validation, type coercion, and `--body` (Story 1.3).
+//! CLI parameter validation, type coercion, and `--body`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
