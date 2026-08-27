@@ -87,10 +87,6 @@ jobs:
       - name: generated files are in sync with the config
         # Fails if .github/workflows/release.yml was hand-edited or left
         # stale after a config change. Fix by running `dist generate` and
-        # committing the result. (The MSI definition is excluded from this
-        # check on purpose - `allow-dirty = ["msi"]` - because main.wxs
-        # carries a hand-applied AllowSameVersionUpgrades; its invariants
-        # are asserted separately below.)
         run: dist generate --check
 
       - name: the release gates can actually stop a release
@@ -100,12 +96,6 @@ jobs:
         # the Release is created in `announce`. All of that is template
         # behaviour `dist generate --check` would happily accept changing.
         run: bash scripts/check-release-gating.sh
-
-      - name: WiX definition has not drifted from dist's template
-        # main.wxs is excluded from `dist generate --check` (allow-dirty), so
-        # regenerate it without that exclusion and allow only the one delta
-        # we applied on purpose.
-        run: bash scripts/check-wxs-drift.sh
 
       - name: no updater artifact (NFR4, no phone home)
         shell: bash
@@ -125,17 +115,15 @@ jobs:
         shell: bash
         run: |
           # Guards the acceptance criteria themselves: AC1 asks for a brew
-          # tap, a shell installer and a Windows MSI; NFR3 asks for three
-          # first-class platforms. A dropped target or installer silently
-          # narrows the release, so assert the plan by name.
+          # tap and a shell installer, for both shipped Apple triples. A
+          # dropped target or installer silently narrows the release, so
+          # assert the plan by name.
           set -euo pipefail
           expected=(
             "outline-cli-installer.sh"
             "outline-cli.rb"
-            "outline-cli-x86_64-pc-windows-msvc.msi"
             "outline-cli-aarch64-apple-darwin.tar.xz"
             "outline-cli-x86_64-apple-darwin.tar.xz"
-            "outline-cli-x86_64-unknown-linux-musl.tar.xz"
           )
           missing=0
           for artifact in "${expected[@]}"; do
@@ -156,20 +144,6 @@ jobs:
         # the config.
         shell: bash
         run: bash scripts/check-action-pins.sh
-
-      - name: MSI version and upgrade semantics
-        shell: bash
-        run: |
-          # Two Windows-only failure modes that would otherwise surface
-          # halfway through a real release:
-          #   1. a prerelease version cargo-wix cannot map onto the MSI's
-          #      fourth version field (hard error on the Windows runner);
-          # (main.wxs itself is covered by check-wxs-drift.sh above.)
-          set -euo pipefail
-          bash scripts/check-msi-version.sh
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            bash scripts/check-msi-version.sh "${GITHUB_REF_NAME}"
-          fi
 
       - name: homebrew tap is reachable
         # Never on a pull request. The step is advisory-only outside a tag,

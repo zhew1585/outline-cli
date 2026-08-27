@@ -130,17 +130,11 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "install musl cross toolchain (Linux release builds)"
-        if: "runner.os == 'Linux'"
-        run: "bash scripts/install-linux-musl-toolchain.sh"
-        shell: "bash"
       - name: "release gating and pinning assertions"
-        if: "runner.os == 'Linux'"
         run: |
           set -euo pipefail
           bash scripts/check-release-gating.sh
           bash scripts/check-action-pins.sh
-          bash scripts/check-msi-version.sh
         shell: "bash"
       - name: "binary size budget for the published target"
         run: |
@@ -153,7 +147,7 @@ jobs:
           for target in "${targets[@]}"; do
             echo "::group::binary size gate (${target})"
             # dist adds the target itself later; doing it here too is a no-op for
-            # a native target and required for the musl cross build.
+            # the native triple and required for the x86_64 cross-build.
             rustup target add "${target}"
             BINARY_SIZE_TARGET="${target}" bash scripts/check-binary-size.sh
             echo "::endgroup::"

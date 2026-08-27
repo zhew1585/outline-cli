@@ -6,9 +6,14 @@
 # injected via .github/build-setup/release-build-setup.yml, whose failure
 # skips `host` and therefore `announce`. See that file for the chain.
 #
-# What this one is for: catching a size regression, and a broken musl build,
-# in the pull request that causes them rather than at tag time. Same script,
-# same threshold, so the two can never disagree.
+# What this one is for: catching a size regression in the pull request that
+# causes it rather than at tag time. Same script, same budgets, so the two
+# can never disagree.
+#
+# Both shipped triples are measured. x86_64-apple-darwin is a cross-build
+# from the arm64 runner - it was previously left out only because it happened
+# to be measurable on a developer's machine, which is not a reason for CI to
+# skip a target we publish.
 #
 # Phone-home policy (NFR4): only standard actions, all pinned to full commit
 # SHAs, matching ci.yml.
@@ -37,22 +42,15 @@ jobs:
     # a target-less build lands in a different directory with a different
     # cargo fingerprint. Naming it keeps what a pull request measures
     # identical to what the release measures.
-    #
-    # The Linux job builds musl, which doubles as a pre-merge proof that the
-    # statically linked release build still works - not a formality, since
-    # rustls' crypto provider (aws-lc-sys) compiles C and has to cross the
-    # libc boundary.
     name: binary size (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -61,12 +59,9 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: install musl cross toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: bash scripts/install-linux-musl-toolchain.sh
       - name: check binary size
-        # bash on all three runners (Git Bash on windows-latest): the script
-        # probes for both `otl` and `otl.exe`.
+        # `shell: bash` is explicit so this keeps working unchanged if a
+        # non-Unix runner is ever added back to the matrix.
         shell: bash
         env:
           BINARY_SIZE_TARGET: ${{ matrix.target }}

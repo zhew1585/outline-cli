@@ -81,4 +81,5 @@ development_status:
   4-3-doctor: done
   4-4-shell-completions: done
   4-5-release-pipeline: done
+  4-7-mac-only-ci: done
   epic-4-retrospective: optional
