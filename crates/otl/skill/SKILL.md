@@ -217,7 +217,10 @@ Outline bearer credential to the storage host.
 `attachments create` only obtains the pre-signed POST/PUT inputs; upload the
 bytes directly to the returned storage URL. For comment updates, `--text`
 creates plain ProseMirror paragraphs and keeps Markdown punctuation literal;
-use `--data FILE` when rich comment formatting must be preserved.
+use `--data FILE` when rich comment formatting must be preserved. A rejected
+`--text`/`--data` request reports only its error code, because the server may
+quote the body back - add `--show-server-message` when you need the server's
+explanation of what it did not like.
 
 `--limit N` is a truncation you asked for: it warns on stderr and exits **0**.
 The CLI's own pagination cap being reached is different - that exits **9**.

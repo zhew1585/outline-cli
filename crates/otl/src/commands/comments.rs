@@ -13,6 +13,7 @@ use crate::exit::CliError;
 use crate::fields;
 use crate::render::OutputMode;
 use crate::session::{self, Session};
+use crate::stdio;
 
 #[derive(Debug, Args)]
 pub struct CommentsArgs {
@@ -127,6 +128,15 @@ struct UpdateArgs {
     /// Reopen the top-level comment thread.
     #[arg(long, conflicts_with = "resolve")]
     unresolve: bool,
+
+    /// Show the server's error message for a --text/--data request.
+    ///
+    /// Withheld by default for the same reason `otl api --body` withholds
+    /// it: the server may quote the request body back, and a comment body
+    /// is content this CLI did not author. The structured error code is
+    /// always shown, and the exit code never depends on this flag.
+    #[arg(long)]
+    show_server_message: bool,
 }
 
 /// Arguments for `otl comments delete`.
@@ -164,12 +174,24 @@ fn list(args: &ListArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), 
     // because you asked" warning on stderr instead of a silent cut.
     let rows = session.call_rows("comments.list", &request, args.limit)?;
     let incomplete = rows.incomplete().copied();
-    let filtered = rows
+    let fetched = rows.items.len();
+    let filtered: Vec<Value> = rows
         .items
         .into_iter()
         .filter(|comment| matches_parent(comment, args.parent.as_deref()))
         .filter(|comment| matches_status(comment, args.status))
         .collect();
+    // `--limit` is counted by the pagination layer, which sees server rows;
+    // `--status` then drops some of them here. Without this line the stderr
+    // warning says "truncated after N items" while stdout shows fewer, and
+    // the two numbers cannot be reconciled by the reader.
+    if filtered.len() < fetched {
+        stdio::write_diagnostic_line(&format!(
+            "note: {} of {fetched} fetched comment(s) shown; the rest were \
+             dropped by the local --status filter",
+            filtered.len()
+        ));
+    }
     output::emit_server(&Value::Array(filtered), mode)?;
     match incomplete {
         Some(truncation) => Err(session::incomplete_error(
@@ -202,9 +224,11 @@ fn update(args: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<
     let session = Session::open(overrides)?;
     let mut content_result = None;
     if let Some(data) = comment_data(args)? {
-        content_result = Some(
-            session.call_raw_data("comments.update", &json!({ "id": args.id, "data": data }))?,
-        );
+        content_result = Some(session.call_raw_data(
+            "comments.update",
+            &json!({ "id": args.id, "data": data }),
+            args.show_server_message,
+        )?);
     }
     let status_result = apply_status_change(&session, args, content_result.as_ref(), mode)?;
     let result = match (content_result, status_result) {
