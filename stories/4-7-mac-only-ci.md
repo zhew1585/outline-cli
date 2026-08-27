@@ -134,6 +134,18 @@ outline-cli/
 - **`release.yml` 永远只能由 `dist generate` 产生**；`release-guards.yml` 的 `dist generate --check` 会抓手改（本 story 变异验证过：手改一处 `runs-on` → 非零退出）。
 - 加任何 target 都必须**先实测体积再写预算**。历史教训：musl 的预算曾用一个从未实测的「比 darwin 高 9%」系数外推，实际低估 0.74 MB，CI 一测就红。
 
+## 后续变更：移除 Homebrew（2026-08-27，用户决定）
+
+本 story 的 AC2 承诺「归档 + shell 安装器 + brew formula」；**brew formula 一项已不再成立**，其余不变。
+
+理由：tap 通道需要一个仓库外的 tap 仓库（`zhew1585/homebrew-tap`，从未创建）和一个能写它的 PAT（`HOMEBREW_TAP_TOKEN`，从未配置），而它发布的是 shell 安装器已经在取的同一批二进制。删掉它同时移除了发布流程里唯一持有他仓库凭据、唯一执行第三方 Ruby 的 job。
+
+改动：`installers = ["shell"]`；删 `tap` 与 `publish-jobs`；`install-path` 由 `CARGO_HOME` 改为 `~/.local/bin`（这是 CLI 而非 Rust 依赖，`$CARGO_HOME/bin` 只对装了工具链的人在 PATH 上）；`dist generate` 后 `publish-homebrew-formula` job 消失、`announce` 的 needs 回到 `[plan, host]`。
+
+守卫随之调整，两条取代了原来的 tap 可达性预检：`no publish job holds credentials for another repository`（配置与生成文件双向断言无 publish job）与 `the documented install path matches the config`（`install-path` 与 README 不同步即失败）。`check-release-gating.sh` 原本要求发布路径上「至少存在一个 publish job」，否则视为空转；现改为要求 `host` 与 `announce` 在列，publish job 的前缀匹配保留，将来加回自动纳入。
+
+**恢复路径**：`installers` 加 `"homebrew"`、加回 `tap` 与 `publish-jobs = ["homebrew"]`、`dist generate`；`release-guards.yml` 里删掉 publish-job 断言步骤、把 `"outline-cli.rb"` 加回 `expected=()`、并从 `git show 119390f:.github/workflows/release-guards.yml` 取回 tap 可达性步骤；`attest-global-artifacts.yml` 的 `subject-path` 加回 `artifacts/*.rb`；README 加回 brew 段落。先建 tap 仓库与 PAT，否则打 tag 会在预检硬失败（那正是它的设计）。
+
 ### References
 
 - [Source: planning/epics.md NFR2、NFR3]（NFR3「三平台一等公民」在本 story 期间**暂时不成立**，这是用户的显式决定）

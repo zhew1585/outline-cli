@@ -7,9 +7,10 @@ description = "Outline CLI (otl): UX layer over the generic engine"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-# Required by cargo-dist's GitHub backend: installers and the Homebrew
-# formula embed release-artifact URLs derived from this repository, the MSI
-# takes its Manufacturer from `authors`, and the formula its `homepage`.
+# `repository` is required by cargo-dist's GitHub backend: the shell
+# installer embeds release-artifact URLs derived from it. `authors` and
+# `homepage` are inherited for completeness; the artifacts that consumed them
+# (MSI, Homebrew formula) are no longer built.
 repository.workspace = true
 authors.workspace = true
 homepage.workspace = true

@@ -8,9 +8,10 @@
 # compiles the crate graph. Attesting the globals in a separate job gets
 # both properties instead of trading one for the other.
 #
-# The gap this closes is not hypothetical: README's headline install command
-# pipes `outline-cli-installer.sh` into a shell, and until now that script -
-# unlike the tarballs it downloads - had no attestation a user could check.
+# The gap this closes is not hypothetical, and it widened when Homebrew was
+# dropped: README's only install command pipes `outline-cli-installer.sh`
+# into a shell, and that script - unlike the tarballs it downloads - is not
+# covered by dist's own attestation step.
 #
 # Registered as a `post-announce-jobs` job. That is the only cargo-dist slot
 # nothing depends on, and the choice is load-bearing rather than cosmetic:
@@ -18,12 +19,14 @@
 # release that is otherwise fine.
 #
 # `host-jobs` looked like the natural home and is a trap. `announce` really
-# does ignore host-job results (its `if` uses `always()`), but
-# publish-homebrew-formula lists host jobs in `needs` and has no `always()`,
-# so a failed attestation would skip the formula push while announce still
-# published the Release - reconstructing exactly the "Release is public but
-# brew cannot install it" state that `github-release = "announce"` was set
-# to eliminate. dist-workspace.toml carries the full slot-by-slot map, and
+# does ignore host-job results (its `if` uses `always()`), but every publish
+# job dist generates lists host jobs in `needs` with no `always()`, so a
+# failed attestation would skip that publish while announce still published
+# the Release - reconstructing exactly the "Release is public but the channel
+# it advertises was never updated" state that `github-release = "announce"`
+# was set to eliminate. No publish job is configured today, so that trap is
+# currently dormant rather than gone: post-announce is safe whether or not one
+# is added back. dist-workspace.toml carries the full slot-by-slot map, and
 # scripts/check-release-gating.sh asserts that no attestation job sits in
 # the needs of anything on the publishing path.
 #
@@ -73,6 +76,5 @@ jobs:
         with:
           subject-path: |
             artifacts/*-installer.sh
-            artifacts/*.rb
             artifacts/sha256.sum
             artifacts/source.tar.gz

@@ -85,4 +85,5 @@ development_status:
   # Two adversarial review rounds (R1, R2): both mergeable, no BLOCKER, no MAJOR; all 8 MINOR fixed.
   4-6-agent-discovery: done
   4-7-mac-only-ci: done
+  # 2026-08-27: Homebrew 分发已移除，shell 安装器成为唯一渠道（AC2 的 brew formula 一项不再成立，见该 story 末尾「后续变更」）。
   epic-4-retrospective: optional

@@ -18,19 +18,22 @@
 #      preflight is registered there and not in `plan-jobs`. `host` lists
 #      those jobs in `needs` and requires skipped-or-success from each.
 #
-# Everything downstream follows: host skipped -> publish-homebrew skipped
-# (it has no `always()`) -> announce skipped (it requires host success) ->
-# no GitHub Release, because `github-release = "announce"` puts the
-# `gh release create` step in `announce`.
+# Everything downstream follows: host skipped -> announce skipped (it
+# requires host success) -> no GitHub Release, because
+# `github-release = "announce"` puts the `gh release create` step in
+# `announce`.
 #
 # The mirror image matters just as much: jobs that exist to *add* something
 # (attestations) must not be able to block anything, or a transient failure
 # turns a good build into a broken release. That is not obvious from the
-# config - `host-jobs` reads like a safe slot but sits in
-# publish-homebrew-formula's `needs`, so a failed attestation would skip the
-# formula push while `announce` still published the Release. So this script
-# also asserts that nothing on the publishing path depends on an attestation
-# job, whichever slot it is registered in.
+# config - `host-jobs` reads like a safe slot but sits in the `needs` of every
+# publish job dist generates, so a failed attestation there would skip a
+# publish while `announce` still published the Release. This repo configures
+# no publish jobs today, which makes that trap invisible rather than absent:
+# adding one re-arms it. So this script asserts that nothing on the publishing
+# path depends on an attestation job, whichever slot it is registered in, and
+# it derives that path from the workflow so a future publish job is covered
+# the day it appears.
 #
 # It also asserts the build job's reduced token, which is a side effect of
 # `github-attestations-phase` rather than a switch of its own, and two
@@ -226,9 +229,9 @@ require(
 
 # 6. Additive jobs must not gate anything. An attestation job that a
 #    publishing job `needs` can skip that job, and a skipped publish reads
-#    as success to `announce` - which is how a Release gets published with
-#    no Homebrew formula pushed. Assert the dependency direction instead of
-#    reasoning about which cargo-dist slot is safe.
+#    as success to `announce` - which is how a Release gets published while
+#    the channel it advertises was never updated. Assert the dependency
+#    direction instead of reasoning about which cargo-dist slot is safe.
 #
 #    Registered workflow paths whose failure must never affect publishing.
 #    Identity comes from the path, not the job name: renaming the workflow
@@ -308,9 +311,15 @@ publishing_path = [
     for name in sections
     if name in ("host", "announce") or name.startswith("publish-")
 ]
+# No `any(startswith("publish-"))` requirement: this repo configures no
+# publish jobs at all, so demanding one would fail on a correct workflow. The
+# vacuity this guards against is covered instead by `host` and `announce`
+# being asserted present at the top of the script - they are always on the
+# publishing path - and by the per-job needs-parseability check below. A
+# publish job added later is picked up automatically by the prefix match.
 require(
-    any(name.startswith("publish-") for name in publishing_path),
-    "at least one publish job was found to check (guards against a silent no-op)",
+    {"host", "announce"} <= set(publishing_path),
+    "the publishing path contains host and announce (guards against a silent no-op)",
 )
 for name in publishing_path:
     # Self-check first: every job on this path has a block-form `needs:` in

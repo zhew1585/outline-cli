@@ -4,18 +4,17 @@
 # release tag it runs as `custom-release-guards` alongside the build matrix.
 # That registration is deliberate and load-bearing: dist's `host` job lists
 # `local-artifacts-jobs` in `needs` and requires skipped-or-success from
-# each, so a failure here skips `host`, which skips
-# `publish-homebrew-formula` (no `always()`) and `announce` (which requires
-# host success) - and with `github-release = "announce"` the GitHub Release
-# is created in `announce`, so nothing is published.
+# each, so a failure here skips `host`, which skips `announce` (which
+# requires host success) - and with `github-release = "announce"` the GitHub
+# Release is created in `announce`, so nothing is published.
 #
 # It must NOT be a `plan-jobs` job. A failing plan job leaves the build jobs
 # *skipped*, and `host` is guarded by
 # `always() && ... (result == 'skipped' || result == 'success')` - skipped
 # passes. `host-jobs` is wrong in a different way: `announce` ignores their
-# result, so they cannot stop a Release, but `publish-homebrew-formula` does
-# list them in `needs` without an `always()`, so they *can* skip the formula
-# push - the worst of both. dist-workspace.toml carries the full slot map.
+# result, so they cannot stop a Release, while every publish job dist
+# generates lists them in `needs` without an `always()`, so they *can* skip a
+# publish - the worst of both. dist-workspace.toml carries the full slot map.
 # scripts/check-release-gating.sh asserts this chain so it cannot regress
 # silently.
 #
@@ -111,17 +110,17 @@ jobs:
           fi
           echo "no updater artifact in the release plan"
 
-      - name: all three platforms and all three installers are planned
+      - name: both platforms and the shell installer are planned
         shell: bash
         run: |
-          # Guards the acceptance criteria themselves: AC1 asks for a brew
-          # tap and a shell installer, for both shipped Apple triples. A
-          # dropped target or installer silently narrows the release, so
-          # assert the plan by name.
+          # Guards the acceptance criteria themselves: a shell installer for
+          # both shipped Apple triples. Since Homebrew was dropped this is
+          # the *only* install channel, so a dropped target or a dropped
+          # installer does not narrow the release, it breaks it. Assert the
+          # plan by name.
           set -euo pipefail
           expected=(
             "outline-cli-installer.sh"
-            "outline-cli.rb"
             "outline-cli-aarch64-apple-darwin.tar.xz"
             "outline-cli-x86_64-apple-darwin.tar.xz"
           )
@@ -145,54 +144,47 @@ jobs:
         shell: bash
         run: bash scripts/check-action-pins.sh
 
-      - name: homebrew tap is reachable
-        # Never on a pull request. The step is advisory-only outside a tag,
-        # so a PR run would gain nothing while moving a PAT that can write to
-        # the tap into an environment any branch author controls. Same
-        # trust-from-the-ref rule ci.yml uses for its contract job.
-        if: github.event_name != 'pull_request'
+      - name: no publish job holds credentials for another repository
         shell: bash
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          # The homebrew publish job checks out an external repository with
-          # a PAT. Both live outside this repo, so a missing token or a
-          # missing tap can only be discovered by asking - and asking after
-          # the release is built is too late. On a tag this is fatal; on a
-          # branch or pull request (where forks legitimately have no
-          # secrets) it is advisory.
+          # Replaces the old Homebrew tap-reachability preflight, which
+          # existed because the formula push checked out an external
+          # repository with a PAT. Nothing does that any more, and this step
+          # keeps it that way: a publish job is the one place in the generated
+          # workflow that receives a non-GITHUB_TOKEN secret and pushes
+          # outside this repo, so re-adding one must be a deliberate change
+          # that also updates the guards - not a side effect of running
+          # `dist init`.
           set -euo pipefail
-          tap="$(sed -n 's/^tap *= *"\([^"]*\)".*/\1/p' dist-workspace.toml)"
-          if [ -z "${tap}" ]; then
-            echo "no homebrew tap configured; nothing to check"
-            exit 0
+          configured="$(sed -n 's/^publish-jobs *= *\(.*\)/\1/p' dist-workspace.toml)"
+          # An explicit empty array is the same statement as omitting the key.
+          [ "${configured}" = "[]" ] && configured=""
+          if [ -n "${configured}" ]; then
+            echo "::error::publish-jobs is configured (${configured}); re-read the header of dist-workspace.toml before enabling one"
+            exit 1
           fi
-          # `tap = "owner/name"` maps to the repository "owner/homebrew-name"
-          # unless the name already carries the prefix.
-          owner="${tap%%/*}"; name="${tap##*/}"
-          case "${name}" in homebrew-*) repo="${owner}/${name}" ;; *) repo="${owner}/homebrew-${name}" ;; esac
-
-          fatal=0
-          [ "${GITHUB_REF_TYPE}" = "tag" ] && fatal=1
-
-          fail() {
-            if [ "${fatal}" -eq 1 ]; then
-              echo "::error::$1"
-              exit 1
-            fi
-            echo "::warning::$1"
-            exit 0
-          }
-
-          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
-            fail "HOMEBREW_TAP_TOKEN is not configured, so publishing to ${repo} would fail"
+          if grep -qE '^  publish-[a-z-]+:' .github/workflows/release.yml; then
+            echo "::error::the generated workflow contains a publish job while publish-jobs is unset"
+            exit 1
           fi
+          echo "ok: no publish job, no external-repository credential"
 
-          status="$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${HOMEBREW_TAP_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${repo}")"
-          if [ "${status}" != "200" ]; then
-            fail "the tap repository ${repo} is not reachable with HOMEBREW_TAP_TOKEN (HTTP ${status})"
+      - name: the documented install path matches the config
+        shell: bash
+        run: |
+          # The shell installer is now the only install channel, and its
+          # destination is a promise README makes to the reader (plus a PATH
+          # note that only makes sense for that directory). dist has no way to
+          # keep the two in sync, so assert it here: changing `install-path`
+          # without touching README fails the release.
+          set -euo pipefail
+          configured="$(sed -n 's/^install-path *= *"\([^"]*\)".*/\1/p' dist-workspace.toml)"
+          if [ -z "${configured}" ]; then
+            echo "::error::install-path is not set in dist-workspace.toml"
+            exit 1
           fi
-          echo "ok: ${repo} is reachable with the configured token"
+          if ! grep -qF "${configured}" README.md; then
+            echo "::error::README.md does not mention the configured install path (${configured})"
+            exit 1
+          fi
+          echo "ok: README documents the configured install path (${configured})"

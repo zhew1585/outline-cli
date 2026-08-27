@@ -1,9 +1,16 @@
 # cargo-dist configuration (Story 4.5: release pipeline).
 #
-# One config produces every distribution channel the spec asks for
+# One config produces the single distribution channel the spec asks for
 # (specs/spec-outline-cli/stack.md "分发"):
-#   * shell installer  -> curl | sh
-#   * homebrew formula -> pushed to the tap named below
+#   * shell installer  -> curl | sh, installs into ~/.local/bin
+#
+# Homebrew was configured here until 2026-08 and was removed deliberately: it
+# required a tap repository and a PAT that can write to it, both outside this
+# repo, and it published the same binaries the shell installer already
+# fetches. Re-adding it means re-adding `tap`, `publish-jobs = ["homebrew"]`,
+# the tap-reachability preflight in release-guards.yml, and the `.rb` entries
+# in release-guards.yml's artifact list and attest-global-artifacts.yml's
+# subject paths.
 #
 # Phone-home policy (NFR4): `install-updater = false` on purpose. The
 # updater axodotdev ships would contact a release server behind the user's
@@ -28,30 +35,23 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app. No `msi`: dist only builds one for
-# a Windows target, and none is published. No `powershell` either - it was
-# never enabled, and a PowerShell installer that fetches macOS archives would
-# be meaningless.
-installers = ["shell", "homebrew"]
-# Homebrew tap the generated formula is pushed to by the `homebrew` publish
-# job. Two prerequisites live outside this repository and NEITHER EXISTS YET
-# (2026-08):
-#   1. the tap repo `zhew1585/homebrew-tap` has to be created;
-#   2. a `HOMEBREW_TAP_TOKEN` repository secret needs `contents: write` on it.
+# The installers to generate for each app. Exactly one, and it is the whole
+# distribution story: a `curl | sh` script that ships with every release,
+# resolves the caller's Apple target, downloads that target's archive from the
+# same release, and unpacks the binary into `install-path` below.
 #
-# Until both are in place a version tag fails fast and publishes nothing: the
-# release-guards preflight resolves this value to `zhew1585/homebrew-tap`,
-# asks the GitHub API whether the configured token can see it, and treats a
-# negative answer as fatal on a tag. That failure skips `host`, so no
-# artifacts are uploaded and no Release is created.
+# No `homebrew`: see the header. No `msi`: dist only builds one for a Windows
+# target, and none is published. No `powershell` either - it was never
+# enabled, and a PowerShell installer that fetches macOS archives would be
+# meaningless.
+installers = ["shell"]
+# No publish jobs. Nothing is pushed anywhere outside this repository, so no
+# release job holds a credential for another repo, and the only artifacts a
+# user can install are the ones attached to the GitHub Release itself.
 #
-# (An earlier version of this comment claimed the release would "still
-# succeed up to the publish step" with the .rb attached. That stopped being
-# true when `github-release = "announce"` moved Release creation behind a
-# successful publish - there is no longer any path that produces a Release
-# without the formula having been pushed.)
-tap = "zhew1585/homebrew-tap"
-publish-jobs = ["homebrew"]
+# Consequence worth knowing before adding one back: a publish job would sit
+# between `host` and `announce`, which is what `github-release = "announce"`
+# below was set up to handle.
 # Target platforms to build apps for (Rust target-triple syntax).
 #
 # macOS only, for now (Story 4.7). Both Apple triples ship: Intel Macs are
@@ -69,8 +69,20 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
 ]
-# Path that installers should place binaries in
-install-path = "CARGO_HOME"
+# Path the shell installer places the binary in.
+#
+# `~/.local/bin` rather than the previous `CARGO_HOME`: this is a CLI, not a
+# Rust dependency, and `$CARGO_HOME/bin` is only on PATH for people who
+# installed a Rust toolchain. `~/.local/bin` is the XDG-conventional
+# user-level bin dir, needs no sudo, and dist's installer appends it to the
+# shell rc files when it is missing from PATH (suppressible with
+# `--no-modify-path`).
+#
+# Not an absolute system path like /usr/local/bin, however much more "global"
+# that sounds: dist accepts only "CARGO_HOME", "~/subdir/" or
+# "$ENV_VAR/subdir/" here, and a system path would need sudo inside a piped
+# shell script. Keep this value in sync with README.md's Install section.
+install-path = "~/.local/bin"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
@@ -83,13 +95,16 @@ pr-run-mode = "skip"
 
 # Create the GitHub Release in the `announce` job rather than in `host`.
 #
-# This is an ordering fix, not a preference. `announce` runs only when
-# `host` succeeded AND the Homebrew publish job succeeded or was skipped, so
-# a missing tap repository, a missing or expired HOMEBREW_TAP_TOKEN, or any
-# other publish failure now leaves *no* public release behind. With the
-# default ("auto", i.e. create during `host`) the release would already be
-# published and visible before the formula was pushed, so a publish failure
-# would strand users on an install channel the README advertises.
+# With no publish jobs configured this is currently a no-op in outcome:
+# `announce` runs immediately after a successful `host` and nothing sits
+# between them. It is kept set because it is the setting that makes the
+# ordering safe the moment a publish job is added - `announce` runs only when
+# `host` succeeded *and* every publish job succeeded or skipped, so a failed
+# publish leaves no public release behind. With the default ("auto", i.e.
+# create during `host`) a release would go public before the publish step
+# ran, stranding users on an install channel the README advertises. Leaving
+# it on costs nothing; noticing it is missing after adding a publish job
+# costs a bad release.
 github-release = "announce"
 
 # GitHub artifact attestations: signed, verifiable build provenance for the
@@ -116,11 +131,11 @@ github-attestations = true
 #   always() && ... && (needs.X.result == 'skipped' || needs.X.result == 'success')
 # so a *skipped* dependency passes and only a *failure* blocks. A plan job
 # that fails leaves the build jobs skipped, not failed, and `host` then runs
-# anyway - taking `publish-homebrew-formula` (writable tap PAT, third-party
-# Ruby) with it. `host` does list `local-artifacts-jobs` in `needs` and does
-# demand skipped-or-success from each, so a failure here genuinely stops the
-# release. `host-jobs` would NOT work either: `announce` lists them in
-# `needs` but its `if` uses `always()` and never checks their result.
+# anyway - uploading the artifacts and taking `announce` with it. `host` does
+# list `local-artifacts-jobs` in `needs` and does demand skipped-or-success
+# from each, so a failure here genuinely stops the release. `host-jobs` would
+# NOT work either: `announce` lists them in `needs` but its `if` uses
+# `always()` and never checks their result.
 #
 # It still starts at the same moment - the job only needs `plan`, so it runs
 # alongside the build matrix rather than after it.
@@ -129,8 +144,8 @@ github-attestations = true
 # workflow, so a cargo-dist upgrade cannot quietly undo it.
 local-artifacts-jobs = ["./release-guards"]
 
-# Attest the global artifacts (shell installer, Homebrew formula,
-# sha256.sum, source tarball). dist only attests *local* artifacts, and only
+# Attest the global artifacts (shell installer, sha256.sum, source tarball).
+# dist only attests *local* artifacts, and only
 # when `github-attestations-phase` is left at its default - and that same
 # default is what gives build-local-artifacts its read-only token, so the
 # phase cannot be moved to cover the globals without handing the compile job
@@ -151,12 +166,18 @@ local-artifacts-jobs = ["./release-guards"]
 #   user-publish-jobs     announce `needs` AND `if`      -> BLOCKS announce
 #   post-announce-jobs    nothing needs it               -> blocks nothing
 #
-# host-jobs specifically would recreate the half-published state that
-# `github-release = "announce"` exists to prevent: a failed attestation
-# skips publish-homebrew-formula, and announce's `if` treats a skipped
-# publish as success, so the Release goes public with no formula in the tap.
-# scripts/check-release-gating.sh now asserts no attestation job can block
-# publishing, whichever slot it is moved to.
+# The host-jobs row is about the template, not about today's job list: with
+# no publish job configured, the only thing that lists host-jobs in `needs`
+# is `announce`, whose `if` uses `always()` and ignores the result. So a
+# host-jobs attestation would not block anything *right now* - and that is
+# exactly why it is the wrong place to put it. Add one publish job and a
+# failed attestation starts skipping that job, while `announce` treats the
+# skip as success and publishes the Release anyway: the half-published state
+# `github-release = "announce"` exists to prevent, reintroduced by a job that
+# only adds a signature. post-announce is safe by construction, not by
+# accident of the current configuration. scripts/check-release-gating.sh
+# asserts no attestation job can block publishing, whichever slot it is
+# moved to.
 post-announce-jobs = ["./attest-global-artifacts"]
 
 # Custom jobs get no special permissions by default; attestation needs
@@ -172,10 +193,9 @@ github-custom-job-permissions = { attest-global-artifacts = { id-token = "write"
 github-build-setup = "../build-setup/release-build-setup.yml"
 
 # Pin every action the generated workflow uses to an immutable commit rather
-# than the movable major-version tags dist emits by default. Release jobs
-# hold a writable GITHUB_TOKEN, and the Homebrew step additionally checks
-# out an external repository with a PAT, so a retagged action would run with
-# real publishing credentials.
+# than the movable major-version tags dist emits by default. The `host` and
+# `announce` jobs hold a writable GITHUB_TOKEN and upload the artifacts users
+# install, so a retagged action would run with real publishing credentials.
 #
 # Resolved 2026-08 from the tags dist requests; refresh together with
 # `cargo-dist-version`, and re-run `dist generate` afterwards.

@@ -35,7 +35,7 @@
 #     host                    download-artifact + chmod
 #
 #   installs dist at all: no
-#     publish-homebrew-formula, announce, and the two custom jobs
+#     announce, and the two custom jobs
 #
 # So a swapped installer may already have executed in `plan` or a build leg
 # by the time a mismatch is reported, and it propagates from `plan` to
@@ -46,7 +46,7 @@
 # What it does guarantee is that a mismatch stops the *release*: release-guards
 # is registered as a `local-artifacts-jobs` job, which `host` lists in `needs`
 # and requires skipped-or-success from, so a failure skips `host`, which skips
-# publish and announce, which is where the GitHub Release is created.
+# `announce`, which is where the GitHub Release is created.
 # Detection for the execution, prevention for the publication.
 #
 # Usage:

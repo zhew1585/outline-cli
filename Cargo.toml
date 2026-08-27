@@ -7,11 +7,12 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/zhew1585/outline-cli"
 rust-version = "1.85"
-# Release-pipeline metadata. The MSI's Manufacturer field is taken from
-# `authors`, and the Homebrew formula's `homepage` from `homepage`;
-# cargo-dist refuses to generate either when they are missing. No e-mail
-# address: these strings are embedded verbatim in published installer
-# metadata.
+# Release-pipeline metadata. Neither field is load-bearing any more - the two
+# artifacts that required them (the MSI's Manufacturer from `authors`, the
+# Homebrew formula's `homepage`) are both gone - but they remain correct
+# package metadata and the shell installer's release URLs are built from
+# `repository` above, which dist does still require. No e-mail address: these
+# strings would be embedded verbatim in published metadata.
 authors = ["weizhe"]
 homepage = "https://github.com/zhew1585/outline-cli"
 

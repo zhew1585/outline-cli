@@ -9,7 +9,7 @@
 # tag like `actions/checkout@v6`. Since `dist generate --check` happily
 # accepts whatever the template produces, the property has to be asserted
 # directly. This matters most in the release workflow, whose jobs hold a
-# writable GITHUB_TOKEN and, for the Homebrew step, a tap PAT.
+# writable GITHUB_TOKEN and upload the artifacts users install.
 #
 # Local reusable workflows (`uses: ./.github/workflows/x.yml`) are this
 # repository's own code at the same commit and are exempt.

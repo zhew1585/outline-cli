@@ -14,24 +14,34 @@ single-digit milliseconds.
 
 ## Install
 
-**macOS only, for now.** Releases are cut from git tags and publish one binary per Apple target, plus a
-Homebrew formula and a shell installer. Linux and Windows are not built or tested at the moment; the
-source still carries their platform branches, so re-adding them is a configuration change rather than a
-rewrite. There is no published release yet — the commands below are the contract the release pipeline
-implements, and they start working with the first tag.
+**macOS only, for now.** Releases are cut from git tags and publish one binary per Apple target plus a
+shell installer. Linux and Windows are not built or tested at the moment; the source still carries their
+platform branches, so re-adding them is a configuration change rather than a rewrite. There is no
+published release yet — the commands below are the contract the release pipeline implements, and they
+start working with the first tag.
 
-**Homebrew**:
-
-```sh
-brew install zhew1585/tap/outline-cli
-```
-
-**Shell installer** (installs into `$CARGO_HOME/bin`):
+One command, no package manager:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/zhew1585/outline-cli/releases/latest/download/outline-cli-installer.sh | sh
 ```
+
+`releases/latest/download/…` is GitHub's own redirect to the newest release, so that URL never changes.
+The script detects your Apple target, downloads that target's archive from the same release, unpacks
+`otl` into `~/.local/bin`, and adds that directory to `PATH` via your shell profiles unless it is
+already there. No sudo, no package manager, nothing installed outside your home directory. Two
+environment variables adjust it:
+
+| Variable | Effect |
+|----------|--------|
+| `OUTLINE_CLI_INSTALL_DIR` | install somewhere else instead of `~/.local/bin` |
+| `OUTLINE_CLI_NO_MODIFY_PATH=1` | install only; leave shell profiles alone |
+
+Run `sh -c "$(curl -LsSf .../outline-cli-installer.sh)" -- --help` for the full option list.
+
+There is no Homebrew formula: a tap would have published the same binaries this script already fetches,
+at the cost of a second repository and a token that can write to it.
 
 Prebuilt archives are attached to every release for these targets:
 
@@ -40,18 +50,18 @@ Prebuilt archives are attached to every release for these targets:
 | macOS (Apple Silicon) | `aarch64-apple-darwin` | |
 | macOS (Intel) | `x86_64-apple-darwin` | separate thin archive, not a universal binary |
 
-**Verifying a download.** Every release artifact — both archives, and also the shell installer, the
-Homebrew formula and `sha256.sum` — carries a GitHub build attestation, so you can check
-it was produced by this repository's release workflow rather than merely that it matches a checksum
-published alongside it:
+**Verifying a download.** Every release artifact — both archives, and also the shell installer and
+`sha256.sum` — carries a GitHub build attestation, so you can check it was produced by this
+repository's release workflow rather than merely that it matches a checksum published alongside it:
 
 ```sh
 gh attestation verify outline-cli-aarch64-apple-darwin.tar.xz --repo zhew1585/outline-cli
 ```
 
 **`otl` never checks for updates.** No telemetry, no update ping, no background spec fetch — the binary
-makes exactly the network requests your command implies. Upgrading is something you do: `brew upgrade`,
-or re-run the shell installer.
+makes exactly the network requests your command implies. Upgrading is something you do: re-run the
+installer command above, which fetches whatever the latest release is and overwrites the binary in
+place.
 
 **From source** (Rust stable, `rust-version` 1.85):
 
@@ -640,18 +650,19 @@ functions unused on Windows, and `cargo test`/`cargo fmt` cannot see any of it; 
 machine, and it also runs in CI (`windows-source-lint`) rather than depending on anyone remembering the
 flag. Run it after splitting or adding a file that carries a `cfg`.
 
-Releasing is `git tag`: [`dist-workspace.toml`](dist-workspace.toml) is the single description of every
+Releasing is `git tag`: [`dist-workspace.toml`](dist-workspace.toml) is the single description of the
 distribution channel, and `.github/workflows/release.yml` is generated from it by
 [cargo-dist](https://axodotdev.github.io/cargo-dist) — edit the config and run `dist generate`, never the
-workflow. (`crates/otl/wix/main.wxs` is the one generated file that is now hand-maintained; see the
-comment inside it.)
+workflow. No secrets beyond the workflow's own `GITHUB_TOKEN` are involved, and no job pushes anywhere
+outside this repository.
 
 Two things guard a release, and both are wired so that failing them actually stops one:
 
 - **`release-guards.yml`** runs alongside the build matrix as one of dist's `local-artifacts-jobs`. It
   verifies the cargo-dist installer against a committed checksum before running it, checks that the
-  generated workflow is in sync, that every action is pinned to a commit SHA, that all four artifacts are
-  planned, that no updater has crept in, and that the Homebrew tap and its token actually exist.
+  generated workflow is in sync, that every action is pinned to a commit SHA, that all three artifacts are
+  planned, that no updater has crept in, that no publish job holds a credential for another repository,
+  and that the install path this README documents is the one the config actually uses.
 - **The binary-size budget** runs *inside* dist's own build job (injected via
   `.github/build-setup/release-build-setup.yml`), once per published target. `binary-size.yml` runs the
   same script on pull requests for early feedback.
