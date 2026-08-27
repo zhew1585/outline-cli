@@ -182,16 +182,17 @@ pub const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
 pub const FILE_READ_ALLOWLIST: &[Exception] = &[
     // User-selected command input files (`--body @file.json` and comment
     // ProseMirror data). One reviewed, bounded reader owns both call sites.
+    //
+    // Only the OPEN is registered: the read itself is `read_to_end` on the
+    // already-open handle, which this list deliberately does not forbid
+    // (getting a file handle to call it on requires one of the patterns
+    // above, and that is the thing worth reviewing). It reads bytes rather
+    // than a `String` so that a file one byte over the cap is reported as
+    // too large instead of as invalid UTF-8.
     Exception {
         file: "crates/otl/src/commands/input.rs",
         pattern: "File::open",
         context: "let file = File::open(path)",
-        count: 1,
-    },
-    Exception {
-        file: "crates/otl/src/commands/input.rs",
-        pattern: "read_to_string",
-        context: ".read_to_string(&mut text)",
         count: 1,
     },
     // The `--spec <PATH>` document, likewise named by the user.

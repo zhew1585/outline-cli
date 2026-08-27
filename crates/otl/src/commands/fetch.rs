@@ -51,28 +51,52 @@ pub struct FetchArgs {
     id: String,
 }
 
+/// One resource, and which output rule its payload falls under.
+///
+/// The distinction is not cosmetic: [`output::emit_server`] must round-trip
+/// what the server said, and [`output::emit_authored`] must scrub what this
+/// CLI wrote around it.
+enum Payload {
+    /// The server's own payload, or a wrapper whose keys are literals here
+    /// and whose values are that payload unchanged.
+    Server(Value),
+    /// An object built here, interpolating text this CLI did not author.
+    Authored(Value),
+}
+
 pub fn run(args: &FetchArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     let id = extract_id(&args.id)?;
     let session = Session::open(overrides)?;
-    let value = match args.resource {
-        Resource::Document => session.call_data(DOCUMENT_INFO, &[pair("id", &id)])?,
+    let payload = match args.resource {
+        Resource::Document => {
+            Payload::Server(session.call_data(DOCUMENT_INFO, &[pair("id", &id)])?)
+        }
         Resource::Collection => {
             let collection = session.call_data(COLLECTION_INFO, &[pair("id", &id)])?;
             let documents = session.call_data(COLLECTION_DOCUMENTS, &[pair("id", &id)])?;
-            json!({ "collection": collection, "documents": documents })
+            // Two server payloads under two literal keys: nothing foreign is
+            // authored into this object, and scrubbing it would rewrite the
+            // documents a caller diffs.
+            Payload::Server(json!({ "collection": collection, "documents": documents }))
         }
         Resource::User if is_current_user(&id) => {
             let auth = session.call_data(CURRENT_USER_INFO, &[])?;
-            auth.get("user").cloned().unwrap_or(Value::Null)
+            Payload::Server(auth.get("user").cloned().unwrap_or(Value::Null))
         }
-        Resource::User => session.call_data(USER_INFO, &[pair("id", &id)])?,
+        Resource::User => Payload::Server(session.call_data(USER_INFO, &[pair("id", &id)])?),
         Resource::Attachment => {
             let signed_url =
                 session.call_redirect_location(ATTACHMENT_REDIRECT, &[pair("id", &id)])?;
-            json!({ "id": id, "signedUrl": signed_url })
+            // `id` is echoed back from the command line - or extracted from
+            // a URL that came out of a server document - so this object is
+            // authored here and carries foreign text.
+            Payload::Authored(json!({ "id": id, "signedUrl": signed_url }))
         }
     };
-    output::emit(&value, mode)
+    match payload {
+        Payload::Server(value) => output::emit_server(&value, mode),
+        Payload::Authored(value) => output::emit_authored(&value, mode),
+    }
 }
 
 fn pair(name: &str, value: &str) -> (String, String) {

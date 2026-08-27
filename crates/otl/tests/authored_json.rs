@@ -128,6 +128,41 @@ const EXEMPT: &[Reviewed] = &[
     },
 ];
 
+/// Call sites of [`render::render`], the THIRD door.
+///
+/// Its JSON branch is `serde_json::to_string_pretty` - byte-for-byte
+/// verbatim, exactly like `render_json` - but it never names `render_json`,
+/// so the scans above cannot see it. That blind spot shipped: the MCP
+/// command surface routes every payload through one `output::emit` helper
+/// built on `render`, and an authored object (`otl fetch attachment`'s
+/// `{id, signedUrl}`, whose `id` is echoed from the command line) went out
+/// unscrubbed while this file claimed every `--json` surface was covered.
+///
+/// The fix is structural rather than per-command: `commands/output.rs` has
+/// one verbatim emitter and one scrubbing emitter, so each command names
+/// the kind of value it is printing, and only those two internal call sites
+/// need to be registered here.
+const RENDER: &[Reviewed] = &[
+    Reviewed {
+        file: "crates/otl/src/commands/api/mod.rs",
+        context: "render::render(payload, mode, schema)",
+        count: 1,
+        why: "SERVER RESPONSE. `otl api`'s whole promise is that the reply \
+              round-trips, and this is the call that keeps it: the payload \
+              is the server's, the schema only picks table columns.",
+    },
+    Reviewed {
+        file: "crates/otl/src/commands/output.rs",
+        context: "render::render(value, mode, &[])",
+        count: 1,
+        why: "SERVER RESPONSE. This is `emit_server`, whose contract is that \
+              its argument came from the server unchanged; the authored case \
+              is `emit_authored` and goes through the scrubbing renderer. \
+              Every caller picks one by name, which is what makes the choice \
+              reviewable at the call site rather than here.",
+    },
+];
+
 /// Call sites of the scrubbing renderer, so an authored surface cannot
 /// quietly stop scrubbing.
 ///
@@ -157,6 +192,15 @@ const SCRUBBED: &[Reviewed] = &[
         why: "AUTHORED. An operation contract built from the compiled spec: \
               summaries, enum values, formats and parameter prose, all of \
               it third-party text an agent will feed to a model.",
+    },
+    Reviewed {
+        file: "crates/otl/src/commands/output.rs",
+        context: "render::render_json_scrubbed(value)",
+        count: 1,
+        why: "AUTHORED. `emit_authored`, the half of this module's pair that \
+              prints objects this CLI built - today `otl fetch attachment`'s \
+              `{id, signedUrl}`, where `id` is echoed from an argument or \
+              extracted from a URL that came out of a server document.",
     },
     Reviewed {
         file: "crates/otl/src/commands/skill/mod.rs",
@@ -228,6 +272,19 @@ fn count_verbatim(line: &str) -> usize {
 
 fn count_scrubbed(line: &str) -> usize {
     line.matches("render_json_scrubbed(").count()
+}
+
+/// Calls to `render::render` itself - the schema-aware renderer whose JSON
+/// branch is verbatim. `render_json`/`render_json_scrubbed` must not be
+/// counted here, and neither must the definition's own signature.
+fn count_render(line: &str) -> usize {
+    line.match_indices("render(")
+        .filter(|(at, _)| !line[..*at].ends_with("render_json_scrubbed_"))
+        .filter(|(at, _)| {
+            let before = &line[..*at];
+            before.ends_with("render::") || before.ends_with("::render::")
+        })
+        .count()
 }
 
 /// Lines of shipped code, with comments and `#[cfg(test)]` modules dropped.
@@ -336,6 +393,18 @@ fn every_scrubbed_json_call_site_is_reviewed() {
     );
 }
 
+#[test]
+fn every_render_call_site_is_reviewed() {
+    let problems = check(RENDER, "render::render", count_render);
+    assert!(
+        problems.is_empty(),
+        "`render::render` emits JSON verbatim, so a value that is not a \
+         server response must not go through it - use the scrubbing \
+         emitter and register it:\n{}",
+        problems.join("\n")
+    );
+}
+
 /// A registration has to name a call site, not a file.
 ///
 /// Without this, `context: ""` - or any substring every line contains -
@@ -344,9 +413,9 @@ fn every_scrubbed_json_call_site_is_reviewed() {
 /// the three known cases happened, one review round apart.
 #[test]
 fn a_registration_names_a_call_site_not_a_whole_file() {
-    for entry in EXEMPT.iter().chain(SCRUBBED) {
+    for entry in EXEMPT.iter().chain(SCRUBBED).chain(RENDER) {
         assert!(
-            entry.context.contains("render_json"),
+            entry.context.contains("render_json") || entry.context.contains("render::render("),
             "{}: context {:?} does not name a render call, so it exempts \
              more than a call site",
             entry.file,
@@ -393,6 +462,22 @@ fn the_scan_finds_a_call_site_it_is_supposed_to_find() {
         calls, 1,
         "expected to see the one `render_json` call in docs/view.rs; seeing \
          none means the scan is blind and the other tests here prove nothing"
+    );
+}
+
+/// The `render::render` scan must see a call too, for the same reason.
+#[test]
+fn the_render_scan_finds_a_call_site_it_is_supposed_to_find() {
+    let source =
+        std::fs::read_to_string(workspace_root().join("crates/otl/src/commands/output.rs"))
+            .unwrap();
+    let calls: usize = code_lines(&source)
+        .iter()
+        .map(|line| count_render(line))
+        .sum();
+    assert_eq!(
+        calls, 1,
+        "expected to see the one `render::render` call in commands/output.rs"
     );
 }
 

@@ -70,7 +70,7 @@ pub fn move_document(
         request.push(("index".to_string(), value.to_string()));
     }
     let result = Session::open(overrides)?.call_data("documents.move", &request)?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }
 
 pub fn delete_document(
@@ -85,5 +85,5 @@ pub fn delete_document(
     };
     let result =
         Session::open(overrides)?.call_data(operation, &[("id".to_string(), args.id.clone())])?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }

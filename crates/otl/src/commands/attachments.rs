@@ -63,5 +63,5 @@ fn create(args: &CreateArgs, mode: OutputMode, overrides: &Overrides) -> Result<
         request.push(("documentId".to_string(), document.clone()));
     }
     let result = Session::open(overrides)?.call_data("attachments.create", &request)?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }

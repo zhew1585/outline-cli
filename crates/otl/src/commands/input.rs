@@ -28,13 +28,19 @@ pub fn read_utf8(path: &Path, label: &str, limit: u64) -> Result<String, CliErro
     if metadata.is_file() && metadata.len() > limit {
         return Err(too_large());
     }
-    let mut text = String::new();
-    let read = file
-        .take(limit + 1)
-        .read_to_string(&mut text)
+    // Bytes first, then UTF-8. Reading straight into a `String` cannot tell
+    // "over the cap" from "not text": a file one byte past the limit whose
+    // last byte begins a multibyte character is cut mid-sequence, and the
+    // read fails as invalid data - so the user is told their file is not
+    // UTF-8 when the actual problem is its size. The bound is `take`, not
+    // the metadata check above, which is only a fast path.
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    if read as u64 > limit {
+    if bytes.len() as u64 > limit {
         return Err(too_large());
     }
-    Ok(text)
+    String::from_utf8(bytes)
+        .map_err(|_| CliError::usage(anyhow!("{label} file {:?} is not valid UTF-8", path)))
 }

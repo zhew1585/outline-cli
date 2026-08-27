@@ -16,6 +16,12 @@ pub(crate) enum ResponseData {
 }
 
 /// Extract a credential-bearing target without exposing a rejected header.
+///
+/// The parsed URL decides whether the header is acceptable; the RAW header
+/// is what comes back. `Url::to_string` re-serializes - it lowercases the
+/// host, drops a default port and re-encodes percent-escapes - and this
+/// value is signed, so a rewritten one can be rejected by the storage host
+/// that issued it. Validation must not rewrite what it validates.
 pub(crate) fn location(response: &reqwest::blocking::Response) -> Option<String> {
     let raw = response.headers().get(LOCATION)?.to_str().ok()?;
     let parsed = Url::parse(raw).ok()?;
@@ -23,5 +29,5 @@ pub(crate) fn location(response: &reqwest::blocking::Response) -> Option<String>
         && parsed.host_str().is_some()
         && parsed.username().is_empty()
         && parsed.password().is_none();
-    safe.then(|| parsed.to_string())
+    safe.then(|| raw.to_string())
 }

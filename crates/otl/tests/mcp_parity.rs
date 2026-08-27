@@ -82,6 +82,53 @@ async fn fetch_attachment_returns_the_signed_location_without_following_it() {
     assert_eq!(value["signedUrl"], signed);
 }
 
+/// `fetch attachment` echoes the id it was given beside the signed URL, so
+/// that object is AUTHORED here rather than forwarded from the server. Two
+/// defences stand behind it, and this pins the outer one: the id is a
+/// `format: uuid` parameter, every curated command validates strictly, and
+/// `fetch` exposes no `--no-validate`, so text that could reorder a
+/// terminal never even reaches the request.
+///
+/// The inner defence - `output::emit_authored` scrubbing what it prints - is
+/// unit-tested in `commands/output.rs`, because nothing that survives this
+/// check can carry a hazard into the output.
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_attachment_refuses_an_id_that_could_reorder_a_terminal() {
+    // A right-to-left override, a zero-width joiner and a soft hyphen: none
+    // is a control character, so JSON encoding would pass all three through.
+    let hostile = "att\u{202e}id\u{200f}\u{00ad}";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/attachments.redirect"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "https://storage/x"))
+        // Nothing may be sent: the argument is refused locally.
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let output = common::blocking(move || {
+        common::otl_at(&uri)
+            .args(["fetch", "attachment", hostile, "--json"])
+            .output()
+            .unwrap()
+    })
+    .await;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a hostile id must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for hazard in ['\u{202e}', '\u{200f}', '\u{00ad}'] {
+        assert!(
+            !stderr.contains(hazard),
+            "{hazard:?} reached stderr: {stderr}"
+        );
+    }
+    assert!(output.stdout.is_empty(), "a refused command printed data");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn collection_archive_uses_the_real_application_api_route() {
     let server = MockServer::start().await;

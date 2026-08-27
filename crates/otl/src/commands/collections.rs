@@ -146,7 +146,13 @@ pub struct UpdateArgs {
 
   Inspect them with:
     otl api describe collections.delete --json
-    otl api describe collections.archive --json")]
+    otl api describe collections.archive --json
+
+  collections.archive is absent from the published API description (see
+  spec/VENDOR.md), so --archive always dispatches from the definition built
+  into this binary. `otl api describe` reads the effective table instead, so
+  after an `otl spec sync` it can report collections.archive as an unknown
+  operation while --archive keeps working.")]
 pub struct DeleteArgs {
     /// Collection ID.
     id: String,
@@ -212,7 +218,7 @@ fn create(cmd: &CreateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(
     push_optional(&mut request, "icon", cmd.icon.as_ref());
     push_optional(&mut request, "color", cmd.color.as_ref());
     let result = Session::open(overrides)?.call_data("collections.create", &request)?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }
 
 fn update(cmd: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
@@ -228,7 +234,7 @@ fn update(cmd: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(
     push_optional(&mut request, "icon", cmd.icon.as_ref());
     push_optional(&mut request, "color", cmd.color.as_ref());
     let result = Session::open(overrides)?.call_data("collections.update", &request)?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }
 
 fn delete(cmd: &DeleteArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
@@ -239,7 +245,7 @@ fn delete(cmd: &DeleteArgs, mode: OutputMode, overrides: &Overrides) -> Result<(
     };
     let result =
         Session::open(overrides)?.call_data(operation, &[("id".to_string(), cmd.id.clone())])?;
-    output::emit(&result, mode)
+    output::emit_server(&result, mode)
 }
 
 fn push_optional(request: &mut Vec<(String, String)>, name: &str, value: Option<&String>) {
