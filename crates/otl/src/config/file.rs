@@ -8,8 +8,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
-
 use super::{
     sanitize_name, ConfigError, ConfigFile, ConfigSource, EnvLayer, LoadedConfig, Overrides,
 };
@@ -28,14 +26,13 @@ const MAX_CONFIG_FILE_BYTES: u64 = 64 * 1024;
 const SCHEMA_HINT: &str = "valid keys are `default_profile` and `profiles` at the top level, \
      and `url` and `auth` (`api-key` or `oauth`) inside a profile";
 
-/// The platform config directory for `otl`, resolved via `directories`.
+/// The default config directory for `otl`.
 ///
-/// Never assume a Unix layout: this is
-/// `~/.config/outline-cli` on Linux, `~/Library/Application
-/// Support/outline-cli` on macOS and `%APPDATA%\outline-cli\config` on
-/// Windows. `None` when no home directory can be determined.
+/// This is `~/.config/outline-cli` on Linux and macOS, and
+/// `%APPDATA%\outline-cli\config` on Windows. `None` when no home directory
+/// can be determined.
 pub fn config_dir() -> Option<PathBuf> {
-    ProjectDirs::from("", "", APP_DIR_NAME).map(|dirs| dirs.config_dir().to_path_buf())
+    crate::user_dirs::config_dir(APP_DIR_NAME)
 }
 
 /// Default path of the user config file.

@@ -7,8 +7,6 @@
 use std::env;
 use std::path::PathBuf;
 
-use directories::ProjectDirs;
-
 use crate::auth::error::StoreError;
 
 /// Environment variable that overrides the whole configuration directory.
@@ -60,16 +58,13 @@ const PROFILE_NAME_PUNCTUATION: &str = "`-`, `_` and `.`";
 /// The directory holding the credential file.
 ///
 /// [`ENV_CONFIG_DIR`] wins when set; otherwise the platform per-user
-/// configuration directory (`~/.config/outline-cli` on Linux,
-/// `~/Library/Application Support/outline-cli` on macOS,
+/// configuration directory (`~/.config/outline-cli` on Linux and macOS,
 /// `%APPDATA%\outline-cli` on Windows).
 pub fn config_dir() -> Result<PathBuf, StoreError> {
     if let Some(dir) = non_empty_env(ENV_CONFIG_DIR) {
         return Ok(PathBuf::from(dir));
     }
-    ProjectDirs::from("", "", APP_DIR_NAME)
-        .map(|dirs| dirs.config_dir().to_path_buf())
-        .ok_or(StoreError::NoConfigDir)
+    crate::user_dirs::config_dir(APP_DIR_NAME).ok_or(StoreError::NoConfigDir)
 }
 
 /// The active profile name, validated for use as a credential-file key.
