@@ -89,22 +89,36 @@ impl Session {
     /// payload. This is for curated commands whose stable flags construct a
     /// complex request that the scalar `key=value` path cannot represent.
     ///
-    /// `ErrorDetail::CodeOnly`, matching `otl api --body` rather than the
-    /// `key=value` path: a server error message may quote the request body,
-    /// and a raw body here carries whatever the user put in it - a
-    /// ProseMirror document from `--data`, comment prose from `--text`. The
-    /// structured error code still reaches the user, and the exit code is
-    /// unaffected. `otl api --body --show-server-message` is the documented
-    /// opt-in for seeing the text; a curated command deliberately does not
-    /// grow a flag for it.
-    pub fn call_raw_data(&self, operation: &str, body: &Value) -> Result<Value, CliError> {
+    /// Defaults to `ErrorDetail::CodeOnly`, matching `otl api --body`
+    /// rather than the `key=value` path: a server error message may quote
+    /// the request body, and a raw body here carries whatever the user put
+    /// in it - a ProseMirror document from `--data`, comment prose from
+    /// `--text`. The structured error code always reaches the user, and the
+    /// exit code never depends on this choice.
+    ///
+    /// `show_server_message` is the caller's opt-in, and exists because
+    /// withholding the text has a real cost: a server that rejects a
+    /// ProseMirror document explains WHY, and without the explanation the
+    /// only way forward is guessing. Same trade as
+    /// `otl api --body --show-server-message`, offered on the same terms.
+    pub fn call_raw_data(
+        &self,
+        operation: &str,
+        body: &Value,
+        show_server_message: bool,
+    ) -> Result<Value, CliError> {
         let op = self.operation(operation)?;
         let encoded = serde_json::to_string(body).map_err(|error| {
             CliError::failure(anyhow!("failed to encode request body: {error}"))
         })?;
+        let detail = if show_server_message {
+            ErrorDetail::Full
+        } else {
+            ErrorDetail::CodeOnly
+        };
         let mut envelope = self
             .client
-            .execute_raw(op, &encoded, ErrorDetail::CodeOnly)
+            .execute_raw(op, &encoded, detail)
             .map_err(map_engine_error)?;
         Ok(take_data(&mut envelope))
     }

@@ -240,7 +240,11 @@ response without forwarding the bearer token to storage.
 
 Comment updates accept `--text` for plain text (Markdown punctuation remains
 literal) or `--data FILE` for a complete ProseMirror JSON document. Resolve and
-unresolve use Outline's dedicated application API routes.
+unresolve use Outline's dedicated application API routes. Those two are separate
+requests: when the content lands and the resolve does not, the updated comment is
+printed and the exit code is **9**, so a retry cannot apply the text twice. The
+server's error text for a rejected body is withheld unless
+`--show-server-message` is given, exactly as for `otl api --body`.
 
 Notes worth knowing:
 

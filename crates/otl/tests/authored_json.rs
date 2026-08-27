@@ -147,9 +147,18 @@ const RENDER: &[Reviewed] = &[
         file: "crates/otl/src/commands/api/mod.rs",
         context: "render::render(payload, mode, schema)",
         count: 1,
-        why: "SERVER RESPONSE. `otl api`'s whole promise is that the reply \
-              round-trips, and this is the call that keeps it: the payload \
-              is the server's, the schema only picks table columns.",
+        why: "SERVER RESPONSE for every operation but one, and this is the \
+              call that keeps `otl api`'s promise that the reply \
+              round-trips: the payload is the server's, the schema only \
+              picks table columns. The exception is the redirect contract \
+              (`attachments.redirect`), where the value is \
+              `{\"data\":{\"signedUrl\": location}}` - a wrapper authored \
+              here around one header value. It stays verbatim ON PURPOSE: \
+              the URL is signed, so scrubbing could invalidate it, and \
+              `HeaderValue::to_str` already constrains it to visible ASCII, \
+              which carries neither a control nor a format character. \
+              AUTHORED, inert, and deliberately not scrubbed - said here \
+              rather than left to look like an oversight.",
     },
     Reviewed {
         file: "crates/otl/src/commands/output.rs",
@@ -274,15 +283,27 @@ fn count_scrubbed(line: &str) -> usize {
     line.matches("render_json_scrubbed(").count()
 }
 
-/// Calls to `render::render` itself - the schema-aware renderer whose JSON
-/// branch is verbatim. `render_json`/`render_json_scrubbed` must not be
-/// counted here, and neither must the definition's own signature.
+/// Calls to `render` itself - the schema-aware renderer whose JSON branch
+/// is verbatim.
+///
+/// Matched by the BARE name, like the two scans above, and that is the
+/// point: the first version required the `render::` qualifier, so a module
+/// that wrote `use crate::render::render;` and then called `render(&value,
+/// mode, &[])` - which the compiler and this codebase's style both accept -
+/// was counted zero, and could have shipped an unregistered authored
+/// surface through the very door this scan was added to watch.
+///
+/// `render_json(` and `render_json_scrubbed(` do not contain `render(`, so
+/// they cannot be double-counted; `try_render_table(` does not either. The
+/// renderer's own definition is in `render.rs`, which [`check`] skips.
 fn count_render(line: &str) -> usize {
     line.match_indices("render(")
-        .filter(|(at, _)| !line[..*at].ends_with("render_json_scrubbed_"))
+        // Only a whole word: `xrender(` is some other function.
         .filter(|(at, _)| {
-            let before = &line[..*at];
-            before.ends_with("render::") || before.ends_with("::render::")
+            line[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(|previous| !previous.is_alphanumeric() && previous != '_')
         })
         .count()
 }
@@ -479,6 +500,30 @@ fn the_render_scan_finds_a_call_site_it_is_supposed_to_find() {
         calls, 1,
         "expected to see the one `render::render` call in commands/output.rs"
     );
+}
+
+/// The `render` scan must see a call however it is spelled.
+///
+/// The qualifier-only version of `count_render` was blind to the
+/// `use`-imported form, which is the spelling a new module is most likely to
+/// reach for.
+#[test]
+fn the_render_scan_sees_every_spelling_of_the_call() {
+    for line in [
+        "    let rendered = render::render(value, mode, &[])",
+        "    let rendered = crate::render::render(value, mode, &[])",
+        "    let rendered = render(value, mode, &[])",
+    ] {
+        assert_eq!(count_render(line), 1, "missed a call in {line:?}");
+    }
+    for line in [
+        "    render::render_json(&payload)",
+        "    render::render_json_scrubbed(&value)",
+        "    try_render_table(payload, schema)",
+        "    stdio::write_data_line(&rendered)",
+    ] {
+        assert_eq!(count_render(line), 0, "counted a non-call in {line:?}");
+    }
 }
 
 /// `render_json_scrubbed` must not be counted as `render_json`.
