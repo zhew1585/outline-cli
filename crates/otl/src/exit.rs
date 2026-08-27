@@ -33,6 +33,29 @@ pub enum ExitCode {
     Partial = 9,
 }
 
+impl ExitCode {
+    /// The stable machine-readable name of this code.
+    ///
+    /// Not a second taxonomy: it is the same nine classes the numeric table
+    /// publishes, spelled so a reader does not have to keep the table in
+    /// their head. Renaming one is exactly as breaking as changing what a
+    /// number means, and is governed by the same rule.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Usage => "usage",
+            Self::ApiRequest => "api-request",
+            Self::Auth => "auth",
+            Self::NotFound => "not-found",
+            Self::Server => "server",
+            Self::Network => "network",
+            Self::RateLimited => "rate-limited",
+            Self::Partial => "partial",
+        }
+    }
+}
+
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
         Self::from(code as u8)

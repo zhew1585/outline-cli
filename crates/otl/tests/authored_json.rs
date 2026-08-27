@@ -219,6 +219,18 @@ const SCRUBBED: &[Reviewed] = &[
               from the environment and the `name` frontmatter of a SKILL.md \
               that some other tool wrote.",
     },
+    Reviewed {
+        file: "crates/otl/src/failure.rs",
+        context: "render::render_json_scrubbed(&payload)",
+        count: 1,
+        why: "AUTHORED. The terminating error `--json` writes to stderr. Its \
+              `message` is the widest authored surface there is: every \
+              CliError in the crate ends up in it, carrying server error \
+              text, filesystem paths and config-file values. Scrubbing here \
+              rather than only at `write_diagnostic_line` matters because \
+              the escaping happens first - a hazard must not survive as a \
+              `\\u` escape that a consumer un-escapes back into a terminal.",
+    },
 ];
 
 /// Workspace root: `crates/otl` -> `crates` -> root.

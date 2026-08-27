@@ -10,6 +10,7 @@ pub mod config;
 pub mod errors;
 pub mod exit;
 pub mod export;
+pub mod failure;
 pub mod fields;
 pub mod ops;
 pub mod pager;

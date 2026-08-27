@@ -12,8 +12,8 @@ use otl::commands::{
     users,
 };
 use otl::exit::ExitCode;
+use otl::failure;
 use otl::render;
-use otl::stdio;
 
 fn main() -> std::process::ExitCode {
     // clap itself exits with code 2 on usage errors, matching the
@@ -43,7 +43,7 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => ExitCode::Success.into(),
         Err(error) => {
-            stdio::write_diagnostic_line(&format!("error: {error}"));
+            failure::report(&error, mode);
             error.code.into()
         }
     }

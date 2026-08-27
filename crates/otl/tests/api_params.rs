@@ -84,14 +84,19 @@ async fn kv_args_become_native_json_types_in_body() {
 fn missing_required_param_exits_2_before_network() {
     // A network attempt against the closed port would yield exit 1 with a
     // transport message; the local validation error must win instead.
-    otl_offline()
+    let assert = otl_offline()
         .args(["api", "documents.update", "publish=true"])
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("\"id\""))
-        .stderr(predicate::str::contains("string"))
         .stdout(predicate::str::is_empty());
+    // Through `common::error_message`, because stdout is a pipe here: the
+    // terminating error is the structured form, and `"id"` reaches the raw
+    // buffer as `\"id\"`.
+    let message = common::error_message(&assert.get_output().stderr);
+    assert!(message.contains("\"id\""), "{message}");
+    assert!(message.contains("string"), "{message}");
+    assert_eq!(common::error_code(&assert.get_output().stderr), "usage");
 }
 
 #[test]

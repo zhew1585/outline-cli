@@ -163,3 +163,44 @@ pub fn no_cache_dir() -> PathBuf {
     );
     path
 }
+
+/// The `message` of the structured error `otl` writes to stderr in JSON
+/// mode, which is the state every `assert_cmd` child runs in (stdout is a
+/// pipe, so `--json` is already the default).
+///
+/// Tests assert on what a message SAYS. Reading the raw stderr makes them
+/// assert on how JSON escapes it as well - a message naming a parameter as
+/// `"id"` arrives as `\"id\"` - which is a fact about serde, not about the
+/// CLI. This unwraps one layer so the assertion is about the sentence.
+///
+/// Diagnostics that are not the terminating error (a truncation warning,
+/// the plaintext-key notice) stay prose on the same stream, so the last
+/// JSON object is the one to read rather than the whole buffer.
+pub fn error_message(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let start = text
+        .find("{\n  \"error\"")
+        .unwrap_or_else(|| panic!("no structured error in stderr:\n{text}"));
+    let value: serde_json::Value = serde_json::from_str(text[start..].trim_end())
+        .unwrap_or_else(|error| panic!("stderr is not a structured error ({error}):\n{text}"));
+    value["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error.message in stderr:\n{text}"))
+        .to_string()
+}
+
+/// The `code` name of that same structured error (`"usage"`, `"partial"`,
+/// ...), for a test whose subject is the classification rather than the
+/// wording.
+pub fn error_code(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let start = text
+        .find("{\n  \"error\"")
+        .unwrap_or_else(|| panic!("no structured error in stderr:\n{text}"));
+    let value: serde_json::Value = serde_json::from_str(text[start..].trim_end())
+        .unwrap_or_else(|error| panic!("stderr is not a structured error ({error}):\n{text}"));
+    value["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error.code in stderr:\n{text}"))
+        .to_string()
+}
