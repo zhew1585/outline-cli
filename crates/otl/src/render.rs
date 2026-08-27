@@ -108,6 +108,51 @@ pub fn render_json(payload: &Value) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(payload)
 }
 
+/// Render JSON that `otl` AUTHORED, scrubbing every string in it.
+///
+/// The `--json` exemption documented in [`crate::text`] is about one thing:
+/// a SERVER RESPONSE has to round-trip byte-for-byte, because that payload
+/// is the server's contract and `render_golden`'s JSON test pins it. That
+/// reasoning does not reach an object this CLI writes itself - `otl doctor`'s
+/// report, `otl api describe`'s contract - which nothing round-trips, and
+/// which interleaves authored prose with text from a spec document, a
+/// filesystem or a server error. Those are the same foreign values the human
+/// rendering scrubs; the state they are printed in does not change what they
+/// are.
+///
+/// So there is one rule with two sinks rather than two policies: [`render`]
+/// (a response) is exempt, this (a document about one) is not. Scrubbing at
+/// the SINK rather than at each field is deliberate for the same reason
+/// [`crate::stdio::scrub_terminal_controls`] is - it holds for fields that
+/// do not exist yet.
+///
+/// Object KEYS are scrubbed too. Every key today is an authored `&'static
+/// str`, so this changes nothing; it costs one comparison and removes the
+/// question.
+pub fn render_json_scrubbed(payload: &Value) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&scrub_value(payload))
+}
+
+/// Deep-copy a JSON value with every string scrubbed.
+fn scrub_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(crate::stdio::scrub_terminal_controls(text)),
+        Value::Array(items) => Value::Array(items.iter().map(scrub_value).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, item)| {
+                    (
+                        crate::stdio::scrub_terminal_controls(key),
+                        scrub_value(item),
+                    )
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Render a table with caller-chosen columns.
 ///
 /// The curated commands (`otl docs search`, `otl collections list`, ...)

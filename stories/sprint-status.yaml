@@ -82,5 +82,7 @@ development_status:
   4-3-doctor: done
   4-4-shell-completions: done
   4-5-release-pipeline: done
+  # R1 adversarial review done (mergeable, 4 MINOR, all fixed); IR 5->6 added during review,
+  # so a second round was requested before merge.
   4-6-agent-discovery: review
   epic-4-retrospective: optional

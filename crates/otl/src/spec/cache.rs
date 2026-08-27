@@ -293,13 +293,24 @@ pub fn load_at(file: &Path) -> Result<Option<CachedIr>, CacheError> {
         Some(raw) => raw,
         None => return Ok(None),
     };
-    let (meta, ops) = decode_body(file, &raw)?;
+    let body = checked_body(file, &raw)?;
+    // Provenance first, then the versions, and only then the operations.
+    // A table written for another `IR_SCHEMA_VERSION` must be reported as
+    // OUTDATED - which it is, and which `otl spec sync` fixes - rather than
+    // as damage, and the way to guarantee that is never to interpret its
+    // operation records at all.
+    let (meta, cursor) = super::bounded::decode_meta(body).map_err(CacheError::Unsupportable)?;
     check_versions(file, &meta)?;
     let damaged = |reason: String| CacheError::Damaged {
         path: file.to_path_buf(),
         reason,
     };
     check_meta(&meta).map_err(damaged)?;
+    // The framed decode is where every allocation bound lives, including
+    // the rule that the body is exactly one table and nothing else: bytes
+    // left over mean this file did not come from this code path, however
+    // well its checksum matches.
+    let ops = super::bounded::decode_ops(body, cursor).map_err(CacheError::Unsupportable)?;
     super::validate_ops(&ops).map_err(damaged)?;
     Ok(Some(CachedIr { meta, ops }))
 }
@@ -411,8 +422,12 @@ fn stat_regular(file: &Path) -> Result<Option<fs::Metadata>, CacheError> {
     Ok(Some(metadata))
 }
 
-/// Check the raw prefix and decode the framed body.
-fn decode_body(file: &Path, raw: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), CacheError> {
+/// Check the raw prefix and return the framed body.
+///
+/// Stops at the header on purpose: the caller decodes the provenance record,
+/// checks the versions, and only then asks for the operations - see
+/// [`super::bounded::decode_table`] for why that order is load-bearing.
+fn checked_body<'a>(file: &Path, raw: &'a [u8]) -> Result<&'a [u8], CacheError> {
     let damaged = |reason: String| CacheError::Damaged {
         path: file.to_path_buf(),
         reason,
@@ -438,11 +453,7 @@ fn decode_body(file: &Path, raw: &[u8]) -> Result<(CacheMeta, Vec<OpSpec>), Cach
             "its checksum does not match its contents".to_string(),
         ));
     }
-    // The framed decode is where every allocation bound lives, including
-    // the rule that the body is exactly one table and nothing else: bytes
-    // left over mean this file did not come from this code path, however
-    // well its checksum matches.
-    super::bounded::decode_table(body).map_err(CacheError::Unsupportable)
+    Ok(body)
 }
 
 /// Reject a cache this build cannot interpret.

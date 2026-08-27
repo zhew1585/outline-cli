@@ -465,6 +465,42 @@ async fn a_document_with_terminal_escapes_is_neutralized() {
     let summary = rows[0]["summary"].as_str().unwrap_or_default();
     assert!(!summary.contains('\t'), "tab survived: {summary:?}");
 
+    // A parameter D\u001bRIPTION is display-only too (Story 4.6), and it is
+    // compiled through the same `sanitize_display` a summary is - so the
+    // document is ACCEPTED and the text is stripped and folded to one line,
+    // rather than the whole document being refused (which is what happens to
+    // text with meaning, below). Asserted through `describe`, the only thing
+    // that prints it.
+    let prose = r#"{"paths":{"/things.info":{"post":{"summary":"ok",
+        "requestBody":{"content":{"application/json":{"schema":{"type":"object",
+        "properties":{"mode":{"type":"string",
+        "description":"before \u001b]52;c;cGF3bmVk\u0007 \tmid \nafter"}}}}}}}}}}"#;
+    let server = serve(prose.to_string()).await;
+    let cache = TempDir::new().unwrap();
+    let url = format!("{}{SPEC_PATH}", server.uri());
+    let (_, stderr, code) = run(cache.path(), &["spec", "sync", "--url", &url]).await;
+    assert_eq!(
+        code, 0,
+        "a hostile description must not refuse the document: {stderr}"
+    );
+    let (stdout, _, code) = run(cache.path(), &["api", "describe", "things.info"]).await;
+    assert_eq!(code, 0);
+    let described = parse(&stdout)["parameters"][0]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    for hazard in ['\u{1b}', '\u{7}', '\n', '\t'] {
+        assert!(
+            !described.contains(hazard),
+            "{hazard:?} survived: {described:?}"
+        );
+    }
+    // Folded to one line, and still the text it came from.
+    assert_eq!(
+        described, "before ]52;c;cGF3bmVk mid after",
+        "{described:?}"
+    );
+
     let refused = r#"{"paths":{"/things.info":{"post":{"requestBody":{"content":
         {"application/json":{"schema":{"type":"object","properties":
         {"mode":{"type":"string","enum":["ok","bad\u001b[31m"]}}}}}}}}}}"#;

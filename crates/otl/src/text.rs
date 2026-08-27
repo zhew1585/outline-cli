@@ -33,15 +33,32 @@
 //! 27 `Cf` codepoints a terminal gives a column to survived its scrub while
 //! this module dropped them. One table cannot disagree with itself.
 //!
-//! # `--json` is a deliberate exemption
+//! # A SERVER RESPONSE in `--json` is a deliberate exemption
 //!
-//! JSON output is not a rendering, it is the payload: its contract is that
-//! `jq` can consume it and that it round-trips to the same value the server
-//! sent. Substituting or dropping a codepoint there would corrupt data to
-//! protect a terminal that was not the intended consumer, and would break
-//! the round-trip property `render_golden`'s JSON test asserts. So `--json`
-//! (and the non-TTY default, which is the same path) emits exactly what
-//! arrived, bidi and all.
+//! Read the scope of this first, because it was once written as "`--json`"
+//! and got applied by analogy to objects it does not cover. **The exemption
+//! is a property of one payload, not of one output state**: it covers the
+//! bytes a server sent, rendered by [`crate::render::render`], and nothing
+//! else.
+//!
+//! For that payload, JSON output is not a rendering, it is the payload: its
+//! contract is that `jq` can consume it and that it round-trips to the same
+//! value the server sent. Substituting or dropping a codepoint there would
+//! corrupt data to protect a terminal that was not the intended consumer,
+//! and would break the round-trip property `render_golden`'s JSON test
+//! asserts. So a response in `--json` (and the non-TTY default, which is the
+//! same path) emits exactly what arrived, bidi and all.
+//!
+//! **What the exemption does NOT cover: JSON that `otl` AUTHORS.** `otl
+//! doctor`'s report and `otl api describe`'s contract are documents this CLI
+//! writes, interleaving authored prose with a profile name, a path, an
+//! operation name out of a fetched spec, or a server's error text. Nothing
+//! round-trips them, no test pins their bytes to anything a server said, and
+//! their reader is often a program that will put the text in front of a
+//! language model. They go through
+//! [`crate::render::render_json_scrubbed`], which scrubs every string at the
+//! sink. Both of them once did not, on the reasoning that "`--json` is the
+//! payload" - which is exactly the analogy this paragraph exists to stop.
 //!
 //! The consequence is worth stating rather than leaving implied: piping
 //! `--json` through a pager or `cat` on a terminal can still show reordered

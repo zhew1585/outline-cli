@@ -219,6 +219,45 @@ fn describe_needs_exactly_one_operation() {
         .stdout(predicate::str::is_empty());
 }
 
+/// The alias has to be an alias in BOTH directions.
+///
+/// `otl api describe documents.info id=x` is a usage error, so the `--help`
+/// spelling of the same mistake must be one too - it used to succeed and
+/// silently discard `id=x`, which is this story's own defect wearing the
+/// flag's clothes. Neither of the two suites above catches it, because both
+/// exercise the paths WITHOUT `--help`, and the alias short-circuits ahead
+/// of them.
+#[test]
+fn operation_level_help_refuses_what_describe_refuses() {
+    let (stdout, stderr, code) = run(&mut otl(), &["api", "documents.info", "--help", "id=x"]);
+    assert_eq!(code, 2, "stdout: {stdout:.200}");
+    assert!(stdout.is_empty(), "answered anyway: {stdout:.200}");
+    assert!(stderr.contains("no further arguments"), "{stderr}");
+    // The message names what was actually typed, not a bare reserved word:
+    // "`otl api documents.info` sends no request" would be false of the
+    // command that name usually spells.
+    assert!(stderr.contains("--help"), "{stderr}");
+
+    for flag in ["--no-validate", "--show-server-message"] {
+        let (stdout, stderr, code) = run(&mut otl(), &["api", "documents.info", "--help", flag]);
+        assert_eq!(code, 2, "{flag}: {stdout:.200}");
+        assert!(stdout.is_empty(), "{flag} answered anyway: {stdout:.200}");
+        assert!(stderr.contains("sends no request"), "{flag}: {stderr}");
+    }
+    let (_, _, code) = run(&mut otl(), &["api", "list", "--help", "--no-validate"]);
+    assert_eq!(code, 0, "a reserved word still gets the command help");
+}
+
+/// With both a typo and a stray argument, the typo is what gets reported:
+/// it is the root cause, and the arity complaint would leave it undiscovered.
+#[test]
+fn operation_level_help_reports_an_unknown_name_before_a_stray_argument() {
+    let (_, stderr, code) = run(&mut otl(), &["api", "documents.inf", "--help", "id=x"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unknown API operation"), "{stderr}");
+    assert!(!stderr.contains("no further arguments"), "{stderr}");
+}
+
 #[test]
 fn describe_rejects_request_flags() {
     for flag in ["--no-validate", "--show-server-message"] {
@@ -324,12 +363,21 @@ fn synced_otl(cache: &Path) -> Command {
 
 /// One operation, with a summary and one enumerated parameter.
 fn document(operation: &str, summary: &str, enum_value: &str) -> String {
+    described(operation, summary, enum_value, "Which mode to use.")
+}
+
+/// [`document`], with the parameter's prose chosen by the caller.
+///
+/// The prose is the only NEW third-party string this story's IR bump adds,
+/// so the hostile fixtures need to be able to aim at it specifically.
+fn described(operation: &str, summary: &str, enum_value: &str, description: &str) -> String {
     format!(
         r#"{{"openapi":"3.0.0","paths":{{"/{operation}":{{"post":{{
           "summary":"{summary}",
           "requestBody":{{"content":{{"application/json":{{"schema":{{
             "type":"object","required":["mode"],
-            "properties":{{"mode":{{"type":"string","enum":["ok","{enum_value}"]}}}}
+            "properties":{{"mode":{{"type":"string","description":"{description}",
+              "enum":["ok","{enum_value}"]}}}}
           }}}}}}}}}}}}}}}}"#
     )
 }
@@ -418,10 +466,13 @@ fn an_operation_named_like_a_reserved_word_is_reported_not_hidden() {
 #[test]
 fn third_party_text_reaches_stdout_scrubbed_in_both_paths() {
     let hostile = "\u{200f}reordered";
-    let cache = synced(&document(
+    let cache = synced(&described(
         "things.info",
         "safe \\u200f summary",
         "bad\\u200fvalue",
+        // Every hazard class the compiler's own table does NOT cover, in the
+        // one string this story newly compiles into the IR.
+        "prose \\u200f\\u200e\\u061c\\u206a\\u00ad\\u180e\\u200b end",
     ));
     for args in [
         vec!["api", "describe", "things.info"],
@@ -430,10 +481,14 @@ fn third_party_text_reaches_stdout_scrubbed_in_both_paths() {
     ] {
         let (stdout, stderr, code) = run(&mut synced_otl(cache.path()), &args);
         assert_eq!(code, 0, "{args:?}: {stderr}");
-        assert!(
-            !stdout.contains('\u{200f}'),
-            "{args:?} passed a bidi mark through: {stdout:?}"
-        );
+        for hazard in [
+            '\u{200f}', '\u{200e}', '\u{061c}', '\u{206a}', '\u{00ad}', '\u{180e}', '\u{200b}',
+        ] {
+            assert!(
+                !stdout.contains(hazard),
+                "{args:?} passed {hazard:?} through: {stdout:?}"
+            );
+        }
         assert!(!stdout.contains(hostile), "{args:?}: {stdout:?}");
     }
     // Control, and the whole reason this test means anything: the mark
@@ -441,11 +496,27 @@ fn third_party_text_reaches_stdout_scrubbed_in_both_paths() {
     // above would pass just as well against a document that never carried
     // it - which is how a scrub test goes quiet.
     let compiled = std::fs::read(cache.path().join("ir-cache.bin")).unwrap();
-    let mark = '\u{200f}'.to_string().into_bytes();
-    assert!(
-        compiled
-            .windows(mark.len())
-            .any(|window| window == mark.as_slice()),
-        "the compiler dropped U+200F itself: this test proves nothing about the sink"
+    for hazard in [
+        '\u{200f}', '\u{200e}', '\u{061c}', '\u{206a}', '\u{00ad}', '\u{180e}',
+    ] {
+        let bytes = hazard.to_string().into_bytes();
+        assert!(
+            compiled
+                .windows(bytes.len())
+                .any(|window| window == bytes.as_slice()),
+            "the compiler dropped {hazard:?} itself: this test proves nothing about the sink"
+        );
+    }
+    // And the prose really did reach the IR, so "no hazard on stdout" is not
+    // just "no prose on stdout".
+    let (stdout, _, _) = run(
+        &mut synced_otl(cache.path()),
+        &["api", "describe", "things.info"],
     );
+    let contract: Value = serde_json::from_str(&stdout).expect("json");
+    let prose = contract["parameters"][0]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(prose.starts_with("prose"), "{contract}");
+    assert!(prose.ends_with("end"), "{contract}");
 }

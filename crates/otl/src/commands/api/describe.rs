@@ -18,14 +18,17 @@
 //!
 //! # Text safety
 //!
-//! Summaries, formats and enumerated values are third-party text: they come
-//! from an OpenAPI document, and with `otl spec sync` that document need not
-//! be the vendored one. Both entry points already filter it -
-//! `spec_compile` sanitizes display text and REJECTS a document whose
-//! meaningful text carries a dangerous character, and `crate::spec` applies
-//! the same `is_display_safe` test to every string of a cache it loads - so
-//! no control character, newline, `U+2028`/`U+2029`/`U+FEFF` or bidi
-//! override/isolate can be in the IR at all.
+//! Summaries, parameter descriptions, formats and enumerated values are
+//! third-party text: they come from an OpenAPI document, and with `otl spec
+//! sync` that document need not be the vendored one. Both IR entry points
+//! already filter it - `spec_compile` SANITIZES display text (summaries and
+//! parameter descriptions: dangerous characters dropped, whitespace folded
+//! to one line, length capped) and REJECTS a document whose text with
+//! MEANING (parameter names, content types, formats, enumerated values)
+//! carries a dangerous character, and `crate::spec` applies the same
+//! `is_display_safe` test to every string of a cache it loads. So no control
+//! character, newline, `U+2028`/`U+2029`/`U+FEFF` or bidi override/isolate
+//! can be in the IR at all.
 //!
 //! That table is nonetheless a strict SUBSET of the one every rendering
 //! surface in this crate uses ([`crate::text::hazard`], the whole assigned
@@ -34,15 +37,24 @@
 //! fail this crate's. Two tables that disagree is exactly the defect
 //! `crate::text`'s module documentation is about, and the compiler cannot
 //! simply borrow the engine's table (it is a build dependency and must not
-//! pull `engine` into the host build). So this module closes the gap at its
-//! own sink, with [`safe`].
+//! pull `engine` into the host build). So every consumer closes the gap at
+//! its own sink - and every consumer does, which is worth stating because it
+//! was once written here as an open gap and is not one:
+//!
+//! - this module's human rendering, per value, with [`safe`];
+//! - this module's JSON, once, in [`to_json_text`];
+//! - `otl api`'s validation diagnostics, which quote enumerated values
+//!   ("allowed values are ..."), through `main`'s
+//!   `stdio::write_diagnostic_line`. Verified rather than assumed: a synced
+//!   document whose enum value carries `U+200F` and `U+206A` produces
+//!   `allowed values are: ok, bad`, with both stripped.
 //!
 //! `--json` is scrubbed here too, unlike a response payload. The exemption
-//! in [`crate::text`] exists so that a SERVER'S RESPONSE round-trips
-//! byte-for-byte; this object is not a response, it is a document `otl`
-//! writes about a third-party spec, nothing round-trips it, and its
-//! intended reader is a program that will put the text in front of a
-//! language model.
+//! in [`crate::text`] covers ONE payload - the bytes a server sent, rendered
+//! by [`crate::render::render`], which have to round-trip. This object is
+//! not that: it is a document `otl` writes about a third-party spec, nothing
+//! round-trips it, and its intended reader is a program that will put the
+//! text in front of a language model.
 
 use serde_json::{json, Value};
 
@@ -63,13 +75,26 @@ pub(super) fn run(op: &OpSpec, mode: OutputMode) -> Result<(), CliError> {
     stdio::write_data_line(&text)
 }
 
-/// Serialize a value the way every other `--json` surface does.
+/// Serialize one of the two JSON documents this pair of commands authors.
+///
+/// [`render::render_json_scrubbed`], not `render_json`: this object is not
+/// a server response to round-trip, so the `--json` exemption documented in
+/// [`crate::text`] does not reach it. That call is also the ONLY place the
+/// JSON path scrubs - the builders below hand it raw IR text - because a
+/// sink holds for fields that do not exist yet, while a per-field call has
+/// to be remembered by whoever adds the next field.
 pub(super) fn to_json_text(value: &Value) -> Result<String, CliError> {
-    render::render_json(value)
+    render::render_json_scrubbed(value)
         .map_err(|error| CliError::failure(anyhow::anyhow!("failed to render: {error}")))
 }
 
-/// Make one string from the compiled spec safe to write to stdout.
+/// Make one string from the compiled spec safe to write to the HUMAN
+/// rendering.
+///
+/// The JSON path does not call this: it is scrubbed once, at
+/// [`to_json_text`]. This one is per value because the human form
+/// interleaves foreign text with layout, so there is no single string to
+/// scrub at the end.
 ///
 /// [`stdio::scrub_terminal_controls`] rather than a filter of this module's
 /// own, deliberately: it matches exhaustively on [`crate::text::Hazard`],
@@ -90,16 +115,17 @@ pub(super) fn safe(raw: &str) -> String {
     stdio::scrub_terminal_controls(raw)
 }
 
-/// A scrubbed string, or JSON `null` when the spec declared nothing.
+/// A string, or JSON `null` when the spec declared nothing.
 ///
 /// One rule for every optional string in this output: an absent facet is
 /// `null`, never `""`. The empty string would claim the spec said something
-/// and that it was empty.
+/// and that it was empty. Scrubbing is [`to_json_text`]'s job, not this
+/// one's - every caller is building the JSON document.
 pub(super) fn optional(raw: &str) -> Value {
     if raw.is_empty() {
         return Value::Null;
     }
-    Value::String(safe(raw))
+    Value::String(raw.to_string())
 }
 
 /// Stable wire name for a body mode.
@@ -135,9 +161,9 @@ fn body_mode_note(op: &OpSpec) -> String {
 /// The whole contract as one JSON object.
 fn as_json(op: &OpSpec) -> Value {
     json!({
-        "operation": safe(&op.name),
+        "operation": op.name.as_ref(),
         "summary": optional(&op.summary),
-        "path": safe(&op.path),
+        "path": op.path.as_ref(),
         "content_type": optional(&op.content_type),
         "body_mode": body_mode_name(op.body_mode),
         "callable": op.body_mode != BodyMode::Unsupported,
@@ -151,12 +177,13 @@ fn as_json(op: &OpSpec) -> Value {
 /// One request parameter, with every facet the IR carries.
 fn param_json(param: &ParamSpec) -> Value {
     json!({
-        "name": safe(&param.name),
+        "name": param.name.as_ref(),
         "type": param.ty.to_string(),
+        "description": optional(&param.description),
         "required": param.required,
         "nullable": param.nullable,
         "enum_values": Value::Array(
-            param.enum_values.iter().map(|value| Value::String(safe(value))).collect(),
+            param.enum_values.iter().map(|value| Value::String(value.to_string())).collect(),
         ),
         "format": optional(&param.format),
         "minimum": param.minimum,
@@ -167,7 +194,7 @@ fn param_json(param: &ParamSpec) -> Value {
 /// One response field, in the source schema's own declaration order.
 fn field_json(field: &FieldSpec) -> Value {
     json!({
-        "name": safe(&field.name),
+        "name": field.name.as_ref(),
         "type": field.ty.to_string(),
         "format": optional(&field.format),
         "nullable": field.nullable,
@@ -196,13 +223,15 @@ fn as_text(op: &OpSpec) -> String {
     let mut blocks = vec![render::render_pairs(&header(op))];
     blocks.push(block(
         "parameters",
-        op.params.iter().map(|p| (p.name.as_ref(), param_line(p))),
+        op.params
+            .iter()
+            .map(|p| (p.name.as_ref(), param_line(p), p.description.to_string())),
     ));
     blocks.push(block(
         "response fields",
         op.response_fields
             .iter()
-            .map(|f| (f.name.as_ref(), field_line(f))),
+            .map(|f| (f.name.as_ref(), field_line(f), String::new())),
     ));
     blocks.join("\n\n")
 }
@@ -232,11 +261,23 @@ fn source_note() -> String {
     }
 }
 
-/// Render one titled block of label/value lines, or say it is empty.
-fn block<'a>(title: &str, rows: impl Iterator<Item = (&'a str, String)>) -> String {
-    let pairs: Vec<(String, String)> = rows
-        .map(|(name, line)| (format!("  {}", safe(name)), line))
-        .collect();
+/// Render one titled block, or say it is empty.
+///
+/// Each row is a name, its facet line, and optionally the schema's prose.
+/// The prose becomes a SECOND pair with an EMPTY label, which
+/// [`render::render_pairs`] pads to the same width - so it lands under the
+/// facet line rather than extending it. Two reasons not to fold it in:
+/// a sentence appended to `string, optional, format=uuid` buries the facets
+/// a caller is scanning for, and prose is the one value here that can be
+/// 200 characters long.
+fn block<'a>(title: &str, rows: impl Iterator<Item = (&'a str, String, String)>) -> String {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (name, line, prose) in rows {
+        pairs.push((format!("  {}", safe(name)), line));
+        if !prose.is_empty() {
+            pairs.push((String::new(), safe(&prose)));
+        }
+    }
     if pairs.is_empty() {
         return format!("{title}\n  (none)");
     }
@@ -248,6 +289,8 @@ fn block<'a>(title: &str, rows: impl Iterator<Item = (&'a str, String)>) -> Stri
 }
 
 /// One parameter as `<type>, required|optional[, facet...]`.
+///
+/// The schema's prose is deliberately not folded in; see [`block`].
 fn param_line(param: &ParamSpec) -> String {
     let mut parts = vec![param.ty.to_string()];
     parts.push(
@@ -446,6 +489,52 @@ mod tests {
         }
     }
 
+    /// The prose is the reason the IR went to schema version 6, and the
+    /// human form is where it does the most work: `documents.info` marks
+    /// NEITHER parameter required, and only the prose says that one of them
+    /// is nonetheless needed.
+    ///
+    /// Its own line, indented under the facets rather than appended to
+    /// them, which is the part that had no test at all until a mutation
+    /// (deleting the prose line) came back GREEN.
+    #[test]
+    fn the_human_form_carries_each_parameters_prose_on_its_own_line() {
+        let spec = op("documents.info");
+        let text = as_text(spec);
+        let described: Vec<&ParamSpec> = spec
+            .params
+            .iter()
+            .filter(|param| !param.description.is_empty())
+            .collect();
+        assert!(
+            !described.is_empty(),
+            "documents.info declares prose on both parameters; an empty list \
+             would make this assertion vacuous"
+        );
+        for param in described {
+            let prose = safe(&param.description);
+            let line = text
+                .lines()
+                .find(|line| line.trim() == prose.trim())
+                .unwrap_or_else(|| panic!("no line of its own for {}: {text}", param.name));
+            // Indented into the value column, not starting at the name.
+            assert!(line.starts_with(' '), "{line:?}");
+            // And the facet line is still its own line, without the prose
+            // appended to it - which is what "on its own line" means.
+            let facets = text
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("{} ", param.name)))
+                .unwrap_or_else(|| panic!("no facet line for {}: {text}", param.name));
+            assert!(
+                !facets.contains(prose.trim()),
+                "prose folded into the facet line: {facets:?}"
+            );
+            assert!(facets.contains(&param.ty.to_string()), "{facets:?}");
+        }
+        // And the disambiguation an agent actually needs is present.
+        assert!(text.contains("Either the UUID or the urlId"), "{text}");
+    }
+
     #[test]
     fn an_uncallable_operation_says_so_in_both_states() {
         let spec = ops::table()
@@ -526,11 +615,22 @@ mod tests {
     #[test]
     fn a_hostile_string_is_neutralised_in_both_states() {
         let hostile = "before\u{1b}]52;c;cGF5bG9hZA==\u{7}after\u{202e}\u{200f}";
+        // The human path scrubs per value, because layout is interleaved.
         let cleaned = safe(hostile);
         assert!(!has_hazard(&cleaned), "{cleaned:?}");
         assert!(cleaned.starts_with("before"), "{cleaned:?}");
         assert!(cleaned.contains("after"), "{cleaned:?}");
-        assert_eq!(optional(hostile), Value::String(cleaned));
+
+        // The JSON path scrubs once, at the sink - so a builder that hands
+        // it raw text (which every builder here does, on purpose) is still
+        // safe. Asserted on the SERIALIZED form, since that is what reaches
+        // stdout: `optional` itself deliberately does not scrub any more.
+        assert_eq!(optional(hostile), Value::String(hostile.to_string()));
+        let rendered = to_json_text(&json!({ "summary": hostile })).expect("json");
+        for line in rendered.lines() {
+            assert!(!has_hazard(line), "{line:?}");
+        }
+        assert!(rendered.contains("before"), "{rendered:?}");
     }
 
     #[test]

@@ -83,9 +83,9 @@ fn as_json(table: &[OpSpec]) -> Value {
             .iter()
             .map(|op| {
                 json!({
-                    "name": describe::safe(&op.name),
+                    "name": op.name.as_ref(),
                     "summary": describe::optional(&op.summary),
-                    "path": describe::safe(&op.path),
+                    "path": op.path.as_ref(),
                     "content_type": describe::optional(&op.content_type),
                     "body_mode": describe::body_mode_name(op.body_mode),
                     "callable": op.body_mode != BodyMode::Unsupported,

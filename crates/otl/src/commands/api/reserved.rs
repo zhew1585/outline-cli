@@ -69,19 +69,21 @@ pub(super) fn dispatch(
         return print_command_help(root).map(|()| Next::Done);
     };
     if cmd.help {
-        return help_for(operation, mode, root).map(|()| Next::Done);
+        return help_for(cmd, operation, mode, root).map(|()| Next::Done);
     }
     match operation {
         LIST_OPERATION => {
             warn_if_shadowed(operation);
-            reject_request_flags(cmd, operation)?;
-            reject_extra_arguments(cmd, operation, 0)?;
+            let invocation = format!("otl api {LIST_OPERATION}");
+            reject_request_flags(cmd, &invocation)?;
+            reject_extra_arguments(cmd, &invocation, 0)?;
             list::run(mode).map(|()| Next::Done)
         }
         DESCRIBE_OPERATION => {
             warn_if_shadowed(operation);
-            reject_request_flags(cmd, operation)?;
-            reject_extra_arguments(cmd, operation, 1)?;
+            let invocation = format!("otl api {DESCRIBE_OPERATION}");
+            reject_request_flags(cmd, &invocation)?;
+            reject_extra_arguments(cmd, &invocation, 1)?;
             describe::run(find(subject(cmd)?)?, mode).map(|()| Next::Done)
         }
         _ => find(operation).map(Next::Call),
@@ -98,11 +100,36 @@ pub(super) fn dispatch(
 /// An unknown operation is deliberately an ERROR here rather than a
 /// fallback to the generic help: printing authoritative-looking text about
 /// something the caller did not ask about is the bug this replaces.
-fn help_for(operation: &str, mode: OutputMode, root: fn() -> Command) -> Result<(), CliError> {
+///
+/// For the same reason the alias is an alias in BOTH directions: it applies
+/// the checks `otl api describe <operation>` applies, so `otl api
+/// documents.info --help id=x` is the same usage error as `otl api describe
+/// documents.info id=x` rather than a success that silently discards
+/// `id=x`. Returning an authoritative-looking answer while throwing away
+/// part of the question is the defect this story is about, and the `--help`
+/// spelling of it was reachable for exactly one review cycle.
+fn help_for(
+    cmd: &ApiArgs,
+    operation: &str,
+    mode: OutputMode,
+    root: fn() -> Command,
+) -> Result<(), CliError> {
     if operation == LIST_OPERATION || operation == DESCRIBE_OPERATION {
         return print_command_help(root);
     }
-    describe::run(find(operation)?, mode)
+    // The NAME is resolved first, and the invocation shape second, which is
+    // the opposite order from the `describe` branch. Deliberate, and the
+    // asymmetry has a reason: in `otl api describe <op>` the positional
+    // count decides which name there even is, while here the name is
+    // already fixed - so with both a typo and a stray argument present, the
+    // typo is the root cause and the more useful thing to say.
+    let op = find(operation)?;
+    // Zero further positionals: the operation is the one already named, so
+    // a `key=value` here describes a request `--help` will never send.
+    let invocation = format!("otl api {} --help", crate::text::quote(operation));
+    reject_request_flags(cmd, &invocation)?;
+    reject_extra_arguments(cmd, &invocation, 0)?;
+    describe::run(op, mode)
 }
 
 /// Render `otl api --help` from the real command tree.
@@ -173,19 +200,24 @@ fn warn_if_shadowed(word: &str) {
 ///
 /// They describe a request that is not going to happen, so accepting them
 /// would be accepting an instruction the command cannot carry out.
-fn reject_request_flags(cmd: &ApiArgs, word: &str) -> Result<(), CliError> {
+///
+/// `invocation` is what the user typed, not just the reserved word: on the
+/// `--help` path the word IS an operation name, and "`otl api
+/// documents.info` sends no request" would be false of the command that
+/// name usually spells.
+fn reject_request_flags(cmd: &ApiArgs, invocation: &str) -> Result<(), CliError> {
     let named = cmd.body.is_some() || cmd.show_server_message || cmd.no_validate;
     if !named && cmd.limit.is_none() {
         return Ok(());
     }
     Err(CliError::usage(anyhow!(
-        "`otl api {word}` sends no request, so it takes no request flags \
+        "`{invocation}` sends no request, so it takes no request flags \
          (--body, --show-server-message, --no-validate, --limit)"
     )))
 }
 
 /// Refuse more positionals than a local path can mean.
-fn reject_extra_arguments(cmd: &ApiArgs, word: &str, allowed: usize) -> Result<(), CliError> {
+fn reject_extra_arguments(cmd: &ApiArgs, invocation: &str, allowed: usize) -> Result<(), CliError> {
     if cmd.args.len() <= allowed {
         return Ok(());
     }
@@ -194,7 +226,7 @@ fn reject_extra_arguments(cmd: &ApiArgs, word: &str, allowed: usize) -> Result<(
         _ => format!("exactly {allowed} further argument"),
     };
     Err(CliError::usage(anyhow!(
-        "`otl api {word}` takes {expected}, and {} were given",
+        "`{invocation}` takes {expected}, and {} were given",
         cmd.args.len()
     )))
 }

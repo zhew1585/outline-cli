@@ -242,6 +242,7 @@ fn a_stored_table_always_loads_back() {
             format: String::new().into(),
             minimum: None,
             maximum: None,
+            description: String::new().into(),
         })
         .collect::<Vec<_>>()
         .into();

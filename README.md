@@ -99,15 +99,20 @@ the one `otl spec sync` installed) and send nothing.
 otl api list                             # every operation: name, summary, path, content type, callable
 otl api describe documents.info          # one operation's full contract
 otl api documents.info --help            # the same thing, from the flag you would reach for
-otl api describe documents.list --json | jq '.parameters[] | select(.required)'
+otl api describe documents.list --json | jq '.parameters[] | {name, type, required, description}'
 ```
 
 `describe` prints exactly what the CLI itself knows: every parameter with its type, whether it is
-required, whether it may be `null`, its `format`, its allowed values and its numeric bounds — the same
-facets local validation enforces and `--no-validate` skips — plus the response fields, the request path
-and content type, whether the operation paginates, and which table the answer came from (`built-in` or
-`synced`). It does **not** print the per-parameter prose from the OpenAPI document: that text is not
-compiled into the binary.
+required, whether it may be `null`, its `format`, its allowed values, its numeric bounds — the same
+facets local validation enforces and `--no-validate` skips — and the one-line description the OpenAPI
+document gives it, plus the response fields, the request path and content type, whether the operation
+paginates, and which table the answer came from (`built-in` or `synced`).
+
+The descriptions matter more than they look. Of the 109 operations that take parameters, **29 mark none
+of them required** — `documents.info` declares both `id` and `shareId` optional, and only the prose says
+"either the UUID or the urlId is acceptable". Without that line, `required: false` everywhere reads as
+"nothing has to be sent". 23 of the 29 carry prose that resolves it; the remaining 6 are as loose
+upstream as they look here, and `describe` does not invent a constraint the spec never stated.
 
 Both obey the usual dual-state rule: a terminal gets a readable rendering, a pipe or `--json` gets
 JSON. (Before 0.2, `otl api list` printed its tab-separated form into pipes as well, `--json` included.
@@ -244,6 +249,13 @@ otl spec reset                         # go back to the spec built into this bin
 
 Nothing checks for spec updates on its own: `otl` never contacts the network unless a command you ran
 requires it.
+
+An `otl` upgrade can change the shape of the compiled operation table, and when it does, a cache written
+by the previous version is **discarded, not migrated**: interpreting an old table with new rules is a
+worse risk than rebuilding a file that is regenerable by definition. That is not an error — commands keep
+working on the spec built into the binary, and one stderr line says the cache was outdated and names
+`otl spec sync` as the fix. `otl doctor` reports it too. (0.2 does exactly this: the table now carries
+each parameter's description.)
 
 ## Checking your environment
 
