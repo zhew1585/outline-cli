@@ -29,6 +29,11 @@ const OPERATION: &str = "documents.info";
 
 /// Arguments for `otl docs view`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contract:
+  This command uses documents.info.
+
+  Inspect it with:
+    otl api describe documents.info --json")]
 pub struct ViewArgs {
     /// Document id (UUID or the short urlId from its URL).
     pub id: String,

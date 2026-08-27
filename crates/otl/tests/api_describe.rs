@@ -92,6 +92,58 @@ fn describe_prints_the_response_shape() {
     assert_eq!(id["read_only"], true);
 }
 
+#[test]
+fn describe_recursively_exposes_nested_response_paths() {
+    let contract = describe("documents.search");
+    let document = contract["response_fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .find(|field| field["name"] == "document")
+        .expect("search result has document");
+    assert_eq!(document["container"], "object");
+    let id = document["fields"]
+        .as_array()
+        .expect("document fields")
+        .iter()
+        .find(|field| field["name"] == "id")
+        .expect("documents.search exposes document.id");
+    assert_eq!(id["type"], "string");
+    assert_eq!(id["format"], "uuid");
+}
+
+#[test]
+fn every_curated_api_command_help_points_to_describe() {
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["docs", "search", "--help"],
+            &["documents.search", "collections.list"],
+        ),
+        (&["docs", "view", "--help"], &["documents.info"]),
+        (&["docs", "create", "--help"], &["documents.create"]),
+        (&["docs", "update", "--help"], &["documents.update"]),
+        (
+            &["docs", "export", "--help"],
+            &["documents.list", "documents.info"],
+        ),
+        (
+            &["collections", "list", "--help"],
+            &["collections.list", "collections.documents"],
+        ),
+    ];
+    for (args, operations) in cases {
+        let (stdout, stderr, code) = run(&mut otl(), args);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        for operation in *operations {
+            let command = format!("otl api describe {operation} --json");
+            assert!(
+                stdout.contains(&command),
+                "{args:?} misses {command}: {stdout}"
+            );
+        }
+    }
+}
+
 /// The facets `--no-validate` skips are exactly the ones a caller needs in
 /// order to send a valid value in the first place.
 #[test]

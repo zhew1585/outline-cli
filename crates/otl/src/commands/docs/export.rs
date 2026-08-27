@@ -40,6 +40,13 @@ const MAX_LISTED_FAILURES: usize = 20;
 
 /// Arguments for `otl docs export`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contracts:
+  This command enumerates documents with documents.list and fetches each
+  document with documents.info.
+
+  Inspect them with:
+    otl api describe documents.list --json
+    otl api describe documents.info --json")]
 pub struct ExportArgs {
     /// Collection to export (its id).
     #[arg(long, value_name = "ID")]

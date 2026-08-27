@@ -1,16 +1,16 @@
-//! JSON-schema walking: request-body parameters and their facets.
+//! JSON-schema walking: request-body parameters, response fields and their
+//! facets.
 //!
-//! Only top-level scalar properties are typed; everything else (objects,
-//! arrays, unions) becomes [`ScalarKind::Json`] and is reachable through a
-//! raw body only. `allOf` compositions and local `$ref`s into
-//! `components.schemas` are expanded, depth-bounded so that a reference
-//! cycle in an untrusted document is a typed error rather than a hang.
+//! Request objects stay flat because `key=value` can only address their
+//! top-level properties. Response objects are walked recursively and stored
+//! as a bounded pre-order list, so every operation exposes nested output
+//! paths without putting recursive containers into the on-disk IR.
 
 use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::{text, CompileError, CompiledField, CompiledParam, ScalarKind};
+use crate::{text, CompileError, CompiledField, CompiledParam, FieldContainer, ScalarKind};
 
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
@@ -258,7 +258,8 @@ pub(crate) fn extract_response_fields(
     };
     let mut fields = Vec::new();
     let mut seen = HashSet::new();
-    walk.collect_fields(item, 0, &mut fields, &mut seen)?;
+    let mut active_refs = HashSet::new();
+    walk.collect_fields(item, 0, 0, &mut fields, &mut seen, &mut active_refs)?;
     Ok(fields)
 }
 
@@ -308,20 +309,111 @@ impl Walk<'_> {
     fn collect_fields(
         &self,
         schema: &Value,
-        depth: usize,
+        schema_depth: usize,
+        field_depth: u8,
         out: &mut Vec<CompiledField>,
         seen: &mut HashSet<String>,
+        active_refs: &mut HashSet<String>,
     ) -> Result<(), CompileError> {
-        check_depth(depth)?;
+        check_depth(schema_depth)?;
+        if schema.get("oneOf").is_some() || schema.get("anyOf").is_some() {
+            // Alternatives are not one guaranteed response shape. The
+            // parent still records `Union`, but inventing shared children
+            // here would teach callers paths that may not exist.
+            return Ok(());
+        }
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            let resolved = resolve_ref(reference, self.components)?;
-            return self.collect_fields(resolved, depth + 1, out, seen);
+            return self.collect_ref_fields(
+                reference,
+                schema_depth,
+                field_depth,
+                out,
+                seen,
+                active_refs,
+            );
+        }
+        if schema.get("type").and_then(Value::as_str) == Some("array") {
+            return self.collect_item_fields(
+                schema,
+                schema_depth,
+                field_depth,
+                out,
+                seen,
+                active_refs,
+            );
         }
         if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
             for branch in branches {
-                self.collect_fields(branch, depth + 1, out, seen)?;
+                self.collect_fields(
+                    branch,
+                    schema_depth + 1,
+                    field_depth,
+                    out,
+                    seen,
+                    active_refs,
+                )?;
             }
         }
+        self.collect_properties(schema, field_depth, out, seen, active_refs)
+    }
+
+    /// Collect the fields of one array item. An array without a declared
+    /// `items` schema describes no reachable path, so it contributes nothing.
+    fn collect_item_fields(
+        &self,
+        schema: &Value,
+        schema_depth: usize,
+        field_depth: u8,
+        out: &mut Vec<CompiledField>,
+        seen: &mut HashSet<String>,
+        active_refs: &mut HashSet<String>,
+    ) -> Result<(), CompileError> {
+        match schema.get("items") {
+            Some(items) => {
+                self.collect_fields(items, schema_depth + 1, field_depth, out, seen, active_refs)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Follow one response `$ref`, stopping a recursive model at the finite
+    /// prefix already emitted on this branch.
+    fn collect_ref_fields(
+        &self,
+        reference: &str,
+        schema_depth: usize,
+        field_depth: u8,
+        out: &mut Vec<CompiledField>,
+        seen: &mut HashSet<String>,
+        active_refs: &mut HashSet<String>,
+    ) -> Result<(), CompileError> {
+        if !active_refs.insert(reference.to_string()) {
+            return Ok(());
+        }
+        let result = match resolve_ref(reference, self.components) {
+            Ok(resolved) => self.collect_fields(
+                resolved,
+                schema_depth + 1,
+                field_depth,
+                out,
+                seen,
+                active_refs,
+            ),
+            Err(error) => Err(error),
+        };
+        active_refs.remove(reference);
+        result
+    }
+
+    /// Emit one object's properties and then their bounded descendants.
+    fn collect_properties(
+        &self,
+        schema: &Value,
+        field_depth: u8,
+        out: &mut Vec<CompiledField>,
+        seen: &mut HashSet<String>,
+        active_refs: &mut HashSet<String>,
+    ) -> Result<(), CompileError> {
         let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
             return Ok(());
         };
@@ -332,13 +424,53 @@ impl Walk<'_> {
             let facets = self.facets(prop)?;
             out.push(CompiledField {
                 name: name.clone(),
-                ty: self.param_type(prop, depth)?,
+                ty: self.param_type(prop, 0)?,
                 format: facets.format,
                 nullable: facets.nullable,
                 read_only: facets.read_only,
+                depth: field_depth,
+                container: self.field_container(prop, 0)?,
             });
+            if usize::from(field_depth) < MAX_SCHEMA_DEPTH {
+                let mut child_seen = HashSet::new();
+                self.collect_fields(prop, 0, field_depth + 1, out, &mut child_seen, active_refs)?;
+            }
         }
         Ok(())
+    }
+
+    /// Classify a response property without changing its scalar wire type.
+    /// Keeping this separate from `ParamType` avoids making request parsing
+    /// pretend it can assemble nested objects from flat arguments.
+    fn field_container(
+        &self,
+        schema: &Value,
+        depth: usize,
+    ) -> Result<FieldContainer, CompileError> {
+        check_depth(depth)?;
+        if schema.get("oneOf").is_some() || schema.get("anyOf").is_some() {
+            return Ok(FieldContainer::Union);
+        }
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            return self.field_container(resolve_ref(reference, self.components)?, depth + 1);
+        }
+        if schema.get("type").and_then(Value::as_str) == Some("array") {
+            return Ok(FieldContainer::Array);
+        }
+        if schema.get("type").and_then(Value::as_str) == Some("object")
+            || schema.get("properties").is_some()
+        {
+            return Ok(FieldContainer::Object);
+        }
+        if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+            for branch in branches {
+                let container = self.field_container(branch, depth + 1)?;
+                if container != FieldContainer::None {
+                    return Ok(container);
+                }
+            }
+        }
+        Ok(FieldContainer::None)
     }
 }
 

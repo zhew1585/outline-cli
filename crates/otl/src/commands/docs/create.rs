@@ -23,6 +23,11 @@ const OPERATION: &str = "documents.create";
 
 /// Arguments for `otl docs create`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contract:
+  This command uses documents.create.
+
+  Inspect it with:
+    otl api describe documents.create --json")]
 pub struct CreateArgs {
     /// Document title. Without it Outline derives one from the body.
     #[arg(long, value_name = "TITLE")]

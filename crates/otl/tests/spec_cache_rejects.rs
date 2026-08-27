@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use engine::ir::{FieldSpec, OpSpec, ParamSpec, ParamType};
+use engine::ir::{FieldContainer, FieldSpec, OpSpec, ParamSpec, ParamType};
 use otl::spec::cache::{self, CacheMeta};
 use tempfile::TempDir;
 
@@ -30,6 +30,8 @@ fn a_cache_with_escapes_in_a_field_name_is_rejected() {
         format: String::new().into(),
         nullable: false,
         read_only: false,
+        depth: 0,
+        container: FieldContainer::None,
     }]
     .into();
     write_raw(
@@ -43,6 +45,34 @@ fn a_cache_with_escapes_in_a_field_name_is_rejected() {
     );
     let error = cache::load_at(&file).expect_err("must be refused");
     assert!(!error.is_stale(), "{error}");
+}
+
+#[test]
+fn a_cache_with_invalid_response_field_nesting_is_rejected() {
+    let (_dir, file) = temp_cache();
+    let mut hostile = op("things.info", "/api/things.info");
+    hostile.response_fields = vec![FieldSpec {
+        name: "id".to_string().into(),
+        ty: ParamType::String,
+        format: String::new().into(),
+        nullable: false,
+        read_only: false,
+        depth: 1,
+        container: FieldContainer::None,
+    }]
+    .into();
+    write_raw(
+        &file,
+        MAGIC,
+        FORMAT_VERSION,
+        &Body {
+            meta: meta(),
+            ops: vec![hostile],
+        },
+    );
+    let error = cache::load_at(&file).expect_err("must be refused");
+    assert!(!error.is_stale(), "{error}");
+    assert!(error.to_string().contains("nesting"), "{error}");
 }
 
 /// A table too large for the cache format must fail BEFORE any file is

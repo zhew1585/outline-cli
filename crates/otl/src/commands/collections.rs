@@ -67,6 +67,13 @@ enum CollectionsCommand {
 
 /// Arguments for `otl collections list`.
 #[derive(Debug, Args)]
+#[command(after_long_help = "API contracts:
+  Results come from collections.list. Unless --no-counts is used, document
+  counts also use collections.documents once per collection.
+
+  Inspect them with:
+    otl api describe collections.list --json
+    otl api describe collections.documents --json")]
 pub struct ListArgs {
     /// Stop after N collections (a warning says so on stderr).
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]

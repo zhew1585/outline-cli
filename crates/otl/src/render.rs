@@ -353,7 +353,7 @@ fn renders_visibly(raw: &str) -> bool {
 fn rank_schema_columns(schema: &[FieldSpec]) -> Vec<&str> {
     let scalars: Vec<&FieldSpec> = schema
         .iter()
-        .filter(|field| field.ty != ParamType::Json)
+        .filter(|field| field.depth == 0 && field.ty != ParamType::Json)
         .collect();
     let identity = scalars
         .iter()
