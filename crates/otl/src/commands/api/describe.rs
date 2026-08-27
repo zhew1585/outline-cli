@@ -194,10 +194,14 @@ fn param_json(param: &ParamSpec) -> Value {
 /// One response field, in the source schema's own declaration order.
 ///
 /// `fields_omitted` is the difference between "this object has no
-/// properties" and "this object's properties are not listed here": a
-/// recursive model has no finite expansion, and a field at the depth limit
-/// stops there. Without the flag an agent reading `"fields": []` is told a
-/// path it can legitimately use does not exist.
+/// properties" and "SOME of this object's properties are not listed here":
+/// a recursive model has no finite expansion, and a field at the depth
+/// limit stops there. Without the flag an agent reading `"fields": []` is
+/// told a path it can legitimately use does not exist.
+///
+/// Some, not all - it can be `true` on a field that also carries `fields`,
+/// which is what a recursive model with extra properties of its own looks
+/// like.
 fn field_json(field: &FieldSpec, fields: Vec<Value>) -> Value {
     json!({
         "name": field.name.as_ref(),

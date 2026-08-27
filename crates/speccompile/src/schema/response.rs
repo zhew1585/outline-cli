@@ -299,17 +299,56 @@ impl Walk<'_> {
         active_refs: &mut HashSet<String>,
     ) -> Result<bool, CompileError> {
         if usize::from(field_depth) >= MAX_SCHEMA_DEPTH {
-            // The limit, not the schema. Only a container has properties to
-            // leave out; a union's are not listed at any depth, by design.
-            return Ok(matches!(
-                container,
-                FieldContainer::Object | FieldContainer::Array
-            ));
+            // The limit, not the schema. Only a container can have
+            // properties to leave out (a union's are not listed at any
+            // depth, by design), and only one that DECLARES some: claiming
+            // omitted properties for an empty object would send a caller
+            // looking for a shape that does not exist, which is the same
+            // class of lie the flag exists to prevent.
+            return Ok(
+                matches!(container, FieldContainer::Object | FieldContainer::Array)
+                    && self.declares_properties(prop, 0)?,
+            );
         }
         let mut child_seen = HashSet::new();
         let emitted =
             self.collect_fields(prop, 0, field_depth + 1, out, &mut child_seen, active_refs)?;
         Ok(emitted == Emitted::Cut)
+    }
+
+    /// Whether a schema declares any property at all, following `$ref`,
+    /// `allOf` and `items` the way the walk itself does.
+    ///
+    /// Asked only at the depth limit, where the walk stops before it can
+    /// find out by walking: the answer decides whether that field says its
+    /// properties were left out. A structural question, so it looks for a
+    /// non-empty `properties` map and nothing else - it never emits a field
+    /// and cannot recurse past [`check_depth`].
+    fn declares_properties(&self, schema: &Value, depth: usize) -> Result<bool, CompileError> {
+        check_depth(depth)?;
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            return self.declares_properties(resolve_ref(reference, self.components)?, depth + 1);
+        }
+        if let Some(items) = schema.get("items") {
+            if schema.get("type").and_then(Value::as_str) == Some("array") {
+                return self.declares_properties(items, depth + 1);
+            }
+        }
+        if schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| !properties.is_empty())
+        {
+            return Ok(true);
+        }
+        if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+            for branch in branches {
+                if self.declares_properties(branch, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Classify a response property without changing its scalar wire type.
@@ -344,5 +383,215 @@ impl Walk<'_> {
             }
         }
         Ok(FieldContainer::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use crate::{compile_json, CompileOptions, FieldContainer};
+
+    fn opts() -> CompileOptions {
+        CompileOptions::with_prefix("/api")
+    }
+
+    #[test]
+    fn response_fields_recurse_through_objects_refs_and_array_items() {
+        let raw = serde_json::json!({
+            "paths": {"/things.list": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": {"type": "object", "properties": {
+                    "result": {"$ref": "#/components/schemas/Result"},
+                    "choice": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+                }}}
+            }}}}}},
+            "components": {"schemas": {"Result": {"type": "object", "properties": {
+                "id": {"type": "string", "format": "uuid"},
+                "items": {"type": "array", "items": {"type": "object", "properties": {
+                    "code": {"type": "integer"}
+                }}}
+            }}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let fields = &compiled.ops[0].response_fields;
+        let shape: Vec<(&str, u8, FieldContainer)> = fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.depth, field.container))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("result", 0, FieldContainer::Object),
+                ("id", 1, FieldContainer::None),
+                ("items", 1, FieldContainer::Array),
+                ("code", 2, FieldContainer::None),
+                ("choice", 0, FieldContainer::Union),
+            ]
+        );
+    }
+
+    /// A recursive model has no finite expansion, so the walk stops - and
+    /// the field that owns the cut subtree must SAY so. Without the flag it
+    /// is indistinguishable from an object with no properties, which denies
+    /// a path (`manager.manager.id`) that the API really serves.
+    #[test]
+    fn a_recursive_model_marks_the_field_whose_children_it_cut() {
+        let raw = serde_json::json!({
+            "paths": {"/things.info": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": {"type": "object", "properties": {
+                    "node": {"$ref": "#/components/schemas/Node"}
+                }}}
+            }}}}}},
+            "components": {"schemas": {"Node": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "manager": {"$ref": "#/components/schemas/Node"}
+            }}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let fields = &compiled.ops[0].response_fields;
+        let shape: Vec<(&str, u8, FieldContainer, bool)> = fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.as_str(),
+                    field.depth,
+                    field.container,
+                    field.children_omitted,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("node", 0, FieldContainer::Object, false),
+                ("id", 1, FieldContainer::None, false),
+                // The recursion stops here, and the field admits it.
+                ("manager", 1, FieldContainer::Object, true),
+            ]
+        );
+    }
+
+    /// `allOf: [$ref Self, {props}]` - a recursive model with extra fields
+    /// of its own - is where "children omitted" and "children listed" are
+    /// both true of one field. An earlier validator rejected exactly this
+    /// document, so the shape is pinned here as well as accepted.
+    #[test]
+    fn a_recursive_model_with_extra_properties_lists_them_and_marks_the_rest() {
+        let raw = serde_json::json!({
+            "paths": {"/things.info": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": {"type": "object", "properties": {
+                    "node": {"$ref": "#/components/schemas/Node"}
+                }}}
+            }}}}}},
+            "components": {"schemas": {"Node": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "manager": {"allOf": [
+                    {"$ref": "#/components/schemas/Node"},
+                    {"type": "object", "properties": {"note": {"type": "string"}}}
+                ]}
+            }}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("a legitimate document");
+        let fields = &compiled.ops[0].response_fields;
+        let shape: Vec<(&str, u8, bool)> = fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.depth, field.children_omitted))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("node", 0, false),
+                ("id", 1, false),
+                // Both at once: `note` is listed below it, the recursive
+                // half is not, and the flag reports the half that is gone.
+                ("manager", 1, true),
+                ("note", 2, false),
+            ]
+        );
+    }
+
+    /// A cut inside an ARRAY item marks the array, not something else: the
+    /// children of an array field describe one item, so that is the field
+    /// whose shape is incomplete.
+    #[test]
+    fn a_recursive_model_inside_an_array_marks_the_array_field() {
+        let raw = serde_json::json!({
+            "paths": {"/things.info": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": {"type": "object", "properties": {
+                    "node": {"$ref": "#/components/schemas/Node"}
+                }}}
+            }}}}}},
+            "components": {"schemas": {"Node": {"type": "object", "properties": {
+                "children": {"type": "array", "items": {"$ref": "#/components/schemas/Node"}}
+            }}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let fields = &compiled.ops[0].response_fields;
+        let shape: Vec<(&str, u8, FieldContainer, bool)> = fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.as_str(),
+                    field.depth,
+                    field.container,
+                    field.children_omitted,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("node", 0, FieldContainer::Object, false),
+                ("children", 1, FieldContainer::Array, true),
+            ]
+        );
+    }
+
+    /// The flag is a claim about the SCHEMA, so an object that declares no
+    /// properties must not carry it - not even at the depth limit, where
+    /// the walk stops before it could find out by walking. Claiming omitted
+    /// properties for an empty object sends a caller looking for a shape
+    /// that does not exist.
+    #[test]
+    fn an_object_with_no_properties_never_claims_omitted_children() {
+        let mut schema = serde_json::json!({"type": "object", "properties": {
+            "empty": {"type": "object"},
+            "loose": {"type": "array"}
+        }});
+        // Nest the pair past the depth limit, so the same assertion covers
+        // the limit branch as well as the ordinary one.
+        for _ in 0..(crate::MAX_SCHEMA_DEPTH + 2) {
+            schema = serde_json::json!({"type": "object", "properties": {"down": schema}});
+        }
+        let raw = serde_json::json!({
+            "paths": {"/things.info": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": schema}
+            }}}}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let fields = &compiled.ops[0].response_fields;
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.depth as usize == crate::MAX_SCHEMA_DEPTH),
+            "the fixture never reaches the depth limit: {:?}",
+            fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.depth))
+                .collect::<Vec<_>>()
+        );
+        for field in fields.iter() {
+            let empty_container = matches!(field.name.as_str(), "empty" | "loose");
+            assert!(
+                !(empty_container && field.children_omitted),
+                "{} declares no properties yet claims omitted children",
+                field.name
+            );
+        }
     }
 }

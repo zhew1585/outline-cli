@@ -246,14 +246,23 @@ fn plan(target: &Target, force: bool) -> Plan {
 fn write_document(target: &Target) -> std::io::Result<()> {
     let dir = target.dir();
     // Re-checked here, not just in `inspect`: `create_dir_all` succeeds on a
-    // symlink that points at a directory, and everything after it would
-    // then write through the link. Narrow rather than closed - the check and
-    // the write are still two steps - but it is the difference between a
-    // symlink being followed as a matter of course and only inside a race.
-    if std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    // link that points at a directory, and everything after it would then
+    // write through that link.
+    //
+    // Narrow rather than closed, deliberately, and the reason is what is at
+    // stake. The credential store closes the same window properly, with
+    // identity checks on an open descriptor, because what it guards is a
+    // secret. Here the payload is a public document and the directory
+    // belongs to the user: anyone who can plant a link inside their agent's
+    // skills directory can already plant a MALICIOUS SKILL there, which is
+    // strictly worse than redirecting this write. So the check buys "not
+    // followed as a matter of course", which is what the module promises,
+    // and `openat` plumbing would buy nothing more against the attacker who
+    // matters.
+    if std::fs::symlink_metadata(&dir).is_ok_and(|meta| targets::is_redirect(&meta)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "the skill directory is a symlink",
+            "the skill directory is a link to somewhere else",
         ));
     }
     std::fs::create_dir_all(&dir)?;

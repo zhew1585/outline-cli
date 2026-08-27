@@ -296,8 +296,14 @@ fn check_field_text(op: &OpSpec) -> Result<(), String> {
 /// ([`crate::commands::api::describe`] rebuilds a tree from this list): the
 /// first entry is top-level, a child is exactly one level below the entry
 /// it follows, its parent is an object or an array, and nothing exceeds the
-/// compiler's depth limit. A field that says its properties are omitted
-/// must not then be followed by them.
+/// compiler's depth limit.
+///
+/// A field may both LIST properties and declare that others are missing:
+/// `children_omitted` means some are not here, never that all are.
+/// `allOf: [$ref Self, {props}]` - a recursive model with extra fields -
+/// compiles to exactly that, and an earlier version of this check rejected
+/// it, so a legitimate document failed `otl spec sync` with a message about
+/// a tree that was in fact well formed.
 fn check_field_nesting(op: &OpSpec) -> Result<(), String> {
     let invalid = || {
         Err(format!(
@@ -308,7 +314,6 @@ fn check_field_nesting(op: &OpSpec) -> Result<(), String> {
         ))
     };
     let mut containers: Vec<engine::ir::FieldContainer> = Vec::new();
-    let mut omitted: Vec<bool> = Vec::new();
     for (index, field) in op.response_fields.iter().enumerate() {
         let depth = usize::from(field.depth);
         if depth > spec_compile::MAX_SCHEMA_DEPTH
@@ -318,12 +323,11 @@ fn check_field_nesting(op: &OpSpec) -> Result<(), String> {
             return invalid();
         }
         containers.truncate(depth);
-        omitted.truncate(depth);
         if depth > 0
-            && (!matches!(
+            && !matches!(
                 containers.get(depth - 1),
                 Some(engine::ir::FieldContainer::Object | engine::ir::FieldContainer::Array)
-            ) || omitted.get(depth - 1) == Some(&true))
+            )
         {
             return invalid();
         }
@@ -336,7 +340,6 @@ fn check_field_nesting(op: &OpSpec) -> Result<(), String> {
             return invalid();
         }
         containers.push(field.container);
-        omitted.push(field.children_omitted);
     }
     Ok(())
 }
