@@ -98,6 +98,8 @@ otl docs search deploy                        # full-text search
 otl docs list                                 # recently updated documents
 otl docs list deploy --collection <id>        # same workflow, scoped
 otl docs view <doc-id>                        # markdown; --raw to skip the pager, --web to open a browser
+otl docs view <doc-id> --outline              # heading tree, byte sizes, and the revision
+otl docs view <doc-id> --section 'Deploy'     # one section's markdown
 
 cat notes.md | otl docs create --title Notes --collection <collection-id>
 otl docs create --title Notes --collection <collection-id> --file notes.md
@@ -105,6 +107,8 @@ otl docs update <doc-id> --title "New title"
 cat revised.md | otl docs update <doc-id>
 printf '\nMore notes\n' | otl docs update <doc-id> --mode append
 printf 'new wording' | otl docs update <doc-id> --mode patch --find-text 'old wording'
+otl docs update <doc-id> --section 'Deploy' --file section.md --if-revision 12
+otl docs update <doc-id> --delete-section 'Deploy > Rollback'
 otl docs move <doc-id> --parent <parent-id> --index 0
 otl docs delete <doc-id>                      # trash; --archive to archive instead
 otl docs export --collection <collection-id> --out ./backup
@@ -135,12 +139,15 @@ otl completions zsh > ~/.zfunc/_otl           # bash, zsh, fish, powershell, elv
 otl skill install                             # install the bundled agent skill
 ```
 
-Four things worth knowing before you write a script:
+Five things worth knowing before you write a script:
 
-- **`docs view` is markdown-first.** A pipe gets the document body, not JSON — the body *is* the data here. Ask for `--json` to get the document object instead.
+- **`docs view` is markdown-first.** A pipe gets the document body, not JSON — the body *is* the data here. Ask for `--json` to get the document object instead. `--outline` is the exception: its datum is structure, so a pipe gets JSON.
 - **`docs list` returns two shapes**, because it dispatches to two operations. Without a query, `documents.list` rows (`.[].id`); with one, `documents.search` hits, where the document is nested (`.[].document.id`). Reach for `docs search` whenever there is a query.
 - **`docs create` and `docs update --json` return a receipt, not the document.** Identity fields only (`id`, `title`, `url`, `urlId`, `revision`, timestamps, …) — the body is not echoed back, so appending one line to a large page does not hand you the whole page. Read it back with `docs view <id> --json` when you need it.
+- **`--section` edits one section without you handling the rest.** The CLI reads the body, splices it, and derives a `findText` that occurs exactly once, so only the changed part is sent and no repeated heading can be patched by mistake. A section runs to the next heading of the same or a higher level, so it includes what is nested under it. Address it by title, by parent (`'Deploy > Rollback'`), or with the level pinned (`'## Deploy'`); an ambiguous address is refused with every match listed.
 - **Pagination never truncates silently.** `--limit N` is a cap you asked for: it warns and exits 0. The CLI's own page cap stopping a fetch early is not, and exits **9**.
+
+Any write can be pinned with `--if-revision <n>` — the number `docs view --outline` reports — and is refused if the document has moved on. Section edits and `--mode patch` pin themselves to the revision they read, so the only gap left is the one between *your* read and your write, which is what the flag closes.
 
 `--json` is the default whenever stdout is not a terminal, and it round-trips what the server sent.
 
