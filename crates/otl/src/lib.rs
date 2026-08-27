@@ -18,3 +18,5 @@ pub mod session;
 pub mod spec;
 pub mod stdio;
 pub mod text;
+
+mod user_dirs;

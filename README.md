@@ -378,8 +378,7 @@ Configuration comes from three layers, resolved **flag > environment > user conf
 an `OUTLINE_URL` in the environment does not discard the rest of the selected profile:
 
 ```toml
-# config.toml in your config directory (~/.config/outline-cli on Linux,
-# ~/Library/Application Support/outline-cli on macOS,
+# config.toml in your config directory (~/.config/outline-cli on Linux/macOS,
 # %APPDATA%\outline-cli\config on Windows). `otl --config FILE` overrides it.
 default_profile = "work"
 
