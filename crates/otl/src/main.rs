@@ -8,13 +8,17 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use otl::commands::api::{self, ApiArgs};
+use otl::commands::attachments::{self, AttachmentsArgs};
 use otl::commands::auth::{self, AuthArgs};
 use otl::commands::collections::{self, CollectionsArgs};
+use otl::commands::comments::{self, CommentsArgs};
 use otl::commands::completions::{self, CompletionsArgs};
 use otl::commands::docs::{self, DocsArgs};
 use otl::commands::doctor::{self, DoctorArgs};
+use otl::commands::fetch::{self, FetchArgs};
 use otl::commands::skill::{self, SkillArgs};
 use otl::commands::spec::{self, SpecArgs};
+use otl::commands::users::{self, UsersArgs};
 use otl::config::Overrides;
 use otl::exit::ExitCode;
 use otl::render;
@@ -60,12 +64,18 @@ impl Cli {
 enum Command {
     /// Call any API operation by name (output format unstable).
     Api(ApiArgs),
+    /// Request a pre-signed attachment upload.
+    Attachments(AttachmentsArgs),
     /// Sign in, sign out, and inspect stored credentials.
     Auth(AuthArgs),
-    /// Work with documents: search, view, create, update, export.
+    /// List, read, create, update, move, delete, and export documents.
     Docs(DocsArgs),
     /// Work with collections.
     Collections(CollectionsArgs),
+    /// List, create, update, resolve, and delete comments.
+    Comments(CommentsArgs),
+    /// Fetch a document, collection, user, or attachment by ID or URL.
+    Fetch(FetchArgs),
     /// Manage the OpenAPI spec this CLI dispatches from.
     Spec(SpecArgs),
     /// Check this environment: credentials, instance, and spec drift.
@@ -74,6 +84,8 @@ enum Command {
     Skill(SkillArgs),
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
     Completions(CompletionsArgs),
+    /// List and filter workspace users.
+    Users(UsersArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -89,13 +101,17 @@ fn main() -> std::process::ExitCode {
         // every other invocation because the builder is only invoked when
         // the help is actually wanted.
         Command::Api(args) => api::run(args, mode, &cli.overrides(), Cli::command),
+        Command::Attachments(args) => attachments::run(args, mode, &cli.overrides()),
         Command::Auth(args) => auth::run(args, mode, &cli.overrides()),
         Command::Docs(args) => docs::run(args, mode, cli.json, &cli.overrides()),
         Command::Collections(args) => collections::run(args, mode, &cli.overrides()),
+        Command::Comments(args) => comments::run(args, mode, &cli.overrides()),
+        Command::Fetch(args) => fetch::run(args, mode, &cli.overrides()),
         Command::Spec(args) => spec::run(args, mode),
         Command::Doctor(args) => doctor::run(args, mode, &cli.overrides()),
         Command::Skill(args) => skill::run(args, mode),
         Command::Completions(args) => completions::run(args, Cli::command()),
+        Command::Users(args) => users::run(args, mode, &cli.overrides()),
     };
     match result {
         Ok(()) => ExitCode::Success.into(),

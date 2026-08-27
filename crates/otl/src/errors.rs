@@ -97,6 +97,7 @@ pub fn server_answered(error: &EngineError) -> bool {
         EngineError::Api { .. }
         | EngineError::RateLimited { .. }
         | EngineError::InvalidResponse { .. }
+        | EngineError::UnexpectedResponse { .. }
         | EngineError::Pagination { .. }
         | EngineError::InvalidPaginationSpec { .. } => true,
         // A transport failure MAY have arrived - the reply is what went
@@ -184,7 +185,8 @@ fn classify_local(error: &EngineError) -> (ExitCode, String) {
         EngineError::Pagination { .. }
         | EngineError::InvalidPaginationSpec { .. }
         | EngineError::ClientBuild(_)
-        | EngineError::InvalidResponse { .. } => (ExitCode::Failure, error.to_string()),
+        | EngineError::InvalidResponse { .. }
+        | EngineError::UnexpectedResponse { .. } => (ExitCode::Failure, error.to_string()),
         // Handled by `classify`; listed so the match stays exhaustive and a
         // new variant still breaks the build.
         EngineError::Credential(_)

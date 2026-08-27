@@ -14,7 +14,7 @@
 //! `otl api` uses, from the same place, so the two can never drift.
 
 use anyhow::anyhow;
-use engine::{Client, Fetched, Truncation, TruncationCause, ValidationMode};
+use engine::{Client, ErrorDetail, Fetched, Truncation, TruncationCause, ValidationMode};
 use serde_json::Value;
 
 use crate::config::Overrides;
@@ -85,6 +85,34 @@ impl Session {
         Ok(take_data(&mut envelope))
     }
 
+    /// Call an operation with a complete JSON body and return its `data`
+    /// payload. This is for curated commands whose stable flags construct a
+    /// complex request that the scalar `key=value` path cannot represent.
+    pub fn call_raw_data(&self, operation: &str, body: &Value) -> Result<Value, CliError> {
+        let op = self.operation(operation)?;
+        let encoded = serde_json::to_string(body).map_err(|error| {
+            CliError::failure(anyhow!("failed to encode request body: {error}"))
+        })?;
+        let mut envelope = self
+            .client
+            .execute_raw(op, &encoded, ErrorDetail::Full)
+            .map_err(map_engine_error)?;
+        Ok(take_data(&mut envelope))
+    }
+
+    /// Call an operation whose successful response is an HTTP redirect and
+    /// return its validated absolute `Location` URL without following it.
+    pub fn call_redirect_location(
+        &self,
+        operation: &str,
+        args: &[(String, String)],
+    ) -> Result<String, CliError> {
+        let op = self.operation(operation)?;
+        self.client
+            .execute_redirect_location(op, args, ValidationMode::Strict)
+            .map_err(map_engine_error)
+    }
+
     /// Call one list operation, auto-paginating to the end (or to `limit`
     /// rows), and return the merged rows together with WHY the fetch
     /// stopped.
@@ -115,7 +143,7 @@ impl Session {
 
     /// Look up a compiled operation by name.
     fn operation(&self, operation: &str) -> Result<&'static engine::OpSpec, CliError> {
-        ops::find(operation).ok_or_else(|| {
+        ops::find_curated(operation).ok_or_else(|| {
             CliError::failure(anyhow!(
                 "internal error: operation {operation:?} is missing from the \
                  compiled API spec"

@@ -32,6 +32,7 @@ pub mod fetch;
 mod format;
 pub mod ir;
 pub mod paginate;
+mod redirect;
 pub mod retry;
 pub mod sanitize;
 mod scalar;

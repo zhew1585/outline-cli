@@ -31,6 +31,14 @@ include!(concat!(env!("OUT_DIR"), "/ir_table.rs"));
 /// The resolved table, computed once per process.
 static TABLE: OnceLock<&'static [OpSpec]> = OnceLock::new();
 
+/// Built-in definitions that stable commands must not lose to spec drift.
+const CURATED_OPERATIONS: &[&str] = &[
+    "collections.archive",
+    "comments.resolve",
+    "comments.unresolve",
+    "comments.list",
+];
+
 /// The operations this process uses: the synced table if one is usable,
 /// the built-in table otherwise.
 pub fn table() -> &'static [OpSpec] {
@@ -46,6 +54,18 @@ pub fn is_synced() -> bool {
 /// Look up an operation by its `resource.method` name.
 pub fn find(name: &str) -> Option<&'static OpSpec> {
     table().iter().find(|op| op.name == name)
+}
+
+/// Resolve a stable command's contract.
+///
+/// The generic API surface remains an exact view of a synced table. Stable
+/// commands use the vetted built-in definition for known upstream omissions,
+/// so a sync cannot remove or weaken those commands.
+pub(crate) fn find_curated(name: &str) -> Option<&'static OpSpec> {
+    if CURATED_OPERATIONS.contains(&name) {
+        return OPS.iter().find(|op| op.name == name);
+    }
+    find(name)
 }
 
 /// Resolve the effective table, warning about (and ignoring) a cache that
