@@ -45,6 +45,7 @@ fn response_fields_survive_the_round_trip() {
             read_only: true,
             depth: 0,
             container: FieldContainer::Object,
+            children_omitted: false,
         },
         FieldSpec {
             name: "id".to_string().into(),
@@ -54,6 +55,7 @@ fn response_fields_survive_the_round_trip() {
             read_only: true,
             depth: 1,
             container: FieldContainer::None,
+            children_omitted: false,
         },
         FieldSpec {
             name: "title".to_string().into(),
@@ -63,6 +65,7 @@ fn response_fields_survive_the_round_trip() {
             read_only: false,
             depth: 0,
             container: FieldContainer::None,
+            children_omitted: false,
         },
     ]
     .into();
@@ -81,6 +84,32 @@ fn response_fields_survive_the_round_trip() {
         loaded.ops[0].response_fields[0].container,
         FieldContainer::Object
     );
+    assert!(!loaded.ops[0].response_fields[0].children_omitted);
+}
+
+/// The `children_omitted` flag has to survive the round trip for the same
+/// reason the depth does: a synced table that lost it would present a
+/// recursive model as an object with no properties, which is the one thing
+/// the flag exists to prevent.
+#[test]
+fn an_omitted_children_marker_survives_the_round_trip() {
+    let (_dir, file) = temp_cache();
+    let mut op = op("documents.info", "/api/documents.info");
+    op.response_fields = vec![FieldSpec {
+        name: "parent".to_string().into(),
+        ty: ParamType::Json,
+        format: String::new().into(),
+        nullable: true,
+        read_only: true,
+        depth: 0,
+        container: FieldContainer::Object,
+        children_omitted: true,
+    }]
+    .into();
+    cache::store_at(&file, &[op.clone()], &meta()).expect("stores");
+    let loaded = cache::load_at(&file).expect("loads").expect("is present");
+    assert_eq!(loaded.ops[0], op);
+    assert!(loaded.ops[0].response_fields[0].children_omitted);
 }
 
 #[test]

@@ -21,10 +21,15 @@
 //!
 //! Its own document, and nothing else. A copy this CLI wrote (recognized by
 //! the `name` in its frontmatter) is replaced, because that is what an
-//! upgrade is. Another skill's `SKILL.md` needs `--force`. Anything that is
-//! not a regular file - a symlink, a directory - is refused whatever the
-//! flags say: following it would turn an install into a write somewhere
-//! else entirely.
+//! upgrade is. Another skill's `SKILL.md` needs `--force`.
+//!
+//! Two things are refused whatever the flags say, because following either
+//! turns an install into a write somewhere else entirely: a document path
+//! that is not a regular file, and a `<skills dir>/<skill>` directory that
+//! is a symlink. The skills directory ABOVE that may be a symlink - it is
+//! the one the user named or the one an agent created, and pointing it at a
+//! dotfiles checkout is ordinary - so the line is drawn exactly where this
+//! command stops following the user and starts creating paths of its own.
 
 mod targets;
 
@@ -225,9 +230,10 @@ fn plan(target: &Target, force: bool) -> Plan {
             ),
         },
         // Not overridable by `--force`, deliberately: see the module note.
-        Installed::Unusable { reason } => Plan::Refuse {
-            reason: format!("the installed path {reason}; remove it by hand"),
-        },
+        // The reason arrives complete, with the remedy that fits THAT case:
+        // "remove it by hand" is wrong advice for a `--dir` that names a
+        // file, and it was what a single appended suffix produced.
+        Installed::Unusable { reason } => Plan::Refuse { reason },
     }
 }
 
@@ -239,6 +245,17 @@ fn plan(target: &Target, force: bool) -> Plan {
 /// on Windows too, which `std::fs::rename` does not.
 fn write_document(target: &Target) -> std::io::Result<()> {
     let dir = target.dir();
+    // Re-checked here, not just in `inspect`: `create_dir_all` succeeds on a
+    // symlink that points at a directory, and everything after it would
+    // then write through the link. Narrow rather than closed - the check and
+    // the write are still two steps - but it is the difference between a
+    // symlink being followed as a matter of course and only inside a race.
+    if std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the skill directory is a symlink",
+        ));
+    }
     std::fs::create_dir_all(&dir)?;
     let mut file = tempfile::Builder::new()
         .prefix(".skill-")

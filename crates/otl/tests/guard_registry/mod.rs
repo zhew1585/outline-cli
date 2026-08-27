@@ -375,13 +375,13 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
     Exception {
         file: "crates/otl/src/commands/skill/targets.rs",
         pattern: "read_to_string",
-        context: "match std::fs::read_to_string(&path)",
+        context: "match std::fs::read_to_string(path)",
         count: 1,
     },
     Exception {
         file: "crates/otl/src/commands/skill/targets.rs",
         pattern: "fs::read",
-        context: "match std::fs::read_to_string(&path)",
+        context: "match std::fs::read_to_string(path)",
         count: 1,
     },
 ];

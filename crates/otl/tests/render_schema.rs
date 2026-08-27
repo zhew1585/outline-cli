@@ -36,6 +36,7 @@ fn field(
         read_only,
         depth: 0,
         container: FieldContainer::None,
+        children_omitted: false,
     }
 }
 

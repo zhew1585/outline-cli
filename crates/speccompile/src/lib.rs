@@ -128,6 +128,17 @@ pub struct CompiledField {
     pub depth: u8,
     /// Shape of a complex response field. Scalars use [`FieldContainer::None`].
     pub container: FieldContainer,
+    /// Whether this field's own properties are NOT in the list although the
+    /// schema declares some.
+    ///
+    /// Two schemas produce it, and a caller needs neither distinguished nor
+    /// hidden: a model that repeats one already open on this branch (a
+    /// recursive model, whose expansion has no end), and an object that
+    /// sits at the depth limit. Without this flag such a field is
+    /// indistinguishable from an object that genuinely has no properties -
+    /// which would tell an agent that a path it can legitimately use does
+    /// not exist.
+    pub children_omitted: bool,
 }
 
 /// Container shape of a response field whose scalar kind is JSON.

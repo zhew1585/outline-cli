@@ -24,16 +24,7 @@ use common::cache::{
 fn a_cache_with_escapes_in_a_field_name_is_rejected() {
     let (_dir, file) = temp_cache();
     let mut hostile = op("things.info", "/api/things.info");
-    hostile.response_fields = vec![FieldSpec {
-        name: "id\u{1b}[31m".to_string().into(),
-        ty: ParamType::String,
-        format: String::new().into(),
-        nullable: false,
-        read_only: false,
-        depth: 0,
-        container: FieldContainer::None,
-    }]
-    .into();
+    hostile.response_fields = vec![field("id\u{1b}[31m", 0, FieldContainer::None)].into();
     write_raw(
         &file,
         MAGIC,
@@ -47,19 +38,106 @@ fn a_cache_with_escapes_in_a_field_name_is_rejected() {
     assert!(!error.is_stale(), "{error}");
 }
 
-#[test]
-fn a_cache_with_invalid_response_field_nesting_is_rejected() {
-    let (_dir, file) = temp_cache();
-    let mut hostile = op("things.info", "/api/things.info");
-    hostile.response_fields = vec![FieldSpec {
-        name: "id".to_string().into(),
+/// One response field, as a cache would carry it.
+fn field(name: &str, depth: u8, container: FieldContainer) -> FieldSpec {
+    FieldSpec {
+        name: name.to_string().into(),
         ty: ParamType::String,
         format: String::new().into(),
         nullable: false,
         read_only: false,
-        depth: 1,
-        container: FieldContainer::None,
-    }]
+        depth,
+        container,
+        children_omitted: false,
+    }
+}
+
+/// Every way the pre-order encoding can be wrong, because
+/// `api describe` REBUILDS A TREE from it: a list that does not encode one
+/// makes children attach to the wrong parent, and a wrong contract is worse
+/// than no contract. One case per rule in `check_field_nesting`, so a rule
+/// deleted from the validator turns exactly one of these red.
+#[test]
+fn a_cache_with_invalid_response_field_nesting_is_rejected() {
+    let cases: Vec<(&str, Vec<FieldSpec>)> = vec![
+        (
+            "the first field is not top-level",
+            vec![field("id", 1, FieldContainer::None)],
+        ),
+        (
+            "a depth jump of more than one level",
+            vec![
+                field("document", 0, FieldContainer::Object),
+                field("id", 2, FieldContainer::None),
+            ],
+        ),
+        (
+            "a child under a scalar",
+            vec![
+                field("title", 0, FieldContainer::None),
+                field("id", 1, FieldContainer::None),
+            ],
+        ),
+        (
+            "a child under a union, whose alternatives are not one shape",
+            vec![
+                field("either", 0, FieldContainer::Union),
+                field("id", 1, FieldContainer::None),
+            ],
+        ),
+        (
+            "a scalar that claims its properties are omitted",
+            vec![FieldSpec {
+                children_omitted: true,
+                ..field("title", 0, FieldContainer::None)
+            }],
+        ),
+        (
+            "a field that claims omitted properties and then lists them",
+            vec![
+                FieldSpec {
+                    children_omitted: true,
+                    ..field("document", 0, FieldContainer::Object)
+                },
+                field("id", 1, FieldContainer::None),
+            ],
+        ),
+    ];
+    for (case, fields) in cases {
+        let (_dir, file) = temp_cache();
+        let mut hostile = op("things.info", "/api/things.info");
+        hostile.response_fields = fields.into();
+        write_raw(
+            &file,
+            MAGIC,
+            FORMAT_VERSION,
+            &Body {
+                meta: meta(),
+                ops: vec![hostile],
+            },
+        );
+        let error = cache::load_at(&file).expect_err(case);
+        assert!(!error.is_stale(), "{case}: {error}");
+        assert!(error.to_string().contains("nesting"), "{case}: {error}");
+    }
+}
+
+/// The other half of the same rule: a legitimately nested table LOADS. A
+/// validator that rejected everything would pass the test above and make
+/// the feature useless.
+#[test]
+fn a_cache_with_valid_response_field_nesting_is_accepted() {
+    let (_dir, file) = temp_cache();
+    let mut nested = op("things.info", "/api/things.info");
+    nested.response_fields = vec![
+        field("document", 0, FieldContainer::Object),
+        field("id", 1, FieldContainer::None),
+        FieldSpec {
+            children_omitted: true,
+            ..field("parent", 1, FieldContainer::Object)
+        },
+        field("title", 0, FieldContainer::None),
+    ]
     .into();
     write_raw(
         &file,
@@ -67,12 +145,14 @@ fn a_cache_with_invalid_response_field_nesting_is_rejected() {
         FORMAT_VERSION,
         &Body {
             meta: meta(),
-            ops: vec![hostile],
+            ops: vec![nested],
         },
     );
-    let error = cache::load_at(&file).expect_err("must be refused");
-    assert!(!error.is_stale(), "{error}");
-    assert!(error.to_string().contains("nesting"), "{error}");
+    let loaded = cache::load_at(&file)
+        .expect("a bounded pre-order tree is usable")
+        .expect("a cache is present");
+    assert_eq!(loaded.ops[0].response_fields.len(), 4);
+    assert!(loaded.ops[0].response_fields[2].children_omitted);
 }
 
 /// A table too large for the cache format must fail BEFORE any file is

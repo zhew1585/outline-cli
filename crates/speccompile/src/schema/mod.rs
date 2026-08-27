@@ -1,16 +1,21 @@
-//! JSON-schema walking: request-body parameters, response fields and their
-//! facets.
+//! JSON-schema walking: request-body parameters and their facets.
 //!
 //! Request objects stay flat because `key=value` can only address their
-//! top-level properties. Response objects are walked recursively and stored
-//! as a bounded pre-order list, so every operation exposes nested output
-//! paths without putting recursive containers into the on-disk IR.
+//! top-level properties. The response half - walked recursively and stored
+//! as a bounded pre-order list, so that nested output paths are exposed
+//! without putting recursive containers into the on-disk IR - lives in
+//! [`response`], which shares this module's [`Walk`] and its `$ref`
+//! resolution.
 
 use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::{text, CompileError, CompiledField, CompiledParam, FieldContainer, ScalarKind};
+use crate::{text, CompileError, CompiledParam, ScalarKind};
+
+mod response;
+
+pub(crate) use response::extract_response_fields;
 
 /// JSON pointer prefix for local component-schema references.
 const COMPONENTS_SCHEMAS_REF: &str = "#/components/schemas/";
@@ -225,253 +230,6 @@ fn merge_facets(schema: &Value, facets: &mut Facets) {
     facets.maximum = facets
         .maximum
         .or_else(|| schema.get("maximum").and_then(Value::as_f64));
-}
-
-/// JSON pointer to the success response schema of an operation. `~1` is
-/// the pointer escape for the `/` in `application/json`.
-const SUCCESS_SCHEMA_POINTER: &str = "/responses/200/content/application~1json/schema";
-
-/// Fields of one item of an operation's success payload.
-///
-/// The envelope (`{"data": ...}`, named by the caller) and the
-/// list-vs-object distinction are resolved here; an operation whose
-/// document describes no success schema, or whose payload is not an
-/// object, yields no fields and leaves the renderer to fall back on the
-/// data it receives.
-pub(crate) fn extract_response_fields(
-    post: &Value,
-    components: &Value,
-    envelope_property: &str,
-) -> Result<Vec<CompiledField>, CompileError> {
-    let Some(schema) = post.pointer(SUCCESS_SCHEMA_POINTER) else {
-        return Ok(Vec::new());
-    };
-    let walk = Walk {
-        components,
-        params: Vec::new(),
-        seen: HashSet::new(),
-        required: HashSet::new(),
-        root_union: false,
-    };
-    let Some(item) = walk.response_item_schema(schema, envelope_property, 0)? else {
-        return Ok(Vec::new());
-    };
-    let mut fields = Vec::new();
-    let mut seen = HashSet::new();
-    let mut active_refs = HashSet::new();
-    walk.collect_fields(item, 0, 0, &mut fields, &mut seen, &mut active_refs)?;
-    Ok(fields)
-}
-
-impl Walk<'_> {
-    /// Walk from a response schema to the schema of one payload item.
-    fn response_item_schema<'a>(
-        &'a self,
-        schema: &'a Value,
-        envelope_property: &str,
-        depth: usize,
-    ) -> Result<Option<&'a Value>, CompileError> {
-        check_depth(depth)?;
-        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            let resolved = resolve_ref(reference, self.components)?;
-            return self.response_item_schema(resolved, envelope_property, depth + 1);
-        }
-        let payload = if envelope_property.is_empty() {
-            Some(schema)
-        } else {
-            schema.pointer(&format!("/properties/{envelope_property}"))
-        };
-        match payload {
-            Some(payload) => self.unwrap_array(payload, depth).map(Some),
-            None => Ok(None),
-        }
-    }
-
-    /// The item schema of an array, or the schema itself when it is not one.
-    fn unwrap_array<'a>(
-        &'a self,
-        schema: &'a Value,
-        depth: usize,
-    ) -> Result<&'a Value, CompileError> {
-        check_depth(depth)?;
-        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            let resolved = resolve_ref(reference, self.components)?;
-            return self.unwrap_array(resolved, depth + 1);
-        }
-        Ok(match schema.get("items") {
-            Some(items) if schema.get("type").and_then(Value::as_str) == Some("array") => items,
-            _ => schema,
-        })
-    }
-
-    /// Collect response fields in declaration order, expanding `$ref` and
-    /// `allOf`. The first definition of a name wins.
-    fn collect_fields(
-        &self,
-        schema: &Value,
-        schema_depth: usize,
-        field_depth: u8,
-        out: &mut Vec<CompiledField>,
-        seen: &mut HashSet<String>,
-        active_refs: &mut HashSet<String>,
-    ) -> Result<(), CompileError> {
-        check_depth(schema_depth)?;
-        if schema.get("oneOf").is_some() || schema.get("anyOf").is_some() {
-            // Alternatives are not one guaranteed response shape. The
-            // parent still records `Union`, but inventing shared children
-            // here would teach callers paths that may not exist.
-            return Ok(());
-        }
-        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            return self.collect_ref_fields(
-                reference,
-                schema_depth,
-                field_depth,
-                out,
-                seen,
-                active_refs,
-            );
-        }
-        if schema.get("type").and_then(Value::as_str) == Some("array") {
-            return self.collect_item_fields(
-                schema,
-                schema_depth,
-                field_depth,
-                out,
-                seen,
-                active_refs,
-            );
-        }
-        if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
-            for branch in branches {
-                self.collect_fields(
-                    branch,
-                    schema_depth + 1,
-                    field_depth,
-                    out,
-                    seen,
-                    active_refs,
-                )?;
-            }
-        }
-        self.collect_properties(schema, field_depth, out, seen, active_refs)
-    }
-
-    /// Collect the fields of one array item. An array without a declared
-    /// `items` schema describes no reachable path, so it contributes nothing.
-    fn collect_item_fields(
-        &self,
-        schema: &Value,
-        schema_depth: usize,
-        field_depth: u8,
-        out: &mut Vec<CompiledField>,
-        seen: &mut HashSet<String>,
-        active_refs: &mut HashSet<String>,
-    ) -> Result<(), CompileError> {
-        match schema.get("items") {
-            Some(items) => {
-                self.collect_fields(items, schema_depth + 1, field_depth, out, seen, active_refs)
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// Follow one response `$ref`, stopping a recursive model at the finite
-    /// prefix already emitted on this branch.
-    fn collect_ref_fields(
-        &self,
-        reference: &str,
-        schema_depth: usize,
-        field_depth: u8,
-        out: &mut Vec<CompiledField>,
-        seen: &mut HashSet<String>,
-        active_refs: &mut HashSet<String>,
-    ) -> Result<(), CompileError> {
-        if !active_refs.insert(reference.to_string()) {
-            return Ok(());
-        }
-        let result = match resolve_ref(reference, self.components) {
-            Ok(resolved) => self.collect_fields(
-                resolved,
-                schema_depth + 1,
-                field_depth,
-                out,
-                seen,
-                active_refs,
-            ),
-            Err(error) => Err(error),
-        };
-        active_refs.remove(reference);
-        result
-    }
-
-    /// Emit one object's properties and then their bounded descendants.
-    fn collect_properties(
-        &self,
-        schema: &Value,
-        field_depth: u8,
-        out: &mut Vec<CompiledField>,
-        seen: &mut HashSet<String>,
-        active_refs: &mut HashSet<String>,
-    ) -> Result<(), CompileError> {
-        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-            return Ok(());
-        };
-        for (name, prop) in properties {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let facets = self.facets(prop)?;
-            out.push(CompiledField {
-                name: name.clone(),
-                ty: self.param_type(prop, 0)?,
-                format: facets.format,
-                nullable: facets.nullable,
-                read_only: facets.read_only,
-                depth: field_depth,
-                container: self.field_container(prop, 0)?,
-            });
-            if usize::from(field_depth) < MAX_SCHEMA_DEPTH {
-                let mut child_seen = HashSet::new();
-                self.collect_fields(prop, 0, field_depth + 1, out, &mut child_seen, active_refs)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Classify a response property without changing its scalar wire type.
-    /// Keeping this separate from `ParamType` avoids making request parsing
-    /// pretend it can assemble nested objects from flat arguments.
-    fn field_container(
-        &self,
-        schema: &Value,
-        depth: usize,
-    ) -> Result<FieldContainer, CompileError> {
-        check_depth(depth)?;
-        if schema.get("oneOf").is_some() || schema.get("anyOf").is_some() {
-            return Ok(FieldContainer::Union);
-        }
-        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            return self.field_container(resolve_ref(reference, self.components)?, depth + 1);
-        }
-        if schema.get("type").and_then(Value::as_str) == Some("array") {
-            return Ok(FieldContainer::Array);
-        }
-        if schema.get("type").and_then(Value::as_str) == Some("object")
-            || schema.get("properties").is_some()
-        {
-            return Ok(FieldContainer::Object);
-        }
-        if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
-            for branch in branches {
-                let container = self.field_container(branch, depth + 1)?;
-                if container != FieldContainer::None {
-                    return Ok(container);
-                }
-            }
-        }
-        Ok(FieldContainer::None)
-    }
 }
 
 /// Schema constraint facets carried into the IR for local validation.
