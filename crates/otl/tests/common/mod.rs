@@ -61,13 +61,13 @@ pub const CACHE_DIR_ENV: &str = "OTL_CACHE_DIR";
 ///
 /// - credentials and instance (`OUTLINE_URL`, `OUTLINE_API_KEY`);
 /// - the user config file and profile selection (`OUTLINE_CONFIG` empty
-///   means "read no file at all", Story 4.1);
-/// - the CREDENTIAL file (`OUTLINE_CONFIG_DIR`, Story 2.6): every command
+///   means "read no file at all");
+/// - the CREDENTIAL file (`OUTLINE_CONFIG_DIR`): every command
 ///   now builds its request channel through `otl::auth`, which looks there
 ///   before it will send anything, so a developer with a stored session
 ///   would get different results from these tests than CI does;
 /// - the synced spec cache, which decides which operations exist at all
-///   (Story 4.2) - pointed at a directory that cannot contain one;
+///   - pointed at a directory that cannot contain one;
 /// - and the output environment (`PAGER`, `BROWSER`).
 pub fn otl() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
@@ -105,7 +105,7 @@ where
 
 /// A cache directory guaranteed to hold no synced spec.
 ///
-/// Story 4.2 made the effective operation table prefer a synced spec cache
+/// The effective operation table prefers a synced spec cache
 /// over the one compiled into the binary. Every test that runs the binary
 /// therefore has to say which of the two it means, or its assertions
 /// silently depend on whether the machine happens to have run `otl spec

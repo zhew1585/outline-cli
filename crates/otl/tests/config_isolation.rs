@@ -1,4 +1,4 @@
-//! Story 4.1: the credential-release boundary is structural.
+//! The credential-release boundary is structural.
 //!
 //! The gate ([`otl::config::release_token`]) is only as strong as the state
 //! it decides from, so three things have to be impossible to forge:
@@ -16,7 +16,7 @@
 //! proof token - and none of them is an ancestor of the others.
 //!
 //! These tests check that from both sides: an external crate (what a library
-//! consumer can do) and a sibling module inside `config` (what the Epic 2
+//! consumer can do) and a sibling module inside `config`
 //! credential source would be able to do).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]

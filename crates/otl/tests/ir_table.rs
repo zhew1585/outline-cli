@@ -37,7 +37,7 @@ fn spec_operation_names(spec: &Value) -> Vec<String> {
 fn table_compiles_every_spec_operation() {
     let spec = vendored_spec();
     let expected = spec_operation_names(&spec);
-    // Sanity: the vendored spec is the full API, not the Story 1.1 subset.
+    // Sanity: the vendored spec is the full API.
     assert!(
         expected.len() > 100,
         "vendored spec unexpectedly small: {} ops",
@@ -355,7 +355,7 @@ fn find_returns_none_for_unknown_operation() {
 }
 
 // ---------------------------------------------------------------------------
-// Story 1-5b: response-shape descriptors compiled into the IR.
+// Response-shape descriptors compiled into the IR.
 // ---------------------------------------------------------------------------
 
 /// Field names of an operation's compiled response shape, in order.

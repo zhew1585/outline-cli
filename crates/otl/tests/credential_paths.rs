@@ -1,15 +1,13 @@
 //! Guard: how many ways there are to obtain a credential, and where they are.
 //!
-//! "A credential must not cross instances" has been fixed four times on four
-//! different paths in this track: the read path (R1), the write path (R2),
-//! `otl auth logout`'s revocation anchor (R3), and `otl auth info`'s live
-//! identity check (R6). Every fix was correct. Every one of them left the
-//! next path to be found by the next reviewer, because each path did its own
-//! resolution and each rule was therefore stated more than once.
+//! "A credential must not cross instances" is enforced on four paths: the
+//! read path, the write path, `otl auth logout`'s revocation anchor, and
+//! `otl auth info`'s live identity check. Each rule is stated once and
+//! shared, so no path resolves on its own.
 //!
-//! This file answers the question that keeps being asked - *what else can
-//! obtain a credential without going through the gate?* - as a test rather
-//! than as an assurance. There are THREE credential classes, they have
+//! This file answers the question - *what else can obtain a credential
+//! without going through the gate?* - as a test rather than as an
+//! assurance. There are THREE credential classes, they have
 //! different correct anchors, and each has exactly one entrance:
 //!
 //! | class | what it authenticates | entrance | anchor |
@@ -117,7 +115,7 @@ const CONFINED: &[Confined] = &[
         why: "which store supplies a fixed key is decided once, next to the \
               release that acts on the decision",
     },
-    // The rule R6 [N1] broke. `auth` reading this variable at all is the bug:
+    // `auth` reading this variable at all is the bug:
     // config scopes an environment key to the selected profile
     // (`OUTLINE_API_KEY_<PROFILE>`) and refuses to fall back to the global
     // one, and a module that names the global variable is a module that can

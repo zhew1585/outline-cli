@@ -1,9 +1,9 @@
-//! NFR4: the CLI never reaches the network on its own.
+//! The CLI never reaches the network on its own.
 //!
 //! No update check, no spec check, no telemetry - a request happens only
-//! because the user asked for one. Story 4.2 adds the first non-API
-//! network call to the codebase (fetching a spec), so the guard here is
-//! about keeping it confined to the one command that owns it.
+//! because the user asked for one. Fetching a spec is the one non-API
+//! network call in the codebase, so the guard here is about keeping it
+//! confined to the one command that owns it.
 //!
 //! Two layers:
 //!

@@ -1,4 +1,4 @@
-//! `otl api list` end-to-end tests (Story 1.2, dual state from Story 4.6).
+//! `otl api list` end-to-end tests.
 //!
 //! The listing is purely local, so every case here runs without an instance
 //! URL, without a credential and without a network.
@@ -7,7 +7,7 @@
 //!
 //! `assert_cmd` captures stdout through a pipe, so these runs are exactly
 //! the non-TTY state the CLI contract describes: `--json` is the default
-//! whenever stdout is not a terminal. Until Story 4.6 this command printed
+//! whenever stdout is not a terminal. This command used to print
 //! its terminal form there instead - including when `--json` was passed
 //! explicitly - which is the bug this file now pins shut. The terminal form
 //! is unit-tested in `commands::api::list`, because no integration test can

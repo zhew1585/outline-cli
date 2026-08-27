@@ -7,9 +7,9 @@
 //! the same directory - which is exactly why the grading rule below is worth
 //! its own file.
 //!
-//! Story 2.6 owns the report this consumes
-//! ([`crate::auth::report::credential_health`]); nothing here re-derives any
-//! of it, and nothing here can reach a credential value.
+//! The report this consumes is [`crate::auth::report::credential_health`];
+//! nothing here re-derives any of it, and nothing here can reach a
+//! credential value.
 
 use serde_json::Value;
 
@@ -24,10 +24,9 @@ use super::report::{optional, Check, Status};
 /// How credentials are protected where there are no POSIX permission bits.
 ///
 /// Stated unconditionally on that platform, not only when a credential file
-/// happens to exist: Story 2.6 AC 6 requires `doctor` to be explicit about
-/// the platform difference, and "no file yet" is exactly when a user is
-/// deciding whether to trust this machine with one. Never printed on Unix,
-/// where it would be false.
+/// happens to exist: "no file yet" is exactly when a user is deciding
+/// whether to trust this machine with one. Never printed on Unix, where it
+/// would be false.
 pub const WINDOWS_PROTECTION_NOTE: &str =
     "on Windows otl sets no permission bits: this platform has none. Protection \
      relies entirely on the per-user ACL of your profile directory, so keep the \
@@ -92,8 +91,7 @@ fn file_check(health: &CredentialHealth) -> Check {
         .fact("plaintext_key_in_environment", health.env_api_key)
         // WITHOUT the store-wide `usable:` line: this check grades the file
         // and the directory separately, and in the directory-only case it is
-        // about to be used. A composite "usable: no" here would be the same
-        // contradiction R1 removed from the exit code and the field names.
+        // about to be used.
         .detailed(health.lines_without_verdict())
         .detailed(protection_note().map(str::to_string))
 }
@@ -108,55 +106,39 @@ fn file_is_usable(health: &CredentialHealth) -> bool {
 
 /// How the credential file and the directory around it are graded.
 ///
-/// The two are deliberately NOT the same verdict, and this is the one place
-/// that decides:
+/// The two are NOT the same verdict, and this is the one place that
+/// decides:
 ///
 /// - **the file itself** unusable - permissions widened, not a regular file,
 ///   a symlink (dangling or not), owned by someone else, malformed, or
-///   written by a newer version - is a PROBLEM (exit 2, see
-///   `docs/exit-codes.md`). No command can use it:
-///   `secret_file::read_checked` refuses it on the open descriptor, so
-///   `doctor` and every other command give the same answer, and nothing is
-///   sent.
-///
-///   That agreement is not free, and it was not there at first: it holds
-///   because [`crate::auth::file_guard::permissions`] uses
+///   written by a newer version - is a PROBLEM (exit 2). No command can use
+///   it: `secret_file::read_checked` refuses it on the open descriptor, so
+///   `doctor` and every other command give the same answer (this agreement
+///   holds because [`crate::auth::file_guard::permissions`] uses
 ///   `symlink_metadata`, i.e. asks the same question the `O_NOFOLLOW` open
-///   asks. While it followed links, a DANGLING one reported `Missing` and
-///   the report called the path empty and healthy while every read of it
-///   failed.
+///   asks).
 /// - **only the directory** being writable by other users, with a sound
 ///   owner-only file inside it, is a WARNING, and `credential` and
 ///   `connectivity` go on to use that file.
 ///
-/// Three things make the warning the honest grade rather than a downgrade:
+/// Why the warning is the honest grade rather than a downgrade:
 ///
 /// 1. the file is opened `O_NOFOLLOW` and then checked THROUGH the open
 ///    descriptor by `require_regular_owned`, which demands the caller's own
-///    uid. Another user with write access to the directory therefore cannot
-///    plant a file this CLI will read - they cannot create one the victim
-///    owns - and a symlink is refused outright;
+///    uid, so another user with write access to the directory cannot plant
+///    a file this CLI will read;
 /// 2. the file is 0600, so they cannot read the credential either;
-/// 3. Story 2.6 Task 1 deliberately does NOT re-permission an EXISTING
-///    directory ("silently changing someone's home directory is overreach"),
-///    so refusing to work in one would contradict the story that created it.
+/// 3. the CLI does not re-permission an EXISTING directory, so refusing to
+///    work in one would contradict the code that created it.
 ///
 /// What is left is deletion, or replacement with a file that then gets
 /// refused: nuisance and denial of service, not confidentiality or
 /// integrity. That is a warning.
 ///
-/// It is still REPORTED, with the directory's actual mode, which is exactly
-/// what Story 2.6 AC 6 asks of `doctor` - report whether permissions are
-/// sound - and a warning cannot change the exit code, which matches
-/// `doctor`'s own rule: a world-writable directory makes no other command
-/// fail, so it is not blocking.
-///
-/// If a later reader sees "world-writable credential directory, exit 0" and
-/// reaches for a fix: that is what this comment is for. It is a decision,
-/// with the reasoning above, and the two tests
-/// `a_writable_directory_around_a_sound_file_is_a_warning` and
-/// `an_over_wide_credential_file_exits_two_before_anything_is_sent` pin both
-/// halves.
+/// It is still REPORTED, with the directory's actual mode, and a warning
+/// cannot change the exit code, which matches `doctor`'s own rule: a
+/// world-writable directory makes no other command fail, so it is not
+/// blocking.
 fn grade(health: &CredentialHealth) -> Status {
     if !file_is_usable(health) {
         return Status::Problem(ExitCode::Usage);
@@ -171,7 +153,7 @@ fn grade(health: &CredentialHealth) -> Status {
 ///
 /// Says something the detail block does not repeat: how many profiles hold
 /// anything, plus the permission state. The detail is `auth::report`'s own
-/// rendering, which Story 2.6 owns and which this check must not paraphrase.
+/// rendering, which this check must not paraphrase.
 fn summary_of(health: &CredentialHealth, status: &Status) -> String {
     match status {
         Status::Problem(_) => "the credential file cannot be used as it stands".to_string(),
@@ -251,7 +233,7 @@ mod tests {
         }
     }
 
-    /// The grading rule the R1 review produced, in one place.
+    /// The grading rule in one place.
     ///
     /// The FILE blocks; the DIRECTORY around a sound file warns. The reasons
     /// are on [`grade`]; this pins the outcomes so that neither half can be
@@ -385,15 +367,9 @@ mod tests {
     /// Asserted by EQUALITY against `AuthError::NoCredentials`: that error
     /// already lists every way in, and `auth`'s own
     /// `the_no_credentials_message_names_every_way_in` is what pins the
-    /// content. Restating the advice here would be a second copy to keep in
-    /// step - and naming the environment variable a second time is what
-    /// `tests/credential_paths.rs` refuses, on the grounds that a module
-    /// which names the global key is a module that can fall back to it.
-    /// The R1 fix reached the exit code, the field names and the summary and
-    /// stopped at the detail block. This is the assertion that was missing:
-    /// the detail of a check that is ABOUT TO USE the file must not carry a
-    /// store-wide "usable: no", and the directory fact must not claim a
-    /// refusal that only the write path performs.
+    /// content. The detail of a check that is ABOUT TO USE the file must not
+    /// carry a store-wide "usable: no", and the directory fact must not
+    /// claim a refusal that only the write path performs.
     #[test]
     fn a_directory_only_warning_never_claims_the_store_was_refused() {
         let condition = crate::auth::error::StoreError::DirectoryTooOpen {
@@ -408,7 +384,7 @@ mod tests {
         assert!(
             !detail.lines().any(|line| line.starts_with("usable:")),
             "a composite verdict in the detail of a check that then uses the \
-             file is the contradiction R1 removed elsewhere: {detail}"
+             file is a contradiction: {detail}"
         );
         assert!(
             !detail.contains("refusing"),
@@ -428,8 +404,7 @@ mod tests {
         assert!(problem.contains("0777"), "{problem}");
     }
 
-    /// A file that does not exist yet must not be called sound. The old
-    /// wording read "the file is sound (file does not exist yet)".
+    /// A file that does not exist yet must not be called sound.
     #[test]
     fn a_warning_about_the_directory_of_an_absent_file_says_the_file_is_absent() {
         let mut absent = health(Permissions::Missing, true, Some("0777, writable"));

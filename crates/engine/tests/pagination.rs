@@ -1,5 +1,5 @@
 //! Auto-pagination: fetching every page, merging rows, and never
-//! truncating silently (Story 1.6).
+//! truncating silently.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -427,7 +427,7 @@ async fn offset_at_u64_max_cannot_overflow() {
     assert_eq!(fetched.value["result"]["rows"].as_array().unwrap().len(), 1);
     let truncation = fetched.truncation.unwrap();
     assert_eq!(truncation.cause, TruncationCause::OffsetSpaceExhausted);
-    // Re-review finding 5: failing to build the next offset does not prove
+    // failing to build the next offset does not prove
     // the server had more rows.
     assert!(
         !truncation.cause.is_definite(),
@@ -437,7 +437,7 @@ async fn offset_at_u64_max_cannot_overflow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn non_list_first_response_is_an_error_not_a_silent_success() {
-    // Re-review finding 3: the caller chose this descriptor, so a first
+    // the caller chose this descriptor, so a first
     // page with no array at the items pointer is a protocol mismatch - not
     // a complete result that happens to have an unknown shape.
     let server = MockServer::start().await;

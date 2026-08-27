@@ -99,9 +99,6 @@ const MAGIC: [u8; 8] = *b"OTL-IRC\x00";
 ///
 /// Bumped when the container changes; the IR schema has its own version
 /// inside the body. Either mismatch discards the whole file.
-///
-/// Version 2 replaced a single encoded value with the framed table in
-/// [`super::bounded`], which is what bounds decode-time allocation.
 const FORMAT_VERSION: u32 = 2;
 /// Size of the raw prefix: magic + format version + checksum.
 const PREFIX_LEN: usize = 8 + 4 + 32;

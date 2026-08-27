@@ -47,8 +47,8 @@ const FETCH_SERVER_HINT: &str =
 const FETCH_RATE_LIMIT_HINT: &str =
     "Wait for the spec source's rate limit to reset and run `otl spec sync` again.";
 
-/// Map an engine error to a `CliError` with a documented exit code
-/// (see `docs/exit-codes.md`) and a polished stderr message.
+/// Map an engine error to a `CliError` with a documented exit code and a
+/// polished stderr message.
 pub fn map_engine_error(error: EngineError) -> CliError {
     map_engine_error_with_hint(error, None)
 }
@@ -100,8 +100,8 @@ pub fn server_answered(error: &EngineError) -> bool {
         | EngineError::Pagination { .. }
         | EngineError::InvalidPaginationSpec { .. } => true,
         // A transport failure MAY have arrived - the reply is what went
-        // missing - so a report must not claim it did. `docs/exit-codes.md`
-        // says the same thing about code 7.
+        // missing - so a report must not claim it did (exit code 7 says the
+        // same thing).
         EngineError::Transport { .. } => false,
         // Never left this machine: refused by local validation, by the
         // credential source, or by the client builder.

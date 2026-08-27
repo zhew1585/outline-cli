@@ -466,11 +466,9 @@ mod tests {
 
     #[test]
     fn an_equivalent_spelling_of_the_instance_url_still_matches() {
-        // R3 [29]: the expected issuer was the user's RAW `OUTLINE_URL`
-        // text while endpoints were compared as parsed origins. Any
-        // equivalent-but-not-byte-identical spelling then failed login -
-        // and blamed the server for it - while working in every other
-        // command. Both sides now go through the same parser.
+        // The expected issuer and the compared endpoints go through the
+        // same parser, so equivalent-but-not-byte-identical spellings of
+        // the instance URL (case, default port, trailing slash) match.
         for spelling in [
             "https://DOCS.example.com",
             "https://docs.example.com:443",

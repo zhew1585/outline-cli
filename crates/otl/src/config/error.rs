@@ -12,11 +12,11 @@
 //!   additional `error:` line.
 //!
 //! `Debug` renders NO field content at all - only the variant name and
-//! non-textual scalars. Forwarding it to `Display` was not enough: `Display`
-//! has to name the profile the user must fix, so a name still reached the
-//! unbounded surface that lands in logs, panics and error chains.
+//! non-textual scalars - because `Display` has to name the profile the
+//! user must fix, and a name must not reach the unbounded surface that
+//! lands in logs, panics and error chains.
 //!
-//! `Display` is also bounded for ANY construction of these variants, not
+//! `Display` is bounded for ANY construction of these variants, not
 //! just the ones this crate builds: every string field is passed through a
 //! sanitizer with a length cap on the way out, because the variants are
 //! public and their fields can hold arbitrary text.

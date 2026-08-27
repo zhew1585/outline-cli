@@ -1,4 +1,4 @@
-//! End-to-end `otl spec sync` / `otl spec reset` (Story 4.2).
+//! End-to-end `otl spec sync` / `otl spec reset`.
 //!
 //! Every case runs the real binary against a wiremock server and a
 //! throwaway cache directory (`OTL_CACHE_DIR`): no test touches the real

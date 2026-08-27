@@ -410,7 +410,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_other_users_can_write_is_reported_as_a_problem() {
-        // The report used to claim it covered the directory and did not.
         // A directory others can write to lets them swap the credential
         // file or the refresh lock, whatever the file's own mode says.
         use std::os::unix::fs::PermissionsExt;
@@ -526,13 +525,8 @@ mod tests {
     }
 
     /// A dangling symlink is something AT the path that every read refuses,
-    /// so the report must not call the path empty and healthy.
-    ///
-    /// This is the case that made link-following metadata visibly wrong:
-    /// `fs::metadata` fails with `NotFound`, which used to become
-    /// `Missing` -> `exists: false` -> `file_readable: true` (nothing there,
-    /// nothing wrong), while `read_checked`'s `O_NOFOLLOW` open failed on the
-    /// same path. One report, two answers.
+    /// so the report must not call the path empty and healthy:
+    /// `read_checked`'s `O_NOFOLLOW` open fails on such a path.
     #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_is_a_file_problem_and_not_an_absent_file() {
@@ -618,8 +612,7 @@ mod tests {
     /// The two phrasings of one error, side by side, because the difference
     /// is the whole point: `Display` is the WRITE path refusing, `condition`
     /// is a report describing. A health report that says "refusing to use
-    /// it" and then reads the file is the contradiction R1 removed from the
-    /// exit code and left in this text.
+    /// it" and then reads the file contradicts itself.
     #[test]
     fn the_display_refuses_and_the_condition_only_describes() {
         let displayed = too_open().to_string();

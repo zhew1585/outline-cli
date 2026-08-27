@@ -462,7 +462,7 @@ fn api_key_with_newline_exits_2_and_never_echoes_the_key() {
 
 #[test]
 fn base_url_path_secret_never_reaches_stderr() {
-    // Reviewer PoC: a secret in the base URL PATH (token-in-path auth) plus
+    // a secret in the base URL PATH (token-in-path auth) plus
     // the same value as API key. Nothing listens on port 9, so the request
     // fails at the transport level - and neither the Transport Display nor
     // the reqwest source chain may put the secret on stderr.

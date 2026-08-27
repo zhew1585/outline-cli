@@ -99,8 +99,7 @@ pub trait CredentialSource: Send + Sync {
 
 /// A fixed credential that never changes and cannot be renewed.
 ///
-/// The behaviour of every pre-renewal caller: [`Client::new`] wraps its
-/// token argument in one of these.
+/// [`Client::new`] wraps its token argument in one of these.
 ///
 /// [`Client::new`]: crate::client::Client::new
 pub struct StaticCredential(String);

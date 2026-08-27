@@ -54,10 +54,8 @@ pub(crate) fn extract_params(
 
 /// Accumulator for one body-schema walk.
 ///
-/// `seen` and `required` are hash sets, not lists, on purpose: an
-/// untrusted document may declare tens of thousands of properties in one
-/// schema, and the linear scans this replaces made compilation quadratic
-/// in that count - a small download could pin a core for minutes.
+/// `seen` and `required` are hash sets so an untrusted document with tens
+/// of thousands of properties in one schema compiles in linear time;
 /// `params` stays a `Vec` so the output keeps the parser's key order.
 struct Walk<'a> {
     components: &'a Value,
@@ -346,9 +344,7 @@ impl Walk<'_> {
 
 /// Schema constraint facets carried into the IR for local validation.
 ///
-/// `pattern` is deliberately not compiled: validating it needs a regex
-/// engine, roughly a megabyte of binary, for the two `pattern` constraints
-/// in the whole vendored document.
+/// `pattern` is not compiled: validating it would need a regex engine.
 #[derive(Default)]
 struct Facets {
     nullable: bool,
@@ -523,8 +519,7 @@ mod tests {
     }
 
     /// A reference token that is not valid RFC 6901 must be refused, not
-    /// mangled into some other schema name. A chained `replace` accepted
-    /// all of these and then looked the result up.
+    /// mangled into some other schema name.
     #[test]
     fn rejects_reference_tokens_that_are_not_valid_rfc_6901() {
         for token in ["A~2B", "A~", "~", "A~1B~", "a/b", "", "A~xB"] {
@@ -579,10 +574,7 @@ mod tests {
         }
     }
 
-    /// A wide schema must compile in linear time. Before the sets below
-    /// were sets, this was two quadratic scans: 64k properties took seconds
-    /// of pure CPU on a release build, and the input for that is a few
-    /// megabytes of JSON - well inside the download limit.
+    /// A wide schema must compile in linear time.
     #[test]
     fn a_very_wide_schema_compiles_in_linear_time() {
         const WIDTH: usize = 20_000;
@@ -603,9 +595,9 @@ mod tests {
 
         assert_eq!(compiled.ops[0].params.len(), WIDTH);
         assert!(compiled.ops[0].params.iter().all(|param| param.required));
-        // Linear work is milliseconds even in a debug build; the quadratic
-        // version needed seconds at this width. A wide margin keeps this
-        // from being load-flaky while still catching a regression.
+        // Linear work is milliseconds even in a debug build; a wide margin
+        // keeps this from being load-flaky while still catching a
+        // regression.
         assert!(
             elapsed < std::time::Duration::from_secs(20),
             "compiling {WIDTH} properties took {elapsed:?}: quadratic again?"

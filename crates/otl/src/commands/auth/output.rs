@@ -1,11 +1,10 @@
 //! Turning an `otl auth` result into the two renderings the CLI contract
 //! promises: human lines on a terminal, one JSON object otherwise.
 //!
-//! Split out of the command module, which had grown past the file-length
-//! limit, along the seam that was already there: nothing here performs an
-//! action, resolves a credential or touches the network. It receives what
-//! the command decided and describes it - which is also why every function
-//! here is straightforward to test without a mock server.
+//! Nothing here performs an action, resolves a credential or touches the
+//! network: it receives what the command decided and describes it - which
+//! is also why every function here is straightforward to test without a
+//! mock server.
 //!
 //! Nothing in this module may print a credential or a fragment of one.
 //! `info_json_never_carries_a_credential_field` and

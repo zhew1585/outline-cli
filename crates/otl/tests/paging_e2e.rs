@@ -1,5 +1,5 @@
-//! End-to-end CLI tests for Story 1.6 (auto-pagination + `--limit`) and
-//! Story 1.7 (429 backoff, rate-limit exit code), via assert_cmd against
+//! End-to-end CLI tests for auto-pagination + `--limit`, 429 backoff and
+//! the rate-limit exit code, via assert_cmd against
 //! wiremock.
 //!
 //! Diagnostics printed to stderr are compared against golden files; the
@@ -138,7 +138,7 @@ async fn limit_flag_without_truncation_stays_silent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_pagination_hint_does_not_stop_early() {
-    // Reviewer PoC (finding 2): the server omits its pagination echo and
+    // the server omits its pagination echo and
     // returns fewer rows than requested. Paging must continue.
     let server = MockServer::start().await;
     for (offset, rows) in [(0, items(0..2)), (2, items(2..3)), (3, vec![])] {
@@ -173,7 +173,6 @@ async fn missing_pagination_hint_does_not_stop_early() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_page_two_fails_instead_of_reporting_success() {
-    // Reviewer PoC (finding 3).
     let server = MockServer::start().await;
     mount_page(&server, 0, 2, items(0..2)).await;
     Mock::given(method("POST"))
@@ -195,7 +194,7 @@ async fn malformed_page_two_fails_instead_of_reporting_success() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_limit_arg_fetches_one_page_and_warns() {
-    // Reviewer PoC (finding 4): a raw limit= must not silently return one
+    // a raw limit= must not silently return one
     // page as if it were everything.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -343,11 +342,11 @@ fn limit_flag_rejects_zero() {
         .stderr(predicate::str::contains("--limit"));
 }
 
-// --- Re-review findings ---------------------------------------------------
+// --- edge cases -----------------------------------------------------------------
 
 #[test]
 fn duplicate_argument_keys_are_a_usage_error() {
-    // Re-review finding 2 PoC B: only one value can reach the request
+    // only one value can reach the request
     // body, so a repeated key must be refused rather than silently
     // resolved. Port 9 is closed: any request would fail differently.
     otl()
@@ -363,7 +362,7 @@ fn duplicate_argument_keys_are_a_usage_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_clamped_manual_page_warns() {
-    // Re-review finding 2 PoC A: limit=1000, Outline applies 25 and says
+    // limit=1000, Outline applies 25 and says
     // so, and more rows exist. Staying silent would be silent truncation.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -474,7 +473,7 @@ async fn absent_offset_echo_succeeds_with_a_notice_and_correct_rows() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn offset_space_exhausted_is_reported_as_possible_truncation() {
-    // Re-review finding 5: the data may have ended exactly there.
+    // the data may have ended exactly there.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/documents.list"))

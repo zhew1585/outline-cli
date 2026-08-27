@@ -1,4 +1,4 @@
-//! End-to-end `otl doctor`: the SPEC half (Story 4.3, FR23).
+//! End-to-end `otl doctor`: the SPEC half.
 //!
 //! Which operation table this binary dispatches from, and how it differs
 //! from the online API description: operations that are missing here,
@@ -20,7 +20,7 @@ mod common;
 use common::doctor::{check, deprecated_document, document, hits, instance, parse, run};
 use common::doctor::{spec_host, Env, DEAD, KNOWN_OP, NEW_OP, SPEC_PATH};
 
-/// FR23, first half: an operation the online API declares and this build
+/// An operation the online API declares and this build
 /// does not is reported by name, with the command that fixes it. The
 /// instance is deliberately unreachable, so this also shows the online
 /// comparison still runs when the instance check has already failed.
@@ -53,7 +53,7 @@ async fn the_online_comparison_names_missing_and_withdrawn_operations() {
     assert_eq!(hits(&specs).await, 1, "one document fetch, no more");
 }
 
-/// FR23, second half: an operation the online API marks deprecated and this
+/// An operation the online API marks deprecated and this
 /// build still offers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deprecated_operation_this_build_still_offers_is_reported() {

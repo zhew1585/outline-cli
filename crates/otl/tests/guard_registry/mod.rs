@@ -80,7 +80,7 @@ pub struct Exception {
 /// Reviewed exceptions. Add one only with a comment saying why, and keep
 /// the context as specific as the reviewed line allows.
 pub const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
-    // Story 4.2: the upstream spec URL ends in the same file name. It is a
+    // The upstream spec URL ends in the same file name. It is a
     // URL constant for `otl spec sync` (a network fetch on one explicit
     // command), not a path to the vendored file - nothing here reads a spec
     // from disk. The context pins it to the URL line: any other mention of
@@ -91,7 +91,7 @@ pub const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
         context: "https://raw.githubusercontent.com/outline/openapi",
         count: 1,
     },
-    // Story 4.2: the name of the `--spec <PATH>` flag of `otl spec sync`,
+    // The name of the `--spec <PATH>` flag of `otl spec sync`,
     // which compiles a document the USER points at (the documented
     // development override). It is a clap flag name, not a directory this
     // process goes looking in.
@@ -101,7 +101,7 @@ pub const SOURCE_SCAN_ALLOWLIST: &[Exception] = &[
         context: "#[arg(long = ",
         count: 1,
     },
-    // Story 3.6: `otl docs export` refuses to write into a directory that
+    // `otl docs export` refuses to write into a directory that
     // already has contents unless `--overwrite` is given, and has to tell
     // leftovers of its own from content the user put there - both of which
     // mean enumerating the user-supplied output directory. Nothing to do
@@ -180,7 +180,7 @@ pub const FORBIDDEN_FILE_READS: &[(&str, &str)] = &[
 /// fails the guard, because its line will not match the registered context
 /// and its count will not match either.
 pub const FILE_READ_ALLOWLIST: &[Exception] = &[
-    // The `--body @file.json` request body, named by the user (Story 1.3).
+    // The `--body @file.json` request body, named by the user.
     Exception {
         file: "crates/otl/src/commands/api/mod.rs",
         pattern: "File::open",
@@ -208,7 +208,7 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
         context: "sender.send(File::open(owned))",
         count: 1,
     },
-    // Story 3.6: `otl docs export` writes into a user-named directory.
+    // `otl docs export` writes into a user-named directory.
     // Opening the directory itself is how it is fsynced (a write is not
     // durable until the directory entry is), and `read_dir` is how it tells
     // its own leftovers from content the user put there.
@@ -243,7 +243,7 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
         context: ".open(&path)?",
         count: 1,
     },
-    // Story 2.6: the credential file. `auth::secret_file` is the ONLY module
+    // The credential file. `auth::secret_file` is the ONLY module
     // that opens it, and every one of these call sites exists because a
     // credential file cannot be opened the ordinary way:
     //
@@ -323,7 +323,7 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
         context: "let handle = File::open(dir)",
         count: 1,
     },
-    // Story 2.5: `otl auth set-key` reads the key from piped stdin. A
+    // `otl auth set-key` reads the key from piped stdin. A
     // handle, not a path - but the pattern list matches the method name, and
     // a blanket file-wide exemption is exactly what this guard refuses.
     Exception {
@@ -332,7 +332,7 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
         context: ".read_to_string(&mut raw)",
         count: 1,
     },
-    // Story 3.3: `otl docs create --file <PATH>`, the document body, named
+    // `otl docs create --file <PATH>`, the document body, named
     // by the user on the command line.
     Exception {
         file: "crates/otl/src/commands/docs/content.rs",
@@ -346,7 +346,7 @@ pub const FILE_READ_ALLOWLIST: &[Exception] = &[
         context: ".read_to_string(&mut text)",
         count: 1,
     },
-    // The user config file (Story 4.1), at a path that comes from
+    // The user config file, at a path that comes from
     // `OUTLINE_CONFIG` or from `directories` - never from the build, so it
     // cannot reach the vendored spec.
     Exception {

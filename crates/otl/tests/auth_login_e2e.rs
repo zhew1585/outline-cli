@@ -32,7 +32,7 @@ async fn login_registers_dynamically_and_stores_a_usable_session() {
         .query_pairs()
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
-    // Story 2.1: PKCE S256, scope read write, a random state, loopback URI.
+    // PKCE S256, scope read write, a random state, loopback URI.
     assert_eq!(pairs["code_challenge_method"], "S256");
     assert_eq!(pairs["scope"], "read write");
     assert_eq!(pairs["response_type"], "code");
@@ -46,7 +46,7 @@ async fn login_registers_dynamically_and_stores_a_usable_session() {
         "redirect must be loopback: {:?}",
         pairs["redirect_uri"]
     );
-    // Story 2.2: the registration and its management token are persisted.
+    // The registration and its management token are persisted.
     let registration = stored_client(dir.path());
     assert_eq!(registration.client_id, "dcr-client-1");
     assert_eq!(

@@ -345,8 +345,8 @@ mod tests {
             "/doc/a\u{200b}b",
             "/doc/\u{feff}x",
             "/doc/\u{2066}x\u{2069}",
-            // Previously missed: not control characters, not whitespace,
-            // and not on the old hand-picked list.
+            // Neither control characters, nor whitespace: caught only by
+            // the whole-category classification.
             "/doc/a\u{061c}b",  // ARABIC LETTER MARK
             "/doc/a\u{206a}b",  // INHIBIT SYMMETRIC SWAPPING (deprecated)
             "/doc/a\u{206e}b",  // NATIONAL DIGIT SHAPES (deprecated)

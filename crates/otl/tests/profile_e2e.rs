@@ -1,4 +1,4 @@
-//! Story 4.1 end-to-end: a named profile actually points the request at
+//! End-to-end: a named profile actually points the request at
 //! that profile's instance, and the precedence order holds at the process
 //! level (not just in the resolver).
 
@@ -121,10 +121,10 @@ async fn profile_flag_sends_the_requests_instance_its_own_credential() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_profiles_key_is_never_sent_to_another_profiles_instance() {
-    // The R1 finding: with only work's key exported (as the GLOBAL variable
-    // or as work's own), `--profile personal` must not reach personal's
-    // instance with it. The mock records every request, so the test can
-    // assert nothing arrived at all.
+    // With only work's key exported (as the GLOBAL variable or as work's
+    // own), `--profile personal` must not reach personal's instance with
+    // it. The mock records every request, so the test can assert nothing
+    // arrived at all.
     let personal = instance("from-personal", "key-for-personal").await;
     let (_dir, config) = config_file(&format!(
         "[profiles.work]\nurl = \"http://127.0.0.1:9\"\n\
@@ -396,11 +396,9 @@ fn an_oauth_profile_does_not_fall_back_to_a_per_profile_api_key() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_env_url_pointing_away_from_the_profile_sends_nothing() {
-    // R2 finding 1. The previous version of this test asserted the command
-    // SUCCEEDED and reached the other instance, which enshrined the very
-    // behaviour under review: a warning cannot recall a credential already on
-    // the wire. The conflict now fails before the request channel, and the
-    // mock proves nothing arrived.
+    // The conflict fails before the request channel: a warning cannot
+    // recall a credential already on the wire. The mock proves nothing
+    // arrived at the other instance.
     let elsewhere = instance("from-elsewhere", "key-for-work").await;
     let (_dir, config) = config_file("[profiles.work]\nurl = \"http://127.0.0.1:9\"\n");
     let config_arg = config.to_str().unwrap().to_string();
@@ -503,9 +501,8 @@ async fn a_matching_env_url_is_not_a_conflict() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     // No CONFLICT is reported - that is what this test is about. The one
-    // thing on stderr is the plaintext-key notice, which now covers a
-    // profile-scoped variable too (it used to fire only for the global one,
-    // because it was decided by reading that variable directly).
+    // thing on stderr is the plaintext-key notice, which covers a
+    // profile-scoped variable as well as the global one.
     assert!(
         !stderr.contains("conflict") && !stderr.contains("deliberately not used"),
         "a conflict was reported for a matching URL: {stderr}"
@@ -563,8 +560,8 @@ async fn a_profile_without_a_url_cannot_bind_an_env_url() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_env_url_equivalent_to_the_profile_url_is_allowed() {
-    // R3 finding 4, end to end: a trailing slash is the same instance, so it
-    // must not be reported as a conflict.
+    // End to end: a trailing slash is the same instance, so it must not
+    // be reported as a conflict.
     let work = instance("from-work", "key-for-work").await;
     let (_dir, config) = config_file(&format!("[profiles.work]\nurl = \"{}\"\n", work.uri()));
     let config_arg = config.to_str().unwrap().to_string();
@@ -593,8 +590,8 @@ async fn an_env_url_equivalent_to_the_profile_url_is_allowed() {
 
 #[test]
 fn a_hostile_config_path_cannot_inject_into_stderr() {
-    // R2 finding 3, end to end: the path reaches stderr through the error
-    // message, so it must arrive inert.
+    // The path reaches stderr through the error message, so it must
+    // arrive inert.
     let hostile =
         "/missing/\u{1b}]8;;https://evil.example.com\u{7}FORGED\u{1b}]8;;\u{7}\nerror: forged";
     let output = otl()

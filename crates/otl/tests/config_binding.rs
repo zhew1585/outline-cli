@@ -1,4 +1,4 @@
-//! Story 4.1: which credential is released, and to which instance.
+//! Which credential is released, and to which instance.
 //!
 //! The behaviour half of the credential gate: per-profile key scoping, the
 //! binding rules for each `UrlSource`, and the proof's tie to the settings it
@@ -64,7 +64,7 @@ auth = "api-key"
 url = "https://personal.example.com"
 "#;
 
-/// A stand-in for a future credential source (the Epic 2 credential file).
+/// A stand-in for the credential-file credential source.
 /// It would happily hand out a secret for any settings at all.
 struct AlwaysYields(&'static str);
 
@@ -128,7 +128,7 @@ fn one_profiles_key_is_not_reachable_by_another_profile() {
 
 #[test]
 fn the_global_api_key_still_serves_the_profile_less_path() {
-    // Epic 1 behaviour, unchanged: no profile, global variable, no config.
+    // No profile, global variable, no config file.
     let dir = tempfile::tempdir().unwrap();
     let env = EnvLayer::default()
         .with_url("https://env.example.com")

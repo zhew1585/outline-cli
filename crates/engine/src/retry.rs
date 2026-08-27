@@ -76,11 +76,9 @@ pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     if let Ok(seconds) = trimmed.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    // A delta-seconds value too large for `u64` is still a delta-seconds
-    // value, and it means "much later". Falling through to backoff here
-    // would answer an absurd wait request with the SHORTEST wait the policy
-    // has - the opposite of what the server asked - so it is reported as
-    // effectively unbounded and clamped by `max_wait` like any other.
+    // A delta-seconds value too large for `u64` still means "much later",
+    // so it is reported as effectively unbounded and clamped by `max_wait`
+    // like any other.
     if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
         return Some(Duration::MAX);
     }

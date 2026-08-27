@@ -22,10 +22,10 @@
 //!    can never be revoked. Revoking A's tokens at A leaks nothing to B.
 //! 2. **This command needs no instance URL at all.** Everything it talks
 //!    to comes out of the credential file. `otl auth logout` therefore
-//!    works when `OUTLINE_URL` is unset, wrong, or a plaintext value that
-//!    predates the transport rule - which is exactly when a user most
-//!    needs to clean up, and the only alternative would be deleting the
-//!    file by hand and orphaning the DCR registration with it.
+//!    works when `OUTLINE_URL` is unset, wrong, or a plaintext value -
+//!    which is exactly when a user most needs to clean up, and the only
+//!    alternative would be deleting the file by hand and orphaning the DCR
+//!    registration with it.
 //! 3. **Nothing irreversible happens by default.** If a server-side step
 //!    could still succeed on a later attempt, the local credentials are
 //!    KEPT so that attempt remains possible, and the command exits

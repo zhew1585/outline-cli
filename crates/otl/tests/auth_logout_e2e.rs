@@ -1,5 +1,5 @@
 //! `otl auth logout`, `--purge`, and the registration lifecycle
-//! (Story 2.4).
+//!
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -253,15 +253,15 @@ async fn a_retried_purge_succeeds_once_the_server_recovers() {
     drop(server);
 }
 
-// --- R3 [§1] / [26] / [28]: cleanup must not be one-way ------------------
+// --- cleanup must not be one-way ------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn logout_revokes_at_the_instance_that_issued_the_session() {
-    // The R3 finding: revocation was anchored to OUTLINE_URL, so pointing
-    // the shell at another instance refused to revoke A's tokens - while
-    // still deleting them locally, turning a revocable token into one that
-    // can never be revoked. The session records its own issuer; that is the
-    // anchor. `dcr::delete` already worked this way, which is how the bug
+    // Revocation is anchored to the stored credential's own endpoint:
+    // anchoring to the shell's instance would refuse to revoke A's tokens
+    // while still deleting them locally, turning a revocable token into
+    // one that can never be revoked. The session records its own issuer;
+    // that is the anchor. `dcr::delete` works the same way.
     // was visible in a single command.
     let issuer = MockServer::start().await;
     Mock::given(method("POST"))
@@ -311,11 +311,10 @@ async fn logout_revokes_at_the_instance_that_issued_the_session() {
 
 #[test]
 fn logout_works_for_a_profile_bound_to_a_plaintext_instance() {
-    // [28]: `logout` used to run `instance_origin`, so a profile stored
-    // against a plaintext URL - one that predates the rule, or was carried
-    // from another machine - could not be cleaned up at all. The only way
-    // out was deleting the file by hand, which takes the
-    // registration_access_token with it and orphans the DCR registration.
+    // `logout` must not require `instance_origin`: a profile stored
+    // against a plaintext URL could otherwise not be cleaned up at all,
+    // and deleting the file by hand would take the
+    // registration_access_token with it and orphan the DCR registration.
     let dir = tempfile::tempdir().unwrap();
     seed_session(dir.path(), "http://legacy.example.invalid", Some(0));
 
@@ -385,9 +384,9 @@ fn logout_works_with_no_instance_configured_at_all() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_revocation_keeps_the_tokens_and_exits_non_zero() {
-    // [26]: the local copy used to be destroyed regardless, with exit 0 -
-    // so the tokens stayed live on the server, nothing could revoke them
-    // any more, and no script could tell.
+    // The local copy must not be destroyed when revocation failed: the
+    // tokens stay live on the server, and the exit code must tell a
+    // script that cleanup did not complete.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oauth/revoke"))
@@ -461,7 +460,7 @@ async fn force_discards_tokens_that_could_not_be_revoked() {
     drop(server);
 }
 
-// --- R4 [N2]: a concurrent refresh inside the revocation window ----------
+// --- a concurrent refresh inside the revocation window --------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_written_during_logout_is_reported_not_declared_signed_out() {
@@ -591,7 +590,7 @@ async fn an_uncontended_logout_still_reports_plain_success() {
     drop(server);
 }
 
-// --- R4 [N3]: never advise retrying something that cannot succeed --------
+// --- never advise retrying something that cannot succeed ------------------
 
 #[test]
 fn a_permanently_unusable_management_uri_is_not_called_retryable() {

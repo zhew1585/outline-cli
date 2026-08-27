@@ -1,5 +1,5 @@
 //! Automatic renewal on the request channel, and its single-flight
-//! guarantee across processes (Story 2.3).
+//! guarantee across processes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -40,7 +40,7 @@ async fn an_expired_access_token_is_renewed_before_the_request() {
 
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(stdout.contains("Renewed"), "stdout: {stdout}");
-    // Story 2.3: the rotated tokens are persisted, and the spent refresh
+    // The rotated tokens are persisted, and the spent refresh
     // token is gone.
     let session = stored_session(dir.path());
     assert_eq!(session.access_token, "access-new");

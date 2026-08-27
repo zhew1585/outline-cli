@@ -1,4 +1,4 @@
-//! Story 4.1: user config file, named profiles, and the strict
+//! User config file, named profiles, and the strict
 //! flag > env > config-file precedence (applied per key, not per layer).
 //!
 //! Every case here builds its layers as DATA (`Overrides` + `EnvLayer`) and
@@ -167,9 +167,9 @@ fn precedence_is_applied_per_key_not_per_layer() {
 
 #[test]
 fn an_env_url_resolves_by_precedence_then_the_gate_refuses_the_credential() {
-    // R3 ruling: OUTLINE_URL stays a normal env layer for the URL, so
-    // resolution honours flag > env > file (AC2). Whether that origin may
-    // receive THIS profile's credential is a separate question, asked once at
+    // OUTLINE_URL stays a normal env layer for the URL, so resolution
+    // honours flag > env > file. Whether that origin may receive THIS
+    // profile's credential is a separate question, asked once at
     // the credential-release boundary - which refuses, because a credential
     // sent to the wrong server cannot be recalled.
     let (_dir, path) = config_file(TWO_PROFILES);
@@ -213,9 +213,9 @@ fn an_env_url_matching_the_profile_origin_releases_the_credential() {
 
 #[test]
 fn origin_equivalence_is_normalized_not_a_string_comparison() {
-    // R3 finding 4: the request channel tolerates and normalizes a trailing
-    // slash, host casing and a default port, so none of them may look like a
-    // different instance to the gate.
+    // The request channel tolerates and normalizes a trailing slash, host
+    // casing and a default port, so none of them may look like a different
+    // instance to the gate.
     for (declared, from_env, bound) in [
         ("http://127.0.0.1:9", "http://127.0.0.1:9/", true),
         ("http://127.0.0.1:9/", "http://127.0.0.1:9", true),
@@ -313,7 +313,7 @@ fn the_url_flag_is_a_deliberate_redirect_and_binds() {
 
 #[test]
 fn the_env_url_is_still_the_source_when_no_profile_is_in_effect() {
-    // Epic 1 path untouched: the restriction is about profile scope only.
+    // The restriction is about profile scope only.
     let dir = tempfile::tempdir().unwrap();
     let env = EnvLayer::default()
         .with_url("https://env.example.com")
@@ -335,7 +335,7 @@ fn absent_default_source(dir: &TempDir) -> ConfigSource {
 
 #[test]
 fn pure_env_path_works_with_no_config_file_at_all() {
-    // A fresh machine has no config file; the Epic 1 env-only path must
+    // A fresh machine has no config file; the env-only path must
     // keep working unchanged.
     let dir = tempfile::tempdir().unwrap();
     let env = EnvLayer::default()
@@ -490,8 +490,8 @@ fn a_profile_without_a_url_and_no_override_is_a_readable_error() {
     let message = error.to_string();
     assert!(matches!(error, ConfigError::MissingUrl { .. }));
     assert!(message.contains("work"), "{message}");
-    // R3 finding 9: it must not recommend a fix the credential gate then
-    // refuses. Setting OUTLINE_URL would resolve, and then fail to bind.
+    // It must not recommend a fix the credential gate then refuses:
+    // setting OUTLINE_URL would resolve, and then fail to bind.
     assert!(
         !message.contains("OUTLINE_URL"),
         "recommends a fix that cannot work: {message}"
@@ -502,7 +502,7 @@ fn a_profile_without_a_url_and_no_override_is_a_readable_error() {
 
 #[test]
 fn missing_url_error_still_names_the_environment_variable() {
-    // Epic 1 behaviour: the pure-env user gets the same actionable message.
+    // The pure-env user gets the same actionable message.
     let error = ConfigError::MissingUrl { profile: None };
     assert!(error.to_string().contains("OUTLINE_URL"));
 }
@@ -607,7 +607,7 @@ fn an_empty_config_file_yields_no_profiles() {
 }
 
 // ---------------------------------------------------------------------------
-// Credentials are scoped to the instance they belong to (R1 finding 1).
+// Credentials are scoped to the instance they belong to.
 //
 // A profile names an instance, so a profile's request must carry THAT
 // instance's key. The global variable is for the no-profile case only, and
@@ -616,15 +616,15 @@ fn an_empty_config_file_yields_no_profiles() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// No configuration type leaks a URL through Debug (R1 finding 2).
+// No configuration type leaks a URL through Debug.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Names from the config file cannot inject into a terminal (R1 finding 7).
+// Names from the config file cannot inject into a terminal.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// No profile NAME reaches any Debug rendering (R2 finding 2).
+// No profile NAME reaches any Debug rendering.
 //
 // A name is config-file content just as much as a URL is: `default_profile =
 // "<secret>"` and `[profiles.<secret>]` are both values the user wrote. Debug
@@ -633,23 +633,22 @@ fn an_empty_config_file_yields_no_profiles() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Config PATHS cannot inject into a terminal either (R2 finding 3).
+// Config PATHS cannot inject into a terminal either.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Environment variable names follow the platform's case rules (R2 finding 6).
+// Environment variable names follow the platform's case rules.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// A derived variable name is bounded at the source (R2 finding 7).
+// A derived variable name is bounded at the source.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// AC2, on ONE key: flag > env > file for the base URL (R3 finding 1).
+// flag > env > file for the base URL, on ONE key.
 //
-// The R2 attempt replaced this with a test where each layer supplied a
-// different key, which only shows that layers do not delete one another. This
-// is the same-key ladder, and it is what the acceptance criterion says.
+// The same-key ladder: each layer supplies the same key, and the higher
+// layer wins. Layers do not delete one another.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -679,21 +678,20 @@ fn the_url_key_itself_resolves_flag_over_env_over_file() {
 
 // ---------------------------------------------------------------------------
 // The binding check is at the shared boundary, not inside one TokenSource
-// (R3 ruling). Epic 2's credential file plugs in as another implementation
+// The credential file plugs in as another implementation
 // and inherits the check without knowing about it.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Bidi and invisible characters (R3 finding 5).
+// Bidi and invisible characters.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Config paths stay out of every Debug rendering (R3 finding 3).
+// Config paths stay out of every Debug rendering.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Every error variant is registered in the public exit-code document
-// (R3 finding 8).
+// Every error variant is registered in the public exit-code document.
 //
 // The exit-code table is a published API, so a new failure mode must be
 // documented before release. The match below is exhaustive: adding a variant
@@ -702,14 +700,14 @@ fn the_url_key_itself_resolves_flag_over_env_over_file() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// The gate's INPUT cannot be forged either (R4 finding 1).
+// The gate's INPUT cannot be forged either.
 //
-// R3 made the proof token unforgeable, which only moved the problem: the
-// proof is issued from a `Settings`, and that was a public struct anyone
-// could build with `url_source: Flag` and any base URL they liked. The secret
-// was also readable straight off `EnvLayer`, without going near the gate.
+// The proof token is unforgeable, and so is its input: `Settings` is a
+// public struct anyone could build with `url_source: Flag` and any base URL
+// they liked, and the secret was readable straight off `EnvLayer` without
+// going near the gate.
 //
-// Both are now closed by construction, which is why the two cases below are
+// Both are closed by construction, which is why the two cases below are
 // COMPILE-FAIL tests rather than runtime ones: there is no value of any
 // argument that reaches the unsafe behaviour, so there is nothing to assert
 // at runtime. `trybuild` is not in the dependency set, so the check is done
@@ -717,6 +715,5 @@ fn the_url_key_itself_resolves_flag_over_env_over_file() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// An unusable URL is diagnosed as such, not as a cross-instance conflict
-// (R4 finding 3).
+// An unusable URL is diagnosed as such, not as a cross-instance conflict.
 // ---------------------------------------------------------------------------

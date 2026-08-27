@@ -1,4 +1,4 @@
-//! Story 2.6: the credential file's permissions, atomicity, locking and
+//! The credential file's permissions, atomicity, locking and
 //! secrecy, as observed from outside the module that implements them.
 //!
 //! These checks live here rather than next to the code for two reasons:

@@ -7,8 +7,8 @@
 //! immediately without a CLI release and without a startup cost.
 //!
 //! Nothing here ever runs on its own: the CLI performs no update check and
-//! no background fetch (NFR4, no phone home). A sync happens when, and
-//! only when, the user types it.
+//! no background fetch (no phone home). A sync happens when, and only
+//! when, the user types it.
 
 use std::collections::HashSet;
 use std::fs;

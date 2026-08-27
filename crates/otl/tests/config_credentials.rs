@@ -1,9 +1,9 @@
-//! Story 2.x integration: WHICH store a credential is released from, and
+//! Integration: WHICH store a credential is released from, and
 //! whether the credential file is subject to the same gate as the
 //! environment.
 //!
 //! `config_binding.rs` covers the gate itself with the environment source.
-//! This file covers the second source Epic 2 added - a credential read out of
+//! This file covers a credential read out of
 //! the credential file - and the selection rule that decides between them.
 //! The two questions are kept apart on purpose: a selection bug sends the
 //! wrong secret, a gate bug sends it to the wrong instance, and only one of
@@ -51,7 +51,7 @@ fn settings(overrides: &Overrides, env: &EnvLayer) -> Settings {
     resolve_settings(overrides, env, &loaded).unwrap()
 }
 
-/// Settings for a single instance with no profile in effect - the Epic 1
+/// Settings for a single instance with no profile in effect - the
 /// shape, which the gate lets through unconditionally because there is no
 /// scoping question to ask.
 fn plain_settings(env: &EnvLayer) -> (TempDir, Settings) {

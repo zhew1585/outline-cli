@@ -1,4 +1,4 @@
-//! Story 4.1: what a `Debug` rendering of a configuration type may contain.
+//! What a `Debug` rendering of a configuration type may contain.
 //!
 //! `Debug` is held to a stricter standard than `Display`: it lands in logs,
 //! panic messages and error chains, where nothing needs naming, so it carries
@@ -143,8 +143,8 @@ fn settings_debug_redacts_the_base_url() {
     let rendered = format!("{resolved:?}");
     assert!(!rendered.contains("pw-secret"), "{rendered}");
     assert!(!rendered.contains("PATH-SECRET"), "{rendered}");
-    // The profile NAME is redacted too (R2 finding 2): a name is config-file
-    // content, and Debug is an unbounded surface. Set-ness is still visible.
+    // The profile NAME is redacted too: a name is config-file content,
+    // and Debug is an unbounded surface. Set-ness is still visible.
     assert!(!rendered.contains("work"), "{rendered}");
     assert!(rendered.contains("***"), "{rendered}");
 }
@@ -288,9 +288,8 @@ fn config_error_debug_never_exposes_raw_names_or_paths() {
         },
     ] {
         let rendered = format!("{error:?}");
-        // R3 finding 2: this is the assertion the previous version was
-        // missing. The secret WAS in `available`, and forwarding Debug to
-        // Display printed it.
+        // The secret must not surface: it was in `available`, and
+        // forwarding Debug to Display would print it.
         assert!(
             !rendered.contains(SECRET_NAME),
             "Debug leaked a profile name: {rendered}"

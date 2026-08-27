@@ -1,5 +1,5 @@
 //! Spec lifecycle: where a spec comes from, and how a compiled one is
-//! cached (Story 4.2).
+//! cached.
 //!
 //! The CLI ships with the vendored spec compiled into the binary by
 //! `build.rs`, and that stays the default. `otl spec sync` is the only
@@ -7,7 +7,7 @@
 //! compiled IR to a cache that later commands deserialize instead of
 //! re-parsing anything. Startup therefore never touches an OpenAPI
 //! document (see `tests/startup_guard.rs`), and the CLI never checks for
-//! spec updates on its own (NFR4: no phone home).
+//! spec updates on its own.
 //!
 //! Everything Outline-specific about specs lives here - the upstream
 //! source and the `/api` path convention - never in `engine` or
@@ -29,7 +29,7 @@ use spec_compile::{
 /// This is the same document this crate vendors and compiles in at build
 /// time; its provenance is recorded in the VENDOR note next to the
 /// vendored copy. Fetched only when the user runs `otl spec sync` - never
-/// on any other code path (NFR4).
+/// on any other code path.
 pub const UPSTREAM_SPEC_URL: &str =
     "https://raw.githubusercontent.com/outline/openapi/main/spec3.json";
 

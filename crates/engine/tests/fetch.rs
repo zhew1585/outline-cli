@@ -143,8 +143,7 @@ async fn honours_retry_after_before_retrying() {
 
 /// A host that never stops rate limiting exhausts the budget and produces
 /// the dedicated error (which the CLI maps to exit code 8), NOT a generic
-/// HTTP failure. This is the case that used to be a single unretried
-/// request.
+/// HTTP failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn exhausted_429_retries_are_their_own_error() {
     let server = MockServer::start().await;
@@ -344,7 +343,7 @@ async fn the_reported_origin_is_the_host_that_answered() {
 
 /// A `Location` carrying credentials still identifies its host. The
 /// credentials are never sent (this channel sends none), and refusing to
-/// name the host because of them used to make the fetch report the
+/// name the host because of them would make the fetch report the
 /// REDIRECTOR as the source - a quiet lie about where a document came
 /// from.
 #[tokio::test(flavor = "multi_thread")]

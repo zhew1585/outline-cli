@@ -1,4 +1,4 @@
-//! `otl docs update <id>` (story 3.4).
+//! `otl docs update <id>`.
 //!
 //! Either the title, the body, or both. The body arrives the same way as
 //! for `create` (a pipe or `--file`); with neither the command refuses

@@ -1,4 +1,4 @@
-//! The on-disk IR cache (Story 4.2): round-trip, atomic writes and permissions.
+//! The on-disk IR cache: round-trip, atomic writes and permissions.
 //!
 //! Nothing here touches the real cache directory: every case works on a
 //! `tempfile::TempDir`. Fixtures live in `common/cache.rs`; see that file
@@ -167,8 +167,7 @@ fn a_pre_existing_temporary_file_does_not_affect_the_store() {
 }
 
 /// The size limits are one limit: whatever store accepts, load accepts -
-/// header included. A table of several megabytes exercises the boundary
-/// the two used to disagree about.
+/// header included. A table of several megabytes exercises the boundary.
 #[test]
 fn the_store_and_load_size_limits_agree() {
     let (_dir, file) = temp_cache();
@@ -224,13 +223,12 @@ fn the_cache_file_is_owner_only() {
 }
 
 /// Whatever `store_at` accepts, `load_at` accepts - including the
-/// footprint rule, which store used to skip.
+/// footprint rule.
 #[test]
 fn a_stored_table_always_loads_back() {
     let (_dir, file) = temp_cache();
-    // Short, legal parameter names: encodes small, decodes big. This is
-    // the shape that used to store "successfully" and be rejected on the
-    // next command.
+    // Short, legal parameter names: encodes small, decodes big - the
+    // shape most likely to trip a size check on load.
     let mut heavy = op("things.info", "/api/things.info");
     heavy.params = (0..2000)
         .map(|index| ParamSpec {

@@ -30,10 +30,6 @@ pub enum ValidationMode {
     Strict,
     /// Skip the facet checks, keeping type coercion and the structural
     /// checks (unknown/missing/complex parameters).
-    ///
-    /// The escape hatch for a spec that disagrees with the live server:
-    /// without it a stale or wrong constraint would make an operation
-    /// uncallable.
     SkipFacets,
 }
 
@@ -71,13 +67,11 @@ impl fmt::Display for ParamType {
 pub enum BodyMode {
     /// A JSON object body that can be assembled from `key=value` pairs.
     KeyValue,
-    /// A JSON body constrained by a root-level `oneOf`/`anyOf` union: the
-    /// choice between branches cannot be expressed as flat `key=value`
-    /// pairs, so only a caller-supplied raw JSON body is accepted.
+    /// A JSON body constrained by a root-level `oneOf`/`anyOf` union;
+    /// only a caller-supplied raw JSON body is accepted.
     RawJsonOnly,
     /// The body uses a content type this generic client cannot assemble
-    /// (e.g. `multipart/form-data`). Not callable; a service-specific
-    /// command has to handle it.
+    /// (e.g. `multipart/form-data`); not callable.
     Unsupported,
 }
 
@@ -86,10 +80,8 @@ pub enum BodyMode {
 /// Constraint facets mirror the source schema so that invalid values are
 /// rejected locally, before any request is sent.
 ///
-/// TODO: `pattern` is deliberately not compiled. Validating it needs a
-/// regex engine, roughly a megabyte of binary against a 5 MB budget, to
-/// serve the two `pattern` constraints in the whole vendored spec; such
-/// values are left for the server to reject.
+/// TODO: `pattern` is not compiled; such values are left for the server to
+/// reject (validating it would need a regex engine).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamSpec {
     /// Parameter name as it appears in the JSON request body.
@@ -98,20 +90,14 @@ pub struct ParamSpec {
     pub ty: ParamType,
     /// Whether the spec marks this parameter as required.
     pub required: bool,
-    /// Whether the schema allows an explicit JSON `null`.
-    ///
-    /// For such a parameter the literal `key=null` is sent as JSON `null`.
-    /// The consequence is that the four-character *string* `"null"` cannot
-    /// be expressed as a `key=value` argument; callers who need it must
-    /// supply a raw JSON body instead.
+    /// Whether the schema allows an explicit JSON `null`; the literal
+    /// `key=null` is then sent as JSON `null`.
     pub nullable: bool,
     /// Allowed values, when the schema constrains the parameter to an
     /// enumeration. Empty means unconstrained.
     pub enum_values: Cow<'static, [Cow<'static, str>]>,
     /// Declared `format` (e.g. `uuid`, `date-time`), empty when absent.
-    ///
-    /// Only formats with an unambiguous definition are enforced; any other
-    /// value is carried for diagnostics but passed through unchecked.
+    /// Only formats with an unambiguous definition are enforced.
     pub format: Cow<'static, str>,
     /// Inclusive lower bound for numeric parameters, if any.
     pub minimum: Option<f64>,
@@ -136,15 +122,9 @@ pub struct ParamSpec {
 /// One field of an operation's response payload.
 ///
 /// These describe the shape of a single response ITEM (one row of a list
-/// response, or the payload object itself), in the order the source schema
-/// declares them. Consumers use them to pick output columns from the schema
-/// rather than from whatever a particular response happened to contain, so
-/// the same operation always renders the same way.
-///
-/// Only facets that a generic presentation layer can act on are carried;
-/// there is deliberately no per-operation presentation data here. Where the
-/// payload lives inside a response envelope is a service convention, so it
-/// is resolved by the spec compiler that emits the IR, never by the engine.
+/// response, or the payload object itself), in source-schema declaration
+/// order. Consumers use them to pick output columns, so the same operation
+/// always renders the same way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldSpec {
     /// Field name as it appears in the JSON response.
@@ -157,8 +137,7 @@ pub struct FieldSpec {
     /// Whether the schema allows an explicit JSON `null`.
     pub nullable: bool,
     /// Whether the schema marks the field as server-generated
-    /// (`readOnly`). A generic renderer can use this to tell a writable
-    /// label (a title, a name) from a derived one (a URL, an id-like slug).
+    /// (`readOnly`).
     pub read_only: bool,
 }
 
@@ -168,8 +147,7 @@ pub struct OpSpec {
     /// Operation name in `resource.method` form (e.g. `things.info`).
     pub name: Cow<'static, str>,
     /// URL path joined verbatim onto the client base URL (e.g.
-    /// `/rpc/things.info`). Any service-specific prefix convention is
-    /// applied by the spec compiler that emits the IR, never by the engine.
+    /// `/rpc/things.info`).
     pub path: Cow<'static, str>,
     /// One-line human-readable summary from the source spec (may be empty).
     pub summary: Cow<'static, str>,

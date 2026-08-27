@@ -1,4 +1,4 @@
-//! Story 4.4: what a REAL shell does with the generated script.
+//! What a REAL shell does with the generated script.
 //!
 //! Split from `completions.rs` by prerequisite, not by size. Everything here
 //! spawns an external shell, so it can only assert where that shell exists

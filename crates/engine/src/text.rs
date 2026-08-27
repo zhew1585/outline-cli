@@ -1,32 +1,23 @@
 //! One classification of characters that are unsafe to print verbatim.
 //!
-//! Lives in the engine because BOTH layers need the same answer. The engine
-//! scrubs text a server sent before it reaches stderr; the CLI scrubs text a
-//! server, a config file or a filesystem produced before it reaches a table
-//! cell, a completion description or a diagnostic. Two tables drift, and
-//! this one already has: the CLI's list was found short of `U+202E`, then of
-//! `U+061C` and `U+206A..U+206F`, then of `U+070F`, `U+0600..U+0605` and the
-//! `U+13430` block - while the engine was meanwhile classifying by RENDERED
-//! WIDTH, which keeps 27 of those same codepoints because a terminal gives
-//! them a column.
+//! Lives in the engine because BOTH layers need the same answer: the
+//! engine scrubs server-sent text before it reaches stderr, and the CLI
+//! scrubs server-, config- or filesystem-provided text before it reaches
+//! a table cell, a completion description or a diagnostic.
 //!
 //! Nothing here is protocol-specific: it is a function from `char` to a
 //! category, with no notion of what the text describes.
 //!
-//! # The table is the whole `Cf` category, not a selection from it
-//!
-//! A partial list reads as complete, so the entries below cover every
-//! assigned `General_Category=Cf` codepoint (Unicode 15.1) plus `U+00AD` and
-//! `U+180E`. [`tests::every_format_character_is_classified`] pins that by
+//! The table covers every assigned `General_Category=Cf` codepoint
+//! (Unicode 15.1) plus `U+00AD` and `U+180E`.
+//! [`tests::every_format_character_is_classified`] pins that by
 //! enumerating the ranges rather than by sampling them.
 //!
-//! # What it does NOT decide
-//!
-//! How to RENDER a hazard is the caller's, because the right answer differs:
-//! a diagnostic wants the character gone, a data cell wants honest width, and
-//! a payload (`--json`) wants the server's bytes untouched. [`hazard`]
-//! returns a category so that a caller has to match on it and cannot be
-//! unaware of one.
+//! How to RENDER a hazard is the caller's, because the right answer
+//! differs: a diagnostic wants the character gone, a data cell wants
+//! honest width, and a payload (`--json`) wants the server's bytes
+//! untouched. [`hazard`] returns a category so that a caller has to match
+//! on it and cannot be unaware of one.
 
 /// A reason a character must not be forwarded to a terminal verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,22 +41,12 @@ pub enum Hazard {
     /// Occupies no column, so it can hide inside a value, pad a name to
     /// evade a comparison, or make two different strings render identically.
     Invisible,
-    /// Invisible, but semantically required by the text it sits in.
-    ///
-    /// Invisible in the same way as the category above, but unlike the rest
-    /// these carry MEANING in ordinary text, so a surface showing DATA has
-    /// to keep them while a surface showing a NAME being compared or quoted
-    /// should not:
-    ///
-    /// - `U+200D` is what makes an emoji ligature one glyph (the family
-    ///   emoji is six codepoints joined by three of them) and `U+200C` is
-    ///   required to spell Persian and Hindi words correctly;
-    /// - the tag block `U+E0020..U+E007F` spells out the subdivision in a
-    ///   flag emoji - dropping it turns the Scotland flag into a black one.
-    ///
-    /// The name is historical: joiners were the first members. What the
-    /// category means is the sentence above, and membership follows from
-    /// that rather than from the word.
+    /// Invisible, but semantically required by the text it sits in:
+    /// unlike the rest these carry MEANING in ordinary text (`U+200D`
+    /// joins an emoji ligature, `U+200C` is required for Persian and
+    /// Hindi, the tag block `U+E0020..U+E007F` spells out a flag
+    /// emoji's subdivision), so a surface showing DATA has to keep them
+    /// while a surface showing a NAME being compared or quoted should not.
     Joiner,
 }
 

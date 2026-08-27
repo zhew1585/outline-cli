@@ -274,7 +274,7 @@ fn cluster_width(text: &str) -> usize {
 
 #[test]
 fn table_aligns_emoji_ligatures() {
-    // Re-review PoC: per-codepoint width sums are wrong for ligatures -
+    // per-codepoint width sums are wrong for ligatures -
     // skin-tone modifiers, ZWJ sequences and family emoji all render as 2
     // columns but sum to 4-8 per codepoint. Every row's last column must
     // still start at the same display column.
@@ -324,7 +324,7 @@ fn table_never_splits_a_grapheme_cluster() {
 
 #[test]
 fn table_caps_zero_width_codepoint_floods() {
-    // Re-review PoC: 100k combining accents are one grapheme cluster of
+    // 100k combining accents are one grapheme cluster of
     // display width 1, so a width-only cap lets a cell carry ~200 KB.
     // Absolute cluster and codepoint caps must bound it.
     let flood = format!("a{}", "\u{301}".repeat(100_000));
@@ -383,7 +383,7 @@ fn mode_resolution_follows_flag_then_tty() {
 }
 
 // ---------------------------------------------------------------------------
-// Story 1-5b: schema-driven column selection.
+// Schema-driven column selection.
 //
 // The column set becomes a property of the OPERATION, taken from the response
 // schema compiled into the IR, instead of a property of one response body.
@@ -392,7 +392,7 @@ fn mode_resolution_follows_flag_then_tty() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Bidi and invisible characters in cell data (R6 finding 3).
+// Bidi and invisible characters in cell data.
 //
 // `is_control()` does not cover the Unicode FORMAT characters, and an
 // unterminated right-to-left override does not stop at the cell boundary: it
@@ -510,7 +510,7 @@ fn a_zero_width_joiner_survives_because_it_is_part_of_the_text() {
 #[test]
 fn json_mode_is_exempt_from_hazard_scrubbing() {
     // A deliberate exemption, pinned so it reads as a decision rather than an
-    // oversight (R7 finding 2). `--json` is the payload, not a rendering: its
+    // `--json` is the payload, not a rendering: its
     // contract is that `jq` consumes it and that it round-trips to what the
     // server sent, so substituting a codepoint there would corrupt data to
     // protect a terminal that is not the intended consumer.

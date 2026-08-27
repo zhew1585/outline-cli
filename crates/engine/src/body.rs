@@ -98,8 +98,7 @@ fn unknown_param(op: &OpSpec, key: &str) -> EngineError {
 ///
 /// Type coercion always applies - a wrongly typed value cannot be put on
 /// the wire at all. Only the facet checks (enum, bounds, format) honour
-/// [`ValidationMode::SkipFacets`], the escape hatch for a spec that
-/// disagrees with the live server.
+/// [`ValidationMode::SkipFacets`].
 fn typed_value(
     op: &OpSpec,
     param: &ParamSpec,

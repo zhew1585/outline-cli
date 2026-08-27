@@ -1,4 +1,4 @@
-//! `otl docs view <id>` (story 3.2).
+//! `otl docs view <id>`.
 //!
 //! The datum of this command is the document's markdown, so - unlike the
 //! list commands - a pipe gets the markdown and not JSON. The dual-state

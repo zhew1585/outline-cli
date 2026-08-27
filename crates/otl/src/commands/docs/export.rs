@@ -1,4 +1,4 @@
-//! `otl docs export --collection <id> --out <dir>` (story 3.6).
+//! `otl docs export --collection <id> --out <dir>`.
 //!
 //! The collection is enumerated through the engine's auto-pagination (so a
 //! collection larger than one page comes back whole), the document tree is
@@ -185,8 +185,7 @@ impl<'a> Export<'a> {
             // Only truncation the caller did NOT ask for makes the export
             // incomplete. `--limit N` stopping at N documents is the
             // requested outcome and stays exit 0 - the same boundary the
-            // other curated list commands honour, and the one registered
-            // in docs/exit-codes.md.
+            // other curated list commands honour.
             truncated: documents.incomplete().copied(),
             limited: documents.truncation.is_some() && documents.incomplete().is_none(),
         }
