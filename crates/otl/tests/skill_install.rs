@@ -282,7 +282,7 @@ fn a_symlinked_skill_directory_is_refused_but_a_symlinked_root_is_not() {
         report["targets"][0]["reason"]
             .as_str()
             .unwrap()
-            .contains("symlink"),
+            .contains("is a link to somewhere else"),
         "{report}"
     );
     assert!(

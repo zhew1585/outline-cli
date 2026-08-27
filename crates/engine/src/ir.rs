@@ -148,7 +148,9 @@ pub struct FieldSpec {
     /// Shape of a complex field, including whether children describe an
     /// object directly or one item of an array.
     pub container: FieldContainer,
-    /// Whether this field declares properties that are NOT in this list.
+    /// Whether SOME of this field's declared properties are missing from
+    /// this list. Some, not all: a field can both carry children here and
+    /// have others omitted.
     ///
     /// True for a model that repeats one already open on its branch (a
     /// recursive model, which has no finite expansion) and for a container

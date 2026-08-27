@@ -106,10 +106,11 @@ children describe one array item. Union alternatives are not merged into a shape
 guarantee.
 
 Two of those shapes have no finite expansion, and the output says so rather than looking empty:
-`"fields_omitted": true` marks a field whose properties exist but are not listed — a model that repeats
-one of its own ancestors (Outline's `User.invitedBy` is a `User`), or a field at the depth limit. Without
-it, `"fields": []` would tell an agent that `…createdBy.invitedBy.id` does not exist, which is worse than
-saying nothing: the whole point of this output is that a caller can trust it.
+`"fields_omitted": true` marks a field some of whose properties exist but are not listed — a model that
+repeats one of its own ancestors (Outline's `User.invitedBy` is a `User`), or a field at the depth limit.
+Some, not all: a recursive model with extra properties of its own lists those and still sets the flag.
+Without it, `"fields": []` would tell an agent that `…createdBy.invitedBy.id` does not exist, which is
+worse than saying nothing: the whole point of this output is that a caller can trust it.
 
 The descriptions matter more than they look. Of the 109 operations that take parameters, **29 mark none
 of them required** — `documents.info` declares both `id` and `shareId` optional, and only the prose says
@@ -492,9 +493,10 @@ document is the one compiled into this binary, so its version is the version of 
 The document carries that version in its own frontmatter, which is the single place it is authored, and
 `otl doctor`'s `skill` check compares each installed copy against it: `ok` when they match or when none
 is installed, `warn` (never blocking) when a copy is behind, was edited, declares no version, is another
-skill's document, or sits at a path that cannot hold one. Each state carries its own `remedy` in the
-report, because they are not answered by the same command — a foreign document needs `--force`, and an
-unusable path needs a look rather than a reinstall.
+skill's document, or sits at a path that cannot hold one, and `skipped` when the machine has no agent
+skills directory at all. Each state carries its own `remedy` in the report, because they are not answered
+by the same command — a foreign document needs `--force`, and an unusable path needs a look rather than a
+reinstall.
 
 Its own document is the only thing an install overwrites. Another skill's `SKILL.md` needs `--force`; a
 document path that is not a regular file, and a `<skills dir>/outline-cli` that is a symlink, are refused

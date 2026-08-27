@@ -233,10 +233,12 @@ Read it like this:
   or absent (a scalar). Children of an `array` describe **one item**. A `union`
   field carries no children on purpose: the alternatives are not one guaranteed
   shape, so no path is promised.
-- `"fields_omitted": true` means this field HAS properties that are not listed
+- `"fields_omitted": true` means SOME of this field's properties are not listed
   here - a model that repeats one of its own ancestors (there is no finite
-  expansion) or a field at the depth limit. Do not read `"fields": []` on such
-  a field as "no properties": look at the ancestor of the same shape instead.
+  expansion) or a field at the depth limit. Some, not all: the flag can be
+  `true` on a field that also carries `fields`, which is a recursive model with
+  extra properties of its own. Do not read `"fields": []` on such a field as
+  "no properties": look at the ancestor of the same shape instead.
   `"fields_omitted": false` with an empty `fields` really is empty.
 - `body_mode: "raw_json_only"` means flat `key=value` cannot express the body -
   use `--body @file.json`. `callable: false` means `otl api` will not send it.
@@ -277,9 +279,11 @@ otl skill show           # print this document to stdout
 installed copy matches this binary - or that none is installed, which is not a
 fault. `warn` means a copy is out of step: behind, edited locally, declaring no
 version, another skill occupying the path (`otl skill install --force`
-replaces it), or a path that cannot hold a copy. Each entry in
-`installed[]` carries its own `state` and `remedy`, so act on that rather than
-on the summary.
+replaces it), or a path that cannot hold a copy. `skipped` means this machine
+has no agent skills directory at all, so there was nothing to compare. Each
+entry in `installed[]` carries its own `state` (`current`, `behind`, `edited`,
+`undeclared`, `absent`, `foreign`, `unusable`) and its own `remedy`, so act on
+those rather than on the summary.
 
 ## 7. Global flags, and the rest of the surface
 

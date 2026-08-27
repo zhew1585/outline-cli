@@ -92,16 +92,6 @@ fn a_cache_with_invalid_response_field_nesting_is_rejected() {
                 ..field("title", 0, FieldContainer::None)
             }],
         ),
-        (
-            "a field that claims omitted properties and then lists them",
-            vec![
-                FieldSpec {
-                    children_omitted: true,
-                    ..field("document", 0, FieldContainer::Object)
-                },
-                field("id", 1, FieldContainer::None),
-            ],
-        ),
     ];
     for (case, fields) in cases {
         let (_dir, file) = temp_cache();
@@ -130,7 +120,13 @@ fn a_cache_with_valid_response_field_nesting_is_accepted() {
     let (_dir, file) = temp_cache();
     let mut nested = op("things.info", "/api/things.info");
     nested.response_fields = vec![
-        field("document", 0, FieldContainer::Object),
+        // A field that both LISTS a property and omits others: the shape
+        // `allOf: [$ref Self, {props}]` compiles to, which an earlier
+        // version of this validator refused.
+        FieldSpec {
+            children_omitted: true,
+            ..field("document", 0, FieldContainer::Object)
+        },
         field("id", 1, FieldContainer::None),
         FieldSpec {
             children_omitted: true,
@@ -152,6 +148,7 @@ fn a_cache_with_valid_response_field_nesting_is_accepted() {
         .expect("a bounded pre-order tree is usable")
         .expect("a cache is present");
     assert_eq!(loaded.ops[0].response_fields.len(), 4);
+    assert!(loaded.ops[0].response_fields[0].children_omitted);
     assert!(loaded.ops[0].response_fields[2].children_omitted);
 }
 

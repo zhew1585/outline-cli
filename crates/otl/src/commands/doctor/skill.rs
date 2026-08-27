@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(found[0].state.key(), "unusable");
         assert_eq!(status(&found), Status::Warn);
         let line = found[0].line();
-        assert!(line.contains("symlink"), "{line}");
+        assert!(line.contains("is a link to somewhere else"), "{line}");
         assert!(
             !line.contains("run `otl skill install`"),
             "prescribes a command that refuses this path: {line}"

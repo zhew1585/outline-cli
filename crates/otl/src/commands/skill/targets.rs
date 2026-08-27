@@ -203,11 +203,11 @@ fn examine_root(root: &Path) -> Option<Installed> {
 /// The directory this skill owns, which this command creates and writes in.
 fn examine_dir(dir: &Path) -> Option<Installed> {
     let meta = std::fs::symlink_metadata(dir).ok()?;
-    if meta.file_type().is_symlink() {
+    if is_redirect(&meta) {
         return Some(Installed::Unusable {
             reason: format!(
-                "{} is a symlink, and this command will not write through one; \
-                 replace it with a real directory",
+                "{} is a link to somewhere else, and this command will not write \
+                 through one; replace it with a real directory",
                 crate::config::sanitize_path(dir)
             ),
         });
@@ -296,6 +296,43 @@ pub fn frontmatter_value(document: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether this metadata describes a path that redirects elsewhere.
+///
+/// `is_symlink()` alone is not the question on Windows: a directory
+/// JUNCTION reports as an ordinary directory there, so a junction planted
+/// at `<skills dir>/<skill>` would be followed by the write while a symlink
+/// would not. Both are reparse points, which is what the Windows branch
+/// looks at - the platform is answered explicitly rather than assumed to
+/// behave like Unix, per `project-context.md`.
+pub fn is_redirect(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink() || is_reparse_point(meta)
+}
+
+/// Whether a path is a Windows reparse point that `is_symlink()` misses -
+/// a junction or a mount point.
+///
+/// Two functions rather than one with an inner `cfg` block: the branch has
+/// to be an expression on both platforms, and `scripts/win-check.sh`
+/// (the only gate that compiles the Windows branch at all) rejected the
+/// early-return form that made the Unix side read oddly.
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`, which covers junctions and mount
+    /// points as well as symlinks.
+    const REPARSE_POINT: u32 = 0x0400;
+
+    meta.file_attributes() & REPARSE_POINT != 0
+}
+
+/// On Unix a symlink is the only redirect a path can be, and
+/// [`is_redirect`] has already answered that.
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Frontmatter delimiter line.

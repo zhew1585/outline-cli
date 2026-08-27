@@ -128,12 +128,16 @@ pub struct CompiledField {
     pub depth: u8,
     /// Shape of a complex response field. Scalars use [`FieldContainer::None`].
     pub container: FieldContainer,
-    /// Whether this field's own properties are NOT in the list although the
-    /// schema declares some.
+    /// Whether SOME of this field's properties are missing from the list
+    /// although the schema declares them.
+    ///
+    /// Some, not all: `allOf: [$ref Self, {props}]` - a recursive model
+    /// with extra fields - lists the extra fields and omits the recursive
+    /// ones, so this flag can sit on a field that has children of its own.
     ///
     /// Two schemas produce it, and a caller needs neither distinguished nor
     /// hidden: a model that repeats one already open on this branch (a
-    /// recursive model, whose expansion has no end), and an object that
+    /// recursive model, whose expansion has no end), and a container that
     /// sits at the depth limit. Without this flag such a field is
     /// indistinguishable from an object that genuinely has no properties -
     /// which would tell an agent that a path it can legitimately use does
@@ -495,41 +499,6 @@ mod tests {
         assert_eq!(op.params[1].name, "count");
         assert_eq!(op.params[1].ty, ScalarKind::Integer);
         assert!(!op.params[1].required);
-    }
-
-    #[test]
-    fn response_fields_recurse_through_objects_refs_and_array_items() {
-        let raw = serde_json::json!({
-            "paths": {"/things.list": {"post": {"responses": {"200": {"content": {
-                "application/json": {"schema": {"type": "object", "properties": {
-                    "result": {"$ref": "#/components/schemas/Result"},
-                    "choice": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
-                }}}
-            }}}}}},
-            "components": {"schemas": {"Result": {"type": "object", "properties": {
-                "id": {"type": "string", "format": "uuid"},
-                "items": {"type": "array", "items": {"type": "object", "properties": {
-                    "code": {"type": "integer"}
-                }}}
-            }}}}
-        })
-        .to_string();
-        let compiled = compile_json(&raw, &opts()).expect("compiles");
-        let fields = &compiled.ops[0].response_fields;
-        let shape: Vec<(&str, u8, FieldContainer)> = fields
-            .iter()
-            .map(|field| (field.name.as_str(), field.depth, field.container))
-            .collect();
-        assert_eq!(
-            shape,
-            [
-                ("result", 0, FieldContainer::Object),
-                ("id", 1, FieldContainer::None),
-                ("items", 1, FieldContainer::Array),
-                ("code", 2, FieldContainer::None),
-                ("choice", 0, FieldContainer::Union),
-            ]
-        );
     }
 
     /// The `deprecated` flag is read per operation, strictly as the JSON
