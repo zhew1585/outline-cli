@@ -92,7 +92,7 @@
 #
 # Usage:
 #   ./scripts/check-binary-size.sh                          # host target
-#   BINARY_SIZE_TARGET=x86_64-unknown-linux-musl ./scripts/check-binary-size.sh
+#   BINARY_SIZE_TARGET=x86_64-apple-darwin ./scripts/check-binary-size.sh
 #   MAX_BINARY_SIZE_BYTES=3000000 ./scripts/check-binary-size.sh   # override
 #   BINARY_SIZE_WARN_PERCENT=90 ./scripts/check-binary-size.sh
 #   BINARY_SIZE_PROFILE=release ./scripts/check-binary-size.sh
