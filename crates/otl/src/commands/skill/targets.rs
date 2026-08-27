@@ -151,43 +151,112 @@ pub enum Installed {
     },
     /// A `SKILL.md` belonging to some other skill.
     Foreign { name: Option<String> },
-    /// Something is there that cannot be used as an installed copy, with
-    /// the reason. Never overwritten, not even with `--force`: a symlink or
-    /// a directory at that path is a situation to look at, and following it
-    /// with a write is how a symlink becomes an arbitrary-file write.
+    /// Nothing usable is there, and `reason` is a full sentence INCLUDING
+    /// its own remedy - which differs case by case, so a single suffix
+    /// appended by the caller would be wrong for most of them.
+    ///
+    /// Never written to, not even with `--force`: every case here is a
+    /// situation to look at rather than to overwrite, and following a
+    /// symlink with a write is how an install becomes a write elsewhere.
     Unusable { reason: String },
 }
 
-/// Examine the copy installed at one target.
+/// Examine the copy installed at one target, and the path leading to it.
 ///
-/// `symlink_metadata`, not `metadata`: a symlink here must be reported as
-/// what it is rather than resolved and then written through.
+/// Three things are checked, in the order a caller can act on them: the
+/// skills directory it was pointed at, the directory this skill owns, and
+/// the document. Each uses `symlink_metadata`, never `metadata`: a symlink
+/// must be REPORTED rather than resolved and then written through.
+///
+/// The asymmetry between the two directories is deliberate. The skills root
+/// may be a symlink - it is the directory the user named or the one an
+/// agent created, and pointing it at a dotfiles checkout is a normal thing
+/// to do. `<root>/<skill>` is a directory this command creates and owns, so
+/// a symlink there redirects a write this command believes is local.
 pub fn inspect(target: &Target) -> Installed {
-    let path = target.file();
-    let meta = match std::fs::symlink_metadata(&path) {
+    if let Some(problem) = examine_root(&target.root) {
+        return problem;
+    }
+    if let Some(problem) = examine_dir(&target.dir()) {
+        return problem;
+    }
+    examine_file(&target.file())
+}
+
+/// The skills directory itself: it has to be a directory, or nothing below
+/// it can exist.
+fn examine_root(root: &Path) -> Option<Installed> {
+    match std::fs::metadata(root) {
+        // Absent is fine: the install creates it inside an existing agent
+        // home, and `--dir` may legitimately name a directory to be made.
+        Err(_) => None,
+        Ok(meta) if meta.is_dir() => None,
+        Ok(_) => Some(Installed::Unusable {
+            reason: format!(
+                "the skills directory {} is not a directory; point --dir at one",
+                crate::config::sanitize_path(root)
+            ),
+        }),
+    }
+}
+
+/// The directory this skill owns, which this command creates and writes in.
+fn examine_dir(dir: &Path) -> Option<Installed> {
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some(Installed::Unusable {
+            reason: format!(
+                "{} is a symlink, and this command will not write through one; \
+                 replace it with a real directory",
+                crate::config::sanitize_path(dir)
+            ),
+        });
+    }
+    if !meta.is_dir() {
+        return Some(Installed::Unusable {
+            reason: format!(
+                "{} is not a directory; remove it by hand",
+                crate::config::sanitize_path(dir)
+            ),
+        });
+    }
+    None
+}
+
+/// The document itself.
+fn examine_file(path: &Path) -> Installed {
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Installed::Absent,
+        // `kind()`, not the error: the raw form carries a platform errno
+        // number that means nothing to the reader of a report.
         Err(error) => {
             return Installed::Unusable {
-                reason: format!("cannot be examined: {error}"),
+                reason: format!(
+                    "the installed document cannot be examined: {}",
+                    error.kind()
+                ),
             }
         }
     };
     if !meta.is_file() {
         return Installed::Unusable {
-            reason: "is not a regular file".to_string(),
+            reason: "the installed document is not a regular file; remove it by hand".to_string(),
         };
     }
     if meta.len() > MAX_INSTALLED_BYTES {
         return Installed::Unusable {
-            reason: format!("is larger than {MAX_INSTALLED_BYTES} bytes"),
+            reason: format!(
+                "the installed document is larger than {MAX_INSTALLED_BYTES} bytes, \
+                 so it is not one this CLI wrote; remove it by hand"
+            ),
         };
     }
-    let document = match std::fs::read_to_string(&path) {
+    let document = match std::fs::read_to_string(path) {
         Ok(document) => document,
         Err(error) => {
             return Installed::Unusable {
-                reason: format!("cannot be read: {error}"),
+                reason: format!("the installed document cannot be read: {}", error.kind()),
             }
         }
     };
@@ -205,6 +274,12 @@ pub fn inspect(target: &Target) -> Installed {
 /// The authoring side of this rule is in `build.rs`, and both halves read
 /// only UNINDENTED lines of the leading fenced block: a nested `metadata:`
 /// entry called `version` must not be able to answer for the document.
+///
+/// The value is SANITIZED, because for an installed copy it is foreign text
+/// that reaches a report: the same rule as every other name this CLI echoes
+/// (control characters replaced, length capped). Nothing is lost for a
+/// document this CLI wrote - `build.rs` accepts neither in its own
+/// frontmatter.
 pub fn frontmatter_value(document: &str, key: &str) -> Option<String> {
     let mut lines = document.lines();
     if lines.next()? != FRONTMATTER_FENCE {
@@ -217,7 +292,7 @@ pub fn frontmatter_value(document: &str, key: &str) -> Option<String> {
         }
         if let Some(value) = line.strip_prefix(&prefix) {
             let value = value.trim().trim_matches('"').trim();
-            return (!value.is_empty()).then(|| value.to_string());
+            return (!value.is_empty()).then(|| crate::config::sanitize_name(value));
         }
     }
     None

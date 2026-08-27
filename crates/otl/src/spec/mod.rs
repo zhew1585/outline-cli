@@ -92,6 +92,7 @@ fn field_to_ir(field: &CompiledField) -> FieldSpec {
         nullable: field.nullable,
         read_only: field.read_only,
         depth: field.depth,
+        children_omitted: field.children_omitted,
         container: match field.container {
             spec_compile::FieldContainer::None => engine::ir::FieldContainer::None,
             spec_compile::FieldContainer::Object => engine::ir::FieldContainer::Object,
@@ -281,25 +282,61 @@ fn check_field_text(op: &OpSpec) -> Result<(), String> {
             return unsafe_text("response field format");
         }
     }
-    let mut containers = Vec::new();
+    check_field_nesting(op)
+}
+
+/// The pre-order encoding of the response fields.
+///
+/// A separate function with a message of its OWN: this is a structural
+/// verdict, and reporting it as text that is "too long or contains control
+/// characters (the value is not shown)" would name a cause that is not the
+/// cause and claim a value was hidden when there is none.
+///
+/// The rules are the ones the presentation side relies on
+/// ([`crate::commands::api::describe`] rebuilds a tree from this list): the
+/// first entry is top-level, a child is exactly one level below the entry
+/// it follows, its parent is an object or an array, and nothing exceeds the
+/// compiler's depth limit. A field that says its properties are omitted
+/// must not then be followed by them.
+fn check_field_nesting(op: &OpSpec) -> Result<(), String> {
+    let invalid = || {
+        Err(format!(
+            "operation {:?} declares response field nesting that is not a \
+             bounded pre-order tree, so its nested output paths cannot be \
+             trusted",
+            op.name
+        ))
+    };
+    let mut containers: Vec<engine::ir::FieldContainer> = Vec::new();
+    let mut omitted: Vec<bool> = Vec::new();
     for (index, field) in op.response_fields.iter().enumerate() {
         let depth = usize::from(field.depth);
         if depth > spec_compile::MAX_SCHEMA_DEPTH
             || (index == 0 && depth != 0)
             || depth > containers.len()
         {
-            return unsafe_text("response field nesting");
+            return invalid();
         }
         containers.truncate(depth);
+        omitted.truncate(depth);
         if depth > 0
-            && !matches!(
+            && (!matches!(
                 containers.get(depth - 1),
                 Some(engine::ir::FieldContainer::Object | engine::ir::FieldContainer::Array)
+            ) || omitted.get(depth - 1) == Some(&true))
+        {
+            return invalid();
+        }
+        if field.children_omitted
+            && !matches!(
+                field.container,
+                engine::ir::FieldContainer::Object | engine::ir::FieldContainer::Array
             )
         {
-            return unsafe_text("response field nesting");
+            return invalid();
         }
         containers.push(field.container);
+        omitted.push(field.children_omitted);
     }
     Ok(())
 }

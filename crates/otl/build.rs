@@ -25,7 +25,7 @@ const API_PATH_PREFIX: &str = "/api";
 /// and never in the engine or the compiler.
 const ENVELOPE_DATA_PROPERTY: &str = "data";
 /// Must match `engine::ir::IR_SCHEMA_VERSION`; asserted in generated code.
-const IR_SCHEMA_VERSION: u32 = 7;
+const IR_SCHEMA_VERSION: u32 = 8;
 
 fn main() {
     println!("cargo:rerun-if-changed=spec/spec3.json");
@@ -249,6 +249,11 @@ fn render_field(out: &mut String, field: &CompiledField) {
         out,
         "                container: engine::ir::FieldContainer::{},",
         field_container_variant(field.container)
+    );
+    let _ = writeln!(
+        out,
+        "                children_omitted: {},",
+        field.children_omitted
     );
     let _ = writeln!(out, "            }},");
 }

@@ -84,6 +84,7 @@ fn check_field_nesting(op: &CompiledOp) -> Result<(), CompileError> {
         reason: "it is not a bounded pre-order tree",
     };
     let mut containers = Vec::new();
+    let mut omitted: Vec<bool> = Vec::new();
     for (index, field) in op.response_fields.iter().enumerate() {
         let depth = usize::from(field.depth);
         if depth > crate::schema::MAX_SCHEMA_DEPTH
@@ -93,15 +94,28 @@ fn check_field_nesting(op: &CompiledOp) -> Result<(), CompileError> {
             return Err(invalid());
         }
         containers.truncate(depth);
+        omitted.truncate(depth);
+        // A parent must be a container, and must not have claimed that its
+        // properties are absent from the list - the claim and the child
+        // contradict each other, and a caller cannot be told both.
         if depth > 0
-            && !matches!(
+            && (!matches!(
                 containers.get(depth - 1),
                 Some(crate::FieldContainer::Object | crate::FieldContainer::Array)
+            ) || omitted.get(depth - 1) == Some(&true))
+        {
+            return Err(invalid());
+        }
+        if field.children_omitted
+            && !matches!(
+                field.container,
+                crate::FieldContainer::Object | crate::FieldContainer::Array
             )
         {
             return Err(invalid());
         }
         containers.push(field.container);
+        omitted.push(field.children_omitted);
     }
     Ok(())
 }

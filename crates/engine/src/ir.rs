@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 /// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`);
 /// 4 added `ParamSpec::format`; 5 added `OpSpec::response_fields`;
 /// 6 added `ParamSpec::description`; 7 added recursive response-field
-/// descriptors (`FieldSpec::depth` and `FieldSpec::container`).
-pub const IR_SCHEMA_VERSION: u32 = 7;
+/// descriptors (`FieldSpec::depth` and `FieldSpec::container`); 8 added
+/// `FieldSpec::children_omitted`.
+pub const IR_SCHEMA_VERSION: u32 = 8;
 
 /// How strictly a request is validated against the IR before being sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -147,6 +148,14 @@ pub struct FieldSpec {
     /// Shape of a complex field, including whether children describe an
     /// object directly or one item of an array.
     pub container: FieldContainer,
+    /// Whether this field declares properties that are NOT in this list.
+    ///
+    /// True for a model that repeats one already open on its branch (a
+    /// recursive model, which has no finite expansion) and for a container
+    /// at the depth limit. Without it such a field is indistinguishable
+    /// from an object with no properties at all, which would deny a path
+    /// that actually exists.
+    pub children_omitted: bool,
 }
 
 /// Container shape of one response field.

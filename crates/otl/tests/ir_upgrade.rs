@@ -1,24 +1,35 @@
 //! The migration path across an `IR_SCHEMA_VERSION` bump.
 //!
-//! Recursive response descriptors take the IR from 6 to 7, which
-//! invalidates every cache `otl spec sync` has written on a user's machine.
-//! That is expected and by design - a cache is regenerable - but "expected"
-//! only counts if the four things a user then does actually work. This file
-//! builds a cache in the OLD shape, by hand, and drives them:
+//! Every bump invalidates the cache `otl spec sync` has written on a user's
+//! machine (recursive response descriptors took the IR from 6 to 7, the
+//! `children_omitted` marker from 7 to 8). That is expected and by design -
+//! a cache is regenerable - but "expected" only counts if the four things a
+//! user then does actually work. This file builds a cache in an OLD shape, by
+//! hand, and drives them:
 //!
 //! 1. ordinary commands keep working, on the built-in table;
 //! 2. the warning says the cache is OUTDATED, not damaged, and names the fix;
 //! 3. `otl doctor` reports it and does not call the environment broken;
 //! 4. `otl spec sync` rebuilds it and `otl spec reset` clears it.
 //!
-//! # Why the old records are written out by hand
+//! # Why the old records are written out by hand, and what that does NOT
+//! prove
 //!
-//! Operation records are `bincode`: positional, with no field names. There
-//! is no way to ask the current types for the previous layout, and a test
+//! Operation records are `bincode`: positional, with no field names. A test
 //! that wrote a CURRENT record and only lowered the version number in the
-//! metadata would prove nothing about the case that actually occurs - the
-//! bytes would still decode. So the v6 structs are mirrored below, field for
-//! field and variant for variant, and serialized with the same encoder.
+//! metadata would describe a file no build ever produced, so the v6 structs
+//! are mirrored below, field for field and variant for variant, and
+//! serialized with the same encoder.
+//!
+//! What that buys is a PLAUSIBLE fixture, and nothing more: `cache::load`
+//! compares the version in the metadata before it decodes any operation, so
+//! these records are never decoded and this file cannot tell whether the
+//! mirror is faithful. Do not read the mirror as an assertion about the v6
+//! layout. Nor is the exact old version load-bearing - every version other
+//! than the current one takes the same path - and that is why the mirror is
+//! left at 6 rather than chased forward on each bump: a fixture that has to
+//! be rewritten to keep testing the same gate is a fixture that will be
+//! rewritten wrongly.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -33,7 +44,8 @@ mod common;
 use common::cache::{push_record, record, write_body, FORMAT_VERSION, MAGIC};
 use common::isolate;
 
-/// The IR schema version this story replaced.
+/// The version these hand-written records claim to be. Any version other
+/// than the current one exercises the same gate; see the module note.
 const PREVIOUS_IR_SCHEMA_VERSION: u32 = 6;
 
 // --- the v6 layout, mirrored ------------------------------------------------

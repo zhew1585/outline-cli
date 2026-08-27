@@ -182,11 +182,19 @@ fn doctor_warns_about_a_stale_copy_without_blocking() {
         "a warning blocks nothing"
     );
     assert_eq!(drifted["installed"][0]["version"], Value::from("0.0.1"));
+    assert_eq!(drifted["installed"][0]["state"], Value::from("behind"));
+    // The remedy belongs to the TARGET, not to the summary: different
+    // states are answered by different commands.
+    assert_eq!(
+        drifted["installed"][0]["remedy"],
+        Value::from("run `otl skill install`"),
+        "{drifted}"
+    );
     assert!(
-        drifted["summary"]
+        drifted["detail"][0]
             .as_str()
             .unwrap()
-            .contains("otl skill install"),
+            .contains("this binary ships"),
         "{drifted}"
     );
     // The run's own code comes from the environment, which has no instance
@@ -222,4 +230,131 @@ fn show_prints_markdown_even_with_the_json_flag() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(output.stdout).unwrap(), document);
+}
+
+/// The regression the doctor check was rewritten for: a foreign document at
+/// the skill path must be a WARNING whose remedy works, not an `ok` that
+/// sends the user at a command which then refuses.
+#[test]
+fn doctor_and_install_agree_about_a_foreign_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let (report, _) = install_json(dir.path(), &[]);
+    let path = dir
+        .path()
+        .join(report["skill"].as_str().unwrap())
+        .join("SKILL.md");
+    std::fs::write(&path, "---\nname: someone-elses\nversion: 3.1.4\n---\n").unwrap();
+
+    let (check, code) = doctor_skill_check(dir.path());
+    assert_eq!(check["status"], Value::from("warn"), "{check}");
+    assert_eq!(check["exit_code"], Value::Null, "the check must not block");
+    assert_eq!(check["installed"][0]["state"], Value::from("foreign"));
+    let remedy = check["installed"][0]["remedy"].as_str().unwrap();
+    assert!(remedy.contains("--force"), "{remedy}");
+    assert_eq!(
+        code, 2,
+        "the code comes from the environment, not the skill"
+    );
+
+    // And the remedy the report gives is the one that works.
+    let (forced, code) = install_json(dir.path(), &["--force"]);
+    assert_eq!(code, 0, "{forced}");
+    assert_eq!(forced["targets"][0]["action"], Value::from("replaced"));
+}
+
+/// A symlink where this command creates its own directory is refused: the
+/// module claims it, so a test has to hold it. The skills root ABOVE it may
+/// still be a symlink, which the second half checks.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_skill_directory_is_refused_but_a_symlinked_root_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("skills");
+    std::fs::create_dir_all(&root).unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::os::unix::fs::symlink(&victim, root.join("outline-cli")).unwrap();
+
+    let (report, code) = install_json(&root, &["--force"]);
+    assert_eq!(code, 2, "--force must not extend to a symlinked directory");
+    assert_eq!(report["targets"][0]["action"], Value::from("refused"));
+    assert!(
+        report["targets"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("symlink"),
+        "{report}"
+    );
+    assert!(
+        !victim.join("SKILL.md").exists(),
+        "the write followed the symlink"
+    );
+
+    // The root itself being a symlink is ordinary (a dotfiles checkout).
+    let real_root = dir.path().join("real-skills");
+    std::fs::create_dir_all(&real_root).unwrap();
+    let linked_root = dir.path().join("linked-skills");
+    std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+    let (through_link, code) = install_json(&linked_root, &[]);
+    assert_eq!(code, 0, "{through_link}");
+    assert!(real_root.join("outline-cli/SKILL.md").exists());
+}
+
+/// `--dir` pointing at a FILE is a usage error, and the reason has to name
+/// the actual fix rather than telling the user to delete their file.
+#[test]
+fn install_into_a_dir_that_is_a_file_says_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_a_dir = dir.path().join("skills.txt");
+    std::fs::write(&not_a_dir, "not a directory").unwrap();
+
+    let (report, code) = install_json(&not_a_dir, &[]);
+    assert_eq!(code, 2, "{report}");
+    let reason = report["targets"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("--dir"), "{reason}");
+    assert!(
+        !reason.contains("remove it by hand"),
+        "wrong remedy for a --dir that names a file: {reason}"
+    );
+    assert!(
+        !reason.contains("os error"),
+        "a raw platform errno reached the user: {reason}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&not_a_dir).unwrap(),
+        "not a directory"
+    );
+}
+
+/// A hostile installed copy cannot flood a report: its frontmatter is
+/// foreign text, so it is scrubbed and capped like every other name.
+#[test]
+fn a_huge_foreign_skill_name_is_capped_in_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let (report, _) = install_json(dir.path(), &[]);
+    let path = dir
+        .path()
+        .join(report["skill"].as_str().unwrap())
+        .join("SKILL.md");
+    let huge = "z".repeat(200_000);
+    std::fs::write(&path, format!("---\nname: {huge}\nversion: 1.0.0\n---\n")).unwrap();
+
+    let (refused, code) = install_json(dir.path(), &[]);
+    assert_eq!(code, 2);
+    let reason = refused["targets"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.len() < 500,
+        "unbounded foreign text: {} bytes",
+        reason.len()
+    );
+
+    let (check, _) = doctor_skill_check(dir.path());
+    let state = check["installed"][0]["state"].as_str().unwrap();
+    assert_eq!(state, "foreign");
+    let detail = check["detail"][0].as_str().unwrap();
+    assert!(
+        detail.len() < 500,
+        "unbounded foreign text: {} bytes",
+        detail.len()
+    );
 }

@@ -192,6 +192,12 @@ fn param_json(param: &ParamSpec) -> Value {
 }
 
 /// One response field, in the source schema's own declaration order.
+///
+/// `fields_omitted` is the difference between "this object has no
+/// properties" and "this object's properties are not listed here": a
+/// recursive model has no finite expansion, and a field at the depth limit
+/// stops there. Without the flag an agent reading `"fields": []` is told a
+/// path it can legitimately use does not exist.
 fn field_json(field: &FieldSpec, fields: Vec<Value>) -> Value {
     json!({
         "name": field.name.as_ref(),
@@ -201,6 +207,7 @@ fn field_json(field: &FieldSpec, fields: Vec<Value>) -> Value {
         "nullable": field.nullable,
         "read_only": field.read_only,
         "fields": Value::Array(fields),
+        "fields_omitted": field.children_omitted,
     })
 }
 
@@ -381,6 +388,12 @@ fn field_line(field: &FieldSpec) -> String {
     if let Some(container) = container_name(field.container) {
         parts.push(container.to_string());
     }
+    if field.children_omitted {
+        // Same reason as `fields_omitted` in the JSON: an object printed
+        // with nothing under it otherwise reads as an object with nothing
+        // in it.
+        parts.push("nested fields not listed".to_string());
+    }
     if field.nullable {
         parts.push("nullable".to_string());
     }
@@ -468,6 +481,7 @@ mod tests {
             "nullable",
             "read_only",
             "fields",
+            "fields_omitted",
         ] {
             assert!(id.get(key).is_some(), "field facet {key} missing: {id}");
         }
