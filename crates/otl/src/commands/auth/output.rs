@@ -318,21 +318,56 @@ pub(super) struct Output {
 }
 
 /// Print a command result: human text on a terminal, JSON otherwise.
+///
+/// BOTH renderings are scrubbed, and this module is the reason the rule is
+/// worth stating rather than assuming. Its output interpolates a profile name
+/// out of a config file, a credential path out of the environment, an error
+/// string, and - the part that decides it - the `account`, `workspace` and
+/// `scope` the SERVER supplied. `otl auth info` is also the command a program
+/// runs to find out whether it has a credential at all, so it is squarely a
+/// text-to-a-machine surface.
+///
+/// It was missed in the first pass at this rule (Story 4.6 F1 covered
+/// `doctor` and `api describe`) and caught in the second, with `U+202E` in a
+/// profile name arriving byte-for-byte on stdout in both states.
+///
+/// `render_json_scrubbed`, not `render`: this value is a summary this module
+/// built, not an operation's response payload, so there is no response schema
+/// to pick table columns from - and not `render_json` either, because the
+/// `--json` exemption covers a server response that has to round-trip, which
+/// this object is not (see [`crate::text`]).
+///
+/// Scrubbing removes hazard characters and nothing else: no field is renamed,
+/// added, dropped or reordered, so the semver-protected shape of
+/// `otl auth info --json` is untouched.
 pub(super) fn emit(output: Output, mode: OutputMode) -> Result<(), CliError> {
+    stdio::write_data_line(&rendered(&output, mode)?)
+}
+
+/// The exact bytes [`emit`] writes, so a test can ask about them.
+///
+/// Split out rather than asserted through stdout: the property is WHICH
+/// renderer each state uses, and a test that reached for
+/// `render_json_scrubbed` itself would keep passing if this stopped calling
+/// it. That is how the gap this function closes survived one review.
+fn rendered(output: &Output, mode: OutputMode) -> Result<String, CliError> {
     match mode {
-        OutputMode::Json => {
-            // `render_json`, not `render`: this value is a summary this
-            // module built, not an operation's response payload, so there is
-            // no response schema to pick table columns from.
-            let rendered = render::render_json(&output.value).map_err(|error| {
-                CliError::new(
-                    ExitCode::Failure,
-                    anyhow!("failed to render the result: {error}"),
-                )
-            })?;
-            stdio::write_data_line(&rendered)
-        }
-        OutputMode::Table => stdio::write_data_line(&output.lines.join("\n")),
+        OutputMode::Json => render::render_json_scrubbed(&output.value).map_err(|error| {
+            CliError::new(
+                ExitCode::Failure,
+                anyhow!("failed to render the result: {error}"),
+            )
+        }),
+        // Per line, then joined: the lines this module builds are a LIST, and
+        // a foreign value carrying a newline must not be able to add an entry
+        // to it. `unavailable_lines` has already split the one legitimately
+        // multi-line value into separate entries.
+        OutputMode::Table => Ok(output
+            .lines
+            .iter()
+            .map(|line| stdio::scrub_to_one_line(line))
+            .collect::<Vec<_>>()
+            .join("\n")),
     }
 }
 
@@ -465,6 +500,90 @@ mod tests {
         assert_eq!(
             output.value["credential_directory_mode"],
             Value::from("0700")
+        );
+    }
+
+    /// Every string this module prints came from somewhere else, and three
+    /// of them came from the SERVER: `account`, `workspace` and `scope`.
+    ///
+    /// `otl auth info` is also the command a program runs to find out whether
+    /// it has a credential, so this is a text-to-a-machine surface with a
+    /// server-controlled half. Both states are checked, because the gap that
+    /// prompted this test was in both, and there was not one assertion of
+    /// this shape in the file - which is why `emit` was missed when the same
+    /// rule was applied to `doctor` and `api describe`.
+    #[test]
+    fn both_renderings_scrub_foreign_text() {
+        use crate::text::has_hazard;
+
+        // `\u{202e}` reverses the rest of the line, `\u{200f}` and
+        // `\u{061c}` are the residual `Cf` set, and the newline is the one
+        // that could forge an entry in a list of lines.
+        let hostile = "ev\u{202e}il\u{200f}\u{061c}\nmethod: forged";
+        assert!(
+            has_hazard(hostile),
+            "the fixture carries no hazard: this test would be vacuous"
+        );
+        let mut snapshot = Snapshot::fixed(crate::auth::selection::Method::EnvApiKey, Vec::new());
+        // The server-supplied half.
+        snapshot.account = Some(hostile.to_string());
+        snapshot.workspace = Some(hostile.to_string());
+        snapshot.scope = Some(hostile.to_string());
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/tmp/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: true,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/tmp"),
+            directory_mode: Some("0700".to_string()),
+            directory_problem: None,
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let output = info_output(
+            // The config-file half: a profile name is a TOML quoted key.
+            hostile,
+            &Ok(hostile.to_string()),
+            &health,
+            &Ok(Some(())),
+            &Some(snapshot),
+            &None,
+        );
+
+        for mode in [OutputMode::Json, OutputMode::Table] {
+            let text = rendered(&output, mode).expect("rendered");
+            for line in text.lines() {
+                assert!(!has_hazard(line), "{mode:?}: {line:?}");
+            }
+            assert!(text.contains("ev"), "{mode:?} lost the text: {text}");
+            assert!(
+                !text.contains("\u{202e}") && !text.contains('\u{200f}'),
+                "{mode:?}: {text:?}"
+            );
+        }
+
+        // The human form is a list, so the forged entry must have been folded
+        // back into the line it came from rather than becoming its own.
+        let human = rendered(&output, OutputMode::Table).expect("rendered");
+        assert!(
+            !human.lines().any(|line| line.starts_with("method: forged")),
+            "a foreign value forged a line: {human}"
+        );
+
+        // And the semver-protected SHAPE is untouched: scrubbing removes
+        // hazard characters, it does not rename, drop or add a field.
+        let json: Value =
+            serde_json::from_str(&rendered(&output, OutputMode::Json).expect("rendered"))
+                .expect("still valid JSON");
+        let expected = output.value.as_object().expect("object");
+        let actual = json.as_object().expect("object");
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "the key set or order changed"
         );
     }
 

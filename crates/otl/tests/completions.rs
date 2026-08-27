@@ -95,9 +95,25 @@ fn operation_candidates_cover_the_whole_ir_table() {
             missing.is_empty(),
             "{shell}: operations not completable: {missing:?}"
         );
-        // `otl api list` is a reserved name, not a spec operation, and must
-        // complete too.
-        assert!(script.contains("list"), "{shell}");
+        // `list` and `describe` are reserved names, not spec operations,
+        // and must complete too: they are the two things a caller types in
+        // that position before it knows any operation name.
+        //
+        // Asserted on the CANDIDATE form, never on the bare word: both
+        // words also occur in the help prose the generator embeds, so
+        // `script.contains("describe")` would pass with no candidate
+        // emitted at all.
+        let candidate = match shell {
+            // bash and zsh emit the candidates as one space-separated list,
+            // reserved words first.
+            "bash" | "zsh" => "list describe ".to_string(),
+            // fish gets one appended `complete` rule per candidate.
+            _ => "-a \"describe\"".to_string(),
+        };
+        assert!(
+            script.contains(&candidate),
+            "{shell}: no reserved-word candidate ({candidate:?})"
+        );
     }
 }
 

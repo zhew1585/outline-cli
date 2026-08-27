@@ -121,6 +121,7 @@ fn param_to_ir(param: &CompiledParam) -> ParamSpec {
         format: param.format.clone().into(),
         minimum: param.minimum,
         maximum: param.maximum,
+        description: param.description.clone().into(),
     }
 }
 
@@ -229,6 +230,12 @@ fn check_param_text(op: &OpSpec) -> Result<(), String> {
         }
         if !is_display_safe(&param.format, spec_compile::MAX_FORMAT_BYTES) {
             return unsafe_text("parameter format");
+        }
+        // A cache is not necessarily one this build wrote, so its
+        // descriptions get the same test the compiler applied - the same
+        // cap as a summary, because the same `sanitize_display` produced it.
+        if !is_display_safe(&param.description, spec_compile::MAX_SUMMARY_BYTES) {
+            return unsafe_text("parameter description");
         }
         if param.enum_values.len() > spec_compile::MAX_ENUM_VALUES {
             return unsafe_text("parameter enum");
@@ -405,6 +412,7 @@ mod tests {
                     format: format.to_string().into(),
                     minimum: None,
                     maximum: None,
+                    description: String::new().into(),
                 }]
                 .into(),
                 ..ops("things.info", "/api/things.info")[0].clone()

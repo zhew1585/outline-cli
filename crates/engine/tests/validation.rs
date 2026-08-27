@@ -29,6 +29,7 @@ fn param(name: &'static str, ty: ParamType, required: bool) -> ParamSpec {
         format: Cow::Borrowed(""),
         minimum: None,
         maximum: None,
+        description: Cow::Borrowed(""),
     }
 }
 
@@ -413,6 +414,7 @@ fn faceted_op() -> OpSpec {
         ParamSpec {
             minimum: Some(0.0),
             maximum: Some(100.0),
+            description: Cow::Borrowed(""),
             ..param("size", ParamType::Integer, false)
         },
         param("id", ParamType::String, false),

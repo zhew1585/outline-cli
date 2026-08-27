@@ -77,6 +77,16 @@ Notes:
 
     Because `null` is falsy in most languages, `if (durable)` reads "unknown" as "failed". The test for *this backup is usable* is `complete == true && durable != false`.
   - **A listed item that could not be used.** `otl docs export` counts a listing row it cannot identify (no document id, an empty one, a non-string one) as a failed document rather than dropping it: the server said that document exists, so an export that skipped it is not complete. A row that merely repeats an id already seen is *not* a failure — that document is exported once and nothing is missing.
+- `otl api`'s two local discovery paths — `otl api list` and `otl api describe <operation>`, the second
+  of which is also what `otl api <operation> --help` prints — introduce **no exit code of their own**.
+  They read the operation table already compiled into the binary (or the one `otl spec sync` installed),
+  send nothing, and exit **0**. Every way they can fail is an existing code 2: an unknown operation name
+  (the same message and the same code the call path gives, so the two can never disagree), `describe`
+  with no operation or more than one, and a request-shaping flag (`--body`, `--no-validate`,
+  `--show-server-message`, `--limit`) on a path that will not send a request. An unknown operation name
+  passed with `--help` is that same code 2 and **not** a fallback to the command's generic help:
+  answering a question about `documents.inf` with authoritative-looking text about `otl api` in general
+  is worse than an error, because an error makes a caller try something else.
 - A truncation the caller ASKED for is not a failure: `--limit N` does exactly what it says, so it warns on stderr and exits **0**. This holds for `otl docs export` too — a `--limit`ed export is a deliberate partial copy, and its `--json` summary says so with `"limit_reached": true` while keeping `"complete": true`, so `complete && !limit_reached` is the test for "this is the whole collection". Only the CLI giving up on its own becomes code 9. (`otl api` is unchanged: it warns and exits 0 in both cases, and its output is explicitly unstable.)
 - A pager or browser launched by `otl docs view` is not part of the command's result: if `$PAGER` cannot be spawned the content is written straight to stdout with a stderr warning and the exit code stays 0, and a pager the user quits early is normal completion. A `--web` invocation that cannot launch a browser is a real failure (code 1) and prints the URL so it can be opened by hand.
 - Authentication failures split along one line, so a script can branch on it: **4** means "authenticate again" (`otl auth login`, or a new API key), **2** means "fix something locally" (a permission bit, a missing environment variable, a client id an administrator has to create). A credential file whose permissions are too wide is code **2**, not 4: the credential may well be valid, but it is refused until the file is tightened.

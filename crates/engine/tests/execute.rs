@@ -27,6 +27,7 @@ fn op_with_path(op_path: &'static str) -> OpSpec {
             format: Cow::Borrowed(""),
             minimum: None,
             maximum: None,
+            description: Cow::Borrowed(""),
         }]),
     }
 }
