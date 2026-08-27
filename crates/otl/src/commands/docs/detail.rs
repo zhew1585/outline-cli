@@ -4,9 +4,27 @@
 //! (the document's identity, its link, and when it last changed), so both
 //! use this module. Field selection only; the layout comes from
 //! [`crate::render`].
+//!
+//! # Why a write receipt is not the whole document
+//!
+//! Outline answers `documents.update` with the document it just stored -
+//! body included. Echoing that back makes the receipt as large as the
+//! document: appending one line to a 46 KB page returned 46 KB, and an
+//! agent driving this CLI pays for every byte of it in a context window
+//! that then has to hold the page it already had.
+//!
+//! So both write commands report the IDENTITY fields (see
+//! [`RECEIPT_FIELDS`]) and drop the rest. Nothing is lost, because the
+//! whole response is still one command away, through either of the two
+//! surfaces whose contract is to forward it verbatim:
+//!
+//! - `otl docs view <id> --json` - the same document, read back;
+//! - `otl api documents.update ...` - the raw operation, unfiltered. That
+//!   is what `otl api` is FOR: the curated commands offer a chosen shape,
+//!   `otl api` offers the server's.
 
 use anyhow::anyhow;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::exit::CliError;
 use crate::fields::{self, Column};
@@ -25,20 +43,82 @@ const FIELDS: &[Column] = &[
     Column::plain("revision", "/revision"),
 ];
 
+/// The fields a write receipt keeps, in the response schema's own order.
+///
+/// What they have in common: each one answers "where did the write land,
+/// and which version is it now" - identity, placement, ordering. What is
+/// absent is everything whose size is unbounded (`text`, `data`,
+/// `tasks`) or whose value the caller supplied moments ago (`icon`,
+/// `color`, `fullWidth`) or that costs a nested object to say something
+/// this receipt does not claim (`createdBy`, `updatedBy`).
+///
+/// `publishedAt` earns its place by being the one field that reports an
+/// outcome rather than an input: a draft is invisible to the workspace, so
+/// "stored" and "stored where anyone can find it" have to be tellable
+/// apart. Table mode spells this out as `status` (see [`status`]); JSON
+/// keeps the server's own field, so the value stays the server's.
+const RECEIPT_FIELDS: &[&str] = &[
+    "id",
+    "collectionId",
+    "parentDocumentId",
+    "title",
+    "url",
+    "urlId",
+    "revision",
+    "createdAt",
+    "updatedAt",
+    "publishedAt",
+];
+
 /// Print one document's metadata.
 ///
-/// `Json` mode prints the server's document object verbatim (that is the
-/// scriptable form, and it holds every field this summary leaves out);
-/// `Table` mode prints the labelled essentials, including the absolute URL
-/// and whether the document is still a draft.
+/// `Json` mode prints the identity fields of the stored document - the
+/// scriptable form, and deliberately NOT the whole response (see the module
+/// docs); `Table` mode prints the labelled essentials, including the
+/// absolute URL and whether the document is still a draft.
 pub fn report(session: &Session, document: &Value, mode: OutputMode) -> Result<(), CliError> {
     if mode == OutputMode::Json {
-        let rendered = render::render_json(document)
+        let rendered = render::render_json_scrubbed(&receipt(document))
             .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
         return stdio::write_data_line(&rendered);
     }
     let url = link(session, document);
     stdio::write_data_line(&render::render_pairs(&pairs(document, url)))
+}
+
+/// The write receipt: [`RECEIPT_FIELDS`] of the stored document.
+///
+/// Two shapes are left alone rather than projected:
+///
+/// - a response that is not an object at all cannot hold a document body
+///   either, so forwarding it whole costs nothing and hides nothing;
+/// - an object holding none of the receipt fields would project to `{}` -
+///   an empty success, which reads as "written, and here is nothing" when
+///   what actually happened is that the response was not the shape this
+///   command knows. It is forwarded with a diagnostic instead, because a
+///   write that already succeeded must not be reported as a failure and
+///   invite a duplicate retry.
+///
+/// Fields the server did not send are dropped rather than sent as null,
+/// matching what [`pairs`] does for the human summary: absent and null are
+/// different claims, and only the server gets to make the second one.
+fn receipt(document: &Value) -> Value {
+    let Some(fields) = document.as_object() else {
+        return document.clone();
+    };
+    let kept: Map<String, Value> = RECEIPT_FIELDS
+        .iter()
+        .filter_map(|name| fields.get_key_value(*name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if kept.is_empty() {
+        stdio::write_diagnostic_line(
+            "warning: the response holds none of the expected document \
+             fields; reporting it unfiltered",
+        );
+        return document.clone();
+    }
+    Value::Object(kept)
 }
 
 /// The labelled essentials of one document, in display order.
@@ -89,6 +169,8 @@ fn status(document: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use serde_json::json;
 
     use super::*;
@@ -102,6 +184,66 @@ mod tests {
             "url": "/doc/release-notes-abc123",
             "publishedAt": "2026-08-20T15:30:37.000Z",
         })
+    }
+
+    /// [`document`] as the API actually answers a write: the body, the
+    /// rich-text mirror of the body, and the nested actor objects.
+    fn full_response() -> Value {
+        let mut document = document();
+        document["text"] = json!("# Release notes\n\nthe whole page\n");
+        document["data"] = json!({ "type": "doc", "content": [] });
+        document["collectionId"] = json!("col-1");
+        document["tasks"] = json!({ "completed": 0, "total": 0 });
+        document["collaboratorIds"] = json!(["user-1"]);
+        document["updatedBy"] = json!({ "id": "user-1", "name": "Ada" });
+        document
+    }
+
+    #[test]
+    fn the_receipt_keeps_identity_and_drops_the_body() {
+        let receipt = receipt(&full_response());
+        for kept in ["id", "title", "url", "revision", "updatedAt", "publishedAt"] {
+            assert!(receipt.get(kept).is_some(), "{kept} missing: {receipt}");
+        }
+        assert_eq!(receipt["collectionId"], json!("col-1"));
+        // The point of the whole change: none of the unbounded fields, and
+        // none of the nested actors, survive into the receipt.
+        for dropped in ["text", "data", "tasks", "collaboratorIds", "updatedBy"] {
+            assert!(
+                receipt.get(dropped).is_none(),
+                "{dropped} survived: {receipt}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_receipt_is_a_small_fraction_of_the_response() {
+        // A 46 KB page returned 46 KB of receipt before this projection.
+        let mut response = full_response();
+        response["text"] = json!("x".repeat(46 * 1024));
+        let full = render::render_json_scrubbed(&response).unwrap();
+        let slim = render::render_json_scrubbed(&receipt(&response)).unwrap();
+        assert!(
+            slim.len() * 50 < full.len(),
+            "receipt is {} bytes against {} bytes of response",
+            slim.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn receipt_fields_the_server_did_not_send_are_absent_rather_than_null() {
+        let receipt = receipt(&json!({ "id": "doc-1", "text": "body" }));
+        assert_eq!(receipt, json!({ "id": "doc-1" }));
+    }
+
+    #[test]
+    fn a_response_holding_no_known_field_is_forwarded_rather_than_emptied() {
+        // Reporting `{}` here would read as "written, and here is nothing".
+        let strange = json!({ "unexpected": "shape" });
+        assert_eq!(receipt(&strange), strange);
+        let not_an_object = json!("done");
+        assert_eq!(receipt(&not_an_object), not_an_object);
     }
 
     #[test]

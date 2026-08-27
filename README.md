@@ -290,6 +290,14 @@ Notes worth knowing:
   entity. Everything else is the operation's own object or array, verbatim. Each command's
   `JSON shape:` section says which it is, and `crates/otl/tests/help_coverage.rs` fails the build if
   a data-printing command stops saying.
+- **`docs create` and `docs update` answer with a receipt, not the document.** Outline replies to a
+  write with the whole stored document, body included, so appending one line to a 46 KB page used to
+  return 46 KB — a cost paid in full by the agent that then has to hold it. Both commands report the
+  identity fields instead: `{id, collectionId, parentDocumentId, title, url, urlId, revision,
+  createdAt, updatedAt, publishedAt}`, with absent fields omitted rather than sent as null. `.text`
+  is never among them. The verbatim response stays one command away, through `docs view <id> --json`
+  or `otl api documents.update id=<id> ...` — the curated command offers a chosen shape, `otl api`
+  offers the server's.
 - **`docs create` publishes** when you give it a `--collection` or `--parent`, because a draft is
   invisible to everyone else; `--draft` opts out. Without a destination Outline cannot publish at all,
   and the command says so.

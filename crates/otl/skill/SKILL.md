@@ -257,7 +257,7 @@ The CLI's own pagination cap being reached is different - that exits **9**.
 ## 4. What each command actually prints
 
 `otl <command> --help` ends in a `JSON shape:` section, and that is the
-authority. Four shapes are worth knowing before you write a single `jq`,
+authority. Five shapes are worth knowing before you write a single `jq`,
 because in each one the obvious guess is wrong.
 
 **`otl docs list` has two shapes.** It dispatches to two operations:
@@ -282,6 +282,22 @@ script, walk the tree:
 otl fetch collection <ID> --json | jq '[.documents | .. | .id? // empty] | length'
 ```
 
+**`otl docs create` and `otl docs update --json` return a receipt, not the
+document.** Outline answers a write with the stored document, body included;
+the CLI reports only the identity fields, so appending one line to a large
+page does not hand you the whole page back:
+
+```sh
+otl docs update <ID> --json   # -> { id, collectionId, parentDocumentId,
+                              #      title, url, urlId, revision,
+                              #      createdAt, updatedAt, publishedAt }
+```
+
+Fields the server did not send are absent. `.text` is never in it - when you
+need the stored body, read it back with `otl docs view <ID> --json`, or call
+`otl api documents.update id=<ID> ...`, which forwards the operation's own
+response unfiltered.
+
 **Some commands compose an object rather than returning the operation's own.**
 
 ```sh
@@ -291,10 +307,10 @@ otl docs view <ID> --web --json    # -> { id, title, url }
 otl comments update <ID> --text T --resolve --json   # -> { comment, status }
 ```
 
-Everything else - `docs view --json`, `docs create`, `docs update`, `docs
-move`, `collections create/update`, `comments list/create`, `users list`,
-`attachments create`, `fetch document`, `fetch user` - returns the operation's
-own object or array, verbatim. Delete commands return `{"success": true}`;
+Everything else - `docs view --json`, `docs move`, `collections
+create/update`, `comments list/create`, `users list`, `attachments create`,
+`fetch document`, `fetch user` - returns the operation's own object or array,
+verbatim. Delete commands return `{"success": true}`;
 their `--archive` variants return the archived entity instead.
 
 **`otl docs export --json` is a run summary, not documents.** The markdown
