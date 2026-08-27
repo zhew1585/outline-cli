@@ -307,7 +307,7 @@ impl Walk<'_> {
             // class of lie the flag exists to prevent.
             return Ok(
                 matches!(container, FieldContainer::Object | FieldContainer::Array)
-                    && self.declares_properties(prop, 0, active_refs)?,
+                    && self.declares_properties(prop, 0, &mut HashSet::new())?,
             );
         }
         let mut child_seen = HashSet::new();
@@ -325,33 +325,44 @@ impl Walk<'_> {
     /// non-empty `properties` map and nothing else - it never emits a
     /// field.
     ///
-    /// It carries the SAME cycle guard as the walk, and for the same
-    /// reason. Without one, `{"type":"array","items":{"$ref":"Self"}}`
-    /// recursed until [`check_depth`] refused the document - so that schema
-    /// compiled at shallow depth, where the walk cuts it through
-    /// `active_refs`, and failed to compile at the limit: the identical
-    /// document accepted or rejected by where it happens to sit. A repeated
-    /// reference contributes no property that has not been considered
-    /// already, so it answers `false` for that branch rather than erroring.
+    /// It needs a cycle guard of its own, and it must be ITS OWN. Two
+    /// wrong versions preceded this one, in both directions:
+    ///
+    /// - with no guard at all, `{"type":"array","items":{"$ref":"Self"}}`
+    ///   recursed until [`check_depth`] refused the whole document, so that
+    ///   schema compiled near the top - where the walk cuts it - and failed
+    ///   to compile at the limit;
+    /// - with the WALK's `active_refs` shared in, a recursive object model
+    ///   answered "declares nothing" the moment it was asked, because its
+    ///   own reference is by definition open on the branch that reached it.
+    ///   `Node = {properties: {back: $ref Node}}` then reported `back` as
+    ///   having no properties, which is the "deny a path that exists"
+    ///   direction the flag exists to prevent.
+    ///
+    /// The two sets answer different questions: `active_refs` means "open
+    /// on the walk's branch", `visited` means "already examined by THIS
+    /// probe". Seeded empty per call, so the answer depends on the schema
+    /// and not on where the walk happens to be.
     fn declares_properties(
         &self,
         schema: &Value,
         depth: usize,
-        active_refs: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
     ) -> Result<bool, CompileError> {
         check_depth(depth)?;
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            if !active_refs.insert(reference.to_string()) {
+            // A reference this probe has already followed cannot add a
+            // property it has not already counted, so the cycle closes as
+            // "nothing more here" instead of as an error.
+            if !visited.insert(reference.to_string()) {
                 return Ok(false);
             }
             let resolved = resolve_ref(reference, self.components)?;
-            let declares = self.declares_properties(resolved, depth + 1, active_refs);
-            active_refs.remove(reference);
-            return declares;
+            return self.declares_properties(resolved, depth + 1, visited);
         }
         if let Some(items) = schema.get("items") {
             if schema.get("type").and_then(Value::as_str) == Some("array") {
-                return self.declares_properties(items, depth + 1, active_refs);
+                return self.declares_properties(items, depth + 1, visited);
             }
         }
         if schema
@@ -363,7 +374,7 @@ impl Walk<'_> {
         }
         if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
             for branch in branches {
-                if self.declares_properties(branch, depth + 1, active_refs)? {
+                if self.declares_properties(branch, depth + 1, visited)? {
                     return Ok(true);
                 }
             }
@@ -641,6 +652,73 @@ mod tests {
         assert!(
             !fields.iter().any(|field| field.name == "unreachable"),
             "the fixture does not actually stop at the limit"
+        );
+    }
+
+    /// A recursive OBJECT at the depth limit still says its properties
+    /// were left out. This is the direction that matters: the model does
+    /// have properties, they are not in the list, and reporting `false`
+    /// would tell an agent that `back.a` and `back.back` do not exist.
+    ///
+    /// The fixture matters as much as the assertion. The recursive
+    /// reference has to be OPEN ON THE BRANCH when the limit is reached -
+    /// which is why `Node` is entered through a property and the depth is
+    /// spent INSIDE it - because that is the state in which sharing the
+    /// walk's `active_refs` with the probe answered "declares nothing". A
+    /// fixture that reached the limit through plain objects would pass
+    /// against that regression and assert nothing.
+    #[test]
+    fn a_recursive_object_at_the_depth_limit_still_reports_omitted_children() {
+        // `back` lands at MAX_SCHEMA_DEPTH: node(0), Node's own properties
+        // at 1, then one level per wrapper.
+        let mut chain = serde_json::json!({"type": "object", "properties": {
+            "back": {"$ref": "#/components/schemas/Node"}
+        }});
+        for _ in 0..(crate::MAX_SCHEMA_DEPTH - 2) {
+            chain = serde_json::json!({"type": "object", "properties": {"deeper": chain}});
+        }
+        let raw = serde_json::json!({
+            "paths": {"/things.info": {"post": {"responses": {"200": {"content": {
+                "application/json": {"schema": {"type": "object", "properties": {
+                    "node": {"$ref": "#/components/schemas/Node"}
+                }}}
+            }}}}}},
+            "components": {"schemas": {"Node": {"type": "object", "properties": {
+                "a": {"type": "string"},
+                "chain": chain
+            }}}}
+        })
+        .to_string();
+        let compiled = compile_json(&raw, &opts()).expect("compiles");
+        let fields = &compiled.ops[0].response_fields;
+        let shape = || {
+            fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.depth, f.children_omitted))
+                .collect::<Vec<_>>()
+        };
+        let back = fields
+            .iter()
+            .find(|field| field.name == "back")
+            .unwrap_or_else(|| panic!("back was not emitted: {:?}", shape()));
+        assert_eq!(
+            usize::from(back.depth),
+            crate::MAX_SCHEMA_DEPTH,
+            "back is not at the depth limit, so the limit branch is untested: {:?}",
+            shape()
+        );
+        assert_eq!(back.container, FieldContainer::Object);
+        assert!(
+            back.children_omitted,
+            "a recursive model at the limit reported no properties at all: {:?}",
+            shape()
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|field| usize::from(field.depth) <= crate::MAX_SCHEMA_DEPTH),
+            "the walk went past the limit: {:?}",
+            shape()
         );
     }
 
