@@ -3,90 +3,17 @@
 #![forbid(unsafe_code)]
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 
-use otl::commands::api::{self, ApiArgs};
-use otl::commands::attachments::{self, AttachmentsArgs};
-use otl::commands::auth::{self, AuthArgs};
-use otl::commands::collections::{self, CollectionsArgs};
-use otl::commands::comments::{self, CommentsArgs};
-use otl::commands::completions::{self, CompletionsArgs};
-use otl::commands::docs::{self, DocsArgs};
-use otl::commands::doctor::{self, DoctorArgs};
-use otl::commands::fetch::{self, FetchArgs};
-use otl::commands::skill::{self, SkillArgs};
-use otl::commands::spec::{self, SpecArgs};
-use otl::commands::users::{self, UsersArgs};
-use otl::config::Overrides;
+use otl::cli::{Cli, Command};
+use otl::commands::{
+    api, attachments, auth, collections, comments, completions, docs, doctor, fetch, skill, spec,
+    users,
+};
 use otl::exit::ExitCode;
 use otl::render;
 use otl::stdio;
-
-/// Outline CLI: work with your Outline knowledge base from the terminal.
-#[derive(Debug, Parser)]
-#[command(name = "otl", version, about)]
-struct Cli {
-    /// Print raw JSON (the default whenever stdout is not a terminal).
-    #[arg(long, global = true)]
-    json: bool,
-
-    /// Named profile from the user config file (env: OUTLINE_PROFILE).
-    #[arg(long, global = true, value_name = "NAME")]
-    profile: Option<String>,
-
-    /// Outline instance base URL, overriding the profile (env: OUTLINE_URL).
-    #[arg(long, global = true, value_name = "URL")]
-    url: Option<String>,
-
-    /// User config file to read (env: OUTLINE_CONFIG).
-    #[arg(long, global = true, value_name = "FILE")]
-    config: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-impl Cli {
-    /// The command-line layer of the configuration, which outranks the
-    /// environment and the config file key by key.
-    fn overrides(&self) -> Overrides {
-        Overrides {
-            profile: self.profile.clone(),
-            url: self.url.clone(),
-            config_path: self.config.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Call any API operation by name (output format unstable).
-    Api(ApiArgs),
-    /// Request a pre-signed attachment upload.
-    Attachments(AttachmentsArgs),
-    /// Sign in, sign out, and inspect stored credentials.
-    Auth(AuthArgs),
-    /// List, read, create, update, move, delete, and export documents.
-    Docs(DocsArgs),
-    /// Work with collections.
-    Collections(CollectionsArgs),
-    /// List, create, update, resolve, and delete comments.
-    Comments(CommentsArgs),
-    /// Fetch a document, collection, user, or attachment by ID or URL.
-    Fetch(FetchArgs),
-    /// Manage the OpenAPI spec this CLI dispatches from.
-    Spec(SpecArgs),
-    /// Check this environment: credentials, instance, and spec drift.
-    Doctor(DoctorArgs),
-    /// Install the agent skill that ships with this binary, or print it.
-    Skill(SkillArgs),
-    /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
-    Completions(CompletionsArgs),
-    /// List and filter workspace users.
-    Users(UsersArgs),
-}
 
 fn main() -> std::process::ExitCode {
     // clap itself exits with code 2 on usage errors, matching the

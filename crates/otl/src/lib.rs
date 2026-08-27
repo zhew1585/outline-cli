@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod browser;
+pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod errors;
