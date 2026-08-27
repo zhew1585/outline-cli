@@ -307,7 +307,7 @@ impl Walk<'_> {
             // class of lie the flag exists to prevent.
             return Ok(
                 matches!(container, FieldContainer::Object | FieldContainer::Array)
-                    && self.declares_properties(prop, 0)?,
+                    && self.declares_properties(prop, 0, active_refs)?,
             );
         }
         let mut child_seen = HashSet::new();
@@ -322,16 +322,36 @@ impl Walk<'_> {
     /// Asked only at the depth limit, where the walk stops before it can
     /// find out by walking: the answer decides whether that field says its
     /// properties were left out. A structural question, so it looks for a
-    /// non-empty `properties` map and nothing else - it never emits a field
-    /// and cannot recurse past [`check_depth`].
-    fn declares_properties(&self, schema: &Value, depth: usize) -> Result<bool, CompileError> {
+    /// non-empty `properties` map and nothing else - it never emits a
+    /// field.
+    ///
+    /// It carries the SAME cycle guard as the walk, and for the same
+    /// reason. Without one, `{"type":"array","items":{"$ref":"Self"}}`
+    /// recursed until [`check_depth`] refused the document - so that schema
+    /// compiled at shallow depth, where the walk cuts it through
+    /// `active_refs`, and failed to compile at the limit: the identical
+    /// document accepted or rejected by where it happens to sit. A repeated
+    /// reference contributes no property that has not been considered
+    /// already, so it answers `false` for that branch rather than erroring.
+    fn declares_properties(
+        &self,
+        schema: &Value,
+        depth: usize,
+        active_refs: &mut HashSet<String>,
+    ) -> Result<bool, CompileError> {
         check_depth(depth)?;
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-            return self.declares_properties(resolve_ref(reference, self.components)?, depth + 1);
+            if !active_refs.insert(reference.to_string()) {
+                return Ok(false);
+            }
+            let resolved = resolve_ref(reference, self.components)?;
+            let declares = self.declares_properties(resolved, depth + 1, active_refs);
+            active_refs.remove(reference);
+            return declares;
         }
         if let Some(items) = schema.get("items") {
             if schema.get("type").and_then(Value::as_str) == Some("array") {
-                return self.declares_properties(items, depth + 1);
+                return self.declares_properties(items, depth + 1, active_refs);
             }
         }
         if schema
@@ -343,7 +363,7 @@ impl Walk<'_> {
         }
         if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
             for branch in branches {
-                if self.declares_properties(branch, depth + 1)? {
+                if self.declares_properties(branch, depth + 1, active_refs)? {
                     return Ok(true);
                 }
             }
@@ -556,15 +576,23 @@ mod tests {
     /// the walk stops before it could find out by walking. Claiming omitted
     /// properties for an empty object sends a caller looking for a shape
     /// that does not exist.
+    ///
+    /// The fixture lands the fields EXACTLY at the limit and asserts they
+    /// are present. An earlier version nested them past it, so they were
+    /// never emitted, nothing was asserted, and the test passed against the
+    /// over-claiming code it was written to catch. The sibling that does
+    /// declare a property is checked in the same breath, so a "fix" that
+    /// stopped setting the flag at the limit fails here too.
     #[test]
     fn an_object_with_no_properties_never_claims_omitted_children() {
         let mut schema = serde_json::json!({"type": "object", "properties": {
             "empty": {"type": "object"},
-            "loose": {"type": "array"}
+            "loose": {"type": "array"},
+            "full": {"type": "object", "properties": {"unreachable": {"type": "string"}}}
         }});
-        // Nest the pair past the depth limit, so the same assertion covers
-        // the limit branch as well as the ordinary one.
-        for _ in 0..(crate::MAX_SCHEMA_DEPTH + 2) {
+        // One wrapper per level above the three fields, so they come out at
+        // exactly MAX_SCHEMA_DEPTH - the last depth the walk emits.
+        for _ in 0..crate::MAX_SCHEMA_DEPTH {
             schema = serde_json::json!({"type": "object", "properties": {"down": schema}});
         }
         let raw = serde_json::json!({
@@ -575,22 +603,79 @@ mod tests {
         .to_string();
         let compiled = compile_json(&raw, &opts()).expect("compiles");
         let fields = &compiled.ops[0].response_fields;
+        let at_limit = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} was not emitted, so this test asserts nothing: {:?}",
+                        fields
+                            .iter()
+                            .map(|f| (f.name.as_str(), f.depth))
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        for name in ["empty", "loose", "full"] {
+            assert_eq!(
+                usize::from(at_limit(name).depth),
+                crate::MAX_SCHEMA_DEPTH,
+                "{name} is not at the depth limit, so the limit branch is untested"
+            );
+        }
         assert!(
-            fields
-                .iter()
-                .any(|field| field.depth as usize == crate::MAX_SCHEMA_DEPTH),
-            "the fixture never reaches the depth limit: {:?}",
-            fields
-                .iter()
-                .map(|f| (f.name.as_str(), f.depth))
-                .collect::<Vec<_>>()
+            !at_limit("empty").children_omitted,
+            "an object with no properties claims omitted children"
         );
-        for field in fields.iter() {
-            let empty_container = matches!(field.name.as_str(), "empty" | "loose");
+        assert!(
+            !at_limit("loose").children_omitted,
+            "an array with no declared items claims omitted children"
+        );
+        // And the flag is still set where properties really are missing:
+        // `unreachable` sits one level past the limit and is not emitted.
+        assert!(
+            at_limit("full").children_omitted,
+            "a container whose properties the limit cut does not say so"
+        );
+        assert!(
+            !fields.iter().any(|field| field.name == "unreachable"),
+            "the fixture does not actually stop at the limit"
+        );
+    }
+
+    /// The same document must compile whether the recursion sits near the
+    /// top or at the depth limit. It did not: the depth-limit probe had no
+    /// cycle guard of its own, so a self-referencing ARRAY (which the walk
+    /// cuts happily) recursed until the depth check refused the whole
+    /// document - the identical schema accepted or rejected by where it
+    /// happens to sit.
+    #[test]
+    fn a_self_referencing_array_compiles_at_every_depth() {
+        let loop_list = serde_json::json!({
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/LoopList"}
+        });
+        for wrappers in [0, crate::MAX_SCHEMA_DEPTH] {
+            let mut schema = serde_json::json!({"type": "object", "properties": {
+                "list": {"$ref": "#/components/schemas/LoopList"}
+            }});
+            for _ in 0..wrappers {
+                schema = serde_json::json!({"type": "object", "properties": {"down": schema}});
+            }
+            let raw = serde_json::json!({
+                "paths": {"/things.info": {"post": {"responses": {"200": {"content": {
+                    "application/json": {"schema": schema}
+                }}}}}},
+                "components": {"schemas": {"LoopList": loop_list}}
+            })
+            .to_string();
+            let compiled = compile_json(&raw, &opts())
+                .unwrap_or_else(|error| panic!("refused with {wrappers} wrapper(s): {error}"));
+            let fields = &compiled.ops[0].response_fields;
             assert!(
-                !(empty_container && field.children_omitted),
-                "{} declares no properties yet claims omitted children",
-                field.name
+                fields.iter().any(|field| field.name == "list"),
+                "the recursive field vanished with {wrappers} wrapper(s)"
             );
         }
     }

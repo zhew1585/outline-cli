@@ -317,6 +317,14 @@ pub fn is_redirect(meta: &std::fs::Metadata) -> bool {
 /// to be an expression on both platforms, and `scripts/win-check.sh`
 /// (the only gate that compiles the Windows branch at all) rejected the
 /// early-return form that made the Unix side read oddly.
+///
+/// What is NOT verified here, stated rather than left to be discovered:
+/// this branch is type-checked and linted for Windows and never RUN. Only
+/// macOS ships today, no test plants a junction, and the behaviour rests on
+/// `symlink_metadata` surfacing the reparse attribute rather than resolving
+/// the junction - which is documented Windows behaviour, not something this
+/// repository has measured. The Unix half of [`is_redirect`] is covered by
+/// tests that plant a real symlink.
 #[cfg(windows)]
 fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt as _;
