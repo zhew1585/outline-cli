@@ -271,7 +271,7 @@ assumed:
   more specific than that of the shared schema it points at.
 - **Request parameters only; response fields deliberately not.** Measured on the vendored document:
   244 request-parameter descriptions total **16,055 bytes**, while 942 response-field descriptions
-  total **53,024 bytes** — 3.3× more, on the target that binds NFR2. And the asymmetry in value runs
+  total **53,024 bytes** — 3.3× more, on whichever target binds NFR2. And the asymmetry in value runs
   the other way: the caller's problem is "which of these must I send", which is the request side. A
   response field's name and type are enough to consume a response. If the response prose is wanted
   later it is an additive change to `FieldSpec` and another version bump.
@@ -661,12 +661,16 @@ confirms that version is sensitive.
 ### Gates (measured, exit status captured before any pipe)
 
 `bash scripts/check-all.sh --windows`, status captured before any pipe (`bash -c '... ; echo
-"EXIT=$?"'`), re-run after the R2 fixes: **EXIT=0** — `cargo fmt --check` ok, `cargo clippy -D warnings`
-ok, `cargo test --workspace` ok, `cargo doc` ok, binary size ok, `win-check.sh` ok. 1,265 tests passing,
-0 failed.
+"EXIT=$?"'`): **EXIT=0**, run twice — once on the branch after the R2 fixes, and again **on the merged
+`develop`**, because Story 4.7 had rewritten `check-all.sh` and `check-binary-size.sh` underneath this
+branch. On the merged tree: `cargo fmt --check` ok, `cargo clippy -D warnings` ok, `cargo test
+--workspace` ok, `cargo doc` ok, binary size ok for **both** shipped targets (4.7's script measures both
+rather than just the host), `win-check.sh` ok — which under 4.7 is a source lint over the
+`#[cfg(windows)]` branches macOS never compiles, not a shipped platform. 1,265 tests passing, 0 failed.
 
-`--linux` deliberately not run (the user asked to skip local Linux; Docker cannot start containers on
-this machine, and CI has native Linux and Windows legs).
+`--linux` deliberately not run (the user asked to skip local Linux, and Docker cannot start containers
+on this machine). Under Story 4.7 there is no Linux CI leg to fall back on either — both platform flags
+are now local-only conveniences rather than a stand-in for a shipped platform.
 
 Worth recording because the script's header is about exactly this: the R1 round's first full run came
 back **FAIL** on clippy and on `win-check.sh`, for a `doc_lazy_continuation` in a doc comment I had just
@@ -675,12 +679,12 @@ last `cargo test`). Two gates, one cause, and neither `cargo test` nor `cargo fm
 
 ### Binary size
 
-Measured with `scripts/check-binary-size.sh` (`--profile dist`), all three states built the same way on
-the same machine. No budget constant was changed.
+Measured with `scripts/check-binary-size.sh` (`--profile dist`) on the same machine at each stage. No
+budget constant was changed.
 
-| target | `develop` | R1 (before the IR bump) | final | total delta |
-|--------|-----------|-------------------------|-------|-------------|
-| aarch64-apple-darwin | 3,464,608 | 3,481,184 | **3,514,960** | **+50,352 B** (+1.45%) — 93% of budget, 70% of NFR2 |
+| target | `develop` before | R1 (before the IR bump) | final | total delta |
+|--------|------------------|-------------------------|-------|-------------|
+| aarch64-apple-darwin | 3,464,608 | 3,481,184 | **3,514,976** | **+50,368 B** (+1.45%) — 93% of budget, 70% of NFR2 |
 | x86_64-apple-darwin | 4,007,712 | 4,028,216 | **4,057,632** | **+49,920 B** (+1.25%) — 93% of budget, 81% of NFR2 |
 
 **The IR bump alone costs +33,776 B (aarch64) / +29,416 B (x86_64), and it is fully accounted for** —
@@ -688,32 +692,38 @@ which the review asked to be checked rather than assumed, on the grounds that a 
 text volume means something else came along. It did not:
 
 - **16,055 B** of description text (244 descriptions, measured on the generated `ir_table.rs`; the
-  reviewer's 10,608 B estimate was low because it did not follow `$ref`/`allOf`);
-- **9,192 B** of struct growth: `Cow<'static, str>` is 24 bytes (verified with `size_of`), and the
-  static table has 383 `ParamSpec` entries — `383 × 24`;
-- the remaining ~8,500 B is the pointer relocation each of those 383 `Cow::Borrowed` entries needs in
+  reviewer independently measured 16,047 B by unescaping in Python — escape noise);
+- **9,192 B** of struct growth: `Cow<'static, str>` is 24 bytes (verified with `size_of`, and
+  independently by the reviewer), and the static table has 383 `ParamSpec` entries — `383 × 24`;
+- the remaining ~8,529 B is the pointer relocation each of those 383 `Cow::Borrowed` entries needs in
   `__DATA_CONST`, plus the rendering code.
 
 All three terms are inherent to putting a string field on a 383-entry static table; none is a
 dependency, and none is trimmable without dropping the feature.
 
-`x86_64-unknown-linux-musl` and `x86_64-pc-windows-msvc` can only be measured by CI (MSVC cannot be
-linked off Windows; the musl toolchain is not installed here). Extrapolating with the platform factor
-the script's own header derives (musl ≈ ×1.139 of x86_64-darwin, the figure the review confirmed), and
-cross-checking against the CI musl figure from Story 4.3 (4,551,792 B) plus the scaled delta:
+#### The musl extrapolation became moot at merge time
 
-- musl ≈ **4,608,000–4,621,000 B** ≈ **94%** of its 4,920,000 budget and **92%** of the 5,000,000 NFR2
-  promise, leaving roughly **385,000 B** of headroom where 448,000 B stood before this story.
+Every earlier draft of this section carried an extrapolation: `x86_64-unknown-linux-musl` could not be
+measured here (no toolchain) and was projected to land near 4,610,000 B, ~94% of its budget and ~92% of
+NFR2, leaving ~385,000 B of headroom. It was flagged as the one number only CI could settle, and the
+whole point of the flag was that a projection is not a measurement.
 
-That is the number a future feature has to live inside, and it is worth flagging plainly: this story
-spent about 14% of the remaining NFR2 headroom, most of it on the IR bump. The regression budget is not
-breached on any target and no constant was touched, but musl moving from 92% to ~94% of its budget is
-the thing CI should be watched for.
+It never had to be settled: **Story 4.7 landed on `develop` while this branch was in review and narrowed
+CI and the release to macOS only.** `x86_64-unknown-linux-musl` and `x86_64-pc-windows-msvc` are no
+longer published, `budget_for_target` no longer defines them, and `install-linux-musl-toolchain.sh` is
+gone. The two remaining published targets are exactly the two measured above, both locally, both at 93%
+of the same budgets as before.
+
+So the risk closed by deletion rather than by evidence, and that distinction is worth keeping: nothing
+was learned about how this change behaves on musl. If either target is ever re-added, the delta to
+re-measure is the +50 KB in the table above, and the ~1.14 platform factor in the size script's header
+is the only guide — a factor whose own basis was removed with the targets it described.
 
 ### Known gaps, left deliberately
 
 - **Response-field descriptions are not compiled in** (D6): 53,024 bytes against 16,055 for the
-  request side, on the target that binds NFR2, for the half of the contract that needs prose least.
+  request side, for the half of the contract that needs prose least (and on the largest shipped
+  target, whichever that is at the time).
   Additive if wanted later, at the cost of another version bump.
 - **`pattern` is still not compiled** (pre-existing `ir.rs` TODO: a regex engine costs ~1 MB against a
   5 MB budget for two constraints in the whole vendored spec). `describe` therefore cannot report it,
