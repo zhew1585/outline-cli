@@ -10,8 +10,15 @@
 //! printed; a pipe or `--json` gets an array of objects, which is what the
 //! CLI contract said it would get all along and did not.
 //!
-//! The JSON form carries `path`, `content_type`, `body_mode` and `callable`
-//! beyond the two columns, and deliberately stops there:
+//! The JSON form carries `path`, `content_type`, `body_mode`, `callable`
+//! and `curated_command` beyond the two columns, and deliberately stops
+//! there:
+//!
+//! - `curated_command` names the semver-stable command that covers this
+//!   operation, or is null. It belongs in a triage list for the same reason
+//!   `callable` does: without it the list answers "how do I reach this
+//!   operation" with the unstable path, because the stable one is invisible
+//!   from here. See [`super::curated`].
 //!
 //! - `callable` has to be there, or the JSON would say LESS than the text:
 //!   the text flags operations the generic client cannot call, and a
@@ -33,7 +40,7 @@ use serde_json::{json, Value};
 
 use engine::{BodyMode, OpSpec};
 
-use super::describe;
+use super::{curated, describe};
 use crate::exit::CliError;
 use crate::ops;
 use crate::render::OutputMode;
@@ -41,6 +48,9 @@ use crate::stdio;
 
 /// Marker appended to operations the generic client cannot call.
 const NOT_CALLABLE_MARKER: &str = "[not callable via api";
+
+/// Marker appended to operations a curated command already covers.
+const CURATED_MARKER: &str = "[stable command: ";
 
 /// Print the effective operation table in the resolved output state.
 pub(super) fn run(mode: OutputMode) -> Result<(), CliError> {
@@ -71,6 +81,15 @@ fn as_text(table: &[OpSpec]) -> String {
             out.push_str(&describe::safe(&op.content_type));
             out.push(']');
         }
+        // The curated command is a literal from this binary, not spec text,
+        // so it needs no scrubbing - but it does need to be here, because
+        // the JSON carries it and neither state may say less than the other.
+        if let Some(command) = curated::curated_command(&op.name) {
+            out.push(' ');
+            out.push_str(CURATED_MARKER);
+            out.push_str(command);
+            out.push(']');
+        }
         out.push('\n');
     }
     out
@@ -89,6 +108,7 @@ fn as_json(table: &[OpSpec]) -> Value {
                     "content_type": describe::optional(&op.content_type),
                     "body_mode": describe::body_mode_name(op.body_mode),
                     "callable": op.body_mode != BodyMode::Unsupported,
+                    "curated_command": curated::curated_command(&op.name),
                 })
             })
             .collect(),
@@ -170,5 +190,53 @@ mod tests {
         }
         let callable_count = rows.iter().filter(|row| row["callable"] == false).count();
         assert_eq!(callable_count, flagged.len(), "the two states disagree");
+    }
+
+    /// Same rule as the flag above, applied to the reverse index: whichever
+    /// state a caller reads, it learns that a stable command exists.
+    #[test]
+    fn a_curated_command_is_named_in_both_states() {
+        let text = as_text(table());
+        let value = as_json(table());
+        let rows = value.as_array().expect("array");
+        let mut named = 0usize;
+        for row in rows {
+            let name = row["name"].as_str().expect("name");
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}\t")))
+                .expect("operation missing from the text state");
+            match row["curated_command"].as_str() {
+                Some(command) => {
+                    named += 1;
+                    assert!(
+                        line.contains(&format!("{CURATED_MARKER}{command}]")),
+                        "{line} does not name {command}"
+                    );
+                }
+                None => assert!(!line.contains(CURATED_MARKER), "{line}"),
+            }
+        }
+        assert_eq!(
+            named,
+            curated::CURATED_COMMANDS.len(),
+            "an entry in the curated table names an operation this binary does not have"
+        );
+    }
+
+    #[test]
+    fn documents_search_points_at_the_stable_command() {
+        let value = as_json(table());
+        let rows = value.as_array().expect("array");
+        let search = rows
+            .iter()
+            .find(|row| row["name"] == "documents.search")
+            .expect("documents.search missing");
+        assert_eq!(search["curated_command"], "otl docs search");
+        let duplicate = rows
+            .iter()
+            .find(|row| row["name"] == "documents.duplicate")
+            .expect("documents.duplicate missing");
+        assert!(duplicate["curated_command"].is_null(), "{duplicate}");
     }
 }

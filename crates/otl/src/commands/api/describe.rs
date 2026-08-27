@@ -60,6 +60,7 @@ use serde_json::{json, Value};
 
 use engine::{BodyMode, FieldContainer, FieldSpec, OpSpec, ParamSpec};
 
+use super::curated;
 use crate::exit::CliError;
 use crate::ops;
 use crate::paging;
@@ -169,6 +170,7 @@ fn as_json(op: &OpSpec) -> Value {
         "callable": op.body_mode != BodyMode::Unsupported,
         "paginates": paging::spec_for(op).is_some(),
         "source": source(),
+        "curated_command": curated::curated_command(&op.name),
         "parameters": Value::Array(op.params.iter().map(param_json).collect()),
         "response_fields": Value::Array(response_fields_json(&op.response_fields)),
     })
@@ -296,7 +298,20 @@ fn header(op: &OpSpec) -> Vec<(&'static str, String)> {
         ("request body", body_mode_note(op)),
         ("paginates", paginates.to_string()),
         ("source", source_note()),
+        ("curated command", curated_note(op)),
     ]
+}
+
+/// Whether a semver-stable command already covers this operation.
+///
+/// Present in both states and on every operation, including the ones with
+/// no curated command: "none" is the answer to a question a caller asked,
+/// and an absent row would read as a fact nobody checked.
+fn curated_note(op: &OpSpec) -> String {
+    match curated::curated_command(&op.name) {
+        Some(command) => format!("{command} (stable flags and output; prefer it)"),
+        None => "none: `otl api` is the way in, and its output is unstable".to_string(),
+    }
 }
 
 /// Where the description came from, spelled out for a reader.

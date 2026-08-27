@@ -18,10 +18,16 @@
 //! - [`describe`] - what one operation takes and returns
 //!   ([`DESCRIBE_OPERATION`]).
 //!
+//! Both of those answer with [`curated`]'s reverse index attached, because
+//! "which operation" is rarely the whole question: an operation with a
+//! curated command has a semver-stable front door, and this command's own
+//! output does not.
+//!
 //! Both are reserved first positionals rather than clap subcommands; see
 //! [`reserved`] for why, and for what happens if a spec ever declares an
 //! operation by one of those names.
 
+mod curated;
 mod describe;
 mod list;
 mod reserved;
