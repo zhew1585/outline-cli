@@ -61,8 +61,8 @@
 # strip="symbols", panic="abort"), 2026-08:
 #
 #   target                        measured     budget    of budget
-#   aarch64-apple-darwin         3,464,608  3,750,000        92%
-#   x86_64-apple-darwin          4,007,712  4,330,000        92%
+#   aarch64-apple-darwin         3,782,224  4,080,000        93%
+#   x86_64-apple-darwin          4,369,768  4,720,000        93%
 #
 # Both built locally - the x86_64 one cross-compiled on an arm64 host, which
 # works because Apple's toolchain targets both slices. Every shipped target is
@@ -70,22 +70,49 @@
 # figure came only from a CI leg, and the extrapolation standing in for it
 # locally was wrong by 0.74 MB. No number here is an extrapolation.
 #
-# Budgets sit ~8% above measurement, which is why both read the same 92% - the
+# The two figures are the LARGER of the local and CI measurements, which
+# differ slightly (aarch64: 3,782,224 local vs 3,781,984 CI; x86_64: 4,363,264
+# local vs 4,369,768 CI, a 0.15% toolchain difference). CI is what gates, so
+# budgeting off the smaller number would put the gate a hair under what it
+# measures.
+#
+# Budgets sit ~8% above measurement, which is why both read the same 93% - the
 # gate is equally strict on each, the point of splitting it.
+#
+# ---------------------------------------------------------------------------
+# Why this table was 284 KB stale, and what to do about it
+# ---------------------------------------------------------------------------
+# The previous rows read 3,464,608 / 4,007,712 (both 92%). By 2026-08-27
+# `develop` measured 3,748,832 / 4,328,752 - 99% of budget on BOTH targets,
+# ~1.2 KB of headroom each. The gate had been warning at 99% ("find what grew
+# before the gate turns red") on every develop run and no re-measure followed,
+# so the next commit of any size was going to turn it red. That commit was the
+# section-editing feature, which added 33 KB.
+#
+# The warning band worked; acting on it is the part that did not happen. If you
+# see 95%+ in a build log, re-measure and update this table THEN - the numbers
+# here are only as good as the last time someone did.
 #
 # HEADROOM AGAINST THE PROMISE, stated plainly because it is the number a
 # future maintainer needs and it should not have to be recomputed:
 #
-#   x86_64-apple-darwin is now the largest artifact we ship, at 4,007,712 B.
+#   x86_64-apple-darwin is the largest artifact we ship, at 4,369,768 B.
 #   NFR2 promises ~5 MB = 5,000,000 B.
-#   Remaining headroom: 992,288 B (19.8%).
+#   Remaining headroom: 630,232 B (12.6%).
 #
-# That is much roomier than it was, and the change is worth stating so nobody
-# carries over the old caution: while x86_64-unknown-linux-musl shipped it was
-# the binding target at 4,556,160 B, leaving only ~443,840 B (8.9%). Dropping
-# Linux roughly doubled the room. If Linux or Windows returns, the binding
-# target and this number change with it - re-measure rather than assuming this
-# figure still holds.
+# That room is shrinking and the trend is worth naming rather than rediscovering:
+# it was 992,288 B (19.8%) at the previous measurement, so ~362 KB of it went in
+# one stretch of development. Note also that this target's BUDGET (4,720,000) is
+# now only 280,000 B under the NFR2 ceiling - the ~8% regression margin has
+# nearly caught up with the promise, and once it passes, the ceiling rather than
+# the budget becomes the binding gate. Before raising this row again, consider
+# whether the growth should be paid back instead.
+#
+# For contrast, so nobody carries over the old caution about a target we no
+# longer ship: while x86_64-unknown-linux-musl shipped it was the binding target
+# at 4,556,160 B, leaving ~443,840 B (8.9%). If Linux or Windows returns, the
+# binding target and this number change with it - re-measure rather than
+# assuming this figure still holds.
 #
 # Raising any budget is a deliberate act: update the measurement in the table
 # in the same commit, and say which dependency bought the space.
@@ -135,8 +162,8 @@ EFFECTIVE_TARGET="${TARGET:-${HOST_TRIPLE}}"
 # asserts that every triple in dist-workspace.toml appears in this case.
 budget_for_target() {
     case "$1" in
-        aarch64-apple-darwin) echo 3750000 ;;
-        x86_64-apple-darwin) echo 4330000 ;;
+        aarch64-apple-darwin) echo 4080000 ;;
+        x86_64-apple-darwin) echo 4720000 ;;
         *) echo "" ;;
     esac
 }
