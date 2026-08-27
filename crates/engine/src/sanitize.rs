@@ -15,18 +15,32 @@
 //!    variation selectors, tag characters, ...) are dropped and control
 //!    characters become spaces. Nothing invisible ever reaches stderr, so
 //!    what a reader sees is what the text actually is.
-//! 2. **Skeleton comparison.** The candidate text and the secret are both
-//!    reduced to lowercase alphanumerics only - every separator, visible or
-//!    not, is discarded. If the secret's skeleton appears in the text's
-//!    skeleton, the field is discarded wholesale. This defeats ANY
-//!    interleaving (invisible characters, punctuation, whitespace, mixed
-//!    case) with one rule instead of enumerating character classes.
+//! 2. **Skeleton FRAGMENT comparison.** The candidate text and the secret
+//!    are both reduced to lowercase alphanumerics only - every separator,
+//!    visible or not, is discarded. If ANY window of
+//!    [`MIN_SECRET_FRAGMENT_CHARS`] consecutive skeleton characters of the
+//!    secret appears anywhere in the text's skeleton, the field is
+//!    discarded wholesale. This is what makes the rule "no fragment, ever"
+//!    rather than "no whole token": a prefix in the middle of a sentence, a
+//!    slice from the middle of the token, and any interleaving of the above
+//!    are all caught by one check.
+//!
+//! Why a *fragment* and not the whole secret: a server that can echo four
+//! characters of a token at a time is an oracle. Repeated across requests,
+//! fragments reassemble. So the bar is set at the shortest fragment worth
+//! protecting, and the cost - occasionally discarding an innocent
+//! diagnostic that happens to contain four matching characters - is
+//! accepted. The exit code and HTTP status survive regardless.
 //!
 //! The remaining ordering is still load-bearing: redact exact occurrences
 //! first (so ordinary echoes keep a readable message), then normalize, then
-//! redact again, then apply the skeleton check, and only then cap length.
+//! redact again, then apply the fragment check, and only then cap length.
+//! Doing the fragment check before exact redaction would discard every
+//! honest message that quotes a token in full.
 
 use unicode_width::UnicodeWidthChar;
+
+use crate::text::{hazard, Hazard};
 
 /// Placeholder shown instead of secrets.
 pub const REDACTED: &str = "***";
@@ -48,14 +62,43 @@ const CAPPED_TAIL_RUNS: usize = 2;
 /// successfully: those fields are complete, and dropping their last words
 /// would corrupt a legitimate diagnostic for no security gain.
 pub fn clean_server_text(raw: &str, secret: &str, may_be_truncated: bool, cap: usize) -> String {
+    clean_server_text_for(raw, std::slice::from_ref(&secret), may_be_truncated, cap)
+}
+
+/// [`clean_server_text`] against EVERY secret a request carried.
+///
+/// One request can involve more than one credential: the channel replaces a
+/// rejected token with a renewed one and replays, so the response to the
+/// replay may echo either. A pipeline that only knows the current value
+/// would print the previous one verbatim. Every secret still in play must
+/// therefore be passed here, and each is applied in turn - a single
+/// fragment match from any of them discards the text.
+pub fn clean_server_text_for(
+    raw: &str,
+    secrets: &[&str],
+    may_be_truncated: bool,
+    cap: usize,
+) -> String {
     let untrusted = if may_be_truncated {
         replace_trailing_runs(raw)
     } else {
         raw.to_string()
     };
-    let normalized = normalize(&redact_secret(&untrusted, secret));
-    let redacted = redact_secret(&normalized, secret);
-    if smuggles_secret(&redacted, secret) {
+    // Exact redaction first, for every secret, so an honest message that
+    // quotes a whole token stays readable.
+    let redacted_once = secrets
+        .iter()
+        .fold(untrusted, |text, secret| redact_secret(&text, secret));
+    let normalized = normalize(&redacted_once);
+    let redacted = secrets
+        .iter()
+        .fold(normalized, |text, secret| redact_secret(&text, secret));
+    // Then the categorical backstop: any surviving fragment of any secret
+    // means the whole field goes.
+    if secrets
+        .iter()
+        .any(|secret| leaks_fragment(&redacted, secret))
+    {
         return REDACTED.to_string();
     }
     redacted
@@ -64,6 +107,13 @@ pub fn clean_server_text(raw: &str, secret: &str, may_be_truncated: bool, cap: u
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// [`redact_secret`] for every secret in play.
+pub fn redact_all(text: &str, secrets: &[&str]) -> String {
+    secrets.iter().fold(text.to_string(), |text, secret| {
+        redact_secret(&text, secret)
+    })
 }
 
 /// Replace every occurrence of `secret` in `text` with [`REDACTED`], then
@@ -140,13 +190,18 @@ fn replace_trailing_runs(text: &str) -> String {
 fn normalize(raw: &str) -> String {
     let collapsed = raw
         .chars()
-        .filter_map(|c| match UnicodeWidthChar::width(c) {
-            // Control characters (width None) and whitespace read as gaps.
-            None => Some(' '),
+        .filter_map(|c| match (hazard(c), UnicodeWidthChar::width(c)) {
+            // Control characters and whitespace read as gaps.
+            (Some(Hazard::Control), _) | (_, None) => Some(' '),
             _ if c.is_whitespace() => Some(' '),
-            // Renders as nothing: it can only be there to mislead.
-            Some(0) => None,
-            Some(_) => Some(c),
+            // Renders as nothing, or renders as something other than what it
+            // is. TWO rules, not one, because neither contains the other:
+            // width catches a combining mark stacked onto a neighbour, which
+            // is not a format character; `hazard` catches the 27 `Cf`
+            // codepoints a terminal gives a column to, which width lets
+            // through. Whichever fires, the character does not go out.
+            (Some(_), _) | (_, Some(0)) => None,
+            _ => Some(c),
         })
         .fold(String::new(), |mut acc, c| {
             if c != ' ' || !acc.ends_with(' ') {
@@ -157,20 +212,34 @@ fn normalize(raw: &str) -> String {
     collapsed.trim().to_string()
 }
 
-/// Whether the secret is still recoverable from `text` once both are
-/// reduced to their skeletons.
+/// Whether ANY fragment of the secret survives in `text`.
 ///
-/// See the module docs: this is the categorical backstop. Any interleaving
-/// a server invents - invisible characters, punctuation, spacing, case
-/// changes - collapses away, so a single containment check catches it.
-/// Secrets whose skeleton is too short are skipped so that an incidental
-/// match cannot suppress legitimate diagnostics.
-fn smuggles_secret(text: &str, secret: &str) -> bool {
-    let secret_skeleton = skeleton(secret);
-    if secret_skeleton.chars().count() < MIN_SECRET_FRAGMENT_CHARS {
+/// The categorical backstop described in the module docs. Both sides are
+/// reduced to skeletons, so every interleaving a server might invent -
+/// invisible characters, punctuation, spacing, case changes - collapses
+/// away first. Then every window of [`MIN_SECRET_FRAGMENT_CHARS`]
+/// consecutive skeleton characters of the secret is looked for in the text.
+///
+/// Windows, not just the whole skeleton: a prefix sitting in the MIDDLE of a
+/// sentence, or a slice taken from the middle of the token, are both
+/// recoverable credential material and neither contains the full skeleton.
+/// A server that can echo one fragment can echo the next one on the next
+/// request.
+///
+/// Secrets whose whole skeleton is shorter than one window are skipped, so
+/// a two-character "secret" cannot blank out every diagnostic.
+fn leaks_fragment(text: &str, secret: &str) -> bool {
+    let fragments: Vec<char> = skeleton(secret).chars().collect();
+    if fragments.len() < MIN_SECRET_FRAGMENT_CHARS {
         return false;
     }
-    skeleton(text).contains(&secret_skeleton)
+    let haystack = skeleton(text);
+    if haystack.is_empty() {
+        return false;
+    }
+    fragments
+        .windows(MIN_SECRET_FRAGMENT_CHARS)
+        .any(|window| haystack.contains(&window.iter().collect::<String>()))
 }
 
 /// Reduce text to lowercase alphanumerics: everything that could be used to
@@ -247,6 +316,49 @@ mod tests {
     }
 
     #[test]
+    fn normalize_drops_every_format_character_not_just_the_zero_width_ones() {
+        // The scrub used to classify by RENDERED WIDTH alone, and a terminal
+        // gives a column to 27 of the `Cf` codepoints - so these survived
+        // into stderr while the CLI's own scrub dropped them. Enumerated
+        // rather than sampled: the point is that the two layers now read the
+        // same table, so a codepoint one drops cannot be one the other keeps.
+        let ranges: &[(u32, u32)] = &[
+            (0x0600, 0x0605),
+            (0x06dd, 0x06dd),
+            (0x070f, 0x070f),
+            (0x0890, 0x0891),
+            (0x08e2, 0x08e2),
+            (0xfff9, 0xfffb),
+            (0x110bd, 0x110bd),
+            (0x110cd, 0x110cd),
+            (0x13430, 0x1343f),
+            (0x1bca0, 0x1bca3),
+            (0xe0001, 0xe0001),
+        ];
+        for (first, last) in ranges {
+            for code in *first..=*last {
+                let Some(c) = char::from_u32(code) else {
+                    panic!("U+{code:04X} is not a scalar value");
+                };
+                let cleaned = clean(&format!("aaa{c}bbb"), "unrelated-token");
+                assert_eq!(
+                    cleaned, "aaabbb",
+                    "U+{code:04X} survived the server-text scrub"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_still_drops_zero_width_characters_that_are_not_format_ones() {
+        // The width rule is not redundant: a combining mark is not a `Cf`
+        // codepoint, and stacking a few hundred of them on one letter is the
+        // other way to make output unreadable.
+        let cleaned = clean("a\u{301}\u{301}\u{489}b", "unrelated-token");
+        assert_eq!(cleaned, "ab");
+    }
+
+    #[test]
     fn capped_text_drops_short_trailing_fragment() {
         // The read cap leaves a 2-char token prefix, shorter than
         // MIN_SECRET_FRAGMENT_CHARS.
@@ -275,6 +387,145 @@ mod tests {
         // cap-tail treatment must not touch them.
         assert_eq!(clean("document not found", TOKEN), "document not found");
         assert_eq!(clean("validation_error", TOKEN), "validation_error");
+    }
+
+    #[test]
+    fn discards_a_prefix_fragment_sitting_in_the_middle_of_a_sentence() {
+        // The reported gap: the truncated-tail logic only ever looked at
+        // the END of the text, so a prefix followed by ordinary words went
+        // through untouched.
+        for raw in [
+            "token reflec is not valid, please retry",
+            "prefix reflected-sec suffix",
+            "the value refl was rejected",
+        ] {
+            let cleaned = clean(raw, TOKEN);
+            assert_eq!(
+                cleaned, REDACTED,
+                "a mid-string fragment survived: {cleaned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discards_an_arbitrary_middle_slice_of_the_secret() {
+        // Every window of the secret must be caught, not just its prefix:
+        // a server echoing successive slices would otherwise reassemble the
+        // whole token across requests.
+        let skeleton_chars: Vec<char> = skeleton(TOKEN).chars().collect();
+        for start in 0..=skeleton_chars.len() - MIN_SECRET_FRAGMENT_CHARS {
+            let slice: String = skeleton_chars[start..start + MIN_SECRET_FRAGMENT_CHARS]
+                .iter()
+                .collect();
+            let raw = format!("rejected value {slice} was not accepted");
+            let cleaned = clean(&raw, TOKEN);
+            assert_eq!(
+                cleaned, REDACTED,
+                "slice at offset {start} ({slice:?}) survived: {cleaned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discards_a_fragment_however_it_is_broken_up() {
+        // The fragment rule inherits the skeleton treatment, so separators
+        // inside a fragment do not help either.
+        for raw in [
+            "value re-fle-cted here",
+            "value r e f l here",
+            "value R\u{200b}E\u{200b}F\u{200b}L here",
+            "value [refl] here",
+        ] {
+            assert_eq!(
+                clean(raw, TOKEN),
+                REDACTED,
+                "a separated fragment survived: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_echo_still_produces_a_readable_message() {
+        // Ordering matters: exact redaction runs before the fragment check,
+        // so the common honest case keeps its diagnostic instead of being
+        // blanked out by its own fragments.
+        assert_eq!(
+            clean("invalid header: Bearer reflected-secret-token", TOKEN),
+            "invalid header: Bearer ***"
+        );
+    }
+
+    #[test]
+    fn a_secret_too_short_to_have_a_window_cannot_blank_everything() {
+        // A 3-character secret has no window, so it only gets exact
+        // redaction - otherwise any 3-letter value would erase every
+        // diagnostic the server ever sends.
+        assert_eq!(
+            clean("the id abc was rejected", "abc"),
+            "the id *** was rejected"
+        );
+    }
+
+    #[test]
+    fn every_secret_in_play_is_redacted_not_just_the_last_one() {
+        // The renew-and-replay case: the reply to the replayed request may
+        // echo the token the FIRST attempt used. Both are redacted, and
+        // because both were echoed in full the message stays readable.
+        let stale = "old-secret-value-1";
+        let fresh = "new-secret-value-2";
+        let cleaned = clean_server_text_for(
+            &format!("token {stale} was replaced by {fresh}"),
+            &[fresh, stale],
+            false,
+            CAP,
+        );
+        assert_eq!(cleaned, "token *** was replaced by ***");
+        for secret in [stale, fresh] {
+            assert!(
+                !skeleton(&cleaned).contains(&skeleton(secret)),
+                "{secret} is recoverable from {cleaned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_superseded_token_is_redacted_even_when_only_it_is_echoed() {
+        // A server that saw T1, then T2 on the replay, and chooses to echo
+        // only T1 back. A pipeline that knew just the current credential
+        // would print T1 verbatim.
+        let cleaned = clean_server_text_for(
+            "the previous token old-secret-value-1 is no longer accepted",
+            &["new-secret-value-2", "old-secret-value-1"],
+            false,
+            CAP,
+        );
+        assert!(
+            !cleaned.contains("old-secret-value-1"),
+            "the superseded token leaked: {cleaned:?}"
+        );
+        assert!(cleaned.contains(REDACTED), "{cleaned:?}");
+    }
+
+    #[test]
+    fn a_fragment_of_any_secret_in_play_discards_the_text() {
+        let cleaned = clean_server_text_for(
+            "the value old-sec was rejected",
+            &["current-token-value", "old-secret-value-1"],
+            false,
+            CAP,
+        );
+        assert_eq!(cleaned, REDACTED, "a fragment survived: {cleaned:?}");
+    }
+
+    #[test]
+    fn unrelated_secrets_do_not_disturb_an_honest_message() {
+        let cleaned = clean_server_text_for(
+            "document not found",
+            &["zzqqxxwwvvuu-1", "yyppmmkkjjhh-2"],
+            false,
+            CAP,
+        );
+        assert_eq!(cleaned, "document not found");
     }
 
     #[test]

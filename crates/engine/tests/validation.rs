@@ -1,4 +1,4 @@
-//! Local parameter validation and body assembly (Story 1.3).
+//! Local parameter validation and body assembly.
 //!
 //! Every validation failure must occur before any network request; the
 //! closed-port tests prove it (a network attempt would surface as a
@@ -29,6 +29,7 @@ fn param(name: &'static str, ty: ParamType, required: bool) -> ParamSpec {
         format: Cow::Borrowed(""),
         minimum: None,
         maximum: None,
+        description: Cow::Borrowed(""),
     }
 }
 
@@ -45,6 +46,7 @@ fn json_op(params: Vec<ParamSpec>) -> OpSpec {
         summary: Cow::Borrowed("Update a thing"),
         content_type: Cow::Borrowed("application/json"),
         body_mode: BodyMode::KeyValue,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Owned(params),
     }
 }
@@ -292,6 +294,7 @@ fn unsupported_op() -> OpSpec {
     OpSpec {
         content_type: Cow::Borrowed("multipart/form-data"),
         body_mode: BodyMode::Unsupported,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Borrowed(&[]),
         ..test_op()
     }
@@ -335,6 +338,7 @@ fn unsupported_body_type_is_rejected_before_any_network_request() {
 fn union_op() -> OpSpec {
     OpSpec {
         body_mode: BodyMode::RawJsonOnly,
+        response_fields: Cow::Borrowed(&[]),
         params: Cow::Owned(vec![
             param("documentId", ParamType::String, false),
             param("collectionId", ParamType::String, false),
@@ -410,6 +414,7 @@ fn faceted_op() -> OpSpec {
         ParamSpec {
             minimum: Some(0.0),
             maximum: Some(100.0),
+            description: Cow::Borrowed(""),
             ..param("size", ParamType::Integer, false)
         },
         param("id", ParamType::String, false),

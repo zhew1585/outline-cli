@@ -1,0 +1,630 @@
+//! Turning an `otl auth` result into the two renderings the CLI contract
+//! promises: human lines on a terminal, one JSON object otherwise.
+//!
+//! Nothing here performs an action, resolves a credential or touches the
+//! network: it receives what the command decided and describes it - which
+//! is also why every function here is straightforward to test without a
+//! mock server.
+//!
+//! Nothing in this module may print a credential or a fragment of one.
+//! `info_json_never_carries_a_credential_field` and
+//! `auth_info_never_prints_a_credential_or_a_fragment_of_one` pin that from
+//! the two sides: the field names here, and the real binary's output.
+
+use serde_json::{json, Value};
+
+use crate::auth::report::{self, CredentialHealth};
+use crate::auth::source::Snapshot;
+use crate::auth::{login, logout, Identity};
+use crate::exit::{CliError, ExitCode};
+use crate::render::{self, OutputMode};
+use crate::stdio;
+use anyhow::anyhow;
+
+/// Human lines plus the machine-readable object for `auth login`.
+pub(super) fn login_output(profile: &str, outcome: &login::Outcome) -> Output {
+    let identity = outcome.identity.as_ref();
+    let account = identity.and_then(Identity::account);
+    let workspace = identity.and_then(|identity| identity.workspace.clone());
+    let mut lines = vec![
+        "Signed in.".to_string(),
+        format!("profile:          {profile}"),
+    ];
+    if let Some(account) = &account {
+        lines.push(format!("account:          {account}"));
+    }
+    if let Some(workspace) = &workspace {
+        lines.push(format!("workspace:        {workspace}"));
+    }
+    if let Some(scope) = &outcome.scope {
+        lines.push(format!("scope:            {scope}"));
+    }
+    lines.push(format!(
+        "credential file:  {}",
+        outcome.credential_path.display()
+    ));
+    lines.push(format!(
+        "client:           {}",
+        outcome.client_source.label()
+    ));
+    Output {
+        lines,
+        value: json!({
+            "profile": profile,
+            "account": account,
+            "workspace": workspace,
+            "scope": outcome.scope,
+            "credential_file": outcome.credential_path.display().to_string(),
+            "client_source": format!("{:?}", outcome.client_source).to_lowercase(),
+        }),
+    }
+}
+
+/// Human lines plus the machine-readable object for `auth logout`.
+pub(super) fn logout_output(profile: &str, report: &logout::Report) -> Output {
+    let headline = if !report.had_credentials {
+        format!("Nothing was stored for profile {profile}.")
+    } else if report.kept_for_retry {
+        format!(
+            "Profile {profile} was NOT signed out: the server could not be \
+             told, so the credentials were kept for a retry."
+        )
+    } else if report.survived_concurrent_write {
+        format!(
+            "Profile {profile} is NOT signed out: a credential written by \
+             another process during this logout is still stored, and was \
+             never revoked."
+        )
+    } else {
+        format!("Signed out of profile {profile}.")
+    };
+    Output {
+        lines: vec![
+            headline,
+            format!("tokens revoked on the server: {}", report.signed_out()),
+            format!(
+                "application deleted:          {}",
+                report.registration_deleted
+            ),
+            format!("credential file removed:      {}", report.file_removed),
+            format!("kept locally for retry:       {}", report.kept_for_retry),
+        ],
+        value: json!({
+            "profile": profile,
+            "had_credentials": report.had_credentials,
+            // The profile-level claim, not just what this run managed to
+            // revoke: a session another process wrote is still live.
+            "revoked": report.signed_out(),
+            "session_survived_concurrent_write": report.survived_concurrent_write,
+            "registration_deleted": report.registration_deleted,
+            "credential_file_removed": report.file_removed,
+            "credentials_kept_for_retry": report.kept_for_retry,
+            "warnings": report.warnings,
+        }),
+    }
+}
+
+/// Human lines plus the machine-readable object for `auth set-key`.
+pub(super) fn set_key_output(profile: &str, health: &CredentialHealth) -> Output {
+    Output {
+        lines: vec![
+            format!("API key stored for profile {profile}."),
+            format!("credential file:  {}", health.path.display()),
+            format!("permissions:      {}", health.permissions.describe()),
+        ],
+        value: json!({
+            "profile": profile,
+            "credential_file": health.path.display().to_string(),
+            "permissions": health.permissions.describe(),
+        }),
+    }
+}
+
+/// Human lines plus the machine-readable object for `auth info`.
+pub(super) fn info_output(
+    profile: &str,
+    instance: &Result<String, String>,
+    health: &CredentialHealth,
+    resolved: &Result<Option<()>, String>,
+    snapshot: &Option<Snapshot>,
+    identity: &Option<Result<Identity, String>>,
+) -> Output {
+    let snapshot = snapshot.as_ref();
+    let mut lines = vec![
+        format!("profile:          {profile}"),
+        format!(
+            "instance:         {}",
+            match instance {
+                Ok(origin) => origin.clone(),
+                Err(reason) => format!("not usable ({reason})"),
+            }
+        ),
+    ];
+    lines.extend(method_lines(resolved, snapshot));
+    lines.extend(identity_lines(snapshot, identity));
+    lines.extend(health.lines());
+    Output {
+        lines,
+        value: info_value(profile, instance, health, resolved, snapshot, identity),
+    }
+}
+
+/// The `auth info` JSON object.
+///
+/// Split from the human lines so neither is long enough to hide a field. The
+/// two describe the same state and must stay in step; anything that appears
+/// in only one of them is a bug in whichever is missing it.
+fn info_value(
+    profile: &str,
+    instance: &Result<String, String>,
+    health: &CredentialHealth,
+    resolved: &Result<Option<()>, String>,
+    snapshot: Option<&Snapshot>,
+    identity: &Option<Result<Identity, String>>,
+) -> Value {
+    json!({
+        "profile": profile,
+        "instance": instance.as_ref().ok().map(String::as_str),
+        "instance_problem": instance.as_ref().err(),
+        "method": snapshot.map(|snapshot| snapshot.method.label()),
+        "available": snapshot
+            .map(|snapshot| snapshot.available.iter().map(|m| m.label()).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        // Reported separately from `available`, because it is an OBSERVATION
+        // and not a candidate. `available` lists what the release gate would
+        // hand over for these settings; a plaintext key sitting in the
+        // environment may not be one of those (a profile scopes its key to
+        // `OUTLINE_API_KEY_<PROFILE>`) and yet is exactly what a user needs
+        // told when they wonder why the key they exported is not in use.
+        //
+        // Named for the hygiene fact rather than for the variable: a field
+        // name containing `api_key` trips
+        // `info_json_never_carries_a_credential_field`, and that guard's
+        // proxy - no credential-bearing NAME in the output - is worth more
+        // than a field name that echoes the variable.
+        "plaintext_key_in_environment": health.env_api_key,
+        "scope": snapshot.and_then(|snapshot| snapshot.scope.clone()),
+        "account": identity_value(snapshot, identity),
+        "expires_in_seconds": snapshot.and_then(|snapshot| snapshot.expires_in),
+        "renewable": snapshot.is_some_and(|snapshot| snapshot.renewable),
+        "credential_file": health.path.display().to_string(),
+        "credential_file_exists": health.exists,
+        "credential_file_permissions": health.permissions.describe(),
+        // The STORE-wide verdict: it folds in the directory around the file,
+        // so the three directory fields below exist to explain it. Without
+        // them a consumer sees `credential_file_usable: false` next to
+        // `credential_file_permissions: "0600 (owner read/write only)"` and
+        // has nothing in the same object that accounts for the false - the
+        // reason was only ever in the human lines. Added rather than
+        // renamed: this key is published, and its meaning is unchanged.
+        "credential_file_usable": health.usable,
+        "credential_directory": health.directory.display().to_string(),
+        "credential_directory_mode": health.directory_mode,
+        "credential_directory_problem": health.directory_problem,
+        "resolution_error": resolved.as_ref().err(),
+    })
+}
+
+/// The `method` / `available` lines of `auth info`.
+fn method_lines(resolved: &Result<Option<()>, String>, snapshot: Option<&Snapshot>) -> Vec<String> {
+    match (resolved, snapshot) {
+        (Err(error), _) => unavailable_lines(error),
+        (Ok(_), Some(snapshot)) => {
+            let mut lines = vec![report::method_line(snapshot.method)];
+            let shadowed: Vec<&str> = snapshot
+                .available
+                .iter()
+                .skip(1)
+                .map(|method| method.label())
+                .collect();
+            if !shadowed.is_empty() {
+                lines.push(format!("also available:   {}", shadowed.join(", ")));
+            }
+            if let Some(scope) = &snapshot.scope {
+                lines.push(format!("scope:            {scope}"));
+            }
+            if let Some(seconds) = snapshot.expires_in {
+                lines.push(format!("access token:     {}", expiry_phrase(seconds)));
+            }
+            lines
+        }
+        (Ok(None), None) => vec!["method:           none (no credentials stored)".to_string()],
+        (Ok(Some(())), None) => vec!["method:           unknown".to_string()],
+    }
+}
+
+/// The `method: unavailable` block, keeping every line of the reason.
+///
+/// The reason is often a remedy spanning several lines ("set
+/// `OUTLINE_API_KEY_WORK`", "run `otl auth login`"). Folding it into one
+/// parenthesised line would cut exactly the part the user needs, and this is
+/// the command they ran BECAUSE something is wrong.
+fn unavailable_lines(reason: &str) -> Vec<String> {
+    let mut lines = vec!["method:           unavailable".to_string()];
+    lines.extend(
+        reason
+            .lines()
+            .map(|line| format!("                  {}", line.trim_end())),
+    );
+    lines
+}
+
+/// The identity lines of `auth info`.
+fn identity_lines(
+    snapshot: Option<&Snapshot>,
+    identity: &Option<Result<Identity, String>>,
+) -> Vec<String> {
+    match identity {
+        Some(Ok(identity)) => {
+            let mut lines = Vec::new();
+            if let Some(account) = identity.account() {
+                lines.push(format!("account:          {account}"));
+            }
+            if let Some(workspace) = &identity.workspace {
+                lines.push(format!("workspace:        {workspace}"));
+            }
+            lines
+        }
+        Some(Err(error)) => vec![format!("account:          could not be checked ({error})")],
+        // Offline, or nothing to ask with: fall back to what login cached.
+        None => cached_identity_lines(snapshot),
+    }
+}
+
+/// Identity as captured at login time, when no live call was made.
+fn cached_identity_lines(snapshot: Option<&Snapshot>) -> Vec<String> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let Some(account) = &snapshot.account {
+        lines.push(format!("account:          {account} (as of last login)"));
+    }
+    if let Some(workspace) = &snapshot.workspace {
+        lines.push(format!("workspace:        {workspace} (as of last login)"));
+    }
+    lines
+}
+
+/// Account value for the JSON output.
+fn identity_value(
+    snapshot: Option<&Snapshot>,
+    identity: &Option<Result<Identity, String>>,
+) -> Value {
+    match identity {
+        Some(Ok(identity)) => json!(identity.account()),
+        Some(Err(_)) => Value::Null,
+        None => json!(snapshot.and_then(|snapshot| snapshot.account.clone())),
+    }
+}
+
+/// Describe a token lifetime in words.
+fn expiry_phrase(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "expired (it will be renewed on the next request)".to_string();
+    }
+    let minutes = seconds / 60;
+    if minutes < 1 {
+        return format!("expires in {seconds}s");
+    }
+    format!("expires in {minutes}m")
+}
+
+/// A command result in both renderings.
+pub(super) struct Output {
+    lines: Vec<String>,
+    value: Value,
+}
+
+/// Print a command result: human text on a terminal, JSON otherwise.
+///
+/// BOTH renderings are scrubbed, and this module is the reason the rule is
+/// worth stating rather than assuming. Its output interpolates a profile name
+/// out of a config file, a credential path out of the environment, an error
+/// string, and - the part that decides it - the `account`, `workspace` and
+/// `scope` the SERVER supplied. `otl auth info` is also the command a program
+/// runs to find out whether it has a credential at all, so it is squarely a
+/// text-to-a-machine surface.
+///
+/// It was missed in the first pass at this rule (Story 4.6 F1 covered
+/// `doctor` and `api describe`) and caught in the second, with `U+202E` in a
+/// profile name arriving byte-for-byte on stdout in both states.
+///
+/// `render_json_scrubbed`, not `render`: this value is a summary this module
+/// built, not an operation's response payload, so there is no response schema
+/// to pick table columns from - and not `render_json` either, because the
+/// `--json` exemption covers a server response that has to round-trip, which
+/// this object is not (see [`crate::text`]).
+///
+/// Scrubbing removes hazard characters and nothing else: no field is renamed,
+/// added, dropped or reordered, so the semver-protected shape of
+/// `otl auth info --json` is untouched.
+pub(super) fn emit(output: Output, mode: OutputMode) -> Result<(), CliError> {
+    stdio::write_data_line(&rendered(&output, mode)?)
+}
+
+/// The exact bytes [`emit`] writes, so a test can ask about them.
+///
+/// Split out rather than asserted through stdout: the property is WHICH
+/// renderer each state uses, and a test that reached for
+/// `render_json_scrubbed` itself would keep passing if this stopped calling
+/// it. That is how the gap this function closes survived one review.
+fn rendered(output: &Output, mode: OutputMode) -> Result<String, CliError> {
+    match mode {
+        OutputMode::Json => render::render_json_scrubbed(&output.value).map_err(|error| {
+            CliError::new(
+                ExitCode::Failure,
+                anyhow!("failed to render the result: {error}"),
+            )
+        }),
+        // Per line, then joined: the lines this module builds are a LIST, and
+        // a foreign value carrying a newline must not be able to add an entry
+        // to it. `unavailable_lines` has already split the one legitimately
+        // multi-line value into separate entries.
+        OutputMode::Table => Ok(output
+            .lines
+            .iter()
+            .map(|line| stdio::scrub_to_one_line(line))
+            .collect::<Vec<_>>()
+            .join("\n")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn expiry_is_described_in_words_a_human_can_act_on() {
+        assert!(expiry_phrase(-5).contains("expired"));
+        assert!(expiry_phrase(-5).contains("renewed"));
+        assert_eq!(expiry_phrase(30), "expires in 30s");
+        assert_eq!(expiry_phrase(3600), "expires in 60m");
+    }
+
+    #[test]
+    fn info_reports_an_unusable_credential_file_instead_of_giving_up() {
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/home/u/.config/outline-cli/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::TooOpen {
+                mode: "0644".to_string(),
+            },
+            usable: false,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/home/u/.config/outline-cli"),
+            directory_mode: Some("0700".to_string()),
+            directory_problem: None,
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let resolved = Err("credential file is accessible to users other than you".to_string());
+        let output = info_output(
+            "default",
+            &Err("OUTLINE_URL is not set".to_string()),
+            &health,
+            &resolved,
+            &None,
+            &None,
+        );
+        let rendered = output.lines.join("\n");
+        assert!(rendered.contains("0644"), "{rendered}");
+        assert!(rendered.contains("unavailable"), "{rendered}");
+        assert!(rendered.contains("not usable"), "{rendered}");
+    }
+
+    /// A `false` verdict has to be explicable from the same object.
+    ///
+    /// `credential_file_usable` is the STORE-wide answer, so it can be false
+    /// because of the directory while the file's own permissions are
+    /// perfect. Before these three fields a consumer saw
+    /// `credential_file_usable: false` beside
+    /// `credential_file_permissions: "0600 (owner read/write only)"` and had
+    /// nothing to account for it - the reason was only in the human lines.
+    #[test]
+    fn a_directory_problem_is_explained_in_the_same_json() {
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/home/u/.config/outline-cli/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: false,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/home/u/.config/outline-cli"),
+            directory_mode: Some("0777".to_string()),
+            directory_problem: Some("it is writable by other users (permissions 0777)".to_string()),
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let output = info_output(
+            "default",
+            &Ok("https://docs.example.com".to_string()),
+            &health,
+            &Ok(None),
+            &None,
+            &None,
+        );
+        assert_eq!(output.value["credential_file_usable"], Value::from(false));
+        // The file's own state is sound, so the false must be explained by
+        // the directory - and it is, in the same object.
+        assert_eq!(
+            output.value["credential_file_permissions"],
+            Value::from("0600 (owner read/write only)")
+        );
+        assert_eq!(
+            output.value["credential_directory_mode"],
+            Value::from("0777")
+        );
+        assert!(
+            output.value["credential_directory_problem"]
+                .as_str()
+                .is_some_and(|text| text.contains("0777")),
+            "{}",
+            output.value
+        );
+        assert_eq!(
+            output.value["credential_directory"],
+            Value::from("/home/u/.config/outline-cli")
+        );
+    }
+
+    #[test]
+    fn a_healthy_directory_reports_no_problem_and_still_reports_its_mode() {
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/tmp/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: true,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/tmp"),
+            directory_mode: Some("0700".to_string()),
+            directory_problem: None,
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let output = info_output(
+            "default",
+            &Ok("https://docs.example.com".to_string()),
+            &health,
+            &Ok(None),
+            &None,
+            &None,
+        );
+        assert_eq!(output.value["credential_directory_problem"], Value::Null);
+        assert_eq!(
+            output.value["credential_directory_mode"],
+            Value::from("0700")
+        );
+    }
+
+    /// Every string this module prints came from somewhere else, and three
+    /// of them came from the SERVER: `account`, `workspace` and `scope`.
+    ///
+    /// `otl auth info` is also the command a program runs to find out whether
+    /// it has a credential, so this is a text-to-a-machine surface with a
+    /// server-controlled half. Both states are checked, because the gap that
+    /// prompted this test was in both, and there was not one assertion of
+    /// this shape in the file - which is why `emit` was missed when the same
+    /// rule was applied to `doctor` and `api describe`.
+    #[test]
+    fn both_renderings_scrub_foreign_text() {
+        use crate::text::has_hazard;
+
+        // `\u{202e}` reverses the rest of the line, `\u{200f}` and
+        // `\u{061c}` are the residual `Cf` set, and the newline is the one
+        // that could forge an entry in a list of lines.
+        let hostile = "ev\u{202e}il\u{200f}\u{061c}\nmethod: forged";
+        assert!(
+            has_hazard(hostile),
+            "the fixture carries no hazard: this test would be vacuous"
+        );
+        let mut snapshot = Snapshot::fixed(crate::auth::selection::Method::EnvApiKey, Vec::new());
+        // The server-supplied half.
+        snapshot.account = Some(hostile.to_string());
+        snapshot.workspace = Some(hostile.to_string());
+        snapshot.scope = Some(hostile.to_string());
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/tmp/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: true,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/tmp"),
+            directory_mode: Some("0700".to_string()),
+            directory_problem: None,
+            profiles: Vec::new(),
+            env_api_key: false,
+        };
+        let output = info_output(
+            // The config-file half: a profile name is a TOML quoted key.
+            hostile,
+            &Ok(hostile.to_string()),
+            &health,
+            &Ok(Some(())),
+            &Some(snapshot),
+            &None,
+        );
+
+        for mode in [OutputMode::Json, OutputMode::Table] {
+            let text = rendered(&output, mode).expect("rendered");
+            for line in text.lines() {
+                assert!(!has_hazard(line), "{mode:?}: {line:?}");
+            }
+            assert!(text.contains("ev"), "{mode:?} lost the text: {text}");
+            assert!(
+                !text.contains("\u{202e}") && !text.contains('\u{200f}'),
+                "{mode:?}: {text:?}"
+            );
+        }
+
+        // The human form is a list, so the forged entry must have been folded
+        // back into the line it came from rather than becoming its own.
+        let human = rendered(&output, OutputMode::Table).expect("rendered");
+        assert!(
+            !human.lines().any(|line| line.starts_with("method: forged")),
+            "a foreign value forged a line: {human}"
+        );
+
+        // And the semver-protected SHAPE is untouched: scrubbing removes
+        // hazard characters, it does not rename, drop or add a field.
+        let json: Value =
+            serde_json::from_str(&rendered(&output, OutputMode::Json).expect("rendered"))
+                .expect("still valid JSON");
+        let expected = output.value.as_object().expect("object");
+        let actual = json.as_object().expect("object");
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "the key set or order changed"
+        );
+    }
+
+    #[test]
+    fn info_json_never_carries_a_credential_field() {
+        let health = CredentialHealth {
+            path: std::path::PathBuf::from("/tmp/credentials.toml"),
+            exists: true,
+            permissions: crate::auth::secret_file::Permissions::OwnerOnly {
+                mode: "0600".to_string(),
+            },
+            usable: true,
+            file_readable: true,
+            directory: std::path::PathBuf::from("/tmp"),
+            directory_mode: Some("0700".to_string()),
+            directory_problem: None,
+            profiles: Vec::new(),
+            env_api_key: true,
+        };
+        let output = info_output(
+            "default",
+            &Ok("https://docs.example.com".to_string()),
+            &health,
+            &Ok(None),
+            &Some(Snapshot::fixed(
+                crate::auth::selection::Method::EnvApiKey,
+                Vec::new(),
+            )),
+            &None,
+        );
+        let rendered = serde_json::to_string(&output.value).unwrap();
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "api_key",
+            "client_secret",
+            "registration_access_token",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{forbidden} appears in auth info output: {rendered}"
+            );
+        }
+    }
+}

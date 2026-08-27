@@ -8,24 +8,45 @@
 //! the vendored spec rejects (spec drift), and `--show-server-message`
 //! restores the server's error text for a `--body` request, which is
 //! withheld by default because it may quote the body.
+//!
+//! # Three jobs, three modules
+//!
+//! This module owns CALLING an operation. The other two are local-only and
+//! answer the questions a caller has before it can call anything:
+//!
+//! - [`list`] - which operations exist ([`LIST_OPERATION`]);
+//! - [`describe`] - what one operation takes and returns
+//!   ([`DESCRIBE_OPERATION`]).
+//!
+//! Both of those answer with [`curated`]'s reverse index attached, because
+//! "which operation" is rarely the whole question: an operation with a
+//! curated command has a semver-stable front door, and this command's own
+//! output does not.
+//!
+//! Both are reserved first positionals rather than clap subcommands; see
+//! [`reserved`] for why, and for what happens if a spec ever declares an
+//! operation by one of those names.
 
-use std::fs::File;
-use std::io::Read;
+mod curated;
+mod describe;
+mod list;
+mod reserved;
+
+use std::path::Path;
 
 use anyhow::anyhow;
 use clap::Args;
-use engine::{
-    BodyMode, Client, EngineError, ErrorDetail, Fetched, Truncation, TruncationCause,
-    ValidationMode,
-};
-use serde_json::Value;
+use engine::{EngineError, ErrorDetail, Fetched, OpSpec, ValidationMode};
+use serde_json::{json, Value};
 
-use crate::config::Config;
-use crate::errors::{map_engine_error, map_engine_error_with_hint};
+use crate::auth;
+use crate::commands::input;
+use crate::config::Overrides;
+use crate::errors::map_engine_error_with_hint;
 use crate::exit::CliError;
-use crate::ops;
 use crate::paging;
 use crate::render::{self, OutputMode};
+use crate::session::{self, UNCONFIRMED_OFFSET_NOTICE};
 use crate::stdio;
 
 /// Hint appended to validation errors that only a raw body can express.
@@ -39,19 +60,17 @@ const SHOW_MESSAGE_HINT: &str =
 const DEDICATED_COMMAND_HINT: &str =
     "it is not callable via `otl api`; a dedicated command is planned";
 
-/// Notice for a list response that carried no pagination echo, so page
-/// boundaries rest on the CLI's own offset counter.
-const UNCONFIRMED_OFFSET_NOTICE: &str =
-    "notice: the server did not echo the pagination offset, so page \
-     boundaries could not be confirmed; results were paged by offset and \
-     may repeat or omit rows if the server ignored it";
-
-/// Marker appended in `otl api list` to operations that cannot be called.
-const NOT_CALLABLE_MARKER: &str = "[not callable via api";
+/// Outline's one RPC-style operation whose success response is a redirect
+/// rather than JSON.
+const REDIRECT_OPERATION: &str = "attachments.redirect";
 
 /// Reserved word: `otl api list` enumerates operations instead of calling
-/// one. Safe because real operation names always contain a `.`.
-const LIST_OPERATION: &str = "list";
+/// one.
+pub(crate) const LIST_OPERATION: &str = "list";
+
+/// Reserved word: `otl api describe <operation>` prints one operation's
+/// full request/response contract instead of calling it.
+pub(crate) const DESCRIBE_OPERATION: &str = "describe";
 
 /// Maximum accepted size of a `--body` file.
 ///
@@ -60,15 +79,35 @@ const LIST_OPERATION: &str = "list";
 pub const MAX_BODY_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Arguments for `otl api`.
+///
+/// `disable_help_flag` plus the hand-rolled [`ApiArgs::help`] below is what
+/// makes `otl api documents.info --help` describe THAT operation. clap's own
+/// help flag is handled during parsing and prints the subcommand's help
+/// whatever else is on the line, so `otl api documents.info --help` used to
+/// print the generic `otl api` help - text that looks authoritative and says
+/// nothing about `documents.info`. For an agent probing the CLI that is
+/// worse than an error: an error makes it try something else, a plausible
+/// wrong answer does not.
 #[derive(Debug, Args)]
+#[command(disable_help_flag = true)]
 pub struct ApiArgs {
-    /// API operation name, e.g. `documents.info` (or `list` to enumerate
-    /// all operations).
-    pub operation: String,
+    /// API operation name, e.g. `documents.info`. Two reserved words:
+    /// `list` enumerates every operation, `describe <operation>` prints one
+    /// operation's parameters and response fields.
+    // `Option` only so `otl api --help` can be answered without a name;
+    // `required_unless_present` keeps it mandatory everywhere else, so every
+    // path that needs a name below is guaranteed one by clap.
+    #[arg(required_unless_present = "help")]
+    pub operation: Option<String>,
 
     /// Request parameters as `key=value` pairs.
     #[arg(value_name = "KEY=VALUE")]
     pub args: Vec<String>,
+
+    /// Describe the named operation (same as `otl api describe <operation>`),
+    /// or print this help when no operation is named.
+    #[arg(short, long, action = clap::ArgAction::SetTrue)]
+    pub help: bool,
 
     /// Raw JSON request body from a file (`--body @file.json`), sent
     /// verbatim. Mutually exclusive with `key=value` arguments.
@@ -106,30 +145,54 @@ enum Payload {
 
 /// Run the `api` subcommand. Configuration and argument validation happen
 /// before any network request.
-pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
-    if cmd.operation == LIST_OPERATION {
-        return run_list(cmd);
+///
+/// `overrides` carries the command-line configuration layer, which outranks
+/// the environment and the user config file key by key. `root` builds the
+/// whole clap command on demand, and is only called to render `otl api
+/// --help`: passing the builder rather than the built command keeps the
+/// cost off every other invocation, and rendering from the REAL command
+/// tree is what keeps that help text identical to the one clap used to
+/// print (global flags included) instead of a second, drifting copy.
+///
+/// Three of the four paths below are purely local - `list`, `describe` and
+/// any form of `--help` need no configuration, no credential and no
+/// network - so they are resolved before [`auth::client`] is ever built.
+pub fn run(
+    cmd: &ApiArgs,
+    mode: OutputMode,
+    overrides: &Overrides,
+    root: fn() -> clap::Command,
+) -> Result<(), CliError> {
+    match reserved::dispatch(cmd, mode, root)? {
+        reserved::Next::Done => Ok(()),
+        reserved::Next::Call(op) => call(cmd, op, mode, overrides),
     }
-    let op = ops::find(&cmd.operation).ok_or_else(|| {
-        CliError::usage(anyhow!(
-            "unknown API operation {:?}; operation names follow the \
-             `resource.method` form, e.g. `documents.info` \
-             (run `otl api list` to see all operations)",
-            cmd.operation
-        ))
-    })?;
+}
+
+/// Call one operation over the network and print its response.
+fn call(
+    cmd: &ApiArgs,
+    op: &'static OpSpec,
+    mode: OutputMode,
+    overrides: &Overrides,
+) -> Result<(), CliError> {
     let payload = build_payload(cmd)?;
     // A raw --body is sent verbatim and once, so pagination never applies.
     let pagination = match &payload {
         Payload::KeyValue(_) => paging::spec_for(op),
         Payload::Raw(_) => None,
     };
-    check_limit_usage(cmd, &payload, pagination.is_some())?;
-    let config = Config::from_env().map_err(CliError::usage)?;
-
-    let client = Client::new(&config.base_url, &config.api_key).map_err(map_engine_error)?;
+    check_limit_usage(cmd, op, &payload, pagination.is_some())?;
+    // One place resolves configuration AND the credential for every command,
+    // and hands the request channel a source that renews itself. `otl api`
+    // must not build its own client: renewal, the transport rule and the
+    // instance binding all live behind this call (see `crate::auth`).
+    let client = auth::client(overrides)?;
     let detail = error_detail(cmd);
     let fetched = match (&payload, &pagination) {
+        (Payload::KeyValue(args), None) if op.name == REDIRECT_OPERATION => client
+            .execute_redirect_location(op, args, validation_mode(cmd))
+            .map(|location| Fetched::complete(json!({ "data": { "signedUrl": location } }))),
         (Payload::KeyValue(args), Some(spec)) => {
             client.execute_paged(op, args, validation_mode(cmd), spec, cmd.limit)
         }
@@ -146,9 +209,9 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
         stdio::write_diagnostic_line(UNCONFIRMED_OFFSET_NOTICE);
     }
     if let Some(truncation) = &fetched.truncation {
-        warn_truncated(truncation);
+        session::warn_truncated(truncation);
     }
-    print_response(&fetched.value, mode)
+    print_response(&fetched.value, mode, &op.response_fields)
 }
 
 /// Reject `--limit` where it cannot mean anything, before any request.
@@ -157,7 +220,12 @@ pub fn run(cmd: &ApiArgs, mode: OutputMode) -> Result<(), CliError> {
 /// mean different things and would silently fight each other, so asking
 /// for both is a usage error rather than a guess. `--limit` on a `--body`
 /// call or on an operation that does not paginate would be a silent no-op.
-fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Result<(), CliError> {
+fn check_limit_usage(
+    cmd: &ApiArgs,
+    op: &OpSpec,
+    payload: &Payload,
+    paginated: bool,
+) -> Result<(), CliError> {
     if cmd.limit.is_none() {
         return Ok(());
     }
@@ -175,42 +243,10 @@ fn check_limit_usage(cmd: &ApiArgs, payload: &Payload, paginated: bool) -> Resul
         return Err(CliError::usage(anyhow!(
             "--limit applies only to list operations called with key=value \
              arguments, and {:?} does not paginate here; drop --limit",
-            cmd.operation
+            op.name
         )));
     }
     Ok(())
-}
-
-/// Explicit stderr warning whenever results may be incomplete (hard rule:
-/// pagination never truncates silently), including how to get more.
-///
-/// Only [`TruncationCause::is_definite`] causes are stated as fact; the
-/// others say results *may* be truncated, because the data could have
-/// ended exactly at the boundary.
-fn warn_truncated(truncation: &Truncation) {
-    let remedy = match truncation.cause {
-        TruncationCause::MaxItems => "raise or drop --limit to fetch more",
-        TruncationCause::PageLimit => {
-            "narrow the query, or continue from this point with an \
-             `offset=` argument"
-        }
-        TruncationCause::ManualPage => {
-            "a `limit=` argument fetches one page only; drop it to fetch \
-             every page, or page manually with `offset=`"
-        }
-        TruncationCause::OffsetSpaceExhausted => {
-            "the pagination offset space is exhausted; narrow the query"
-        }
-    };
-    let certainty = if truncation.cause.is_definite() {
-        "results truncated"
-    } else {
-        "results may be truncated"
-    };
-    stdio::write_diagnostic_line(&format!(
-        "warning: {certainty} after {} items; {remedy}",
-        truncation.fetched
-    ));
 }
 
 /// How strictly to validate locally: `--no-validate` keeps the structural
@@ -261,43 +297,13 @@ fn load_body_file(value: &str) -> Result<String, CliError> {
             "--body expects `@` followed by a file path, e.g. --body @file.json"
         )));
     };
-    let raw = read_capped(path)?;
+    let raw = input::read_utf8(Path::new(path), "--body", MAX_BODY_FILE_BYTES)?;
     // Validate without materializing a Value tree: the bytes are sent as
     // they are, so only well-formedness matters here.
     if let Err(error) = serde_json::from_str::<serde::de::IgnoredAny>(&raw) {
         return Err(CliError::usage(anyhow!(
             "--body file {path:?} is not valid JSON: {error}"
         )));
-    }
-    Ok(raw)
-}
-
-/// Read a file, refusing anything over [`MAX_BODY_FILE_BYTES`].
-///
-/// The metadata size is checked first (cheap rejection) and the read is
-/// bounded as well, so a file that grows between the two - or one whose
-/// reported size is unreliable, such as a pipe - cannot exhaust memory.
-fn read_capped(path: &str) -> Result<String, CliError> {
-    let io_error = |error: std::io::Error| {
-        CliError::usage(anyhow!("cannot read --body file {path:?}: {error}"))
-    };
-    let too_large = || {
-        CliError::usage(anyhow!(
-            "--body file {path:?} is too large: the limit is {MAX_BODY_FILE_BYTES} bytes"
-        ))
-    };
-    let file = File::open(path).map_err(io_error)?;
-    let metadata = file.metadata().map_err(io_error)?;
-    if metadata.is_file() && metadata.len() > MAX_BODY_FILE_BYTES {
-        return Err(too_large());
-    }
-    let mut raw = String::new();
-    let read = file
-        .take(MAX_BODY_FILE_BYTES + 1)
-        .read_to_string(&mut raw)
-        .map_err(io_error)?;
-    if read as u64 > MAX_BODY_FILE_BYTES {
-        return Err(too_large());
     }
     Ok(raw)
 }
@@ -330,37 +336,6 @@ fn hint_for(error: &EngineError, detail: ErrorDetail) -> Option<&'static str> {
     None
 }
 
-/// Print every compiled operation as `name<TAB>summary`, one per line.
-/// Purely local: needs no configuration and touches no network.
-///
-/// Operations the generic client cannot call are listed too, but flagged
-/// with the content type they need.
-fn run_list(cmd: &ApiArgs) -> Result<(), CliError> {
-    let request_flags = cmd.body.is_some() || cmd.show_server_message || cmd.no_validate;
-    if !cmd.args.is_empty() || request_flags {
-        return Err(CliError::usage(anyhow!(
-            "`otl api list` takes no further arguments or request flags"
-        )));
-    }
-    let mut out = String::new();
-    for op in ops::OPS {
-        out.push_str(&op.name);
-        out.push('\t');
-        out.push_str(&op.summary);
-        if op.body_mode == BodyMode::Unsupported {
-            out.push(' ');
-            out.push_str(NOT_CALLABLE_MARKER);
-            out.push_str(": requires ");
-            out.push_str(&op.content_type);
-            out.push(']');
-        }
-        out.push('\n');
-    }
-    // Never `print!` on the data path: a consumer that closes the pipe
-    // early (`otl api list | head -1`) must not turn into a panic.
-    stdio::write_data(&out)
-}
-
 /// Parse raw `key=value` CLI arguments; reject malformed ones fail-fast.
 ///
 /// A malformed argument is reported by POSITION only. Its text is never
@@ -386,9 +361,17 @@ fn parse_key_value_args(raw: &[String]) -> Result<Vec<(String, String)>, CliErro
 
 /// Print the `data` field (or the whole envelope if absent) to stdout in
 /// the resolved output mode (raw JSON, or a table for list-shaped data).
-fn print_response(response: &Value, mode: OutputMode) -> Result<(), CliError> {
+///
+/// `schema` is the operation's compiled response shape, which drives table
+/// column selection; the same `data` convention is applied here and by the
+/// build pipeline that extracted it.
+fn print_response(
+    response: &Value,
+    mode: OutputMode,
+    schema: &[engine::FieldSpec],
+) -> Result<(), CliError> {
     let payload = response.get("data").unwrap_or(response);
-    let rendered = render::render(payload, mode)
+    let rendered = render::render(payload, mode, schema)
         .map_err(|error| CliError::failure(anyhow!("failed to render response: {error}")))?;
     // Never `println!` on the data path: a consumer that closes the pipe
     // early must not turn into a panic and exit code 101.

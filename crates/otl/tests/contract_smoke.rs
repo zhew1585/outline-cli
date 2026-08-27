@@ -1,4 +1,4 @@
-//! Contract smoke test against a real Outline workspace (Story 1.8).
+//! Contract smoke test against a real Outline workspace.
 //!
 //! Ignored by default so `cargo test` never touches the network. The CI
 //! contract job runs it with `-- --ignored` and injects credentials via the
@@ -9,6 +9,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use assert_cmd::Command;
+
+mod common;
+use common::{no_cache_dir, CACHE_DIR_ENV};
 
 /// Read contract-test credentials from the environment, or `None` to skip.
 fn contract_credentials() -> Option<(String, String)> {
@@ -21,8 +24,8 @@ fn contract_credentials() -> Option<(String, String)> {
 }
 
 // The smoke uses `documents.search` because the current IR table only
-// compiles the documents.* subset (Story 1.1 MVP slice). Once the
-// full-endpoint IR lands (Story 1.2), switch this to `auth.info` for a
+// compiles the documents.* subset. Once the
+// full-endpoint IR lands, switch this to `auth.info` for a
 // cheaper, side-effect-free identity check.
 #[test]
 #[ignore = "contract test: needs OUTLINE_TEST_URL / OUTLINE_TEST_API_KEY"]
@@ -32,10 +35,21 @@ fn documents_search_succeeds_against_real_workspace() {
         return;
     };
 
+    // Empty config DIRECTORY too, not just an empty config file: the
+    // credential file lives in that directory and now outranks
+    // OUTLINE_API_KEY, so a developer with a stored credential would be
+    // smoke-testing that one instead of the key this test was given.
+    let config_dir = tempfile::tempdir().unwrap();
     let output = Command::cargo_bin("otl")
         .unwrap()
         .env("OUTLINE_URL", &url)
         .env("OUTLINE_API_KEY", &key)
+        // A contract test checks the VENDORED spec against the live API;
+        // a synced cache on the runner would test something else.
+        .env(CACHE_DIR_ENV, no_cache_dir())
+        .env_remove("OUTLINE_PROFILE")
+        .env("OUTLINE_CONFIG", "")
+        .env("OUTLINE_CONFIG_DIR", config_dir.path())
         .args(["api", "documents.search", "query=contract-smoke"])
         .output()
         .unwrap();

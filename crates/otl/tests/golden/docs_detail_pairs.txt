@@ -1,0 +1,6 @@
+id        doc-1
+title     Release notes
+updated   2026-08-20 15:30 UTC
+revision  4
+url       https://docs.example.com/doc/release-notes-abc123
+status    published

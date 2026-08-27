@@ -1,44 +1,110 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/otl"]
+members = ["crates/engine", "crates/otl", "crates/speccompile"]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/weizhesafeheron/outline-cli"
+repository = "https://github.com/zhew1585/outline-cli"
 rust-version = "1.85"
+# Release-pipeline metadata. Neither field is load-bearing any more - the two
+# artifacts that required them (the MSI's Manufacturer from `authors`, the
+# Homebrew formula's `homepage`) are both gone - but they remain correct
+# package metadata and the shell installer's release URLs are built from
+# `repository` above, which dist does still require. No e-mail address: these
+# strings would be embedded verbatim in published metadata.
+authors = ["weizhe"]
+homepage = "https://github.com/zhew1585/outline-cli"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 anyhow = "1.0"
-# NOTE: story file says feature "rustls-tls" (the reqwest 0.12 name); in
-# reqwest 0.13 the rustls backend feature is named "rustls", with
-# "webpki-roots" providing the trust roots.
+# NOTE: in reqwest 0.13 the rustls backend feature is named "rustls"
+# ("rustls-tls" was the reqwest 0.12 name), with "webpki-roots" providing
+# the trust roots.
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",
+    # RFC 6749 requires application/x-www-form-urlencoded token requests.
+    "form",
     "rustls",
     "webpki-roots",
 ] }
+# URL parsing without exposing the HTTP client in non-channel modules.
+url = "2"
 clap = { version = "4.6", features = ["derive"] }
+# Shell completion scripts are generated from the same clap command tree the
+# binary parses with, augmented with operation names from the IR.
+clap_complete = "4.6"
 httpdate = "1.0"
+# User config file, and the credential file the auth commands own. `parse`
+# for reading config; `display` as well, because unlike config the credential
+# file is WRITTEN by the CLI (`otl auth login` / `set-key`).
+toml = { version = "1", default-features = false, features = [
+    "parse",
+    "display",
+    "serde",
+] }
+# Cross-platform config and cache directory resolution. Never assume Unix
+# paths.
+directories = "6"
+# OAuth (otl only; the engine stays service-agnostic).
+base64 = "0.22"
+getrandom = "0.4"
+# Spec/payload hashing for the IR cache key and integrity check, and the
+# PKCE S256 challenge. ONE version for both: two majors of a hash crate in
+# one binary is duplicated code generation for no benefit, and the older of
+# the two is the one already in the lockfile.
+sha2 = "0.10"
+# Advisory file locks (credential-file transactions, refresh single-flight).
+# Pure Rust, no libc, so it needs no `unsafe` on our side; `std::fs::File::lock`
+# would raise the workspace MSRV from 1.85 to 1.89, which is not this epic's
+# call to make.
+fs4 = "1.1"
+# Terminal echo suppression for interactive API key entry. A secret typed at a
+# prompt must not be readable off the screen, a screen share, or a terminal
+# scrollback buffer.
+rpassword = "7"
+# O_NOFOLLOW / O_NONBLOCK when opening a credential file, and fstat on the
+# opened descriptor. Needed to refuse a symlinked or non-regular credential
+# path without a TOCTOU window, and without `unsafe` on our side. Already in
+# the dependency graph via fs4 and tempfile.
+rustix = { version = "1.1", features = ["fs", "process"] }
+# On-disk IR cache written by `spec sync`. bincode 2.x with the `serde`
+# feature; 3.0.0 on crates.io is an empty placeholder release.
+bincode = { version = "2.0", features = ["serde"] }
 # Terminal column width of a string is not its char count (CJK is 2
 # columns wide, combining marks 0); table alignment depends on this.
 unicode-width = "0.2"
 # Emoji ligatures (ZWJ sequences, skin-tone modifiers) are one grapheme
 # cluster of width 2, not the sum of their codepoints' widths.
 unicode-segmentation = "1.12"
+# Unicode normalization for export file names: NFC and NFD spellings of the
+# same title are ONE directory entry on macOS, so the de-duplication key has
+# to be normalization-insensitive.
+unicode-normalization = "0.1"
+# Terminal height, to decide whether `docs view` output exceeds one screen.
+# There is no std API for this and the alternative (an ioctl) needs unsafe,
+# which both crates forbid.
+terminal_size = "0.4"
+
+# Shared OpenAPI -> IR compiler (build script and `spec sync` both use it).
+spec-compile = { path = "crates/speccompile" }
 
 # dev / test
+# Heap profiler used by tests/memory_bounds.rs. Its allocator is safe to
+# use from our side (the `unsafe impl GlobalAlloc` lives in dhat), and it
+# never enters the shipped binary.
+dhat = "0.3"
 wiremock = "0.6"
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-# Release profile tuned for binary size and cold-start time (SPEC: <10ms
+# Release profile tuned for binary size and cold-start time (<10ms
 # startup, ~5MB binary). `panic = "abort"` is safe for `cargo test --release`
 # because Cargo forces unwind when building test harnesses.
 [profile.release]
@@ -47,6 +113,14 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# The profile that 'dist' will build with. Deliberately a bare `inherits`:
+# `dist init` writes `lto = "thin"` here to keep release CI fast, but that
+# downgrades the fat LTO configured above and cost 0.7 MB of binary in
+# measurement (2.45 MiB -> 3.13 MiB on aarch64-apple-darwin). Shipped
+# artifacts must be byte-identical to `--release`.
+[profile.dist]
+inherits = "release"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

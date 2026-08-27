@@ -1,4 +1,4 @@
-//! CLI parameter validation, type coercion, and `--body` (Story 1.3).
+//! CLI parameter validation, type coercion, and `--body`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -10,13 +10,21 @@ use serde_json::json;
 use wiremock::matchers::{body_json, body_string, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+use common::isolate;
+
 /// Nothing listens here; validation must fail before any network attempt.
 const CLOSED_PORT_URL: &str = "http://127.0.0.1:9";
 
 /// `otl` with valid-looking config pointing at a closed port.
+///
+/// `common::isolate` shuts off the credential file, the user config file, the
+/// selected profile, the plaintext-key notice and the spec cache - validation
+/// is asserted against the facets of the spec compiled into the binary.
 fn otl_offline() -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env("OUTLINE_URL", CLOSED_PORT_URL)
+    isolate(&mut cmd)
+        .env("OUTLINE_URL", CLOSED_PORT_URL)
         .env("OUTLINE_API_KEY", "test-key");
     cmd
 }
@@ -24,7 +32,8 @@ fn otl_offline() -> Command {
 /// `otl` pointed at a wiremock server.
 fn otl_online(uri: &str) -> Command {
     let mut cmd = Command::cargo_bin("otl").unwrap();
-    cmd.env("OUTLINE_URL", uri)
+    isolate(&mut cmd)
+        .env("OUTLINE_URL", uri)
         .env("OUTLINE_API_KEY", "test-key");
     cmd
 }
@@ -75,14 +84,19 @@ async fn kv_args_become_native_json_types_in_body() {
 fn missing_required_param_exits_2_before_network() {
     // A network attempt against the closed port would yield exit 1 with a
     // transport message; the local validation error must win instead.
-    otl_offline()
+    let assert = otl_offline()
         .args(["api", "documents.update", "publish=true"])
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("\"id\""))
-        .stderr(predicate::str::contains("string"))
         .stdout(predicate::str::is_empty());
+    // Through `common::error_message`, because stdout is a pipe here: the
+    // terminating error is the structured form, and `"id"` reaches the raw
+    // buffer as `\"id\"`.
+    let message = common::error_message(&assert.get_output().stderr);
+    assert!(message.contains("\"id\""), "{message}");
+    assert!(message.contains("string"), "{message}");
+    assert_eq!(common::error_code(&assert.get_output().stderr), "usage");
 }
 
 #[test]

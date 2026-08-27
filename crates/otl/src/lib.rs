@@ -2,11 +2,23 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
+pub mod browser;
+pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod errors;
 pub mod exit;
+pub mod export;
+pub mod failure;
+pub mod fields;
 pub mod ops;
+pub mod pager;
 pub mod paging;
 pub mod render;
+pub mod session;
+pub mod spec;
 pub mod stdio;
+pub mod text;
+
+mod user_dirs;

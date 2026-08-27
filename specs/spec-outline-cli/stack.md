@@ -55,7 +55,8 @@ kernel 的 intent 不含实现处方，全部落在此处。
 
 ## 分发
 
-- cargo-dist：一份配置产出 brew tap、shell 安装器、MSI。
+- cargo-dist：一份配置产出 shell 安装器（`curl | sh`，装入 `~/.local/bin`）与各 Apple target 的归档。
+- 单一渠道（2026-08 定）：brew tap 已移除——它需要独立 tap 仓库和可写它的 PAT，发布的又是 shell 安装器已经在取的同一批二进制；MSI 同期移除，无 Windows target 可发。
 - 单静态二进制，目标体积 ~5MB。
 - 命名（已定）：crate `outline-cli`，二进制 `otl`；备选名 outl/oln/outctl。
 

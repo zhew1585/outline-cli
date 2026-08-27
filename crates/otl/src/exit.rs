@@ -27,6 +27,33 @@ pub enum ExitCode {
     /// Rate limited: the server kept answering HTTP 429 until the retry
     /// budget was exhausted.
     RateLimited = 8,
+    /// Partial success: a batch command completed, but some items in the
+    /// batch failed. Whatever succeeded is on disk / on stdout, and the
+    /// failures are summarized on stderr.
+    Partial = 9,
+}
+
+impl ExitCode {
+    /// The stable machine-readable name of this code.
+    ///
+    /// Not a second taxonomy: it is the same nine classes the numeric table
+    /// publishes, spelled so a reader does not have to keep the table in
+    /// their head. Renaming one is exactly as breaking as changing what a
+    /// number means, and is governed by the same rule.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Usage => "usage",
+            Self::ApiRequest => "api-request",
+            Self::Auth => "auth",
+            Self::NotFound => "not-found",
+            Self::Server => "server",
+            Self::Network => "network",
+            Self::RateLimited => "rate-limited",
+            Self::Partial => "partial",
+        }
+    }
 }
 
 impl From<ExitCode> for std::process::ExitCode {
@@ -65,6 +92,16 @@ impl CliError {
     /// A generic failure (exit code 1).
     pub fn failure(source: impl Into<anyhow::Error>) -> Self {
         Self::new(ExitCode::Failure, source)
+    }
+
+    /// A partial failure of a batch command (exit code 9).
+    ///
+    /// Reserved for commands that keep going after an individual item
+    /// fails: the successful part of the work stands, and this code tells a
+    /// script that the batch was incomplete without pretending it failed
+    /// wholesale.
+    pub fn partial(source: impl Into<anyhow::Error>) -> Self {
+        Self::new(ExitCode::Partial, source)
     }
 }
 

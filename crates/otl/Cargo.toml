@@ -7,6 +7,13 @@ description = "Outline CLI (otl): UX layer over the generic engine"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# `repository` is required by cargo-dist's GitHub backend: the shell
+# installer embeds release-artifact URLs derived from it. `authors` and
+# `homepage` are inherited for completeness; the artifacts that consumed them
+# (MSI, Homebrew formula) are no longer built.
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
 
 [lib]
 name = "otl"
@@ -18,17 +25,55 @@ path = "src/main.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+spec-compile = { workspace = true }
 anyhow = { workspace = true }
+bincode = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
+directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Two callers, one version: the spec cache's integrity hash and the PKCE
+# S256 challenge (`auth::pkce`).
+sha2 = { workspace = true }
+# Atomic cache writes: exclusive creation with a random name in the target
+# directory (a predictable temp name is a symlink/permission attack), 0600
+# on Unix, and a persist() that replaces the target on Windows too - which
+# std's rename does not.
+tempfile = { workspace = true }
+# Typed errors for the spec cache and for the credential/OAuth failures this
+# crate maps to exit codes. anyhow stays the boundary type (main and the
+# command layer); both of these need to be inspectable - "stale" vs
+# "damaged", "refresh me" vs "sign in again" - so they are real enums.
+thiserror = { workspace = true }
+toml = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
+# OAuth lives here, never in the engine: the token/registration/revocation
+# endpoints are the documented exception to the single request channel, so
+# this crate needs its own HTTP client for them.
+reqwest = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+fs4 = { workspace = true }
+rpassword = { workspace = true }
+terminal_size = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [build-dependencies]
-serde_json = { workspace = true }
+# The spec compiler; it owns the parse, so the `preserve_order` decision
+# that used to live here moved into its own manifest (see the note there).
+spec-compile = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
+# Cache tests build a cache file byte by byte to pin its layout.
+bincode = { workspace = true }
+sha2 = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 wiremock = { workspace = true }

@@ -10,7 +10,8 @@
 //! construction (see `engine::error`). Never interpolate raw URLs,
 //! tokens, or unsanitized server text here.
 
-use engine::EngineError;
+use engine::fetch::FetchError;
+use engine::{CredentialFault, EngineError};
 
 use crate::config::ENV_API_KEY;
 use crate::exit::{CliError, ExitCode};
@@ -29,9 +30,25 @@ const RATE_LIMIT_HINT: &str =
 /// Hint appended to network/transport failures.
 const NETWORK_RETRY_HINT: &str =
     "Check your network connection and the OUTLINE_URL host, then retry.";
+/// Hints for the spec-source domain. None of them mention the API key or
+/// the instance URL: neither is involved in fetching a spec.
+const FETCH_NETWORK_HINT: &str =
+    "Check your network connection and that the spec source above is reachable, then retry. \
+     `otl` keeps working on the spec built into the binary meanwhile.";
+const FETCH_AUTH_HINT: &str =
+    "The spec source requires authentication. `otl spec sync` fetches the document \
+     anonymously and never sends your API key to a spec host; point --url at a \
+     publicly readable copy, or pass --spec with a local file.";
+const FETCH_NOT_FOUND_HINT: &str =
+    "Check the --url value, or pass --spec with a local copy of the document.";
+const FETCH_SERVER_HINT: &str =
+    "The spec source failed to serve the document; it may help to retry later.";
+/// Hint appended when spec-fetch rate-limit retries are exhausted.
+const FETCH_RATE_LIMIT_HINT: &str =
+    "Wait for the spec source's rate limit to reset and run `otl spec sync` again.";
 
-/// Map an engine error to a `CliError` with a documented exit code
-/// (see `docs/exit-codes.md`) and a polished stderr message.
+/// Map an engine error to a `CliError` with a documented exit code and a
+/// polished stderr message.
 pub fn map_engine_error(error: EngineError) -> CliError {
     map_engine_error_with_hint(error, None)
 }
@@ -51,9 +68,72 @@ pub fn map_engine_error_with_hint(error: EngineError, hint: Option<&str>) -> Cli
     CliError::new(code, anyhow::Error::new(error).context(message))
 }
 
+/// The exit code an engine error produces, without consuming it.
+///
+/// For `otl doctor`, which reports the code a failure WOULD have produced
+/// and keeps the error to print. It reads the same [`classify`] table
+/// [`map_engine_error`] does, so a report cannot disagree with the command
+/// it describes.
+pub fn engine_exit_code(error: &EngineError) -> ExitCode {
+    classify(error).0
+}
+
+/// Whether the server answered, i.e. whether the request left this machine
+/// AND something came back.
+///
+/// A separate question from the exit code, and it has to be, because one code
+/// covers both answers: `ExitCode::Usage` is a local validation failure for
+/// `UnknownParam` (nothing sent) and also for `InvalidRequest` (a header this
+/// machine could not build, nothing sent), while `ExitCode::Failure` covers
+/// both `ClientBuild` (nothing sent) and `InvalidResponse` (very much sent).
+/// `otl doctor` reports this as a FACT (`reachable`), so guessing it from the
+/// code makes the report claim a server answered when nothing was ever sent.
+///
+/// Exhaustive on purpose: a new variant has to answer the question rather
+/// than inherit a default.
+pub fn server_answered(error: &EngineError) -> bool {
+    match error {
+        // These are all readings OF a response, so there was one.
+        EngineError::Api { .. }
+        | EngineError::RateLimited { .. }
+        | EngineError::InvalidResponse { .. }
+        | EngineError::UnexpectedResponse { .. }
+        | EngineError::Pagination { .. }
+        | EngineError::InvalidPaginationSpec { .. } => true,
+        // A transport failure MAY have arrived - the reply is what went
+        // missing - so a report must not claim it did (exit code 7 says the
+        // same thing).
+        EngineError::Transport { .. } => false,
+        // Never left this machine: refused by local validation, by the
+        // credential source, or by the client builder.
+        EngineError::Credential(_)
+        | EngineError::InvalidBaseUrl { .. }
+        | EngineError::InvalidRequest { .. }
+        | EngineError::ClientBuild(_)
+        | EngineError::UnknownParam { .. }
+        | EngineError::MissingParam { .. }
+        | EngineError::ComplexParam { .. }
+        | EngineError::InvalidParamValue { .. }
+        | EngineError::InexactNumber { .. }
+        | EngineError::UnionBody { .. }
+        | EngineError::UnsupportedBodyType { .. }
+        | EngineError::InvalidRequestBody { .. } => false,
+    }
+}
+
 /// Pick the exit code and compose the top-level message for an engine error.
 fn classify(error: &EngineError) -> (ExitCode, String) {
     match error {
+        // The credential source composed its own actionable message (it
+        // knows whether the fix is `chmod`, `otl auth login`, or an
+        // environment variable); only the exit class is decided here.
+        EngineError::Credential(inner) => (
+            match inner.fault {
+                CredentialFault::Unavailable => ExitCode::Usage,
+                CredentialFault::ReauthRequired => ExitCode::Auth,
+            },
+            inner.message.clone(),
+        ),
         EngineError::InvalidBaseUrl { .. } => (ExitCode::Usage, error.to_string()),
         // Nothing was sent, so this is a configuration problem, not a
         // network one: no retry hint, and exit code 2.
@@ -69,10 +149,21 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
             code,
             message,
         } => classify_api(*status, code.as_deref(), message),
+        other => classify_local(other),
+    }
+}
+
+/// Classify the errors that never reached the network, plus the ones whose
+/// class does not depend on any server response.
+///
+/// Split out of [`classify`] only to keep both within the project's
+/// function-length rule; the arms are still listed one by one on purpose, so
+/// a new engine variant must fail to compile here rather than silently
+/// inherit a class.
+fn classify_local(error: &EngineError) -> (ExitCode, String) {
+    match error {
         // Local validation: rejected before a single byte went on the wire,
         // so these are usage errors (exit code 2) like a bad flag would be.
-        // Listed one by one on purpose: a new engine variant must fail to
-        // compile here rather than silently inherit a class.
         EngineError::UnknownParam { .. }
         | EngineError::MissingParam { .. }
         | EngineError::ComplexParam { .. }
@@ -91,13 +182,65 @@ fn classify(error: &EngineError) -> (ExitCode, String) {
         // A server that breaks its own pagination contract mid-fetch, or a
         // descriptor that cannot be used: both are "the result is not
         // trustworthy", never a partial success.
-        EngineError::Pagination { .. } | EngineError::InvalidPaginationSpec { .. } => {
-            (ExitCode::Failure, error.to_string())
-        }
-        EngineError::ClientBuild(_) | EngineError::InvalidResponse { .. } => {
-            (ExitCode::Failure, error.to_string())
-        }
+        EngineError::Pagination { .. }
+        | EngineError::InvalidPaginationSpec { .. }
+        | EngineError::ClientBuild(_)
+        | EngineError::InvalidResponse { .. }
+        | EngineError::UnexpectedResponse { .. } => (ExitCode::Failure, error.to_string()),
+        // Handled by `classify`; listed so the match stays exhaustive and a
+        // new variant still breaks the build.
+        EngineError::Credential(_)
+        | EngineError::InvalidBaseUrl { .. }
+        | EngineError::InvalidRequest { .. }
+        | EngineError::Transport { .. }
+        | EngineError::Api { .. } => (ExitCode::Failure, error.to_string()),
     }
+}
+
+/// Map a document-fetch error to a `CliError`.
+///
+/// A separate function from [`map_engine_error`] on purpose, and not a
+/// delegation to it: the two describe different servers. The Outline
+/// instance is reached with the user's API key, so its 401 means "your key
+/// is wrong" and its DNS failure means "check `OUTLINE_URL`". A spec host
+/// is reached anonymously and has nothing to do with either, so every hint
+/// here talks about the spec SOURCE. Exit codes keep their documented
+/// meaning (a 404 is still "not found", an exhausted 429 is still 8) - it
+/// is the wording, and only the wording, that differs.
+pub fn map_fetch_error(error: FetchError) -> CliError {
+    let (code, message) = classify_fetch(&error);
+    CliError::new(code, anyhow::Error::new(error).context(message))
+}
+
+/// Pick the exit code and message for a document-fetch error.
+fn classify_fetch(error: &FetchError) -> (ExitCode, String) {
+    match error {
+        // Nothing was sent: the URL never passed local checks.
+        FetchError::InvalidUrl { .. } => (ExitCode::Usage, error.to_string()),
+        FetchError::ClientBuild(_) => (ExitCode::Failure, error.to_string()),
+        FetchError::Transport { .. } => {
+            (ExitCode::Network, format!("{error}.\n{FETCH_NETWORK_HINT}"))
+        }
+        FetchError::Status { status, .. } => classify_fetch_status(*status, error),
+        FetchError::RateLimited { .. } => (
+            ExitCode::RateLimited,
+            format!("{error}.\n{FETCH_RATE_LIMIT_HINT}"),
+        ),
+        FetchError::Unusable { .. } => (ExitCode::Failure, error.to_string()),
+    }
+}
+
+/// Class of a non-success status from a document host.
+fn classify_fetch_status(status: u16, error: &FetchError) -> (ExitCode, String) {
+    let (exit, hint) = match status {
+        401 | 403 => (ExitCode::Auth, Some(FETCH_AUTH_HINT)),
+        404 => (ExitCode::NotFound, Some(FETCH_NOT_FOUND_HINT)),
+        400..=499 => (ExitCode::ApiRequest, None),
+        500..=599 => (ExitCode::Server, Some(FETCH_SERVER_HINT)),
+        _ => (ExitCode::Failure, None),
+    };
+    let suffix = hint.map(|hint| format!("\n{hint}")).unwrap_or_default();
+    (exit, format!("{error}{suffix}"))
 }
 
 /// Map an API error envelope (status + code + message) to its class.
@@ -137,6 +280,47 @@ mod tests {
             code: code.map(str::to_string),
             message: message.to_string(),
         }
+    }
+
+    /// The question `otl doctor` reports as `reachable`, and why it cannot be
+    /// read off the exit code: `Usage` and `Failure` each cover one error
+    /// that was sent and one that never left the machine.
+    #[test]
+    fn a_request_that_never_left_is_not_an_answer() {
+        // Sent, and answered.
+        assert!(server_answered(&api(401, None, "nope")));
+        assert!(server_answered(&EngineError::RateLimited {
+            origin: "https://docs.example.com".to_string(),
+            retries: 3,
+        }));
+        // Never sent - and note that this one is `Usage`, the same code as a
+        // parameter the spec rejected, while a response that is not JSON is
+        // `Failure`, the same code as a client that could not be built.
+        assert!(!server_answered(&EngineError::InvalidRequest {
+            reason: "a header value contains characters that are not valid in HTTP".to_string(),
+        }));
+        assert!(!server_answered(&EngineError::InvalidBaseUrl {
+            reason: "no host".to_string(),
+        }));
+        assert!(!server_answered(&EngineError::MissingParam {
+            operation: "auth.info".to_string(),
+            name: "id".to_string(),
+            ty: engine::ir::ParamType::String,
+        }));
+        // The exit codes of an unsent and an answered failure can be equal,
+        // which is the whole reason this function exists.
+        let unsent = EngineError::InvalidRequest {
+            reason: "bad header".to_string(),
+        };
+        assert_eq!(engine_exit_code(&unsent), ExitCode::Usage);
+        assert_eq!(
+            engine_exit_code(&EngineError::UnknownParam {
+                operation: "auth.info".to_string(),
+                name: "x".to_string(),
+                valid: "none".to_string(),
+            }),
+            ExitCode::Usage
+        );
     }
 
     #[test]

@@ -329,18 +329,13 @@ where
     for page in 0..spec.max_pages {
         let request_limit = page_request_limit(spec, max_items, merged.len() as u64);
         let mut response = fetch_page(offset, request_limit)?;
-        let AcceptedPage {
-            items,
-            capacity,
-            offset_unconfirmed,
-        } = accept_page(spec, &mut response, offset, page + 1, merged.len())?;
-        unconfirmed |= offset_unconfirmed;
-
-        let received = items.len() as u64;
+        let accepted = accept_page(spec, &mut response, offset, page + 1, merged.len())?;
+        let (received, capacity) = (accepted.items.len() as u64, accepted.capacity);
+        unconfirmed |= accepted.offset_unconfirmed;
         if envelope.is_none() {
             envelope = Some(response);
         }
-        merged.extend(items);
+        merged.extend(accepted.items);
 
         if let Some(cut) = truncate_to_cap(&mut merged, max_items) {
             return Ok(finish(spec, envelope, merged, Some(cut), unconfirmed));
@@ -349,33 +344,38 @@ where
             return Ok(finish(spec, envelope, merged, None, unconfirmed));
         }
         let Some(next) = offset.checked_add(received) else {
-            let truncation = Truncation {
-                fetched: merged.len() as u64,
-                cause: TruncationCause::OffsetSpaceExhausted,
-            };
-            return Ok(finish(
-                spec,
-                envelope,
-                merged,
-                Some(truncation),
-                unconfirmed,
-            ));
+            let cause = TruncationCause::OffsetSpaceExhausted;
+            return Ok(stopped(spec, envelope, merged, cause, unconfirmed));
         };
         offset = next;
     }
 
     // Only reachable when every allowed page came back full.
-    let truncation = Truncation {
-        fetched: merged.len() as u64,
-        cause: TruncationCause::PageLimit,
-    };
-    Ok(finish(
+    Ok(stopped(
         spec,
         envelope,
         merged,
-        Some(truncation),
+        TruncationCause::PageLimit,
         unconfirmed,
     ))
+}
+
+/// Finish a fetch that stopped short, recording why.
+///
+/// The row count is taken from what was actually merged, so the warning the
+/// caller prints can never disagree with the data it accompanies.
+fn stopped(
+    spec: &PaginationSpec,
+    envelope: Option<Value>,
+    merged: Vec<Value>,
+    cause: TruncationCause,
+    unconfirmed: bool,
+) -> Fetched {
+    let truncation = Truncation {
+        fetched: merged.len() as u64,
+        cause,
+    };
+    finish(spec, envelope, merged, Some(truncation), unconfirmed)
 }
 
 /// Assemble the merged envelope: rows at the items pointer, page-local
@@ -407,13 +407,11 @@ fn finish(
 /// Check the offset the server reports against the one requested.
 ///
 /// Returns whether the page had to be accepted unconfirmed (no report,
-/// under [`OffsetEcho::ValidateIfPresent`]).
-///
-/// A report that exists but contradicts the request - or is there in a form
-/// that cannot be compared - is always fatal: advancing by the received
-/// count would then skip or duplicate rows, and wrong data must never be
-/// presented as a result. A report that is simply absent is tolerated
-/// unless the descriptor declares it [`OffsetEcho::Required`].
+/// under [`OffsetEcho::ValidateIfPresent`]). A report that exists but
+/// contradicts the request - or cannot be compared - is fatal: advancing
+/// by the received count would skip or duplicate rows. A report that is
+/// simply absent is tolerated unless the descriptor declares it
+/// [`OffsetEcho::Required`].
 fn check_offset_echo(
     spec: &PaginationSpec,
     response: &Value,

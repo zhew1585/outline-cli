@@ -1,5 +1,13 @@
-# CI baseline (Story 1.8): three-platform matrix, lint gates, startup
-# performance gate, runtime-YAML guard, and a secrets-gated contract job.
+# CI baseline (Story 1.8, narrowed to macOS in Story 4.7): lint gates, a
+# startup performance gate, a runtime-YAML guard, a Windows-source lint, and
+# a secrets-gated contract job.
+#
+# macOS is currently the only shipped platform (dist-workspace.toml
+# `targets`), so every job that compiles or runs the crate does so for a
+# platform we actually ship. Keeping a Linux or Windows leg would mean a red
+# build could come from a target nobody receives, and green would say nothing
+# about what users get. Restoring the other platforms is one matrix edit
+# plus the dist config - see stories/4-7-mac-only-ci.md.
 #
 # Phone-home policy: only standard actions (checkout, rust-toolchain,
 # rust-cache) - no telemetry or update-check actions. All third-party
@@ -25,7 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Narrowed to the only shipped platform. Re-add ubuntu-latest and
+        # windows-latest here when those targets ship again.
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -44,6 +54,14 @@ jobs:
         run: cargo test --workspace
 
   runtime-yaml-guard:
+    # Stays on ubuntu deliberately, and it is now correct there because the
+    # check names its targets instead of inheriting the runner's. The
+    # dependency graph IS platform-specific - measured on this workspace,
+    # a Linux host resolves linux-raw-sys, openssl-probe and
+    # rustls-native-certs that macOS does not, and misses core-foundation,
+    # errno and security-framework that macOS does. A host-resolved graph was
+    # therefore checking a set of crates we do not ship, and could have
+    # missed a YAML parser reachable only on macOS.
     name: no runtime YAML/OpenAPI parser
     runs-on: ubuntu-latest
     steps:
@@ -60,17 +78,29 @@ jobs:
           # `-e normal` excludes dev- and build-dependencies, so this fails
           # only when a YAML/OpenAPI parser leaks into the shipped binary.
           # Fail-closed: a cargo tree failure aborts via set -e before grep.
+          #
+          # One graph per shipped triple, named explicitly: `cargo tree`
+          # resolves cfg(target_os) dependencies for whatever it is pointed
+          # at, and it needs no toolchain installed for a target, so this is
+          # both correct and cheap on any runner.
           set -euo pipefail
-          tree_out="$(cargo tree -p outline-cli -e normal --prefix none)"
-          if grep -iE 'yaml|yml|openapi|oas3' <<<"${tree_out}"; then
-            echo "::error::YAML/OpenAPI parser found in the runtime dependency graph"
-            exit 1
-          fi
-          echo "runtime dependency graph is clean"
+          failed=0
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            echo "--- ${target}"
+            tree_out="$(cargo tree -p outline-cli -e normal --prefix none --target "${target}")"
+            if grep -iE 'yaml|yml|openapi|oas3' <<<"${tree_out}"; then
+              echo "::error::YAML/OpenAPI parser found in the ${target} runtime dependency graph"
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then exit 1; fi
+          echo "runtime dependency graph is clean for every shipped target"
 
   startup-bench:
+    # On macOS because the <10 ms budget is a promise about the platform we
+    # ship; measuring cold start on Linux measured the wrong machine.
     name: startup time gate (release)
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -78,7 +108,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: install hyperfine
-        run: sudo apt-get update && sudo apt-get install -y hyperfine
+        run: brew install hyperfine
       - name: bench otl --help cold start
         env:
           # Hard acceptance line (SPEC.md Constraints): mean < 10 ms.
@@ -104,11 +134,16 @@ jobs:
     # Trust comes from the ref, never from actor permissions. Secrets are
     # also exposed only to the two `run` steps below - never to third-party
     # actions via job-level env.
+    #
+    # On macOS for the same reason as the matrix: this job compiles the crate
+    # and runs the resulting binary against a live workspace. On ubuntu it
+    # would be exercising an artifact nobody receives, and would quietly
+    # oblige us to keep Linux building.
     name: contract tests (real workspace)
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - name: check for contract-test credentials
         id: creds
@@ -137,3 +172,29 @@ jobs:
           OUTLINE_TEST_URL: ${{ secrets.OUTLINE_TEST_URL }}
           OUTLINE_TEST_API_KEY: ${{ secrets.OUTLINE_TEST_API_KEY }}
         run: cargo test -p outline-cli --test contract_smoke -- --ignored
+
+  windows-source-lint:
+    # Windows is not shipped and not tested, but the `#[cfg(windows)]`
+    # branches and tests/portability.rs are deliberately KEPT so re-adding
+    # the platform is an edit rather than a rewrite. Retained code with
+    # nothing compiling it rots invisibly: macOS never even type-checks those
+    # branches, which is exactly how two `doc_lazy_continuation` violations
+    # reached the tree before - `cargo test` and `cargo fmt` cannot see them.
+    #
+    # So the cheapest possible check stays, and it runs here rather than
+    # being an opt-in local flag nobody remembers. `cargo clippy --target`
+    # only type-checks and lints; it never links, so no Windows runner and no
+    # MSVC toolchain are needed. Deleting this job means the retained Windows
+    # source is unverified, and "add it back later" becomes archaeology.
+    name: windows source still lints (no windows runner)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: clippy for x86_64-pc-windows-msvc
+        run: bash scripts/win-check.sh

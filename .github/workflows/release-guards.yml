@@ -1,0 +1,190 @@
+# Release preflight (Story 4.5).
+#
+# Registered as a cargo-dist `local-artifacts-jobs` custom job, so on a
+# release tag it runs as `custom-release-guards` alongside the build matrix.
+# That registration is deliberate and load-bearing: dist's `host` job lists
+# `local-artifacts-jobs` in `needs` and requires skipped-or-success from
+# each, so a failure here skips `host`, which skips `announce` (which
+# requires host success) - and with `github-release = "announce"` the GitHub
+# Release is created in `announce`, so nothing is published.
+#
+# It must NOT be a `plan-jobs` job. A failing plan job leaves the build jobs
+# *skipped*, and `host` is guarded by
+# `always() && ... (result == 'skipped' || result == 'success')` - skipped
+# passes. `host-jobs` is wrong in a different way: `announce` ignores their
+# result, so they cannot stop a Release, while every publish job dist
+# generates lists them in `needs` without an `always()`, so they *can* skip a
+# publish - the worst of both. dist-workspace.toml carries the full slot map.
+# scripts/check-release-gating.sh asserts this chain so it cannot regress
+# silently.
+#
+# The binary-size budget is not here: it must fail *the build job* itself,
+# see .github/build-setup/release-build-setup.yml.
+#
+# Everything here is either impossible to check from the generated files
+# alone, or a property of them that `dist generate --check` does not cover.
+#
+# Phone-home policy (NFR4): only standard actions, pinned to full commit
+# SHAs, plus the cargo-dist installer - which this job verifies against a
+# checksum committed in the repo before running it.
+#
+# NOTE on dtolnay/rust-toolchain: when pinned to a SHA the toolchain is no
+# longer carried by the ref, so `with: toolchain: stable` is mandatory.
+name: Release guards
+
+on:
+  # Called by the generated release workflow as a release gate. dist passes
+  # the plan manifest to `local-artifacts-jobs` jobs, so the input has to be
+  # declared even though nothing here reads it - GitHub rejects a call with
+  # an undeclared input.
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist-manifest JSON produced by the plan job (unused)"
+        required: false
+        type: string
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  release-config:
+    name: cargo-dist config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - name: verify and install cargo-dist
+        shell: bash
+        run: |
+          # The generated release workflow installs dist by piping a remote
+          # script into a shell with no integrity check, which dist offers
+          # no way to configure (axodotdev/cargo-dist#2420). This job
+          # verifies the exact bytes against scripts/cargo-dist-installers.sha256
+          # first and then runs the copy it verified - never a second
+          # download - so a swapped installer fails here and, because every
+          # release job needs this one, nothing is published.
+          set -euo pipefail
+          INSTALLER_OUT_DIR="${RUNNER_TEMP}/dist-installer" \
+            bash scripts/verify-cargo-dist-installer.sh
+          sh "${RUNNER_TEMP}/dist-installer/cargo-dist-installer.sh"
+
+      - name: dist plan
+        run: dist plan --output-format=json > dist-plan.json
+
+      - name: generated files are in sync with the config
+        # Fails if .github/workflows/release.yml was hand-edited or left
+        # stale after a config change. Fix by running `dist generate` and
+        run: dist generate --check
+
+      - name: the release gates can actually stop a release
+        # Asserts the needs/if chain in the generated workflow: that a
+        # failure of this job blocks `host`, that a build-job failure does
+        # too, that the compile job still has a read-only token, and that
+        # the Release is created in `announce`. All of that is template
+        # behaviour `dist generate --check` would happily accept changing.
+        run: bash scripts/check-release-gating.sh
+
+      - name: no updater artifact (NFR4, no phone home)
+        shell: bash
+        run: |
+          # `install-updater = false` is load-bearing, not cosmetic: the
+          # updater axodotdev ships polls a release server behind the
+          # user's back. Assert no updater artifact is planned, so turning
+          # the option back on cannot pass review silently.
+          set -euo pipefail
+          if grep -iE '"[^"]*(updater|axoupdater)[^"]*"' dist-plan.json; then
+            echo "::error::an updater artifact appeared in the dist plan; NFR4 forbids phone-home behaviour"
+            exit 1
+          fi
+          echo "no updater artifact in the release plan"
+
+      - name: both platforms and the shell installer are planned
+        shell: bash
+        run: |
+          # Guards the acceptance criteria themselves: a shell installer for
+          # both shipped Apple triples. Since Homebrew was dropped this is
+          # the *only* install channel, so a dropped target or a dropped
+          # installer does not narrow the release, it breaks it. Assert the
+          # plan by name.
+          set -euo pipefail
+          expected=(
+            "outline-cli-installer.sh"
+            "outline-cli-aarch64-apple-darwin.tar.xz"
+            "outline-cli-x86_64-apple-darwin.tar.xz"
+          )
+          missing=0
+          for artifact in "${expected[@]}"; do
+            if grep -qF "\"${artifact}\"" dist-plan.json; then
+              echo "ok: ${artifact}"
+            else
+              echo "::error::release plan is missing ${artifact}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: every third-party action is pinned to a commit SHA
+        # The hand-written workflows pin SHAs by convention; the generated
+        # one only does because `[dist.github-action-commits]` tells it to,
+        # and a dist upgrade introducing a new action would silently
+        # reintroduce a movable tag. Assert the property rather than trust
+        # the config.
+        shell: bash
+        run: bash scripts/check-action-pins.sh
+
+      - name: no publish job holds credentials for another repository
+        shell: bash
+        run: |
+          # Replaces the old Homebrew tap-reachability preflight, which
+          # existed because the formula push checked out an external
+          # repository with a PAT. Nothing does that any more, and this step
+          # keeps it that way: a publish job is the one place in the generated
+          # workflow that receives a non-GITHUB_TOKEN secret and pushes
+          # outside this repo, so re-adding one must be a deliberate change
+          # that also updates the guards - not a side effect of running
+          # `dist init`.
+          set -euo pipefail
+          configured="$(sed -n 's/^publish-jobs *= *\(.*\)/\1/p' dist-workspace.toml)"
+          # An explicit empty array is the same statement as omitting the key.
+          [ "${configured}" = "[]" ] && configured=""
+          if [ -n "${configured}" ]; then
+            echo "::error::publish-jobs is configured (${configured}); re-read the header of dist-workspace.toml before enabling one"
+            exit 1
+          fi
+          if grep -qE '^  publish-[a-z-]+:' .github/workflows/release.yml; then
+            echo "::error::the generated workflow contains a publish job while publish-jobs is unset"
+            exit 1
+          fi
+          echo "ok: no publish job, no external-repository credential"
+
+      - name: the documented install path matches the config
+        shell: bash
+        run: |
+          # The shell installer is now the only install channel, and its
+          # destination is a promise README makes to the reader (plus a PATH
+          # note that only makes sense for that directory). dist has no way to
+          # keep the two in sync, so assert it here: changing `install-path`
+          # without touching README fails the release.
+          set -euo pipefail
+          configured="$(sed -n 's/^install-path *= *"\([^"]*\)".*/\1/p' dist-workspace.toml)"
+          if [ -z "${configured}" ]; then
+            echo "::error::install-path is not set in dist-workspace.toml"
+            exit 1
+          fi
+          if ! grep -qF "${configured}" README.md; then
+            echo "::error::README.md does not mention the configured install path (${configured})"
+            exit 1
+          fi
+          echo "ok: README documents the configured install path (${configured})"

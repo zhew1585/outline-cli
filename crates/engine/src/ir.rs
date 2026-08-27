@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 /// Version history: 2 added `OpSpec::summary`; 3 added
 /// `OpSpec::content_type`, `OpSpec::body_mode` and the `ParamSpec`
 /// constraint facets (`nullable`, `enum_values`, `minimum`, `maximum`);
-/// 4 added `ParamSpec::format`.
-pub const IR_SCHEMA_VERSION: u32 = 4;
+/// 4 added `ParamSpec::format`; 5 added `OpSpec::response_fields`;
+/// 6 added `ParamSpec::description`; 7 added recursive response-field
+/// descriptors (`FieldSpec::depth` and `FieldSpec::container`); 8 added
+/// `FieldSpec::children_omitted`.
+pub const IR_SCHEMA_VERSION: u32 = 8;
 
 /// How strictly a request is validated against the IR before being sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,10 +32,6 @@ pub enum ValidationMode {
     Strict,
     /// Skip the facet checks, keeping type coercion and the structural
     /// checks (unknown/missing/complex parameters).
-    ///
-    /// The escape hatch for a spec that disagrees with the live server:
-    /// without it a stale or wrong constraint would make an operation
-    /// uncallable.
     SkipFacets,
 }
 
@@ -70,13 +69,11 @@ impl fmt::Display for ParamType {
 pub enum BodyMode {
     /// A JSON object body that can be assembled from `key=value` pairs.
     KeyValue,
-    /// A JSON body constrained by a root-level `oneOf`/`anyOf` union: the
-    /// choice between branches cannot be expressed as flat `key=value`
-    /// pairs, so only a caller-supplied raw JSON body is accepted.
+    /// A JSON body constrained by a root-level `oneOf`/`anyOf` union;
+    /// only a caller-supplied raw JSON body is accepted.
     RawJsonOnly,
     /// The body uses a content type this generic client cannot assemble
-    /// (e.g. `multipart/form-data`). Not callable; a service-specific
-    /// command has to handle it.
+    /// (e.g. `multipart/form-data`); not callable.
     Unsupported,
 }
 
@@ -85,10 +82,8 @@ pub enum BodyMode {
 /// Constraint facets mirror the source schema so that invalid values are
 /// rejected locally, before any request is sent.
 ///
-/// TODO: `pattern` is deliberately not compiled. Validating it needs a
-/// regex engine, roughly a megabyte of binary against a 5 MB budget, to
-/// serve the two `pattern` constraints in the whole vendored spec; such
-/// values are left for the server to reject.
+/// TODO: `pattern` is not compiled; such values are left for the server to
+/// reject (validating it would need a regex engine).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamSpec {
     /// Parameter name as it appears in the JSON request body.
@@ -97,25 +92,85 @@ pub struct ParamSpec {
     pub ty: ParamType,
     /// Whether the spec marks this parameter as required.
     pub required: bool,
-    /// Whether the schema allows an explicit JSON `null`.
-    ///
-    /// For such a parameter the literal `key=null` is sent as JSON `null`.
-    /// The consequence is that the four-character *string* `"null"` cannot
-    /// be expressed as a `key=value` argument; callers who need it must
-    /// supply a raw JSON body instead.
+    /// Whether the schema allows an explicit JSON `null`; the literal
+    /// `key=null` is then sent as JSON `null`.
     pub nullable: bool,
     /// Allowed values, when the schema constrains the parameter to an
     /// enumeration. Empty means unconstrained.
     pub enum_values: Cow<'static, [Cow<'static, str>]>,
     /// Declared `format` (e.g. `uuid`, `date-time`), empty when absent.
-    ///
-    /// Only formats with an unambiguous definition are enforced; any other
-    /// value is carried for diagnostics but passed through unchecked.
+    /// Only formats with an unambiguous definition are enforced.
     pub format: Cow<'static, str>,
     /// Inclusive lower bound for numeric parameters, if any.
     pub minimum: Option<f64>,
     /// Inclusive upper bound for numeric parameters, if any.
     pub maximum: Option<f64>,
+    /// One-line prose from the source schema, empty when absent.
+    ///
+    /// Carried for one reason, and it is not decoration: a schema may
+    /// declare no parameter required and still be unusable without one -
+    /// the constraint that says "give me exactly one of these two" is often
+    /// stated only in prose. A caller reading `required: false` on every
+    /// parameter would conclude that none is needed, which is worse than
+    /// having no information at all.
+    ///
+    /// Display-only text: nothing dispatches on it, so it is SANITIZED at
+    /// compile time (dangerous characters dropped, whitespace folded to one
+    /// line, length capped) rather than validated, exactly like
+    /// `OpSpec::summary`.
+    pub description: Cow<'static, str>,
+}
+
+/// One field of an operation's response payload.
+///
+/// These describe the shape of a single response ITEM (one row of a list
+/// response, or the payload object itself), in source-schema declaration
+/// order. Consumers use them to pick output columns, so the same operation
+/// always renders the same way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldSpec {
+    /// Field name as it appears in the JSON response.
+    pub name: Cow<'static, str>,
+    /// Declared wire type; [`ParamType::Json`] for objects, arrays and
+    /// unions (anything that is not a single displayable value).
+    pub ty: ParamType,
+    /// Declared `format` (e.g. `uuid`, `date-time`), empty when absent.
+    pub format: Cow<'static, str>,
+    /// Whether the schema allows an explicit JSON `null`.
+    pub nullable: bool,
+    /// Whether the schema marks the field as server-generated
+    /// (`readOnly`).
+    pub read_only: bool,
+    /// Nesting level in a pre-order flat list. Top-level fields are zero.
+    /// This representation keeps untrusted cache decoding non-recursive;
+    /// consumers may reconstruct a tree after the usual bounds checks.
+    pub depth: u8,
+    /// Shape of a complex field, including whether children describe an
+    /// object directly or one item of an array.
+    pub container: FieldContainer,
+    /// Whether SOME of this field's declared properties are missing from
+    /// this list. Some, not all: a field can both carry children here and
+    /// have others omitted.
+    ///
+    /// True for a model that repeats one already open on its branch (a
+    /// recursive model, which has no finite expansion) and for a container
+    /// at the depth limit. Without it such a field is indistinguishable
+    /// from an object with no properties at all, which would deny a path
+    /// that actually exists.
+    pub children_omitted: bool,
+}
+
+/// Container shape of one response field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldContainer {
+    /// Scalar, or an otherwise undeclared complex shape.
+    None,
+    /// Object whose properties follow at the next depth.
+    Object,
+    /// Array whose item properties follow at the next depth.
+    Array,
+    /// `oneOf`/`anyOf`; alternatives are not unsafely merged.
+    Union,
 }
 
 /// A single RPC operation.
@@ -124,8 +179,7 @@ pub struct OpSpec {
     /// Operation name in `resource.method` form (e.g. `things.info`).
     pub name: Cow<'static, str>,
     /// URL path joined verbatim onto the client base URL (e.g.
-    /// `/rpc/things.info`). Any service-specific prefix convention is
-    /// applied by the spec compiler that emits the IR, never by the engine.
+    /// `/rpc/things.info`).
     pub path: Cow<'static, str>,
     /// One-line human-readable summary from the source spec (may be empty).
     pub summary: Cow<'static, str>,
@@ -136,6 +190,9 @@ pub struct OpSpec {
     pub body_mode: BodyMode,
     /// Request-body parameters.
     pub params: Cow<'static, [ParamSpec]>,
+    /// Fields of one item of the success response payload, in source-schema
+    /// declaration order. Empty when the spec describes no response shape.
+    pub response_fields: Cow<'static, [FieldSpec]>,
 }
 
 impl OpSpec {

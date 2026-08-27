@@ -22,11 +22,19 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::credential::CredentialError;
 use crate::ir::ParamType;
 
 /// Errors produced by the engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// The credential source could not supply or renew a credential.
+    ///
+    /// Credential-free by construction: [`CredentialError`] carries only
+    /// authored text composed by the source itself.
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+
     /// The configured base URL could not be parsed or is not usable.
     ///
     /// Deliberately does not carry the offending URL: a malformed value may
@@ -130,6 +138,20 @@ pub enum EngineError {
         /// (`without_url()`).
         #[source]
         source: reqwest::Error,
+    },
+
+    /// A response used a valid HTTP status but did not carry the response
+    /// metadata required by the operation (for example, a redirect without
+    /// a usable `Location` header).
+    ///
+    /// The reason is authored by the engine and never includes the response
+    /// header value, which may itself contain a signed credential.
+    #[error("unexpected response from {origin}: {reason}")]
+    UnexpectedResponse {
+        /// Origin (`scheme://host[:port]`) of the request.
+        origin: String,
+        /// Credential-free explanation of the missing or invalid shape.
+        reason: String,
     },
 
     /// A `key=value` argument does not name any parameter of the operation.
