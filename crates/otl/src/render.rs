@@ -114,7 +114,8 @@ pub fn render_json(payload: &Value) -> Result<String, serde_json::Error> {
 /// a SERVER RESPONSE has to round-trip byte-for-byte, because that payload
 /// is the server's contract and `render_golden`'s JSON test pins it. That
 /// reasoning does not reach an object this CLI writes itself - `otl doctor`'s
-/// report, `otl api describe`'s contract - which nothing round-trips, and
+/// report, `otl api describe`'s contract, every `otl auth` result - which
+/// nothing round-trips, and
 /// which interleaves authored prose with text from a spec document, a
 /// filesystem or a server error. Those are the same foreign values the human
 /// rendering scrubs; the state they are printed in does not change what they

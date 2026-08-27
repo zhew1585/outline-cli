@@ -25,9 +25,17 @@
 //! it for stderr. Doing it per call site is how a surface ends up with one
 //! forgotten interpolation.
 //!
-//! `--json` is exempt, for the reason stated in [`crate::text`]: JSON is the
-//! payload, not a rendering, and altering it to protect a terminal would
-//! corrupt the data a script consumes.
+//! **`--json` is NOT exempt either**, and the sentence that used to stand
+//! here saying it was is worth naming rather than deleting: it read "JSON is
+//! the payload, not a rendering". That is true of a SERVER RESPONSE, whose
+//! contract is to round-trip byte-for-byte
+//! ([`crate::render::render`], pinned by `render_golden`). It is not true of
+//! this report, which `otl` writes itself and which nothing round-trips - and
+//! the sentence sat two screens above an `emit` that had taken the exemption
+//! by analogy. Both go through the same values; the output STATE does not
+//! change what they are. So the JSON branch renders through
+//! [`crate::render::render_json_scrubbed`], and
+//! `the_json_report_is_scrubbed_too_because_otl_wrote_it` holds it there.
 
 use serde_json::{Map, Value};
 
@@ -183,12 +191,13 @@ impl Check {
 }
 
 /// One line of human output, with everything a terminal would execute
-/// removed.
+/// removed and the result forced onto ONE line.
 ///
-/// The line is also forced onto ONE line: a foreign value that arrived with
-/// a newline must not be able to pose as another check's verdict.
+/// [`stdio::scrub_to_one_line`] is the shared rule; the fold matters here
+/// because a foreign value that arrived with a newline must not be able to
+/// pose as another check's verdict.
 fn human_line(text: &str) -> String {
-    stdio::scrub_terminal_controls(text).replace('\n', " ")
+    stdio::scrub_to_one_line(text)
 }
 
 // --- fact values -------------------------------------------------------

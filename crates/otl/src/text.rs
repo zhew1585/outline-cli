@@ -50,15 +50,25 @@
 //! same path) emits exactly what arrived, bidi and all.
 //!
 //! **What the exemption does NOT cover: JSON that `otl` AUTHORS.** `otl
-//! doctor`'s report and `otl api describe`'s contract are documents this CLI
-//! writes, interleaving authored prose with a profile name, a path, an
-//! operation name out of a fetched spec, or a server's error text. Nothing
-//! round-trips them, no test pins their bytes to anything a server said, and
-//! their reader is often a program that will put the text in front of a
-//! language model. They go through
-//! [`crate::render::render_json_scrubbed`], which scrubs every string at the
-//! sink. Both of them once did not, on the reasoning that "`--json` is the
-//! payload" - which is exactly the analogy this paragraph exists to stop.
+//! doctor`'s report, `otl api describe`'s contract and every `otl auth`
+//! result are documents this CLI writes, interleaving authored prose with a
+//! profile name out of a config file, a path out of the environment, an
+//! operation name out of a fetched spec, and - in `auth`'s case - the
+//! `account`, `workspace` and `scope` a SERVER supplied. Nothing round-trips
+//! them, no test pins their bytes to anything a server said, and their
+//! reader is often a program that will put the text in front of a language
+//! model. They go through [`crate::render::render_json_scrubbed`], which
+//! scrubs every string at the sink.
+//!
+//! All three once did not, on the reasoning that "`--json` is the payload" -
+//! which is exactly the analogy this paragraph exists to stop. It took three
+//! review rounds to find all three, and they were found in that order:
+//! `describe` (by design), `doctor` (R1), `auth` (R2). There is still no
+//! GUARD - nothing asserts that a new authored-JSON surface reaches for the
+//! scrubbing renderer - so this paragraph is what a fourth one has to be
+//! read against. `otl docs export --json` is a knowing exception, argued in
+//! Story 3.6 and re-examined in 4.6: it carries a document id verbatim so a
+//! script can retry with it.
 //!
 //! The consequence is worth stating rather than leaving implied: piping
 //! `--json` through a pager or `cat` on a terminal can still show reordered

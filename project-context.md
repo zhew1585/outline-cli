@@ -88,9 +88,13 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - 不要把来自不受信 spec/服务器的文本直接打到终端。控制字符（ANSI/OSC 转义、`\r`、`\n`、`\t`、bidi override）要么丢弃（纯展示文本），要么整体拒绝（有语义的标识符），并且长度必须有上限。
 - **`--json` 的清洗豁免只覆盖「服务器发来的 payload」这一条路径**（`render::render`，理由是必须逐字节
   round-trip，由 `render_golden` 钉住）。**otl 自己撰写的 JSON 不在豁免内**——`otl doctor` 的报告、
-  `otl api describe` 的契约都掺了 spec 文本、路径、profile 名与服务端错误文本，没有任何东西 round-trip
-  它们，一律走 `render::render_json_scrubbed`。两者都曾按「`--json` 就是 payload」类推而漏掉清洗
-  （Story 4.6 R1 审查）。新增一个自撰 JSON 输出时，用哪个渲染器是必须显式回答的问题。
+  `otl api describe` 的契约、以及**每一个 `otl auth` 结果**（其 `account`/`workspace`/`scope` 来自
+  服务端）都掺了外来文本，没有任何东西 round-trip 它们，一律走 `render::render_json_scrubbed`；
+  human 形态若是「自己拼的行列表」，逐行过 `stdio::scrub_to_one_line`（外来值不得伪造出一行）。
+  三处都曾按「`--json` 就是 payload」类推而漏掉清洗，且是分三轮审查才找齐的
+  （describe 设计时、doctor 在 4.6 R1、auth 在 4.6 R2）。**目前没有守卫测试**，所以新增一个自撰
+  JSON 输出时，用哪个渲染器是必须显式回答的问题。已知的知情例外只有一个：
+  `otl docs export --json` 逐字携带 document id（Story 3.6 的决定，脚本要拿它重试）。
 - 不要实现非目标清单里的东西（pull/push 同步、TUI、watch、MCP、device flow、离线队列）。
 - DCR 注册后必须持久化 registration_access_token。丢了服务器上就删不掉了。
 

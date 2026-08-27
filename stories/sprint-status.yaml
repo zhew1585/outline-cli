@@ -75,14 +75,13 @@ development_status:
   3-5-collections-list: done
   3-6-docs-export: done
   epic-3-retrospective: optional
-  # Reopened: 4.6 was found by field-testing the discovery flow after 4.5 shipped.
-  epic-4: in-progress
+  # Reopened for 4.6, found by field-testing the discovery flow after 4.5 shipped; done again.
+  epic-4: done
   4-1-config-and-profiles: done
   4-2-spec-sync: done
   4-3-doctor: done
   4-4-shell-completions: done
   4-5-release-pipeline: done
-  # R1 adversarial review done (mergeable, 4 MINOR, all fixed); IR 5->6 added during review,
-  # so a second round was requested before merge.
-  4-6-agent-discovery: review
+  # Two adversarial review rounds (R1, R2): both mergeable, no BLOCKER, no MAJOR; all 8 MINOR fixed.
+  4-6-agent-discovery: done
   epic-4-retrospective: optional

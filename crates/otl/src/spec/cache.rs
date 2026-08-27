@@ -426,7 +426,9 @@ fn stat_regular(file: &Path) -> Result<Option<fs::Metadata>, CacheError> {
 ///
 /// Stops at the header on purpose: the caller decodes the provenance record,
 /// checks the versions, and only then asks for the operations - see
-/// [`super::bounded::decode_table`] for why that order is load-bearing.
+/// [`super::bounded::decode_meta`] for why that order is load-bearing.
+/// (It used to say `decode_table`, which is the function that was split into
+/// `decode_meta`/`decode_ops` to make the order possible in the first place.)
 fn checked_body<'a>(file: &Path, raw: &'a [u8]) -> Result<&'a [u8], CacheError> {
     let damaged = |reason: String| CacheError::Damaged {
         path: file.to_path_buf(),

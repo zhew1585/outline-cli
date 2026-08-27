@@ -1,6 +1,6 @@
 # Story 4.6: agent discovery (`otl api describe`, `api list --json`, operation-level `--help`)
 
-Status: review
+Status: done
 
 ## Story
 
@@ -62,6 +62,11 @@ Walked end to end against `https://docs.91aql.com`. Discovery stalled in three p
    **Then** that prose is printed, sanitized through the same path a summary takes — and a cache written
    by a build with the previous IR schema is reported as *outdated*, discarded, and rebuildable with
    `otl spec sync`, with no command failing in the meantime
+10. (R2) **Given** any `otl auth` result
+    **When** it is printed in either state
+    **Then** every string in it - the profile name from a config file, the path from the environment, and
+    the `account`/`workspace`/`scope` the SERVER supplied - has been scrubbed, with the published field
+    names, their order and the human line structure unchanged
 
 ## Tasks / Subtasks
 
@@ -101,7 +106,7 @@ Walked end to end against `https://docs.91aql.com`. Discovery stalled in three p
 - [x] Task 8: tests (AC: 1-8)
   - [x] 19 end-to-end (`tests/api_describe.rs`) + 6 (`tests/api_list.rs`, rewritten) + 5
         (`tests/ir_upgrade.rs`) + 17 unit + `no_phone_home` / `spec_sync_e2e` / `completions` extended
-  - [x] 32 mutations, 32 red (table in Dev Agent Record)
+  - [x] 36 mutations, 36 red (table in Dev Agent Record, emitted by the harness)
 - [x] Task 9 (R1): the `--help` alias refuses what `describe` refuses (F3)
 - [x] Task 10 (R1): one renderer for JSON `otl` authors; `doctor` uses it; the `crate::text` exemption
       narrowed to "a server response", and the rule recorded in `project-context.md` (F1)
@@ -109,6 +114,13 @@ Walked end to end against `https://docs.91aql.com`. Discovery stalled in three p
       in `describe.rs` (F2)
 - [x] Task 12 (R1, user scope): `ParamSpec::description`, `IR_SCHEMA_VERSION` 5 -> 6, sanitized through
       the one existing display-text path, with the migration path driven end to end
+- [x] Task 13 (R2): `otl auth`'s output scrubbed in BOTH states, with the one-line fold shared out of
+      `doctor` into `stdio::scrub_to_one_line`, `emit` split so the bytes are testable, and the first
+      terminal-safety assertions that module has ever had (F3)
+- [x] Task 14 (R2): `doctor/report.rs`'s module header no longer contradicts its own `emit` (F1)
+- [x] Task 15 (R2): `cache.rs`'s doc link retargeted from the split-away `decode_table` (F2)
+- [x] Task 16 (R2): the mutation table is emitted by the harness instead of transcribed, after three
+      rounds of counting errors (F4)
 
 ## Dev Notes
 
@@ -327,6 +339,14 @@ convergence table is unchanged, and its behavioural case gained the two new comm
 lines and functions under 50; no runtime OpenAPI parsing (`describe` reads the compiled IR — the
 `spec sync` module is untouched).
 
+One more after R2, and it is the interesting one: **the rule this story introduced then failed to apply
+to a module it did not think it was touching.** `otl auth`'s output was already unscrubbed before this
+branch existed, so it is not a regression — but the moment the story wrote "always" into
+`project-context.md`, `text.rs` and `render.rs`, the exception became this story's problem. A rule stated
+as universal has to be true universally, or the statement is the defect. Checked by hand after the fix:
+the remaining `render_json` call sites are `render.rs`'s own definition and `render::render`'s response
+path, which is the one the exemption is about.
+
 ### Project Structure Notes
 
 ```
@@ -342,7 +362,9 @@ crates/otl/
   src/commands/api/describe.rs          # what one operation is
   src/commands/api/reserved.rs          # what the first positional means (+ the --help alias checks)
   src/commands/completions.rs           # reserved words imported, not respelled
+  src/commands/auth/output.rs           # R2: both states scrubbed; `emit` split so it is testable
   src/commands/doctor/report.rs         # self-authored JSON scrubbed; `emit` split so it is testable
+  src/stdio.rs                          # + scrub_to_one_line, shared by doctor and auth
   src/render.rs                         # + render_json_scrubbed (one renderer for authored JSON)
   src/spec/bounded.rs                   # decode_table -> decode_meta + decode_ops
   src/spec/cache.rs                     # versions checked BEFORE any operation record is decoded
@@ -351,6 +373,7 @@ crates/otl/
   src/main.rs                           # passes `Cli::command` to api::run
   tests/api_describe.rs                 # new, 19 end-to-end
   tests/ir_upgrade.rs                   # new, 5 end-to-end: the v5 -> v6 migration path
+  tests/auth_output_terminal.rs         # new, 2 end-to-end: a hostile profile name through the binary
   tests/api_list.rs                     # rewritten for the dual state
   tests/spec_sync_e2e.rs                # + a hostile parameter description
   tests/{guard_registry,no_phone_home,completions,spec_cache*,...}
@@ -430,10 +453,11 @@ ok, bad`, both `Cf` characters stripped) and corrected in both the story and `de
 documentation. The bullet is rewritten rather than deleted, because a false gap is a standing invitation
 to "fix" something that is not broken.
 
-**M1's red count was wrong (6, actually 7 → now 8).** The second counting error in the table, after the
-one already confessed. Root cause both times: the first run was made without `--no-fail-fast`, so cargo
-stopped at the first failing target and later targets never ran. The whole table has been re-measured,
-not patched row by row.
+**M1's red count was wrong (reported as 6, actually 7).** The second counting error in the table, after
+the one already confessed. Root cause both times: the first run was made without `--no-fail-fast`, so
+cargo stopped at the first failing target and later targets never ran. The whole table was re-measured
+rather than patched row by row — and then miscounted again, which is why R2's F4 stopped treating it as
+an arithmetic problem. See the head of the mutation section.
 
 ### Scope added by the user during review: parameter descriptions in the IR
 
@@ -444,53 +468,153 @@ carry, so `IR_SCHEMA_VERSION` went 5 → 6 with `ParamSpec::description`. Reques
 the hostile fixture aimed at it. The cache-invalidation path is driven by `tests/ir_upgrade.rs` against
 a real v5 cache, and a latent ordering defect it would have activated is fixed (D10).
 
+### R2 adversarial review, and what it changed
+
+R2 verdict: mergeable, no BLOCKER, no MAJOR, four MINOR. The reviewer drove the cache reader with
+malformed files against the real binary — truncation at six offsets, oversized length prefixes for the
+metadata record / an operation record / the operation count, a count at exactly the limit with too few
+bytes behind it, trailing bytes, a metadata record with its own trailing bytes, and forged schema
+versions 5/7/200 — all refused before allocation, no panic, no silently wrong table. It also byte-checked
+that the `decode_table` split was verbatim, re-derived the v5 record layout from `git show
+5ded310:crates/engine/src/ir.rs`, and independently re-encoded v5 and v6 caches to drive the real binary.
+
+Two of my own stated risks were disproved, both in the safe direction, and both are recorded because a
+retracted worry is as useful as a confirmed one:
+
+- **`decode_meta` cannot be used to trust a table.** It is `pub(super)`, has one call site, and returns
+  `(CacheMeta, usize)` — no operations. The path I was worried about does not exist in the type.
+- **A description cannot forge a facet line.** `sanitize_display` folds it through `split_whitespace`
+  at compile time and `is_display_safe` refuses controls on the cache path, so it cannot carry a
+  newline; a PTY run confirms a hostile description produces one line, indented into the value column.
+
+The size arithmetic was reproduced independently and closes (`Cow<str>` 24 B, 383 `ParamSpec ` entries,
+244 non-empty descriptions, 16,047 B by the reviewer's unescaping against my 16,055 — escape noise).
+
+**F3 [MINOR, fixed properly rather than documented away] — `otl auth`'s output was not scrubbed.**
+`commands/auth/output.rs::emit` still used `render_json` for JSON and joined its human lines raw, while
+this story had asserted "always" in three places (`project-context.md`, `text.rs`, `render.rs`). The
+reviewer measured `U+202E` in a config-file profile name arriving byte-for-byte in both states.
+
+The reviewer offered narrowing the documentation instead; the user required the fix, and the reason is
+the right one: `account`, `workspace` and `scope` in that output come from the **server**, and `otl auth
+info` is the command a program runs to learn whether it has a credential. That is not a third pending
+path, it is the scenario the rule exists for. Narrowing the docs would have demoted a live hole to a
+known gap.
+
+- JSON → `render_json_scrubbed`. Human → per line through a new shared `stdio::scrub_to_one_line`.
+- The one-line fold was already in `doctor::report::human_line`; rather than copy it, it moved to
+  `stdio` and `doctor` delegates. Both surfaces that assemble their own line LIST need it, and a second
+  copy is how one of them ends up without it — which is the shape of this very finding.
+- `emit` split into a testable `rendered()`, for the same reason it was in `doctor`: a test that called
+  `render_json_scrubbed` itself would keep passing if `emit` stopped calling it. That is exactly how
+  this gap survived R1.
+- **The semver surface is untouched**: scrubbing removes hazard characters and renames, drops, adds and
+  reorders nothing. `both_renderings_scrub_foreign_text` asserts the key set and order are identical to
+  the unscrubbed object, and the e2e checks the published field names are all still there.
+- Why it hid: `auth/output.rs` had **no assertion of this shape at all** — every existing test there was
+  about credential leakage or about field presence. Two were added, at both levels: a unit test
+  rendering both states with a hostile profile name AND server-supplied `account`/`workspace`/`scope`,
+  and `tests/auth_output_terminal.rs`, which drives the real binary against a config file whose default
+  profile name carries `U+202E`/`U+200F`/`U+061C` (with a control asserting the character really is in
+  the file, so "no hazard on stdout" is not "no profile name on stdout").
+
+**F1 [MINOR] — `doctor/report.rs`'s module header contradicted its own implementation.** It still said
+"`--json` is exempt … JSON is the payload, not a rendering" two screens above an `emit` that had been
+switched to `render_json_scrubbed`. Rewritten rather than deleted: it now names the sentence that used
+to stand there and why it is false of a report `otl` writes, because leaving a ready-made justification
+next to the code is how a fix gets reverted.
+
+**F2 [MINOR] — a broken doc link.** `cache.rs::checked_body` pointed at `super::bounded::decode_table`,
+which this story split into `decode_meta`/`decode_ops`. Retargeted to `decode_meta`, with a note saying
+what `decode_table` was, so a reader chasing "why is the order load-bearing" is not sent after a symbol
+that no longer exists. (Both F1 and F2 are invisible to the gate: `cargo doc` runs without
+`-D warnings`. Worth adding — deliberately NOT in this round, per the user.)
+
+**F4 [MINOR] — the mutation table miscounted for the third time.** See the note at the head of the
+mutation section: the fix is to stop transcribing it by hand, not to correct two more numbers.
+
 ### Mutation verification (break the behaviour → confirm red → restore)
 
-Driven by a script that patches one anchor, runs `cargo test --no-fail-fast` over twelve targets
+Driven by a script that patches one anchor, runs `cargo test --no-fail-fast` over thirteen targets
 (`--lib`, `api_list`, `api_describe`, `spec_sync_e2e`, `no_phone_home`, `startup_guard`, `ir_upgrade`,
-`completions`, `doctor_e2e`, `doctor_golden`, `spec_cache`, `spec_cache_rejects`), records the failures
-and restores the file. **32 of 32 turn red.** Every row below was re-measured after the R1 changes; none
-is carried over from the first run.
+`completions`, `doctor_e2e`, `doctor_golden`, `spec_cache`, `spec_cache_rejects`,
+`auth_output_terminal`), records the failures and restores the file. **36 of 36 turn red.**
 
-`--no-fail-fast` is load-bearing and the reason for the re-run: without it cargo stops at the first
+#### How this table is produced, after miscounting three times
+
+The counts in this table were wrong in three consecutive rounds — M14 (self-reported), M1 (three
+different numbers in three reports), then M27 and M31's attribution. The pattern is diagnostic: the
+TOTALS were usually right and the ATTRIBUTIONS usually wrong, which is not what a slip looks like. It is
+what a manual copy step looks like. The harness knew the answer every time; a human retyped it.
+
+So the table is now **emitted by the harness, not transcribed**: it writes
+`/tmp/mutation-table.md` with one row per mutation and the **full list of failing test names**, and that
+file is pasted in verbatim. Two consequences worth stating, because they are the actual fix:
+
+- there is no step at which a number can be summarised, rounded, or grouped by hand ("1 + 4" instead of
+  "2 + 3" was exactly that);
+- every row now names its tests, so a wrong count is falsifiable by anyone with the repo rather than by
+  a reviewer re-running the whole table.
+
+`--no-fail-fast` is the other half, and the reason for each re-run: without it cargo stops at the first
 failing target, so a mutation caught only by a later target reads as caught by fewer tests — or, if the
-only test that catches it lives in a target that never ran, as **not caught at all**. That is the
-difference between a coverage table and a comforting one.
+only test that catches it lives in a target that never ran, as **not caught at all**.
+
+One discrepancy from the R2 report is resolved rather than papered over. The reviewer measured **M27 as
+3 red including `the_json_report_is_scrubbed_too_because_otl_wrote_it`**; this harness measures 2, and
+both are right about different mutations. M27 as written here changes which renderer *`api describe`*
+asks for, which cannot affect `doctor` — `doctor` calls `render_json_scrubbed` itself. The mutation that
+does reach all three consumers is neutering the shared sink, and it was missing from the table; it is
+now **M35**, and it measures **5** (all three authored-JSON surfaces plus the two `describe` tests).
+That is the row the reviewer's number belongs to.
+
+**And on its first run the emitted table immediately paid for itself: M32 came back 0 red.** Not because
+the ordering is unpinned — the ad-hoc measurement during R1 had found 2 — but because the mutation
+DEFINITION was wrong. It moved the version check past `check_meta` and stopped there, which is still
+before `decode_ops`, so it expressed no change at all. Re-run as a two-part patch that actually puts the
+check after the operation decode, it is 2 red, and those two are the migration tests. A hand-written
+table would have carried the number 2 from the earlier run and never shown that the mutation it claimed
+to measure was a no-op. That is the failure mode behind all three counting errors, seen from the inside:
+the number was right and the thing it described was not.
 
 | # | What was broken | Red | Which tests |
 |---|-----------------|-----|-------------|
-| M1 | `list` ignores the output mode (always the terminal form) | 8 | 4 × `api_list` + 2 × `spec_sync_e2e` + `ir_upgrade` + `api_describe` |
-| M2 | `list` JSON always says `callable: true` | 2 | `an_operation_that_cannot_be_called_is_flagged_in_both_states`, `api_list_flags_operations_that_are_not_callable` |
-| M3 | the human form of `describe` renders nothing | 2 | `the_human_form_names_the_operation_and_every_parameter`, `an_uncallable_operation_says_so_in_both_states` |
-| M4 | `describe` drops `enum_values` | 2 | `numeric_bounds_and_enumerations_reach_the_output`, `describe_prints_the_enumerations_local_validation_enforces` |
-| M5 | `describe` drops `minimum`/`maximum` | 1 | `numeric_bounds_and_enumerations_reach_the_output` |
-| M6 | `describe` drops `response_fields` | 2 | `the_json_form_carries_the_response_shape`, `describe_prints_the_response_shape` |
-| M7 | `source` always reports `built-in` | 2 | `describe_answers_from_the_effective_table_not_the_built_in_one`, `sync_rebuilds_the_cache_and_reset_clears_it` |
-| M8 | lookups answer from the built-in table, not the effective one | 6 | 3 × synced-table + `sync_makes_a_new_endpoint_available_to_api_list` + hostile-text + `sync_rebuilds_...` |
+| M1 | list ignores the output mode (always the terminal form) | 8 | `a_cache_from_the_previous_ir_version_is_outdated_not_damaged, a_document_with_terminal_escapes_is_neutralized, a_synced_spec_replaces_the_built_in_one_entirely, an_operation_named_like_a_reserved_word_is_reported_not_hidden, api_list_flags_operations_that_are_not_callable, api_list_includes_known_operations_with_their_summary, api_list_prints_one_object_per_spec_operation_without_config, the_explicit_json_flag_and_the_pipe_default_agree` |
+| M2 | list JSON always says callable | 2 | `api_list_flags_operations_that_are_not_callable, an_operation_that_cannot_be_called_is_flagged_in_both_states` |
+| M3 | the human form of describe renders nothing | 2 | `an_uncallable_operation_says_so_in_both_states, the_human_form_names_the_operation_and_every_parameter` |
+| M4 | describe drops enum_values | 2 | `numeric_bounds_and_enumerations_reach_the_output, describe_prints_the_enumerations_local_validation_enforces` |
+| M5 | describe drops numeric bounds | 1 | `numeric_bounds_and_enumerations_reach_the_output` |
+| M6 | describe drops response_fields | 2 | `the_json_form_carries_the_response_shape, describe_prints_the_response_shape` |
+| M7 | source always reports the built-in table | 2 | `describe_answers_from_the_effective_table_not_the_built_in_one, sync_rebuilds_the_cache_and_reset_clears_it` |
+| M8 | lookups answer from the built-in table instead of the effective one | 6 | `a_document_with_terminal_escapes_is_neutralized, an_operation_named_like_a_reserved_word_is_reported_not_hidden, describe_answers_from_the_effective_table_not_the_built_in_one, sync_makes_a_new_endpoint_available_to_api_list, sync_rebuilds_the_cache_and_reset_clears_it, third_party_text_reaches_stdout_scrubbed_in_both_paths` |
 | M9 | a shadowed reserved word warns nobody | 1 | `an_operation_named_like_a_reserved_word_is_reported_not_hidden` |
-| M10 | spec text reaches the HUMAN rendering unscrubbed | 1 | `a_hostile_string_is_neutralised_in_both_states` |
-| M11 | `--help` on an unknown operation falls back to the generic help | 2 | `help_on_an_unknown_operation_is_an_error_not_a_generic_help`, `..._reports_an_unknown_name_before_a_stray_argument` |
-| M12 | `--help` always prints the generic help (**the original defect**) | 5 | all four `operation_level_help_*` / `the_short_help_flag_*` + the unknown-name test |
-| M13 | the generic help is rendered from an unbuilt command tree (globals lost) | 2 | `command_level_help_still_works_and_names_both_reserved_words`, `help_on_a_reserved_word_prints_the_command_help` |
-| M14 | request flags are accepted on a local path | 3 | `api_list_rejects_request_flags`, `describe_rejects_request_flags`, `operation_level_help_refuses_what_describe_refuses` |
-| M15 | extra positionals are accepted on a local path | 3 | `api_list_rejects_extra_arguments`, `describe_needs_exactly_one_operation`, `operation_level_help_refuses_...` |
+| M10 | spec text reaches the human rendering unscrubbed | 1 | `a_hostile_string_is_neutralised_in_both_states` |
+| M11 | --help on an unknown operation falls back to the generic help | 2 | `help_on_an_unknown_operation_is_an_error_not_a_generic_help, operation_level_help_reports_an_unknown_name_before_a_stray_argument` |
+| M12 | --help always prints the generic help (the original defect) | 5 | `help_on_an_unknown_operation_is_an_error_not_a_generic_help, operation_level_help_describes_that_operation, operation_level_help_refuses_what_describe_refuses, operation_level_help_reports_an_unknown_name_before_a_stray_argument, the_short_help_flag_describes_too` |
+| M13 | the generic help is rendered from an unbuilt command tree | 2 | `command_level_help_still_works_and_names_both_reserved_words, help_on_a_reserved_word_prints_the_command_help` |
+| M14 | request flags are accepted on a local path | 3 | `api_list_rejects_request_flags, describe_rejects_request_flags, operation_level_help_refuses_what_describe_refuses` |
+| M15 | extra positionals are accepted on a local path | 3 | `api_list_rejects_extra_arguments, describe_needs_exactly_one_operation, operation_level_help_refuses_what_describe_refuses` |
 | M16 | `describe` with no operation silently picks one | 1 | `describe_needs_exactly_one_operation` |
-| M17 | `describe` is routed to the network call path | 14 | every `describe_*` + `discovery_sends_nothing_even_when_it_could` + `a_local_command_works_with_every_outbound_route_dead` + 8 more |
-| M18 | an absent facet becomes `""` instead of `null` | 1 | `an_absent_facet_is_null_rather_than_an_empty_string` |
-| M19 | `paginates` is always `false` | 2 | `pagination_is_reported_and_agrees_with_the_call_path`, `describe_says_whether_an_operation_paginates` |
+| M17 | `describe` is routed to the network call path | 14 | `a_document_with_terminal_escapes_is_neutralized, a_local_command_works_with_every_outbound_route_dead, an_operation_named_like_a_reserved_word_is_reported_not_hidden, describe_answers_from_the_effective_table_not_the_built_in_one, describe_falls_back_to_the_built_in_table_too, describe_flags_an_operation_the_generic_client_cannot_call, describe_prints_every_request_facet_without_configuration, describe_prints_the_enumerations_local_validation_enforces, describe_prints_the_response_shape, describe_says_whether_an_operation_paginates, discovery_sends_nothing_even_when_it_could, operation_level_help_describes_that_operation, sync_rebuilds_the_cache_and_reset_clears_it, third_party_text_reaches_stdout_scrubbed_in_both_paths` |
+| M18 | an absent facet becomes an empty string instead of null | 1 | `an_absent_facet_is_null_rather_than_an_empty_string` |
+| M19 | pagination is always reported as absent | 2 | `pagination_is_reported_and_agrees_with_the_call_path, describe_says_whether_an_operation_paginates` |
 | M20 | a real operation wins over the reserved word | 1 | `an_operation_named_like_a_reserved_word_is_reported_not_hidden` |
-| M21 | a reserved word collides with a real operation name (`list` = `documents.info`) | 27 | `api_reserved_words_name_no_built_in_operation` + 26 others |
-| M22 | the `describe` candidate is dropped from the completion scripts | 1 | `operation_candidates_cover_the_whole_ir_table` |
-| M23 | the `list` JSON drops `content_type` (says "no" without saying why) | 1 | `an_operation_that_cannot_be_called_is_flagged_in_both_states` |
-| M24 | the reserved-word warning fires only for `describe`, not `list` | 1 | `an_operation_named_like_a_reserved_word_is_reported_not_hidden` |
-| M25 | the `--help` alias stops refusing what `describe` refuses (**F3**) | 1 | `operation_level_help_refuses_what_describe_refuses` |
-| M26 | doctor's self-authored JSON goes back to `render_json` (**F1**) | 1 | `the_json_report_is_scrubbed_too_because_otl_wrote_it` |
-| M27 | the JSON sink stops scrubbing | 2 | `a_hostile_string_is_neutralised_in_both_states`, `third_party_text_reaches_stdout_scrubbed_in_both_paths` |
-| M28 | `describe` drops the parameter description | 3 | `third_party_text_...`, `sync_rebuilds_the_cache_and_reset_clears_it`, `a_document_with_terminal_escapes_is_neutralized` |
+| M21 | a reserved word collides with a real operation name | 27 | `a_cache_from_the_previous_ir_version_is_outdated_not_damaged, a_damaged_cache_falls_back_to_the_built_in_spec, a_document_that_is_not_a_spec_is_rejected_and_the_cache_kept, a_document_with_terminal_escapes_is_neutralized, a_local_command_works_with_every_outbound_route_dead, a_local_document_can_be_compiled_without_any_network, a_synced_spec_replaces_the_built_in_one_entirely, an_operation_named_like_a_reserved_word_is_reported_not_hidden, an_unknown_operation_still_gets_the_cli_error_not_a_clap_error, api_known_op_resolves_in_ir_with_no_spec_file_reachable, api_list_flags_operations_that_are_not_callable, api_list_includes_known_operations_with_their_summary, api_list_prints_one_object_per_spec_operation_without_config, api_list_rejects_request_flags, api_reserved_words_name_no_built_in_operation, discovery_sends_nothing_even_when_it_could, help_on_a_reserved_word_prints_the_command_help, help_on_an_unknown_operation_is_an_error_not_a_generic_help, operation_candidates_cover_the_whole_ir_table, operation_level_help_describes_that_operation, operation_level_help_refuses_what_describe_refuses, reset_removes_a_cache_this_build_cannot_read, reset_returns_to_the_built_in_spec, sync_heals_a_damaged_cache, sync_makes_a_new_endpoint_available_to_api_list, the_short_help_flag_describes_too, third_party_text_reaches_stdout_scrubbed_in_both_paths` |
+| M22 | the describe candidate is dropped from the completion scripts | 1 | `operation_candidates_cover_the_whole_ir_table` |
+| M23 | the list JSON drops content_type | 1 | `an_operation_that_cannot_be_called_is_flagged_in_both_states` |
+| M24 | the reserved-word warning fires only for `describe` | 1 | `an_operation_named_like_a_reserved_word_is_reported_not_hidden` |
+| M25 | the --help alias stops refusing what `describe` refuses (F3) | 1 | `operation_level_help_refuses_what_describe_refuses` |
+| M26 | doctor's self-authored JSON goes back to render_json (F1) | 1 | `the_json_report_is_scrubbed_too_because_otl_wrote_it` |
+| M27 | the JSON sink stops scrubbing | 2 | `a_hostile_string_is_neutralised_in_both_states, third_party_text_reaches_stdout_scrubbed_in_both_paths` |
+| M28 | describe drops the parameter description | 3 | `a_document_with_terminal_escapes_is_neutralized, sync_rebuilds_the_cache_and_reset_clears_it, third_party_text_reaches_stdout_scrubbed_in_both_paths` |
 | M29 | the human form drops the parameter's prose | 1 | `the_human_form_carries_each_parameters_prose_on_its_own_line` |
 | M30 | a description is compiled in raw instead of sanitized | 1 | `a_document_with_terminal_escapes_is_neutralized` |
-| M31 | the cache stops checking its versions before using a table | 5 | `a_cache_from_the_previous_ir_version_is_outdated_not_damaged` + 4 pre-existing cache tests |
-| M32 | the version check moves back AFTER the operation decode (the D10 defect, restored) | 2 | `a_cache_from_the_previous_ir_version_is_outdated_not_damaged`, `describe_falls_back_to_the_built_in_table_too` |
+| M31 | the cache checks its versions only after decoding operations | 5 | `a_cache_from_the_previous_ir_version_is_outdated_not_damaged, a_version_string_from_the_file_is_never_echoed_raw, another_cli_version_is_stale_not_damaged, another_ir_schema_version_is_stale_not_damaged, describe_falls_back_to_the_built_in_table_too` |
+| M32 | the version check moves back AFTER the operation decode (the D10 defect, restored) | 2 | `a_cache_from_the_previous_ir_version_is_outdated_not_damaged, describe_falls_back_to_the_built_in_table_too` |
+| M33 | auth output's JSON goes back to render_json (R2 F3) | 2 | `auth_info_json_carries_no_hazard_from_the_config_file, both_renderings_scrub_foreign_text` |
+| M34 | auth output's human lines stop being scrubbed (R2 F3) | 1 | `both_renderings_scrub_foreign_text` |
+| M35 | the shared authored-JSON sink stops scrubbing | 5 | `auth_info_json_carries_no_hazard_from_the_config_file, a_hostile_string_is_neutralised_in_both_states, both_renderings_scrub_foreign_text, the_json_report_is_scrubbed_too_because_otl_wrote_it, third_party_text_reaches_stdout_scrubbed_in_both_paths` |
+| M36 | the one-line fold is dropped from the shared scrub | 2 | `both_renderings_scrub_foreign_text, one_line_scrubbing_folds_a_forged_entry_back_into_its_line` |
 
 **M29 came back GREEN on the first attempt**, and that is the one finding in this round I owe to the
 harness rather than to the reviewer: deleting the prose line from the human rendering broke nothing. The
@@ -505,8 +629,8 @@ different reason — `id`'s prose contains the word "identifier".
 **M31 vs M32, stated precisely** because they look redundant: M31 deletes the version check from
 `load_at` entirely (so it tests that the check exists), while M32 restores it to where it used to be,
 AFTER the operation decode (so it tests the ORDER, which is what D10 is about). Only the two migration
-tests catch M32; the four pre-existing cache tests do not, because they were written when the old order
-was correct.
+tests catch M32; the four pre-existing cache tests M31 also trips do not, because they were written when
+the old order was correct.
 
 Three assertions were written specifically so they could not pass vacuously, following the lesson from
 Story 4.3's M14:
@@ -522,6 +646,11 @@ Story 4.3's M14:
 - `an_operation_that_cannot_be_called_is_flagged_in_both_states` asserts the set of flagged operations
   is non-empty before comparing the two states, compares counts rather than spot-checking, and checks
   that the content type in each JSON row appears in the corresponding text line.
+- R2 added two more of the same shape: `both_renderings_scrub_foreign_text` asserts `has_hazard` of its
+  own fixture first (a scrub test whose input is already clean proves nothing), and
+  `the_hostile_name_really_is_in_the_config_file_and_in_the_output_path` reads the config file back off
+  disk to show the character is genuinely on the path from file to stdout — so "no hazard on stdout" is
+  not "no profile name on stdout".
 
 One assertion was rewritten mid-flight for the same reason: the completions test first said
 `script.contains("describe")`, which passes with no candidate emitted at all, because the word also
@@ -532,8 +661,9 @@ confirms that version is sensitive.
 ### Gates (measured, exit status captured before any pipe)
 
 `bash scripts/check-all.sh --windows`, status captured before any pipe (`bash -c '... ; echo
-"EXIT=$?"'`): **EXIT=0** — `cargo fmt --check` ok, `cargo clippy -D warnings` ok, `cargo test
---workspace` ok, `cargo doc` ok, binary size ok, `win-check.sh` ok.
+"EXIT=$?"'`), re-run after the R2 fixes: **EXIT=0** — `cargo fmt --check` ok, `cargo clippy -D warnings`
+ok, `cargo test --workspace` ok, `cargo doc` ok, binary size ok, `win-check.sh` ok. 1,265 tests passing,
+0 failed.
 
 `--linux` deliberately not run (the user asked to skip local Linux; Docker cannot start containers on
 this machine, and CI has native Linux and Windows legs).
@@ -597,17 +727,48 @@ the thing CI should be watched for.
   validation diagnostics. **The previous version of this bullet claimed the diagnostics were an open
   hole. That was wrong** — see D5 — and it is corrected rather than deleted, because a false gap is a
   standing invitation to "fix" something that is not broken.
-- **`otl doctor`'s `--json` was scrubbed by this story, not by its own.** Its exposure was nil in
-  practice (its only third-party strings are operation names and origin hosts, both ASCII-constrained by
-  `is_safe_op_name` / origin serialization), but two `--json` policies in one binary is the drift
+- **`otl doctor`'s and `otl auth`'s output were scrubbed by this story, not by their own.** doctor's
+  exposure was nil in practice (its only third-party strings are operation names and origin hosts, both
+  ASCII-constrained); `auth`'s was not — `account`, `workspace` and `scope` come from the server. Both
+  were fixed here rather than deferred, because two `--json` policies in one binary is the drift
   `crate::text` exists to prevent.
+- **`otl docs export --json` carries server text verbatim, by a deliberate decision of Story 3.6 that
+  this story is NOT overriding.** An earlier draft of this bullet said the remaining `render_json` call
+  sites "were checked by hand" — they had not been, and checking them properly found one surface the
+  claim would have covered up. All six, classified:
+  - `render.rs` (the definition), `docs/search.rs`, `docs/detail.rs`, `docs/view.rs`,
+    `collections.rs` — all print a SERVER RESPONSE verbatim (raw rows, the document object). Exempt,
+    correctly, and each says so at the call site.
+  - `docs/export.rs::print_json` — an **authored summary** (`complete`, `durable`, `stray`, `exported`,
+    `failed[]`), so by this story's rule it should be scrubbed. It is not.
+  Story 3.6 decided that on purpose: `Failure::id` is documented as "kept RAW … the JSON summary carries
+  it verbatim" so a script can retry with it, and
+  `docs_export_terminal.rs::a_hostile_document_id_cannot_rewrite_the_terminal` pins it with an
+  `assert_eq!` against an id containing `ESC`, `BEL` and a newline. That reasoning ("JSON encoding makes
+  it safe to carry") is **sound for control characters** — `serde_json` escapes them to `\u001b`, so
+  they cannot reach a terminal as an escape sequence — and **unsound for the residual `Cf` set**, which
+  `serde_json` emits raw. So the gap is real but narrow: bidi and invisible characters in a document id
+  or failure label, in that one summary.
+  Not fixed here, and the asymmetry with R2's F3 is the point. `auth info` was an oversight with no
+  decision behind it and no test, so fixing it was strictly a correction. This is a considered,
+  documented, test-pinned decision on another story's semver-protected surface; reversing it is a
+  judgement call that belongs in review, not in a drive-by edit on a branch that is being merged.
+  **What is still missing either way is the guard**: nothing asserts that a command's authored-JSON path
+  goes through `render_json_scrubbed`. A hand classification is a snapshot. That test is the real fix
+  and it does not exist.
+- **`cargo doc` runs without `-D warnings`**, so both R2 documentation findings were invisible to the
+  gate — as are two pre-existing broken intra-doc links in files this story did not touch
+  (`engine/src/text.rs`, `auth/mod.rs`). Adding the flag was explicitly deferred by the user to keep it
+  out of this change.
 
 ### Completion Notes
 
-- The workspace suite goes from **1,218 to 1,261 passing** (+43), 0 failed.
+- The workspace suite goes from **1,218 to 1,265 passing** (+47), 0 failed.
 - No new exit code; `docs/exit-codes.md` gained a note and the README's generated table is unchanged.
 - No new network entry point: `tests/no_phone_home.rs`'s convergence table is untouched (its
   behavioural case gained the two new commands).
 - No binary-size budget constant changed.
 - The engine gains exactly one data field (`ParamSpec::description`) and stays Outline-agnostic.
 - `project-context.md` gained one rule: which JSON renderer a new `--json` surface must use.
+- Three surfaces now share one terminal-safety policy where there were three: `api describe`, `doctor`
+  and `auth`, with the one-line fold in `stdio` rather than copied per module.
