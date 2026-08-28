@@ -103,8 +103,27 @@ jobs:
           # updater axodotdev ships polls a release server behind the
           # user's back. Assert no updater artifact is planned, so turning
           # the option back on cannot pass review silently.
+          #
+          # The three announcement fields are stripped first because they
+          # carry the CHANGELOG verbatim, and this promise is one a release
+          # note should be able to STATE. Grepping them too made the guard
+          # fail on the sentence documenting it - a false positive that
+          # would have been "fixed" by removing the sentence, i.e. by
+          # deleting the disclosure to satisfy the check on it. Everything
+          # dist generates about the artifacts themselves - names, kinds,
+          # descriptions, install hints - is still in scope, so an updater
+          # that is actually planned still fails here.
           set -euo pipefail
-          if grep -iE '"[^"]*(updater|axoupdater)[^"]*"' dist-plan.json; then
+          jq 'del(.announcement_title, .announcement_changelog, .announcement_github_body)' \
+            dist-plan.json > plan-artifacts.json
+
+          # Non-vacuity: an empty or unparseable plan must not read as a pass.
+          if ! jq -e '(.artifacts // {}) | length > 0' plan-artifacts.json > /dev/null; then
+            echo "::error::the dist plan lists no artifacts; the updater check would be vacuous"
+            exit 1
+          fi
+
+          if grep -iE '"[^"]*(updater|axoupdater)[^"]*"' plan-artifacts.json; then
             echo "::error::an updater artifact appeared in the dist plan; this project forbids phone-home behaviour"
             exit 1
           fi
