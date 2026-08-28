@@ -108,6 +108,7 @@ printf 'new wording' | otl docs update <doc-id> --mode patch --find-text 'old wo
 otl docs move <doc-id> --parent <parent-id> --index 0
 otl docs delete <doc-id>                      # trash; --archive to archive instead
 otl docs export --collection <collection-id> --out ./backup
+otl docs update --file ./backup/Design.md     # write an exported file back
 
 otl collections list                          # name / id / document count, every page fetched
 otl collections create --name Engineering --icon 🛠️ --color '#3366FF'
@@ -135,11 +136,12 @@ otl completions zsh > ~/.zfunc/_otl           # bash, zsh, fish, powershell, elv
 otl skill install                             # install the bundled agent skill
 ```
 
-Four things worth knowing before you write a script:
+Five things worth knowing before you write a script:
 
 - **`docs view` is markdown-first.** A pipe gets the document body, not JSON — the body *is* the data here. Ask for `--json` to get the document object instead.
 - **`docs list` returns two shapes**, because it dispatches to two operations. Without a query, `documents.list` rows (`.[].id`); with one, `documents.search` hits, where the document is nested (`.[].document.id`). Reach for `docs search` whenever there is a query.
 - **`docs create` and `docs update --json` return a receipt, not the document.** Identity fields only (`id`, `title`, `url`, `urlId`, `revision`, timestamps, …) — the body is not echoed back, so appending one line to a large page does not hand you the whole page. Read it back with `docs view <id> --json` when you need it.
+- **Exported files name their document.** Each one opens with a YAML block carrying `outline_id`, `outline_url_id`, `title`, `revision` and `updated_at` — a file name is a sanitized derivative of a title, so without it an export is a copy you can read but never write back. `docs create --file` and `docs update --file` strip the block before sending; `docs update` also takes the id from it (making the ID argument optional) and refuses to overwrite a document whose revision has moved past the file's, unless you pass `--force`. `docs export --no-front-matter` writes plain markdown instead.
 - **Pagination never truncates silently.** `--limit N` is a cap you asked for: it warns and exits 0. The CLI's own page cap stopping a fetch early is not, and exits **9**.
 
 `--json` is the default whenever stdout is not a terminal, and it round-trips what the server sent.

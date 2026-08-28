@@ -5,6 +5,13 @@
 //! rebuilt from `parentDocumentId`, and each document is written as one
 //! markdown file whose name went through [`crate::export`].
 //!
+//! Each file opens with the [`super::frontmatter`] block, because a file
+//! name is a sanitized derivative of a title and cannot be turned back into
+//! a document id: without the block, an export is a copy you can read but
+//! never write back. `otl docs create` and `otl docs update` remove the
+//! block again when they read a body, so the round trip does not accumulate
+//! metadata in the document text.
+//!
 //! One document failing does not end the export: failures are collected,
 //! summarized at the end, and turned into exit code 9 (partial failure), so
 //! a backup of 500 documents is not lost to one unreadable one.
@@ -25,6 +32,7 @@ use crate::stdio;
 use crate::text;
 
 use super::dir::{self, Dir, Durability};
+use super::frontmatter;
 use super::outdir::{self, Prepared};
 use super::target::{self, TempNames};
 use super::tree::{self, Plan};
@@ -48,6 +56,25 @@ const MAX_LISTED_FAILURES: usize = 20;
     otl api describe documents.list --json
     otl api describe documents.info --json
 
+File shape:
+  Each file opens with a YAML frontmatter block naming the document, so a
+  local copy can be written back:
+
+    ---
+    outline_id: \"55baa74a-bad1-4b16-a0d0-ec103c656b8e\"
+    outline_url_id: \"engKBTOaWe\"
+    title: \"Billing dunning\"
+    revision: 15
+    updated_at: \"2026-08-27T16:17:58.967Z\"
+    ---
+
+  `otl docs create --file` and `otl docs update --file` remove that block
+  before sending, so it never becomes document text; `otl docs update`
+  additionally takes the document id from it (making the ID argument
+  optional) and refuses to overwrite a document whose revision has moved on
+  since the export. Fields the server did not send are omitted, not null.
+  Pass --no-front-matter for plain markdown with no block at all.
+
 JSON shape:
   The markdown files are the output; --json prints a summary of the run,
   an object this CLI authors rather than anything the server sent:
@@ -59,8 +86,9 @@ JSON shape:
       \"limit_reached\": false,        // --limit cut it, because you asked
       \"durable\": true,               // writes were flushed to disk;
                                       // null = this platform cannot confirm
-      \"stray\": [],                   // pre-existing files left in place
-      \"exported\": 42,                // files written
+      \"stray\": [],                   // temporary files left behind, if any
+      \"exported\": [\"Alpha.md\", \"Alpha/Beta.md\"],  // paths written,
+                                      // relative to \"out\"
       \"failed\": [ { \"id\", \"label\", \"reason\" } ]
     }
 
@@ -84,6 +112,11 @@ pub struct ExportArgs {
     /// Write into a directory that already has contents, replacing files.
     #[arg(long)]
     pub overwrite: bool,
+
+    /// Write plain markdown, without the YAML block naming each document
+    /// (a file exported this way cannot be written back by id).
+    #[arg(long)]
+    pub no_front_matter: bool,
 }
 
 /// One document that could not be exported.
@@ -153,6 +186,8 @@ pub fn run(cmd: &ExportArgs, mode: OutputMode, overrides: &Overrides) -> Result<
 struct Export<'a> {
     session: &'a Session,
     overwrite: bool,
+    /// Whether each file opens with the block naming its document.
+    front_matter: bool,
     root: &'a Path,
     written: Vec<String>,
     failures: Vec<Failure>,
@@ -201,6 +236,7 @@ impl<'a> Export<'a> {
         Self {
             session,
             overwrite: cmd.overwrite,
+            front_matter: !cmd.no_front_matter,
             root,
             written: Vec::new(),
             failures: Vec::new(),
@@ -406,11 +442,15 @@ impl<'a> Export<'a> {
         self.stray.push(stray.display().to_string());
     }
 
-    /// The markdown for one document, with a title heading.
+    /// The file contents for one document: the frontmatter block, then the
+    /// markdown with a title heading.
     ///
     /// Outline keeps the title out of `text`, and the file name is a
     /// sanitized derivative, so the heading is what preserves the real
-    /// title. It is not added when the body already opens with one.
+    /// title. It is not added when the body already opens with one. The
+    /// heading stays even though the block also carries the title: the
+    /// block is for a sync script, the heading is what a markdown reader
+    /// renders, and dropping either would cost the other's reader.
     ///
     /// A response with NO `text` field (or a null one) is an error, not an
     /// empty document: writing a file holding only the title would record
@@ -428,10 +468,19 @@ impl<'a> Export<'a> {
                  refusing to write a file that would look like an empty one"
             ))
         })?;
-        if text.trim_start().starts_with("# ") || title.is_empty() {
-            return Ok(with_trailing_newline(text));
-        }
-        Ok(with_trailing_newline(&format!("# {title}\n\n{text}")))
+        let body = if text.trim_start().starts_with("# ") || title.is_empty() {
+            with_trailing_newline(text)
+        } else {
+            with_trailing_newline(&format!("# {title}\n\n{text}"))
+        };
+        let Some(block) = self
+            .front_matter
+            .then(|| frontmatter::block(&document))
+            .flatten()
+        else {
+            return Ok(body);
+        };
+        Ok(format!("{block}\n{body}"))
     }
 
     /// Record a written file, by its path relative to the output directory.

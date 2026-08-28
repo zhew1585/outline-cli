@@ -1,7 +1,7 @@
 ---
 name: outline-cli
 description: Work with an Outline knowledge base from the shell using the `otl` CLI - search, read, create, update and export documents and collections, call any Outline API operation by name, and discover each operation's request and response contract offline. Use when the user mentions Outline, a wiki/knowledge-base document, an Outline URL or document id, or when `otl` is installed and the task involves reading or writing docs. Also use when `otl` reports an authentication, configuration or exit-code failure and the user needs to be guided through authorization.
-version: 1.2.0
+version: 1.3.0
 metadata:
   produced_by: outline-cli (otl)
   install: otl skill install
@@ -210,6 +210,8 @@ otl docs delete <ID> --archive                     # archive
 
 otl docs export --collection <ID> --out ./backup  # one markdown file per document
 otl docs export --collection <ID> --out ./backup --overwrite --limit 100
+otl docs export --collection <ID> --out ./backup --no-front-matter
+otl docs update --file ./backup/Design.md          # write an exported file back
 
 otl fetch document <ID-or-URL>
 otl fetch collection <ID-or-URL>                   # metadata + full tree
@@ -313,14 +315,38 @@ create/update`, `comments list/create`, `users list`, `attachments create`,
 verbatim. Delete commands return `{"success": true}`;
 their `--archive` variants return the archived entity instead.
 
+**Exported files name their document, and can be written back.** Every file
+`otl docs export` writes opens with a YAML block:
+
+```yaml
+---
+outline_id: "55baa74a-bad1-4b16-a0d0-ec103c656b8e"
+outline_url_id: "engKBTOaWe"
+title: "Billing dunning"
+revision: 15
+updated_at: "2026-08-27T16:17:58.967Z"
+---
+```
+
+`otl docs create --file` and `otl docs update --file` strip that block before
+sending, so it never becomes document text. `otl docs update` also reads the
+document id out of it - so the ID argument is optional when `--file` names an
+exported file - and refuses the write if the document's revision has moved
+past the one recorded in the file (`--force` overrides). Fields the server did
+not send are omitted. `--no-front-matter` exports plain markdown instead, at
+the cost of not being able to write it back by id.
+
 **`otl docs export --json` is a run summary, not documents.** The markdown
 files are the output. The summary is:
 
 ```json
 { "out": "./backup", "complete": true, "enumeration_truncated": false,
-  "limit_reached": false, "durable": true, "stray": [], "exported": 42,
+  "limit_reached": false, "durable": true, "stray": [],
+  "exported": ["Alpha.md", "Alpha/Beta.md"],
   "failed": [ { "id": "...", "label": "...", "reason": "..." } ] }
 ```
+
+`exported` holds the paths written, relative to `out`.
 
 The test for "this backup is usable" is `complete == true && durable != false`
 - `durable: null` means "this platform cannot confirm a flush", not "it

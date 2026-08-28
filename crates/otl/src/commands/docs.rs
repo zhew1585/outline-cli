@@ -14,6 +14,7 @@ mod create;
 mod detail;
 mod dir;
 mod export;
+mod frontmatter;
 mod lifecycle;
 mod list;
 mod outdir;
