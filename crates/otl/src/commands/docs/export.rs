@@ -71,9 +71,10 @@ File shape:
   `otl docs create --file` and `otl docs update --file` remove that block
   before sending, so it never becomes document text; `otl docs update`
   additionally takes the document id from it (making the ID argument
-  optional) and refuses to overwrite a document whose revision has moved on
-  since the export. Fields the server did not send are omitted, not null.
-  Pass --no-front-matter for plain markdown with no block at all.
+  optional) and pins the write to the recorded revision, so a copy the
+  document has moved past is refused rather than written. Fields the server
+  did not send are omitted, not null. Pass --no-front-matter for plain
+  markdown with no block at all.
 
 JSON shape:
   The markdown files are the output; --json prints a summary of the run,

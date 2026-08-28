@@ -9,6 +9,7 @@
 //! Unlike `otl api`, these flags and their output ARE a stable contract
 //! (semver), which is why the surface is deliberately small.
 
+mod anchor;
 mod content;
 mod create;
 mod detail;
@@ -19,6 +20,7 @@ mod lifecycle;
 mod list;
 mod outdir;
 mod search;
+mod section;
 mod target;
 mod tree;
 mod update;

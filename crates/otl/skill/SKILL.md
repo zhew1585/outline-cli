@@ -30,7 +30,7 @@ the copy installed here and says when to re-run `otl skill install`.
 3. **Read the shape before you write the jq.** `otl <command> --help` ends in
    a `JSON shape:` section that states exactly what that command prints. It
    is not always the operation's own object, and one command (`otl docs
-   list`) has two shapes. Section 4 below is the summary; the help is the
+   list`) has two shapes. Section 5 below is the summary; the help is the
    authority.
 4. **Never read, print, echo or copy a credential.** Do not open
    `credentials.toml`, do not paste an API key into a command line, do not put
@@ -39,7 +39,7 @@ the copy installed here and says when to re-run `otl skill install`.
    `auth info`) is built to never print one back.
 5. **Check the exit code**, not the wording. The codes are a published
    contract (table at the end). In `--json` mode the failure is also an
-   object on **stderr** - see section 8. Code 9 means *partial*: the output
+   object on **stderr** - see section 9. Code 9 means *partial*: the output
    is real but incomplete; never report it as success.
 6. **Ask the user for anything interactive.** `otl auth login` opens a browser
    and waits for a redirect. Prefer `otl auth login --no-browser` and hand the
@@ -184,7 +184,7 @@ Their flags and output are a semver contract. Every one names its underlying
 operation and its JSON shape in `--help`.
 
 ```sh
-otl collections list                              # id and name (see section 4 on counts)
+otl collections list                              # id and name (see section 5 on counts)
 otl collections list --query "eng" --limit 20
 otl collections list --no-counts                  # skip one request per collection
 
@@ -198,12 +198,17 @@ otl docs view <ID> --raw                          # markdown straight to stdout
 otl docs view <ID> --json                         # the document object instead
 otl docs view <ID> --web                          # open in a browser
 
+otl docs view <ID> --outline                       # heading tree; see section 4
+otl docs view <ID> --section 'Deploy'              # one section's markdown
+
 otl docs create --title "Notes" --collection <ID> < body.md
 otl docs create --title "Notes" --file body.md --draft --icon "📓"
 otl docs update <ID> --title "New title" --file body.md --publish
 otl docs update <ID> --clear-icon
 printf '\nMore notes\n' | otl docs update <ID> --mode append   # or prepend
 printf 'new wording' | otl docs update <ID> --mode patch --find-text 'old wording'
+otl docs update <ID> --section 'Deploy' --file section.md --if-revision 12
+otl docs update <ID> --delete-section 'Deploy > Rollback'
 otl docs move <ID> --collection <ID> --parent <ID> --index 0
 otl docs delete <ID>                               # trash
 otl docs delete <ID> --archive                     # archive
@@ -256,7 +261,65 @@ explanation of what it did not like.
 `--limit N` is a truncation you asked for: it warns on stderr and exits **0**.
 The CLI's own pagination cap being reached is different - that exits **9**.
 
-## 4. What each command actually prints
+## 4. Changing part of a document
+
+**Do not read a whole page to change part of it, and do not send one back.**
+Three commands cover the loop, and none of them puts the full body in your
+context:
+
+```sh
+otl docs view <ID> --outline --json               # heading tree + .revision
+otl docs view <ID> --section 'Deploy' --raw       # just that section
+otl docs update <ID> --section 'Deploy' --file new.md --if-revision 12
+otl docs update <ID> --delete-section 'Deploy > Rollback' --if-revision 12
+```
+
+`--outline --json` returns `{id, title, revision, updatedAt, bytes,
+sections[]}`, each section carrying `{level, title, path, line, bytes}`.
+`path` is the address every other flag here takes; `revision` is the value
+for `--if-revision`; `bytes` is how much you chose not to read.
+
+Only the changed part reaches the network: the CLI reads the body itself,
+splices it, and derives a `findText` that occurs exactly once. You never
+compute an anchor and never handle the rest of the page.
+
+**Addresses** are a heading title, its parents (`'Deploy > Rollback'`), or a
+pinned level (`'## Deploy'`). Matching is exact, then case-insensitive, and
+never a substring. An address matching two headings exits **2** and lists
+both with line numbers — retry with the parent, do not guess. An unknown
+address exits 2 and lists the document's whole outline, so one retry is
+enough.
+
+**A section includes what is nested under it.** It runs to the next heading
+of the same or a higher level, so replacing `## Deploy` also replaces the
+`### Rollback` beneath it, and deleting it deletes both. The last section of
+a page therefore runs to the end of the page.
+
+**A replacement includes the heading line**, exactly as `--section` printed
+it — that is what makes renaming a heading expressible. The blank line
+before the next heading is preserved for you, so a body without a trailing
+newline cannot weld two sections together.
+
+**Pass `--if-revision <N>`** whenever the text you are sending was written
+against something you read on an earlier turn. Without it the write is still
+pinned to the revision the CLI just read, which closes its own read-to-write
+window — but not yours: an edit computed from a copy you read three steps ago
+can otherwise apply cleanly on top of someone else's change. Exit **2** means
+your copy was stale (read the outline again and redo the edit); exit **3**
+naming revision N means the document moved between the CLI's read and its
+write (same remedy).
+
+**`--mode patch` is the lower-level form** and verifies its anchor before
+sending: a `--find-text` occurring twice or not at all exits 2, and the
+refusal names each position and the section it falls in. Prefer `--section`,
+which cannot have that problem.
+
+Two things this does *not* save: `documents.info` has no field selection, so
+the CLI fetches the whole body either way, and there is no section-level
+endpoint to fetch instead. What these commands reduce is what **you** have to
+hold, which is the cost that binds.
+
+## 5. What each command actually prints
 
 `otl <command> --help` ends in a `JSON shape:` section, and that is the
 authority. Five shapes are worth knowing before you write a single `jq`,
@@ -307,7 +370,19 @@ otl fetch collection <ID> --json   # -> { collection, documents }
 otl fetch attachment <ID> --json   # -> { id, signedUrl }
 otl docs view <ID> --web --json    # -> { id, title, url }
 otl comments update <ID> --text T --resolve --json   # -> { comment, status }
+otl docs view <ID> --outline --json   # -> { id, title, revision, updatedAt,
+                                      #      bytes, sections: [ { level,
+                                      #      title, path, line, bytes } ] }
+otl docs view <ID> --section 'H' --json   # -> { id, revision, path, level,
+                                          #      line, bytes, text }
 ```
+
+`--outline` is the one place `docs view` follows the ordinary dual-state rule
+instead of this command's markdown-first one: its datum is structure, so a
+pipe gets JSON. `--section` keeps the markdown-first rule, and **that form is
+the byte-exact one** — the `--json` wrapper is scrubbed of terminal control
+characters like every object this CLI authors. Use plain `--section` (or
+`--raw`) when the bytes matter.
 
 Everything else - `docs view --json`, `docs move`, `collections
 create/update`, `comments list/create`, `users list`, `attachments create`,
@@ -329,12 +404,14 @@ updated_at: "2026-08-27T16:17:58.967Z"
 ```
 
 `otl docs create --file` and `otl docs update --file` strip that block before
-sending, so it never becomes document text. `otl docs update` also reads the
-document id out of it - so the ID argument is optional when `--file` names an
-exported file - and refuses the write if the document's revision has moved
-past the one recorded in the file (`--force` overrides). Fields the server did
-not send are omitted. `--no-front-matter` exports plain markdown instead, at
-the cost of not being able to write it back by id.
+sending, so it never becomes document text. `otl docs update` also reads it:
+the ID argument is optional when `--file` names an exported file, and the
+block's `revision` becomes the write's `--if-revision` unless you pass one, so
+a copy the document has moved past is refused rather than written. `--force`
+drops that pin. An ID argument that disagrees with the block is a usage error
+(exit 2), never a silent choice between them. Fields the server did not send
+are omitted. `--no-front-matter` exports plain markdown instead, at the cost of
+not being able to write it back by id.
 
 **`otl docs export --json` is a run summary, not documents.** The markdown
 files are the output. The summary is:
@@ -353,7 +430,7 @@ The test for "this backup is usable" is `complete == true && durable != false`
 failed". In `failed[]`, `id` is `null` for a listing row that never had one, so
 retry the entries where `id != null` and report the rest.
 
-## 5. Any operation, and its contract
+## 6. Any operation, and its contract
 
 ```sh
 otl api list                                  # every operation, with `callable` and `curated_command`
@@ -425,7 +502,7 @@ commands always dispatch from the built-in definitions, so after an `otl spec
 sync` those commands keep working while `otl api describe` - which reads the
 EFFECTIVE table - can report them as unknown.
 
-## 6. Keeping the operation table current
+## 7. Keeping the operation table current
 
 ```sh
 otl spec sync            # fetch the upstream API description, compile, use it now
@@ -439,7 +516,7 @@ Nothing here happens on its own: `otl` performs no background fetch and no
 update check. `otl doctor`'s `online-spec` check is what reports drift, and it
 only runs when you type it.
 
-## 7. This skill
+## 8. This skill
 
 ```sh
 otl skill install        # install or upgrade this document for the agents on this machine
@@ -457,7 +534,7 @@ nothing to compare. Each entry in `installed[]` carries its own `state`
 (`current`, `behind`, `edited`, `undeclared`, `absent`, `foreign`, `unusable`)
 and its own `remedy`, so act on those rather than on the summary.
 
-## 8. Global flags, failures, and the rest of the surface
+## 9. Global flags, failures, and the rest of the surface
 
 Every command accepts these, and they outrank the environment, which outranks
 the config file, key by key:
@@ -495,7 +572,7 @@ otl --version
 `otl api <operation> --help` prints that operation's contract rather than
 generic help.
 
-## 9. Exit codes (published contract)
+## 10. Exit codes (published contract)
 
 <!-- BEGIN GENERATED EXIT CODES (from docs/exit-codes.md; see tests/exit_code_tables.rs) -->
 

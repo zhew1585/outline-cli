@@ -420,30 +420,19 @@ fn exported_file(revision: u64) -> String {
     )
 }
 
-/// `documents.info` answering with the document at `revision`.
-async fn mount_info(server: &MockServer, revision: u64) {
-    let mut document = document();
-    document["revision"] = json!(revision);
-    Mock::given(method("POST"))
-        .and(path("/api/documents.info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": document,
-            "status": 200,
-            "ok": true,
-        })))
-        .mount(server)
-        .await;
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exported_file_is_written_back_without_its_block_and_without_an_id() {
-    // The round trip this feature exists for: no ID argument, and the
-    // metadata block must not reach the server as document text.
+    // The round trip this feature exists for: no ID argument, the metadata
+    // block must not reach the server as document text, and the block's
+    // revision becomes the pin - a real JSON number, not "1".
     let server = MockServer::start().await;
-    mount_info(&server, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
-        .and(body_json(json!({ "id": "doc-new", "text": NOTES })))
+        .and(body_json(json!({
+            "id": "doc-new",
+            "text": NOTES,
+            "lastRevision": 1,
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": document(), "status": 200, "ok": true,
         })))
@@ -470,10 +459,20 @@ async fn an_exported_file_is_written_back_without_its_block_and_without_an_id() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_edited_since_the_export_is_refused_rather_than_overwritten() {
+    // The pin travels as `lastRevision`, so the server is the one that
+    // refuses - which is what makes it atomic rather than a read followed
+    // by a hopeful write.
     let server = MockServer::start().await;
-    mount_info(&server, 4).await;
-    // documents.update is deliberately NOT mounted: reaching it at all
-    // would mean the stale copy was sent.
+    Mock::given(method("POST"))
+        .and(path("/api/documents.update"))
+        .and(body_partial_json(json!({ "lastRevision": 1 })))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "ok": false,
+            "error": "revision_conflict",
+            "message": "Document has been updated since the given revision",
+        })))
+        .mount(&server)
+        .await;
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("Notes.md");
@@ -490,16 +489,15 @@ async fn a_document_edited_since_the_export_is_refused_rather_than_overwritten()
     .await;
     assert
         .failure()
-        .code(2)
-        .stderr(predicate::str::contains("revision 1"))
-        .stderr(predicate::str::contains("revision 4"))
-        .stderr(predicate::str::contains("--force"));
+        .code(3)
+        .stderr(predicate::str::contains("pinned to revision 1"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn force_overwrites_the_newer_version() {
+    // --force drops the block's revision, so no pin travels at all and the
+    // write lands on whatever the document is now.
     let server = MockServer::start().await;
-    mount_info(&server, 4).await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
         .and(body_json(json!({ "id": "doc-new", "text": NOTES })))
@@ -553,7 +551,6 @@ async fn an_id_that_contradicts_the_file_is_refused_before_any_request() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_short_id_from_a_url_is_not_a_contradiction() {
     let server = MockServer::start().await;
-    mount_info(&server, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
         .and(body_partial_json(json!({ "id": "xyz789" })))
@@ -615,8 +612,8 @@ async fn creating_from_an_exported_file_strips_the_block_and_says_what_it_did() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_piped_body_still_costs_exactly_one_request() {
-    // The revision check must not appear for callers who never exported
-    // anything: no documents.info is mounted, so reaching it would fail.
+    // No block, so nothing to pin to: the request must carry no
+    // lastRevision, and no documents.info may be spent looking for one.
     let server = server_for("documents.update").await;
     let uri = server.uri();
     let assert = blocking(move || {
