@@ -232,6 +232,31 @@ const SCRUBBED: &[Reviewed] = &[
               `otl api documents.update`, both of which stay exempt.",
     },
     Reviewed {
+        file: "crates/otl/src/commands/docs/view.rs",
+        context: "render::render_json_scrubbed(payload)",
+        count: 1,
+        why: "AUTHORED. `otl docs view --outline --json` and `--section \
+              --json`, both composed by `print_authored`: heading titles and \
+              a section body from the server, mixed with positions this CLI \
+              computed (line numbers, byte counts, an address it built). \
+              Nothing round-trips them - there is no server response shaped \
+              like either object - so the exemption's premise does not hold, \
+              while the heading text is exactly the third-party string an \
+              agent will read back. \
+              \
+              The one thing worth stating, because it is a real cost: \
+              scrubbing means `--section --json`'s `.text` is not \
+              byte-guaranteed, and that field is markdown someone may want \
+              to edit and send back. It is registered here rather than \
+              exempted because the byte-exact form already exists and is the \
+              DEFAULT for that flag - plain `--section` prints the markdown \
+              verbatim, like the rest of this command - and because write \
+              correctness does not rest on it either way: `otl docs update \
+              --section` derives its own anchor from a fresh read, so no \
+              anchor ever travels through the caller. `--help` says which \
+              form is verbatim.",
+    },
+    Reviewed {
         file: "crates/otl/src/failure.rs",
         context: "render::render_json_scrubbed(&payload)",
         count: 1,
