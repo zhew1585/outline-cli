@@ -1,6 +1,6 @@
 //! `otl auth` output is data, and its data is other people's text.
 //!
-//! Story 4.6 R2. Every string `otl auth info` prints came from somewhere
+//! Every string `otl auth info` prints came from somewhere
 //! else: the profile name from a config file (a TOML quoted key, which may
 //! carry anything), the credential path from the environment, the error text
 //! from this CLI's own resolution - and `account`, `workspace` and `scope`

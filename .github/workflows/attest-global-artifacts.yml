@@ -1,4 +1,4 @@
-# Build provenance for the global release artifacts (Story 4.5).
+# Build provenance for the global release artifacts.
 #
 # cargo-dist attests only the *local* artifacts - the per-target archives -
 # and only while `github-attestations-phase` is left at its default. Moving

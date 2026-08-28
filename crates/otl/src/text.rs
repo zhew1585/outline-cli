@@ -56,9 +56,9 @@
 //! `describe` (by design), `doctor` (R1), `auth` (R2). There is still no
 //! GUARD - nothing asserts that a new authored-JSON surface reaches for the
 //! scrubbing renderer - so this paragraph is what a fourth one has to be
-//! read against. `otl docs export --json` is a knowing exception, argued in
-//! Story 3.6 and re-examined in 4.6: it carries a document id verbatim so a
-//! script can retry with it.
+//! read against. `otl docs export --json` is a knowing exception, argued
+//! twice and kept both times: it carries a document id verbatim so a script
+//! can retry with it.
 //!
 //! The consequence is worth stating rather than leaving implied: piping
 //! `--json` through a pager or `cat` on a terminal can still show reordered

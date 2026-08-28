@@ -2,7 +2,7 @@
 //!
 //! `otl api` takes an operation NAME, so every local sub-feature it grows
 //! has to live somewhere in that same namespace. Two words are reserved:
-//! `list` (Story 1.2) and `describe`.
+//! `list` and `describe`.
 //!
 //! # Why reserved words rather than clap subcommands
 //!

@@ -1,6 +1,6 @@
 //! The filesystem primitives every credential write and read goes through.
 //!
-//! Six rules, none of them negotiable (see `project-context.md`):
+//! Six rules, none of them negotiable:
 //!
 //! 1. A file holding credentials is CREATED with owner-only permissions.
 //!    There is no create-then-`chmod` window, because the permission bits

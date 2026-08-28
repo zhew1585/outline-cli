@@ -348,7 +348,7 @@ for name in attest_jobs:
 # 6. Every published target must have a measured regression budget. The size
 #    gate deliberately refuses to invent one, so a target added to
 #    dist-workspace.toml without a budget would silently fall back to the
-#    NFR2 ceiling alone - a much weaker check than the one it is supposed to
+#    size ceiling alone - a much weaker check than the one it is supposed to
 #    have. Assert coverage here so adding a triple forces measuring it.
 size_script = (root / "scripts/check-binary-size.sh").read_text(encoding="utf-8")
 budgeted = set(re.findall(r"^\s+([a-z0-9_]+-[a-z0-9_-]+)\)\s+echo\s+\d+\s+;;", size_script, re.MULTILINE))

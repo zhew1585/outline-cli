@@ -1,4 +1,4 @@
-# CI baseline (Story 1.8, narrowed to macOS in Story 4.7): lint gates, a
+# CI baseline, narrowed to macOS: lint gates, a
 # startup performance gate, a runtime-YAML guard, a Windows-source lint, and
 # a secrets-gated contract job.
 #
@@ -7,7 +7,7 @@
 # platform we actually ship. Keeping a Linux or Windows leg would mean a red
 # build could come from a target nobody receives, and green would say nothing
 # about what users get. Restoring the other platforms is one matrix edit
-# plus the dist config - see stories/4-7-mac-only-ci.md.
+# here plus a `targets` edit in dist-workspace.toml.
 #
 # Phone-home policy: only standard actions (checkout, rust-toolchain,
 # rust-cache) - no telemetry or update-check actions. All third-party

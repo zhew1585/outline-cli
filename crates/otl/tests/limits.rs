@@ -1,4 +1,4 @@
-//! Guard: the file-length limit from `project-context.md`.
+//! Guard: this repository's file-length limit.
 //!
 //! > 文件 <800 行（典型 200-400）
 //!
@@ -78,8 +78,8 @@ fn no_rust_file_is_longer_than_the_limit() {
     }
     assert!(
         violations.is_empty(),
-        "these files exceed the {MAX_LINES}-line limit from \
-         project-context.md, which has no test exemption:\n{}\n\
+        "these files exceed the {MAX_LINES}-line limit, which has no test \
+         exemption:\n{}\n\
          Split them by responsibility rather than by line count.",
         violations.join("\n")
     );

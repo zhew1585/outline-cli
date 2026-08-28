@@ -246,7 +246,7 @@ fn run(pager: &Pager, text: &str) -> Result<(), String> {
 /// column line occupies 125 rows of an 80-column window and a document made
 /// of one such line fills many screens. Counting `lines()` would call it a
 /// single row and dump it past the top of the scrollback - the exact case
-/// story 3.2 promises the pager for.
+/// the pager exists for.
 ///
 /// Width is measured in terminal columns via [`render::display_columns`], so
 /// CJK (two columns per character) and combining marks (zero) are counted
