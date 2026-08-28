@@ -51,9 +51,70 @@ async fn a_hierarchy_becomes_nested_directories() {
     );
     let alpha = std::fs::read_to_string(out.join("Alpha/Alpha.md")).unwrap();
     // The real title survives as a heading even when the file name was
-    // sanitized away from it.
-    assert!(alpha.starts_with("# Alpha\n\n"), "{alpha:?}");
+    // sanitized away from it - after the block that names the document.
+    assert!(
+        alpha.starts_with("---\noutline_id: \"a\"\ntitle: \"Alpha\"\n---\n\n# Alpha\n\n"),
+        "{alpha:?}"
+    );
     assert!(alpha.contains("body of a"), "{alpha:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_file_names_the_document_it_came_from() {
+    // The whole point of the block: a file name is a sanitized derivative
+    // of a title, so without this an export cannot be written back.
+    let server = server_with(vec![row("a", "Alpha", None), row("b", "Beta", Some("a"))]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "export", "--collection", COLLECTION, "--out"])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+
+    for (path, id) in [("Alpha/Alpha.md", "a"), ("Alpha/Beta.md", "b")] {
+        let written = std::fs::read_to_string(out.join(path)).unwrap();
+        assert!(
+            written.contains(&format!("outline_id: \"{id}\"")),
+            "{path}: {written:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_front_matter_writes_plain_markdown() {
+    let server = server_with(vec![row("a", "Alpha", None)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+
+    let uri = server.uri();
+    let target = out.clone();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "export",
+                "--no-front-matter",
+                "--collection",
+                COLLECTION,
+                "--out",
+            ])
+            .arg(&target)
+            .assert()
+    })
+    .await;
+    assert.success();
+
+    assert_eq!(
+        std::fs::read_to_string(out.join("Alpha.md")).unwrap(),
+        "# Alpha\n\nbody of a\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -475,7 +536,7 @@ async fn an_empty_document_body_is_still_exported() {
     assert_eq!(tree(&out), BTreeSet::from(["Blank.md".to_string()]));
     assert_eq!(
         std::fs::read_to_string(out.join("Blank.md")).unwrap(),
-        "# Blank\n\n"
+        "---\noutline_id: \"blank\"\ntitle: \"Blank\"\n---\n\n# Blank\n\n"
     );
 }
 

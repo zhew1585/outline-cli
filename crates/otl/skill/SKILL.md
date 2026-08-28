@@ -215,6 +215,8 @@ otl docs delete <ID> --archive                     # archive
 
 otl docs export --collection <ID> --out ./backup  # one markdown file per document
 otl docs export --collection <ID> --out ./backup --overwrite --limit 100
+otl docs export --collection <ID> --out ./backup --no-front-matter
+otl docs update --file ./backup/Design.md          # write an exported file back
 
 otl fetch document <ID-or-URL>
 otl fetch collection <ID-or-URL>                   # metadata + full tree
@@ -388,14 +390,42 @@ create/update`, `comments list/create`, `users list`, `attachments create`,
 verbatim. Delete commands return `{"success": true}`;
 their `--archive` variants return the archived entity instead.
 
+**Exported files name their document, and can be written back.** Every file
+`otl docs export` writes opens with a YAML block:
+
+```yaml
+---
+outline_id: "55baa74a-bad1-4b16-a0d0-ec103c656b8e"
+outline_url_id: "engKBTOaWe"
+title: "Billing dunning"
+revision: 15
+updated_at: "2026-08-27T16:17:58.967Z"
+---
+```
+
+`otl docs create --file` and `otl docs update --file` strip that block before
+sending, so it never becomes document text. `otl docs update` also reads it:
+the ID argument is optional when `--file` names an exported file, and the
+block's `revision` becomes the write's `--if-revision` unless you pass one, so
+a copy the document has moved past is refused (exit 2, nothing sent) rather
+than written. `--force` drops that pin. An ID argument that disagrees with the
+block is a usage error, never a silent choice between them - the UUID, the
+short `urlId` and the slug a URL carries (`billing-dunning-engKBTOaWe`) all
+name the same document and none of them conflict. Fields the server did not send
+are omitted. `--no-front-matter` exports plain markdown instead, at the cost of
+not being able to write it back by id.
+
 **`otl docs export --json` is a run summary, not documents.** The markdown
 files are the output. The summary is:
 
 ```json
 { "out": "./backup", "complete": true, "enumeration_truncated": false,
-  "limit_reached": false, "durable": true, "stray": [], "exported": 42,
+  "limit_reached": false, "durable": true, "stray": [],
+  "exported": ["Alpha.md", "Alpha/Beta.md"],
   "failed": [ { "id": "...", "label": "...", "reason": "..." } ] }
 ```
+
+`exported` holds the paths written, relative to `out`.
 
 The test for "this backup is usable" is `complete == true && durable != false`
 - `durable: null` means "this platform cannot confirm a flush", not "it

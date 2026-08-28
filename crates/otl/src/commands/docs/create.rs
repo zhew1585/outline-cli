@@ -4,6 +4,14 @@
 //! `--file`; the two are equivalent, and `--file` wins when both are on the
 //! table (see [`super::content`] for why that is precedence rather than an
 //! error).
+//!
+//! A body that carries an `otl docs export` frontmatter block has it
+//! removed like everywhere else, but here the block is also a signal: a
+//! file that already names a document is almost certainly meant to be
+//! written BACK to that document, and this command would instead file a
+//! second copy of it. That gets a diagnostic rather than a refusal -
+//! creating a new document from an old one is a real thing to want, and the
+//! command was asked to create.
 
 use anyhow::anyhow;
 use clap::Args;
@@ -78,6 +86,13 @@ pub fn run(cmd: &CreateArgs, mode: OutputMode, overrides: &Overrides) -> Result<
              create --title Notes --collection <id>`) or pass --file <path>"
         )));
     };
+    if let Some(existing) = body.front.as_ref().and_then(|front| front.document_id()) {
+        stdio::write_diagnostic_line(&format!(
+            "notice: this body came from an export of document {existing}; \
+             creating a NEW document from it (use `otl docs update --file \
+             <path>` to write back to that one instead)"
+        ));
+    }
     let session = Session::open(overrides)?;
     let args = request_args(cmd, body.text);
     let document = session.call_data(OPERATION, &args)?;

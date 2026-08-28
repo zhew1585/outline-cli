@@ -14,7 +14,16 @@
 //! - a stdin that IS a terminal means "no body was supplied". The command
 //!   never blocks waiting for a human to type a document.
 //!
+//! Both sources also go through [`super::frontmatter`]: a body that opens
+//! with the block `otl docs export` writes has it removed here, once, so no
+//! write command can push this CLI's own metadata into a document as text.
+//! What the block SAID is kept on the [`Body`] for `update` to act on.
+//!
 //! A source that yields nothing but whitespace also counts as "no body".
+//! That test runs on the body AFTER the block is removed, so a file holding
+//! nothing but frontmatter is "no body" - which is what makes `otl docs
+//! update <id> --title X --file meta.md` a title change rather than an
+//! attempt to store a metadata block.
 //! That matters in both directions: `otl docs update <id> --title X` run
 //! from a script (where stdin is `/dev/null` or closed) must not be read as
 //! "replace the document with nothing", and an accidental `| otl docs
@@ -33,6 +42,8 @@ use std::path::Path;
 use anyhow::anyhow;
 
 use crate::exit::CliError;
+
+use super::frontmatter::{self, FrontMatter};
 
 /// Maximum accepted size of a document body, in bytes.
 ///
@@ -63,10 +74,12 @@ impl Origin {
 /// A document body that was actually supplied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Body {
-    /// The markdown text, verbatim.
+    /// The markdown text, with any `otl` frontmatter block removed.
     pub text: String,
     /// Where it came from.
     pub origin: Origin,
+    /// What the removed block said, when there was one.
+    pub front: Option<FrontMatter>,
 }
 
 /// Read the document body, if one was supplied.
@@ -89,8 +102,18 @@ fn read_with_stdin_tty(file: Option<&Path>, stdin_is_tty: bool) -> Result<Option
 }
 
 /// Wrap read text as a body, unless it is blank (see the module docs).
+///
+/// The frontmatter block comes off BEFORE the blankness test, so a file
+/// that is nothing but a block reads as "no body" rather than as a body
+/// made of metadata.
 fn supplied(text: String, origin: Origin) -> Option<Body> {
-    (!text.trim().is_empty()).then_some(Body { text, origin })
+    let (front, body) = frontmatter::split(&text);
+    let text = body.to_string();
+    (!text.trim().is_empty()).then_some(Body {
+        text,
+        origin,
+        front,
+    })
 }
 
 /// Read a file with the size cap applied.
@@ -233,6 +256,52 @@ mod tests {
                 "{content:?} was taken as a body"
             );
         }
+    }
+
+    #[test]
+    fn an_exported_files_frontmatter_is_removed_and_remembered() {
+        // The round trip this feature exists for: what `otl docs export`
+        // wrote must not come back as document text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(
+            &path,
+            "---\n\
+             outline_id: \"55baa74a\"\n\
+             outline_url_id: \"engKBTOaWe\"\n\
+             title: \"Notes\"\n\
+             revision: 15\n\
+             ---\n\
+             \n\
+             # Notes\n\
+             \n\
+             body\n",
+        )
+        .unwrap();
+        let body = read_with_stdin_tty(Some(&path), true).unwrap().unwrap();
+        assert_eq!(body.text, "# Notes\n\nbody\n");
+        let front = body.front.unwrap();
+        assert_eq!(front.id.as_deref(), Some("55baa74a"));
+        assert_eq!(front.revision, Some(15));
+    }
+
+    #[test]
+    fn a_file_that_is_only_frontmatter_counts_as_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.md");
+        std::fs::write(&path, "---\noutline_id: \"doc-1\"\n---\n").unwrap();
+        assert_eq!(read_with_stdin_tty(Some(&path), true).unwrap(), None);
+    }
+
+    #[test]
+    fn a_document_opening_with_a_horizontal_rule_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rule.md");
+        let text = "---\nNote: a rule, not metadata\n---\n\nbody\n";
+        std::fs::write(&path, text).unwrap();
+        let body = read_with_stdin_tty(Some(&path), true).unwrap().unwrap();
+        assert_eq!(body.text, text);
+        assert_eq!(body.front, None);
     }
 
     #[test]

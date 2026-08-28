@@ -1,8 +1,30 @@
-//! `otl docs update <id>`.
+//! `otl docs update [ID]`.
 //!
 //! Either the title, the body, or both. The body arrives the same way as
 //! for `create` (a pipe or `--file`); with neither the command refuses
 //! rather than sending an empty update.
+//!
+//! # Writing back an exported file
+//!
+//! A file `otl docs export` wrote opens with a block naming the document
+//! (see [`super::frontmatter`]), so `otl docs update --file backup/Doc.md`
+//! needs no ID: the block supplies it.
+//!
+//! The block also records the revision the copy was taken from, and that
+//! becomes the write's `--if-revision` unless the caller stated one. This
+//! is the same staleness the flag exists for, arriving by a different
+//! route: the copy was read at a known version, edited over some span of
+//! time, and a write computed from it can still apply cleanly on top of
+//! somebody else's change. `--force` drops the block's revision for a
+//! caller who means to overwrite the newer version.
+//!
+//! That check costs one `documents.info` on the paths that do not already
+//! read the body, and it is not optional - a whole-body replace is the one
+//! write that overwrites the entire page, so it is the last place that may
+//! delegate the check to a server field an instance might not implement.
+//!
+//! All of this happens only when a block was actually present. A piped
+//! body, or a file without one, behaves exactly as it did before.
 //!
 //! # Editing part of a body
 //!
@@ -28,9 +50,10 @@ use crate::exit::CliError;
 use crate::render::OutputMode;
 use crate::session::Session;
 
-use super::anchor::{self, Plan};
+use super::anchor::{self, Pin, PinSource, Plan};
 use super::content::{self, Body};
 use super::detail;
+use super::frontmatter::FrontMatter;
 
 /// The compiled operation this command drives.
 const OPERATION: &str = "documents.update";
@@ -106,12 +129,28 @@ Not overwriting someone else's edit:
   body you read earlier: without it, an edit computed from a stale copy can
   still apply cleanly on top of someone else's change.
 
-  Every path that reads the body also pins the write to the revision it
-  just read, so the window between this command's own read and its write is
-  closed with or without the flag.")]
+  Enforced by this CLI, on every mode, before anything is sent: a
+  mismatch exits 2 and no write happens. The revision is also sent as
+  lastRevision, which asks the server to reject a stale write on its side
+  too - but not every instance implements that field, so it is a second
+  line and never the only one.
+
+Writing back an exported file:
+  A file from `otl docs export` opens with a YAML block naming the
+  document, so ID may be omitted:
+
+    otl docs update --file backup/Design.md
+
+  The block is stripped before sending, so it never becomes document text.
+  Its `revision` becomes --if-revision unless you pass one, so a copy the
+  document has since moved past is refused (exit 2) rather than written;
+  --force drops it. An ID that disagrees with the block is a usage error,
+  not a silent choice between them - the UUID, the short urlId and the
+  slug a URL carries all name the same document and none of them conflict.")]
 pub struct UpdateArgs {
-    /// Document id (UUID or the short urlId from its URL).
-    pub id: String,
+    /// Document id (UUID or the short urlId from its URL). Optional when
+    /// the body comes from a file carrying an `outline_id` block.
+    pub id: Option<String>,
 
     /// New title.
     #[arg(long, value_name = "TITLE")]
@@ -164,23 +203,92 @@ pub struct UpdateArgs {
     /// Publish the document if it is still a draft.
     #[arg(long)]
     pub publish: bool,
+
+    /// Send the update even when the file records a revision the document
+    /// has since moved past (drops the block's --if-revision).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Run `otl docs update`.
+///
+/// The two facts a frontmatter block supplies - which document, and which
+/// revision the copy was taken from - are resolved before the session is
+/// opened, so a file naming no document and an ID contradicting the file
+/// both cost nothing.
 pub fn run(cmd: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<(), CliError> {
     let body = content::read(cmd.file.as_deref())?;
+    let front = body.as_ref().and_then(|body| body.front.clone());
+    let id = resolve_id(cmd.id.as_deref(), front.as_ref())?;
+    let pin = pinned_revision(cmd, front.as_ref());
     validate(cmd, body.as_ref())?;
     let session = Session::open(overrides)?;
-    let plan = body_args(&session, cmd, body)?;
-    let mut args = metadata_args(cmd);
+    let plan = body_args(&session, cmd, &id, pin, body)?;
+    let mut args = metadata_args(cmd, &id);
     args.extend(plan.args);
     if let Some(revision) = plan.pinned {
         args.push(("lastRevision".to_string(), revision.to_string()));
     }
     let document = session
         .call_data(OPERATION, &args)
-        .map_err(|error| anchor::explain_conflict(&cmd.id, plan.pinned, error))?;
+        .map_err(|error| anchor::explain_conflict(&id, plan.pinned, error))?;
     detail::report(&session, &document, mode)
+}
+
+/// Which document to write to.
+///
+/// A command line id wins when both are present, because it is the more
+/// deliberate of the two - but only after it is checked against the block,
+/// and a disagreement is refused rather than resolved. Silently preferring
+/// either one would mean a mistyped id quietly overwrites the wrong
+/// document with the contents of this file, which is the one outcome this
+/// command must never produce. Note that the two spellings of an id are not
+/// a disagreement: `outline_url_id` is what a caller copies out of a URL.
+fn resolve_id(argument: Option<&str>, front: Option<&FrontMatter>) -> Result<String, CliError> {
+    if let Some(argument) = argument {
+        if let Some(from_file) = front.filter(|front| !front.names(argument)) {
+            let from_file = from_file.document_id().unwrap_or_default();
+            return Err(CliError::usage(anyhow!(
+                "the ID argument ({argument}) is not the document this file \
+                 describes ({from_file}); pass the right one, or drop the ID \
+                 argument to use the file's"
+            )));
+        }
+        return Ok(argument.to_string());
+    }
+    front
+        .and_then(FrontMatter::document_id)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CliError::usage(anyhow!(
+                "no document to update: pass its id, or use --file with a \
+                 file from `otl docs export` (which names the document in \
+                 its leading `outline_id` block)"
+            ))
+        })
+}
+
+/// The revision this write is pinned to before any body is read.
+///
+/// An explicit `--if-revision` wins over the block's: it is an assertion
+/// the caller just made, while the block's is a fact about a file that may
+/// have been sitting on disk for a week. `--force` drops the block's
+/// without touching the flag, so `--force --if-revision N` still means what
+/// it says.
+fn pinned_revision(cmd: &UpdateArgs, front: Option<&FrontMatter>) -> Option<Pin> {
+    if let Some(revision) = cmd.if_revision {
+        return Some(Pin {
+            revision,
+            origin: PinSource::Flag,
+        });
+    }
+    front
+        .filter(|_| !cmd.force)
+        .and_then(|front| front.revision)
+        .map(|revision| Pin {
+            revision,
+            origin: PinSource::File,
+        })
 }
 
 /// Everything that can be refused before a request is sent.
@@ -264,8 +372,8 @@ fn validate_section(cmd: &UpdateArgs, has_body: bool) -> Result<(), CliError> {
 }
 
 /// The `key=value` arguments that are not about the body.
-fn metadata_args(cmd: &UpdateArgs) -> Vec<(String, String)> {
-    let mut args = vec![("id".to_string(), cmd.id.clone())];
+fn metadata_args(cmd: &UpdateArgs, id: &str) -> Vec<(String, String)> {
+    let mut args = vec![("id".to_string(), id.to_string())];
     if let Some(title) = &cmd.title {
         args.push(("title".to_string(), title.clone()));
     }
@@ -286,38 +394,49 @@ fn metadata_args(cmd: &UpdateArgs) -> Vec<(String, String)> {
 /// The order of the branches is the precedence the flags declare: the two
 /// section flags conflict with everything else at the clap level, so by the
 /// time a later branch is reached the earlier ones were genuinely absent.
-fn body_args(session: &Session, cmd: &UpdateArgs, body: Option<Body>) -> Result<Plan, CliError> {
+fn body_args(
+    session: &Session,
+    cmd: &UpdateArgs,
+    id: &str,
+    pin: Option<Pin>,
+    body: Option<Body>,
+) -> Result<Plan, CliError> {
     if let Some(address) = &cmd.delete_section {
-        let (text, pinned) = anchor::current_body(session, &cmd.id, cmd.if_revision)?;
+        let (text, pinned) = anchor::current_body(session, id, pin)?;
         return anchor::section_plan(&text, pinned, "--delete-section", address, None);
     }
     if let Some(address) = &cmd.section {
         // `validate` has already refused the bodyless case.
         let replacement = body.map(|body| body.text).unwrap_or_default();
-        let (text, pinned) = anchor::current_body(session, &cmd.id, cmd.if_revision)?;
+        let (text, pinned) = anchor::current_body(session, id, pin)?;
         return anchor::section_plan(&text, pinned, "--section", address, Some(&replacement));
     }
     let Some(body) = body else {
+        anchor::require_revision(session, id, pin)?;
         return Ok(Plan {
             args: Vec::new(),
-            pinned: cmd.if_revision,
+            pinned: pin.map(|pin| pin.revision),
         });
     };
     if cmd.mode == Some(EditMode::Patch) {
         let target = cmd.find_text.clone().unwrap_or_default();
-        let (text, pinned) = anchor::current_body(session, &cmd.id, cmd.if_revision)?;
+        let (text, pinned) = anchor::current_body(session, id, pin)?;
         anchor::verify(&text, &target)?;
         return Ok(anchor::patch_plan(body.text, target, pinned));
     }
-    // Replace, append and prepend have no anchor to verify, so they stay a
-    // single request and pin only what the caller asserted.
+    // Replace, append and prepend have no anchor to derive, so they read
+    // nothing unless a revision was asserted - and then they read only the
+    // revision, because `lastRevision` alone is not a check this CLI can
+    // rely on (see `anchor::require_revision`). A replace is the write with
+    // the most to lose, so it is the last one that may skip it.
+    anchor::require_revision(session, id, pin)?;
     let mut args = vec![("text".to_string(), body.text)];
     if let Some(mode) = cmd.mode {
         args.push(("editMode".to_string(), mode.api_value().to_string()));
     }
     Ok(Plan {
         args,
-        pinned: cmd.if_revision,
+        pinned: pin.map(|pin| pin.revision),
     })
 }
 
@@ -331,7 +450,7 @@ mod tests {
 
     fn cmd(title: Option<&str>, publish: bool) -> UpdateArgs {
         UpdateArgs {
-            id: "doc-1".to_string(),
+            id: Some("doc-1".to_string()),
             title: title.map(str::to_string),
             icon: None,
             clear_icon: false,
@@ -342,6 +461,7 @@ mod tests {
             delete_section: None,
             if_revision: None,
             publish,
+            force: false,
         }
     }
 
@@ -349,6 +469,7 @@ mod tests {
         Some(Body {
             text: text.to_string(),
             origin: Origin::Stdin,
+            front: None,
         })
     }
 
@@ -363,7 +484,7 @@ mod tests {
         let mut both = cmd(Some("New"), true);
         both.icon = Some("\u{1f4d3}".to_string());
         validate(&both, body("new text").as_ref()).unwrap();
-        let built = metadata_args(&both);
+        let built = metadata_args(&both, "doc-1");
         assert_eq!(value(&built, "id"), Some("doc-1"));
         assert_eq!(value(&built, "title"), Some("New"));
         assert_eq!(value(&built, "publish"), Some("true"));
@@ -375,14 +496,17 @@ mod tests {
         let mut cleared = cmd(None, false);
         cleared.clear_icon = true;
         validate(&cleared, None).unwrap();
-        assert_eq!(value(&metadata_args(&cleared), "icon"), Some("null"));
+        assert_eq!(
+            value(&metadata_args(&cleared, "doc-1"), "icon"),
+            Some("null")
+        );
     }
 
     #[test]
     fn publish_alone_is_enough() {
         validate(&cmd(None, true), None).unwrap();
         assert_eq!(
-            value(&metadata_args(&cmd(None, true)), "publish"),
+            value(&metadata_args(&cmd(None, true), "doc-1"), "publish"),
             Some("true")
         );
     }
@@ -507,5 +631,103 @@ mod tests {
                 "{argv:?} was accepted"
             );
         }
+    }
+
+    fn front(id: Option<&str>, url_id: Option<&str>, revision: Option<u64>) -> FrontMatter {
+        FrontMatter {
+            id: id.map(str::to_string),
+            url_id: url_id.map(str::to_string),
+            revision,
+        }
+    }
+
+    #[test]
+    fn an_exported_file_supplies_the_document_id() {
+        let front = front(Some("55baa74a"), Some("engKBTOaWe"), Some(15));
+        assert_eq!(resolve_id(None, Some(&front)).unwrap(), "55baa74a");
+    }
+
+    #[test]
+    fn a_command_line_id_wins_when_it_agrees_with_the_file() {
+        let front = front(Some("55baa74a"), Some("engKBTOaWe"), None);
+        assert_eq!(
+            resolve_id(Some("55baa74a"), Some(&front)).unwrap(),
+            "55baa74a"
+        );
+        // The short id out of a URL is the same document, not a conflict.
+        assert_eq!(
+            resolve_id(Some("engKBTOaWe"), Some(&front)).unwrap(),
+            "engKBTOaWe"
+        );
+    }
+
+    #[test]
+    fn an_id_that_contradicts_the_file_is_refused_rather_than_picked() {
+        // The failure this refusal exists for: a mistyped id would
+        // otherwise overwrite an unrelated document with this file.
+        let front = front(Some("55baa74a"), Some("engKBTOaWe"), None);
+        let error = resolve_id(Some("other-doc"), Some(&front)).unwrap_err();
+        assert_eq!(error.code, ExitCode::Usage);
+        assert!(error.to_string().contains("55baa74a"), "{error}");
+    }
+
+    #[test]
+    fn a_body_with_no_block_still_needs_an_id_argument() {
+        let error = resolve_id(None, None).unwrap_err();
+        assert_eq!(error.code, ExitCode::Usage);
+        assert!(error.to_string().contains("outline_id"), "{error}");
+        // A block that named no document is the same case.
+        let error = resolve_id(None, Some(&front(None, None, Some(3)))).unwrap_err();
+        assert_eq!(error.code, ExitCode::Usage);
+    }
+
+    #[test]
+    fn a_piped_body_is_unaffected_by_any_of_this() {
+        assert_eq!(resolve_id(Some("doc-1"), None).unwrap(), "doc-1");
+        assert_eq!(pinned_revision(&cmd(None, false), None), None);
+    }
+
+    #[test]
+    fn the_files_revision_becomes_the_pin() {
+        let front = front(Some("doc-1"), None, Some(15));
+        assert_eq!(
+            pinned_revision(&cmd(None, false), Some(&front)),
+            Some(Pin {
+                revision: 15,
+                origin: PinSource::File
+            })
+        );
+    }
+
+    #[test]
+    fn an_explicit_if_revision_wins_over_the_files() {
+        // The flag is an assertion the caller just made; the block is a
+        // fact about a file that may be a week old.
+        let mut asserted = cmd(None, false);
+        asserted.if_revision = Some(20);
+        let front = front(Some("doc-1"), None, Some(15));
+        assert_eq!(
+            pinned_revision(&asserted, Some(&front)),
+            Some(Pin {
+                revision: 20,
+                origin: PinSource::Flag
+            })
+        );
+    }
+
+    #[test]
+    fn force_drops_the_files_revision_but_not_the_flag() {
+        let front = front(Some("doc-1"), None, Some(15));
+        let mut forced = cmd(None, false);
+        forced.force = true;
+        assert_eq!(pinned_revision(&forced, Some(&front)), None);
+        forced.if_revision = Some(20);
+        assert_eq!(
+            pinned_revision(&forced, Some(&front)),
+            Some(Pin {
+                revision: 20,
+                origin: PinSource::Flag
+            })
+        );
     }
 }

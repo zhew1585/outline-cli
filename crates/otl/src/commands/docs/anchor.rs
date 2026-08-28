@@ -27,16 +27,17 @@
 //!
 //! An anchor computed from text that has since changed can still match, in
 //! a place that now means something else. So every path here pins its write
-//! to the revision it read (`lastRevision`) and the server rejects it
-//! otherwise.
+//! to the revision it read, by sending `lastRevision`.
 //!
-//! That closes the window between this CLI's own read and its write, which
-//! is milliseconds. The window that actually matters is longer and this CLI
-//! cannot see it: an agent reads a section on one turn and writes it two
-//! turns later, and by then its own copy is stale while every read this
-//! module performs is fresh. `--if-revision` is the caller's half of the
-//! check for exactly that - it asserts the revision the CALLER last saw,
-//! and [`current_body`] enforces it before anything is sent.
+//! That asks the server to close the window between this CLI's own read and
+//! its write, which is milliseconds - and only asks, because not every
+//! instance implements the field (see [`require_revision`]). The window
+//! that actually matters is longer and this CLI cannot see it: an agent
+//! reads a section on one turn and writes it two turns later, and by then
+//! its own copy is stale while every read this module performs is fresh.
+//! `--if-revision` is the caller's half of the check for exactly that - it
+//! asserts the revision the CALLER last saw, and it is enforced HERE,
+//! locally, on every path, before anything is sent.
 
 use anyhow::anyhow;
 use serde_json::Value;
@@ -63,26 +64,81 @@ const PATCH_MODE: &str = "patch";
 pub(super) struct Plan {
     /// `text`, and `editMode`/`findText` when there is an anchor.
     pub args: Vec<(String, String)>,
-    /// Sent as `lastRevision`, so the server rejects a write whose anchor
-    /// was computed against a body that has since moved.
+    /// Sent as `lastRevision`, which asks the server to reject a write
+    /// whose anchor was computed against a body that has since moved.
+    ///
+    /// A request, not a guarantee: not every instance implements it (see
+    /// [`require_revision`]), so this rides alongside a local check rather
+    /// than standing in for one.
     pub pinned: Option<u64>,
+}
+
+/// A revision the caller asserted, and where they asserted it.
+///
+/// The origin is carried because it is the only difference between the two
+/// refusals a mismatch can produce. "Not the 16 given to --if-revision" is
+/// wrong - and confusing - for someone who never typed that flag and is
+/// writing back an exported file, and the remedy differs too: re-read, or
+/// re-export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Pin {
+    /// The revision the caller's copy was taken from.
+    pub revision: u64,
+    /// How that number arrived.
+    pub origin: PinSource,
+}
+
+/// Where a pinned revision came from.
+///
+/// Named for the pin rather than just `Origin`, because `content::Origin`
+/// already means "where the body came from" in this module tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PinSource {
+    /// `--if-revision N`, typed by the caller.
+    Flag,
+    /// The `revision` recorded in an exported file's frontmatter.
+    File,
+}
+
+impl PinSource {
+    /// How the refusal names this number.
+    fn describes(self) -> &'static str {
+        match self {
+            Self::Flag => "given to --if-revision",
+            Self::File => "recorded in the file's `revision`",
+        }
+    }
+
+    /// What to do about a mismatch.
+    fn remedy(self, id: &str) -> String {
+        match self {
+            Self::Flag => format!(
+                "Read it again with `otl docs view {} --outline --json` and \
+                 redo the edit.",
+                text::quote(id)
+            ),
+            Self::File => "Export it again, reapply your edits to the fresh \
+                           copy, and write that back - or pass --force to \
+                           overwrite the newer version with this one."
+                .to_string(),
+        }
+    }
 }
 
 /// Read the document's current markdown body and revision.
 ///
-/// This is also where `--if-revision` is enforced. Checking it locally
-/// rather than leaving it to `lastRevision` alone is deliberate: a mismatch
-/// here means the CALLER's copy is stale, which has a remedy ("read it
-/// again"), while the server's 409 cannot tell that case apart from a race.
+/// This is also where a [`Pin`] is enforced. Checking it locally rather
+/// than leaving it to `lastRevision` alone is deliberate, and the reason is
+/// stronger than it first looks - see [`require_revision`].
 pub(super) fn current_body(
     session: &Session,
     id: &str,
-    if_revision: Option<u64>,
+    pin: Option<Pin>,
 ) -> Result<(String, Option<u64>), CliError> {
     let document = session.call_data(READ_OPERATION, &[("id".to_string(), id.to_string())])?;
     let current = document.pointer("/revision").and_then(Value::as_u64);
-    if let Some(expected) = if_revision {
-        check_revision(id, expected, current)?;
+    if let Some(pin) = pin {
+        check_revision(id, pin, current)?;
     }
     let text = fields::string_at(&document, "/text").ok_or_else(|| {
         CliError::failure(anyhow!(
@@ -94,20 +150,65 @@ pub(super) fn current_body(
     Ok((text.to_string(), current))
 }
 
+/// Enforce `--if-revision` for a write that does not otherwise read the
+/// document.
+///
+/// # Why this exists rather than trusting `lastRevision`
+///
+/// The spec declares `lastRevision` and documents it as rejecting a stale
+/// write with HTTP 409. Real instances do not all implement it: on one
+/// tested Outline, `--if-revision 999` against a document at revision 17
+/// was accepted and written. The write that has the most to lose is
+/// exactly the one that used to rely on it - a whole-body replace, where
+/// the local copy overwrites the page outright - so a promise this CLI
+/// makes in its own help cannot be delegated to a field the server may
+/// ignore.
+///
+/// So every `--if-revision` is checked HERE, against a revision this CLI
+/// read. `lastRevision` is still sent: on a server that honours it, it
+/// closes the window between this read and the write, which nothing local
+/// can. Neither mechanism is load-bearing alone; the local one is the one
+/// that is always there.
+///
+/// Costs one `documents.info`, and only when the caller (or an exported
+/// file's frontmatter) actually asserted a revision.
+pub(super) fn require_revision(
+    session: &Session,
+    id: &str,
+    pin: Option<Pin>,
+) -> Result<(), CliError> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    let document = session.call_data(READ_OPERATION, &[("id".to_string(), id.to_string())])?;
+    check_revision(
+        id,
+        pin,
+        document.pointer("/revision").and_then(Value::as_u64),
+    )
+}
+
 /// Refuse the write when the caller's revision is not the current one.
-fn check_revision(id: &str, expected: u64, current: Option<u64>) -> Result<(), CliError> {
+///
+/// A server that reports no revision at all is also a refusal: the caller
+/// asked for a guarantee, and "could not check" is not that guarantee. On a
+/// write that replaces a whole page, quietly proceeding would be the worst
+/// of the three outcomes.
+fn check_revision(id: &str, pin: Pin, current: Option<u64>) -> Result<(), CliError> {
+    let Pin { revision, origin } = pin;
     match current {
-        Some(found) if found == expected => Ok(()),
+        Some(found) if found == revision => Ok(()),
         Some(found) => Err(CliError::usage(anyhow!(
-            "this document is at revision {found}, not the {expected} given to \
-             --if-revision: it changed since you read it, so the edit was \
-             written against an older version and nothing was sent. Read it \
-             again with `otl docs view {} --outline --json` and redo the edit.",
-            text::quote(id)
+            "this document is at revision {found}, not the {revision} {}: it \
+             changed since your copy was read, so the edit was written \
+             against an older version and nothing was sent. {}",
+            origin.describes(),
+            origin.remedy(id)
         ))),
         None => Err(CliError::usage(anyhow!(
-            "--if-revision {expected} cannot be checked: the server did not \
-             report a revision for this document, so nothing was sent."
+            "the revision {revision} {} cannot be checked: the server did not \
+             report a revision for this document, so nothing was sent.",
+            origin.describes()
         ))),
     }
 }
@@ -419,21 +520,46 @@ mod tests {
         assert!(!error.to_string().contains('\u{1b}'), "{error}");
     }
 
+    fn pin(revision: u64, origin: PinSource) -> Pin {
+        Pin { revision, origin }
+    }
+
     #[test]
     fn a_stale_caller_revision_is_refused_before_anything_is_sent() {
-        let error = check_revision("doc-1", 11, Some(12)).unwrap_err();
+        let error = check_revision("doc-1", pin(11, PinSource::Flag), Some(12)).unwrap_err();
         assert_eq!(error.code, ExitCode::Usage);
         let message = error.to_string();
         assert!(message.contains("revision 12, not the 11"), "{message}");
         assert!(message.contains("--outline"), "{message}");
 
-        assert!(check_revision("doc-1", 12, Some(12)).is_ok());
+        assert!(check_revision("doc-1", pin(12, PinSource::Flag), Some(12)).is_ok());
 
         // A server that reports no revision cannot answer the question, and
         // guessing "it is probably fine" is the wrong direction.
-        let error = check_revision("doc-1", 12, None).unwrap_err();
+        let error = check_revision("doc-1", pin(12, PinSource::Flag), None).unwrap_err();
         assert_eq!(error.code, ExitCode::Usage);
         assert!(error.to_string().contains("cannot be checked"), "{error}");
+    }
+
+    #[test]
+    fn the_refusal_names_where_the_revision_came_from() {
+        // A caller writing back an exported file never typed
+        // --if-revision, so naming that flag would send them looking for
+        // an argument they did not pass - and the remedy is different.
+        let flag = check_revision("doc-1", pin(11, PinSource::Flag), Some(12))
+            .unwrap_err()
+            .to_string();
+        assert!(flag.contains("--if-revision"), "{flag}");
+        assert!(flag.contains("Read it again"), "{flag}");
+        assert!(!flag.contains("--force"), "{flag}");
+
+        let file = check_revision("doc-1", pin(11, PinSource::File), Some(12))
+            .unwrap_err()
+            .to_string();
+        assert!(file.contains("recorded in the file"), "{file}");
+        assert!(file.contains("Export it again"), "{file}");
+        assert!(file.contains("--force"), "{file}");
+        assert!(!file.contains("--if-revision"), "{file}");
     }
 
     #[test]
