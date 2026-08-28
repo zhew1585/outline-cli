@@ -323,8 +323,9 @@ fn describe_rejects_request_flags() {
     }
 }
 
-/// NFR4, the sharp version: a credential and an instance ARE configured, so
-/// there is something to send. The mock still has to receive nothing.
+/// The no-phone-home rule, sharp version: a credential and an instance ARE
+/// configured, so there is something to send. The mock still has to receive
+/// nothing.
 ///
 /// The control call at the end is what makes this assertion sensitive: it
 /// proves the fixture would have recorded a request had one been made.

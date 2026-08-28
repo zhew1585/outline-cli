@@ -14,7 +14,7 @@
 #   --windows  also cross-check for x86_64-pc-windows-msvc (needs the target)
 #   --linux    also run the suite on real Linux in docker (needs docker)
 #
-# Only macOS ships (Story 4.7), so the two platform flags are no longer part
+# Only macOS ships, so the two platform flags are no longer part
 # of any promise. `--windows` is kept because it is the ONLY thing that
 # type-checks the `#[cfg(windows)]` branches this repository deliberately
 # retains - macOS never compiles them - and it now also runs in CI

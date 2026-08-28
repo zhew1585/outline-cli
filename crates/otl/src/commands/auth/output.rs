@@ -326,8 +326,8 @@ pub(super) struct Output {
 /// runs to find out whether it has a credential at all, so it is squarely a
 /// text-to-a-machine surface.
 ///
-/// It was missed in the first pass at this rule (Story 4.6 F1 covered
-/// `doctor` and `api describe`) and caught in the second, with `U+202E` in a
+/// It was missed in the first pass at this rule (which covered `doctor` and
+/// `api describe`) and caught in the second, with `U+202E` in a
 /// profile name arriving byte-for-byte on stdout in both states.
 ///
 /// `render_json_scrubbed`, not `render`: this value is a summary this module

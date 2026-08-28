@@ -1,4 +1,4 @@
-# Release preflight (Story 4.5).
+# Release preflight.
 #
 # Registered as a cargo-dist `local-artifacts-jobs` custom job, so on a
 # release tag it runs as `custom-release-guards` alongside the build matrix.
@@ -24,7 +24,7 @@
 # Everything here is either impossible to check from the generated files
 # alone, or a property of them that `dist generate --check` does not cover.
 #
-# Phone-home policy (NFR4): only standard actions, pinned to full commit
+# Phone-home policy: only standard actions, pinned to full commit
 # SHAs, plus the cargo-dist installer - which this job verifies against a
 # checksum committed in the repo before running it.
 #
@@ -96,7 +96,7 @@ jobs:
         # behaviour `dist generate --check` would happily accept changing.
         run: bash scripts/check-release-gating.sh
 
-      - name: no updater artifact (NFR4, no phone home)
+      - name: no updater artifact (no phone home)
         shell: bash
         run: |
           # `install-updater = false` is load-bearing, not cosmetic: the
@@ -105,7 +105,7 @@ jobs:
           # the option back on cannot pass review silently.
           set -euo pipefail
           if grep -iE '"[^"]*(updater|axoupdater)[^"]*"' dist-plan.json; then
-            echo "::error::an updater artifact appeared in the dist plan; NFR4 forbids phone-home behaviour"
+            echo "::error::an updater artifact appeared in the dist plan; this project forbids phone-home behaviour"
             exit 1
           fi
           echo "no updater artifact in the release plan"

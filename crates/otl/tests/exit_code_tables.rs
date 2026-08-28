@@ -1,7 +1,7 @@
 //! Every published exit-code table must agree with `docs/exit-codes.md`.
 //!
-//! The exit-code table is a public API (project-context.md, CLI contract),
-//! and it is published in three places. `docs/exit-codes.md` carries the
+//! The exit-code table is part of the CLI's public contract, and it is
+//! published in three places. `docs/exit-codes.md` carries the
 //! full detail and is the single source of truth; the other two are
 //! renderings of it, each shaped for who reads it:
 //!

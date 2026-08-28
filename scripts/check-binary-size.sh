@@ -5,15 +5,15 @@
 # ---------------------------------------------------------------------------
 # Two different numbers, because one number cannot do both jobs
 # ---------------------------------------------------------------------------
-# NFR2 (planning/epics.md, specs/spec-outline-cli/stack.md) promises a single
-# static binary of roughly 5 MB. That is the promise to users, and it is a
-# useless regression gate: by the time a change pushed the binary from 3.4 MB
-# to 5 MB the damage would be long merged. So there are two checks:
+# The distribution promise is a single static binary of roughly 5 MB. That is
+# the promise to users, and it is a useless regression gate: by the time a
+# change pushed the binary from 3.4 MB to 5 MB the damage would be long
+# merged. So there are two checks:
 #
 #   * a per-target REGRESSION BUDGET, ~8% above what that target measures
 #     today. Tight enough that one fat dependency fails the build, loose
 #     enough that a toolchain bump does not.
-#   * the NFR2 CEILING of 5,000,000 bytes, applied to every target. This is
+#   * the SIZE CEILING of 5,000,000 bytes, applied to every target. This is
 #     the promise, not a regression signal.
 #
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@
 # regressed at all. A single number is simultaneously too loose for the
 # smallest target and wrong for the largest, so budgets are per target.
 #
-# Only macOS ships today (Story 4.7), so both budgets below are measured on
+# Only macOS ships today, so both budgets below are measured on
 # this machine and nothing is extrapolated. The former musl and msvc rows are
 # gone with their targets. What is worth keeping from that episode, because
 # whoever re-adds a platform will need it, is that targets are NOT
@@ -97,13 +97,13 @@
 # future maintainer needs and it should not have to be recomputed:
 #
 #   x86_64-apple-darwin is the largest artifact we ship, at 4,369,768 B.
-#   NFR2 promises ~5 MB = 5,000,000 B.
+#   The promise is ~5 MB = 5,000,000 B.
 #   Remaining headroom: 630,232 B (12.6%).
 #
 # That room is shrinking and the trend is worth naming rather than rediscovering:
 # it was 992,288 B (19.8%) at the previous measurement, so ~362 KB of it went in
 # one stretch of development. Note also that this target's BUDGET (4,720,000) is
-# now only 280,000 B under the NFR2 ceiling - the ~8% regression margin has
+# now only 280,000 B under the size ceiling - the ~8% regression margin has
 # nearly caught up with the promise, and once it passes, the ceiling rather than
 # the budget becomes the binding gate. Before raising this row again, consider
 # whether the growth should be paid back instead.
@@ -126,9 +126,9 @@
 #   SKIP_BUILD=1 ./scripts/check-binary-size.sh             # measure as-is
 set -euo pipefail
 
-# The NFR2 promise, in bytes. Applies to every target, overridable only to
+# The size promise, in bytes. Applies to every target, overridable only to
 # make the check stricter in an experiment - never relax it here.
-NFR2_CEILING_BYTES="${NFR2_CEILING_BYTES:-5000000}"
+SIZE_CEILING_BYTES="${SIZE_CEILING_BYTES:-5000000}"
 
 # Percentage of a budget at which the build still passes but says so loudly.
 # 95 keeps the band a narrow "you are about to break it" strip rather than a
@@ -232,8 +232,8 @@ printf 'size:   %s bytes (%d.%02d MiB)\n' \
     "$((SIZE_BYTES / 1048576))" \
     "$((SIZE_BYTES % 1048576 * 100 / 1048576))"
 
-nfr2_percent=$((SIZE_BYTES * 100 / NFR2_CEILING_BYTES))
-printf 'NFR2:   %s%% of the %s byte promise\n' "${nfr2_percent}" "${NFR2_CEILING_BYTES}"
+ceiling_percent=$((SIZE_BYTES * 100 / SIZE_CEILING_BYTES))
+printf 'cap:    %s%% of the %s byte promise\n' "${ceiling_percent}" "${SIZE_CEILING_BYTES}"
 
 failed=0
 
@@ -241,7 +241,7 @@ if [[ -z "${BUDGET}" ]]; then
     # An unpublished triple - somebody's local host, or a new target added
     # without a measurement. Enforce the promise, and say plainly that the
     # regression budget is absent rather than inventing one.
-    echo "note: no regression budget is defined for ${EFFECTIVE_TARGET}; enforcing only the NFR2 ceiling" >&2
+    echo "note: no regression budget is defined for ${EFFECTIVE_TARGET}; enforcing only the size ceiling" >&2
     echo "      (add a measured row to budget_for_target() before publishing this target)" >&2
 else
     percent=$((SIZE_BYTES * 100 / BUDGET))
@@ -263,13 +263,13 @@ else
 fi
 
 # The promise is checked independently of the regression budget, so no future
-# budget edit can quietly authorise shipping more than NFR2 allows.
-if ((SIZE_BYTES > NFR2_CEILING_BYTES)); then
-    echo "error: ${BIN_NAME} for ${EFFECTIVE_TARGET} is ${SIZE_BYTES} bytes, past the ${NFR2_CEILING_BYTES} byte NFR2 promise" >&2
-    echo "hint: this is a product decision, not a threshold to edit - NFR2 says ~5 MB" >&2
+# budget edit can quietly authorise shipping more than the promise allows.
+if ((SIZE_BYTES > SIZE_CEILING_BYTES)); then
+    echo "error: ${BIN_NAME} for ${EFFECTIVE_TARGET} is ${SIZE_BYTES} bytes, past the ${SIZE_CEILING_BYTES} byte size promise" >&2
+    echo "hint: this is a product decision, not a threshold to edit - the promise is ~5 MB" >&2
     failed=1
-elif ((nfr2_percent >= 95)); then
-    warning="${BIN_NAME} for ${EFFECTIVE_TARGET} is at ${nfr2_percent}% of the NFR2 ~5 MB promise"
+elif ((ceiling_percent >= 95)); then
+    warning="${BIN_NAME} for ${EFFECTIVE_TARGET} is at ${ceiling_percent}% of the ~5 MB size promise"
     echo "::warning::${warning}"
     echo "warning: ${warning}" >&2
 fi

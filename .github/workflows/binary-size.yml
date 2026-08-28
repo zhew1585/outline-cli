@@ -1,4 +1,4 @@
-# Pre-merge binary size feedback (Story 4.5, NFR2/NFR3).
+# Pre-merge binary size feedback.
 #
 # This workflow is NOT what gates the release - a workflow triggered by the
 # same tag runs in parallel with the release and could only turn itself red.
@@ -15,7 +15,7 @@
 # to be measurable on a developer's machine, which is not a reason for CI to
 # skip a target we publish.
 #
-# Phone-home policy (NFR4): only standard actions, all pinned to full commit
+# Phone-home policy: only standard actions, all pinned to full commit
 # SHAs, matching ci.yml.
 #
 # NOTE on dtolnay/rust-toolchain: when pinned to a SHA the toolchain is no

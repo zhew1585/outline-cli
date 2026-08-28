@@ -144,7 +144,7 @@ Notes:
     nothing is sent, because `read_checked` refuses it on the open descriptor. A world-writable DIRECTORY
     holding a sound `0600` file is a warning and the credential is used: another user cannot plant a file
     the caller owns (the ownership check is on the open descriptor, and symlinks are refused), cannot read
-    the `0600` file, and Story 2.6 deliberately does not re-permission an existing directory. The residual
+    the `0600` file, and `otl` deliberately does not re-permission an existing directory. The residual
     risk is deletion or a replacement that then gets refused - nuisance, not disclosure - and no other
     command fails in that state either, so `doctor` must not. The *text* obeys the same rule: a report
     that is about to use the file does not print the store-wide "usable: no", and does not repeat the

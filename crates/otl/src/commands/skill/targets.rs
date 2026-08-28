@@ -305,7 +305,7 @@ pub fn frontmatter_value(document: &str, key: &str) -> Option<String> {
 /// at `<skills dir>/<skill>` would be followed by the write while a symlink
 /// would not. Both are reparse points, which is what the Windows branch
 /// looks at - the platform is answered explicitly rather than assumed to
-/// behave like Unix, per `project-context.md`.
+/// behave like Unix.
 pub fn is_redirect(meta: &std::fs::Metadata) -> bool {
     meta.file_type().is_symlink() || is_reparse_point(meta)
 }

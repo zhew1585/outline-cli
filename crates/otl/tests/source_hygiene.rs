@@ -1,7 +1,7 @@
 //! Architectural constraints that no functional test can catch.
 //!
-//! `project-context.md` states these as hard rules, not style preferences:
-//! files under 800 lines, functions under 50, nesting under 4. A module that
+//! These are hard rules here, not style preferences: files under 800 lines,
+//! functions under 50, nesting under 4. A module that
 //! outgrows any of them keeps compiling and keeps passing its own tests, so
 //! nothing notices until a reviewer counts by hand - which is how the file
 //! limit was first breached, and then how the function limit was breached
@@ -20,9 +20,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// Hard limits from `project-context.md` ("函数 <50 行，嵌套 <4 层").
+/// Hard limits: functions under 50 lines, nesting under 4 levels.
 ///
-/// The file-length limit from the same sentence is NOT here: `limits.rs`
+/// The file-length limit from the same rule is NOT here: `limits.rs`
 /// enforces it, and one rule with two guards is worse than one with one.
 /// Two of them means two exemption policies - `limits.rs` keeps a shrinking
 /// ledger of files that arrived over the limit from another branch, this file
@@ -62,8 +62,8 @@ fn no_production_function_exceeds_the_length_or_nesting_limit() {
     }
     assert!(
         too_long.is_empty(),
-        "these functions exceed the {MAX_FUNCTION_LINES}-line limit from \
-         project-context.md; extract the parts that have their own name:\n{}",
+        "these functions exceed the {MAX_FUNCTION_LINES}-line limit; \
+         extract the parts that have their own name:\n{}",
         too_long.join("\n")
     );
     assert!(
@@ -226,9 +226,9 @@ fn show(file: &Path) -> String {
 
 /// Collect `crates/*/src/**/*.rs` and `crates/*/tests/**/*.rs`.
 ///
-/// Tests are included deliberately: `project-context.md` grants them no
-/// exemption, and a 1500-line test file is exactly as hard to navigate as a
-/// 1500-line module.
+/// Tests are included deliberately: the rules grant them no exemption, and
+/// a 1500-line test file is exactly as hard to navigate as a 1500-line
+/// module.
 fn source_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     let crates_dir = workspace_root().join("crates");

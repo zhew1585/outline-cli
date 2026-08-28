@@ -1,7 +1,6 @@
-# cargo-dist configuration (Story 4.5: release pipeline).
+# cargo-dist configuration for the release pipeline.
 #
-# One config produces the single distribution channel the spec asks for
-# (specs/spec-outline-cli/stack.md "分发"):
+# One config produces the single distribution channel this project ships:
 #   * shell installer  -> curl | sh, installs into ~/.local/bin
 #
 # Homebrew was configured here until 2026-08 and was removed deliberately: it
@@ -12,7 +11,7 @@
 # in release-guards.yml's artifact list and attest-global-artifacts.yml's
 # subject paths.
 #
-# Phone-home policy (NFR4): `install-updater = false` on purpose. The
+# Phone-home policy: `install-updater = false` on purpose. The
 # updater axodotdev ships would contact a release server behind the user's
 # back, which this project forbids. Do not turn it on.
 #
@@ -54,12 +53,12 @@ installers = ["shell"]
 # below was set up to handle.
 # Target platforms to build apps for (Rust target-triple syntax).
 #
-# macOS only, for now (Story 4.7). Both Apple triples ship: Intel Macs are
+# macOS only, for now. Both Apple triples ship: Intel Macs are
 # still in use, and dropping x86_64 would silently strand them.
 #
 # Deliberately NOT universal2-apple-darwin, which would look tidier: a fat
-# binary carries both slices, so it would measure ~7.5 MB against NFR2's
-# ~5 MB promise. Two thin artifacts keep the promise; one fat one breaks it.
+# binary carries both slices, so it would measure ~7.5 MB against the ~5 MB
+# size promise. Two thin artifacts keep the promise; one fat one breaks it.
 #
 # Keep this list in sync with the platform matrix in README.md ("Install")
 # and with the per-target budgets in scripts/check-binary-size.sh -

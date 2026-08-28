@@ -2,7 +2,7 @@
 # Measure `otl --help` cold-start time with hyperfine and fail when the mean
 # exceeds the threshold. Also reports the release binary size.
 #
-# Performance target (specs/spec-outline-cli/SPEC.md, Constraints):
+# Performance target:
 #   mean cold start < 10 ms on a release build. This is a hard acceptance
 #   line; CI (.github/workflows/ci.yml) enforces the same 10 ms threshold.
 #

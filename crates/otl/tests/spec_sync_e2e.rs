@@ -465,7 +465,7 @@ async fn a_document_with_terminal_escapes_is_neutralized() {
     let summary = rows[0]["summary"].as_str().unwrap_or_default();
     assert!(!summary.contains('\t'), "tab survived: {summary:?}");
 
-    // A parameter D\u001bRIPTION is display-only too (Story 4.6), and it is
+    // A parameter D\u001bRIPTION is display-only too, and it is
     // compiled through the same `sanitize_display` a summary is - so the
     // document is ACCEPTED and the text is stripped and folded to one line,
     // rather than the whole document being refused (which is what happens to

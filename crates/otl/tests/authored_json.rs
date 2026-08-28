@@ -108,8 +108,8 @@ const EXEMPT: &[Reviewed] = &[
         why: "AUTHORED, and deliberately unscrubbed - the one entry here \
               that is not a server response. `print_json` builds the object \
               with `serde_json::json!`, mixing in server text (`failure.id`, \
-              `failure.label`, `failure.reason`) and local paths. Story 3.6 \
-              chose to keep `Failure::id` byte-exact so a script can retry \
+              `failure.label`, `failure.reason`) and local paths. `docs \
+              export` keeps `Failure::id` byte-exact so a script can retry \
               precisely the entries where `id != null`, and pinned it with \
               `a_hostile_document_id_cannot_rewrite_the_terminal`. That \
               reasoning holds for control characters, which serde escapes. \

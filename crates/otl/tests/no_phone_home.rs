@@ -32,8 +32,8 @@
 //!
 //! # The third channel
 //!
-//! `project-context.md` names two channels; there are three, and the third
-//! is the documented exception rather than an oversight. RFC 6749 token,
+//! The rule below names two channels; there are three, and the third is
+//! the documented exception rather than an oversight. RFC 6749 token,
 //! RFC 7591/7592 registration and RFC 7009 revocation requests cannot go
 //! through the engine's authenticated channel - they carry no bearer token,
 //! they are form-encoded rather than JSON, they are not described by the
@@ -48,10 +48,9 @@
 //!   `Url` parse) but cannot send, which is what the send-site rule
 //!   enforces and what makes the wider `reqwest` allowlist safe.
 //!
-//! The invariant they support (not replace) is the one in
-//! `project-context.md`, amended by the paragraph above: every outbound
-//! request goes through one of the three channels, and only a command the
-//! user typed causes one.
+//! The invariant they support (not replace), as amended by the paragraph
+//! above: every outbound request goes through one of the three channels,
+//! and only a command the user typed causes one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -768,7 +767,7 @@ fn a_local_command_works_with_every_outbound_route_dead() {
     let cache = TempDir::new().unwrap();
     for args in [
         vec!["api", "list"],
-        // The discovery pair from Story 4.6: both read the compiled table
+        // The discovery pair: both read the compiled table
         // and nothing else, so both belong in this list.
         vec!["api", "describe", "documents.info"],
         vec!["api", "documents.info", "--help"],
