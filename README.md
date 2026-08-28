@@ -16,7 +16,6 @@ Two ways to reach the API, and the difference matters:
 ## Install
 
 **macOS only, for now.** Linux and Windows are not built or tested at the moment.
-There is no published release yet — the command below is the contract the release pipeline implements, and it starts working with the first tag.
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
