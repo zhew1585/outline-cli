@@ -407,9 +407,11 @@ updated_at: "2026-08-27T16:17:58.967Z"
 sending, so it never becomes document text. `otl docs update` also reads it:
 the ID argument is optional when `--file` names an exported file, and the
 block's `revision` becomes the write's `--if-revision` unless you pass one, so
-a copy the document has moved past is refused rather than written. `--force`
-drops that pin. An ID argument that disagrees with the block is a usage error
-(exit 2), never a silent choice between them. Fields the server did not send
+a copy the document has moved past is refused (exit 2, nothing sent) rather
+than written. `--force` drops that pin. An ID argument that disagrees with the
+block is a usage error, never a silent choice between them - the UUID, the
+short `urlId` and the slug a URL carries (`billing-dunning-engKBTOaWe`) all
+name the same document and none of them conflict. Fields the server did not send
 are omitted. `--no-front-matter` exports plain markdown instead, at the cost of
 not being able to write it back by id.
 

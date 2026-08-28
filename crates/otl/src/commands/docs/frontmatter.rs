@@ -100,15 +100,39 @@ pub struct FrontMatter {
 impl FrontMatter {
     /// Whether `candidate` names the document this block describes.
     ///
-    /// Either spelling counts, because either is what a caller would have
-    /// copied out of a URL. A block that names no id at all cannot
-    /// contradict anything, so it matches.
+    /// Every spelling of a document id that the rest of this CLI accepts
+    /// has to be accepted here too, or the check invents a conflict where
+    /// there is none and refuses a write that was perfectly correct. There
+    /// are three, and Outline's URLs are why:
+    ///
+    /// - the UUID;
+    /// - the bare `urlId` (`engKBTOaWe`);
+    /// - the SLUG a URL actually carries, which is the title slugified and
+    ///   the `urlId` appended (`billing-dunning-engKBTOaWe`). This is the
+    ///   form a person copies, and it is the one a literal comparison
+    ///   misses - it was reported as a false conflict against a block whose
+    ///   `outline_id` was the same document's UUID.
+    ///
+    /// A block that names no id at all cannot contradict anything, so it
+    /// matches.
     pub fn names(&self, candidate: &str) -> bool {
-        let known = [self.id.as_deref(), self.url_id.as_deref()];
-        if known.iter().all(Option::is_none) {
+        if self.id.is_none() && self.url_id.is_none() {
             return true;
         }
-        known.iter().flatten().any(|known| *known == candidate)
+        let candidate = tail(candidate);
+        if self.id.as_deref() == Some(candidate) {
+            return true;
+        }
+        let Some(url_id) = self.url_id.as_deref() else {
+            return false;
+        };
+        // A slug ends in the url id after a hyphen. Requiring the hyphen
+        // keeps this from matching a different id that merely ends in the
+        // same characters.
+        candidate == url_id
+            || candidate
+                .strip_suffix(url_id)
+                .is_some_and(|slug| slug.ends_with('-'))
     }
 
     /// The id to write to, preferring the UUID.
@@ -208,6 +232,20 @@ fn absorb(front: &mut FrontMatter, key: &str, value: &str) -> bool {
 /// `text` unless it is empty.
 fn non_empty(text: String) -> Option<String> {
     (!text.is_empty()).then_some(text)
+}
+
+/// The last path segment of `candidate`, or `candidate` itself.
+///
+/// A document id never contains a slash, so this is a no-op for one and
+/// reduces a pasted URL to the slug at its end. Whether the API accepts a
+/// whole URL is not this function's business: comparing the two ids is,
+/// and a URL and a slug name the same document.
+fn tail(candidate: &str) -> &str {
+    let trimmed = candidate.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((_, last)) if !last.is_empty() => last,
+        _ => trimmed,
+    }
 }
 
 /// `text` with a leading line equal to `expected` (ignoring a trailing
@@ -520,6 +558,59 @@ mod tests {
         assert!(front.names("engKBTOaWe"));
         assert!(!front.names("something-else"));
         assert_eq!(front.document_id(), Some("55baa74a"));
+    }
+
+    #[test]
+    fn the_slug_form_out_of_a_url_names_the_document_too() {
+        // Reported as a false conflict: `otl-e2e-2peEK9IF9n` is the slug
+        // every other otl command accepts, and it was refused against a
+        // block whose outline_id is the same document's UUID.
+        let front = FrontMatter {
+            id: Some("3b9070da-cb1a-4c8f-83ab-2c6bb168ea93".to_string()),
+            url_id: Some("2peEK9IF9n".to_string()),
+            revision: None,
+        };
+        for spelling in [
+            "3b9070da-cb1a-4c8f-83ab-2c6bb168ea93",
+            "2peEK9IF9n",
+            "otl-e2e-2peEK9IF9n",
+            "billing-dunning-2peEK9IF9n",
+            "https://docs.example.com/doc/otl-e2e-2peEK9IF9n",
+            "https://docs.example.com/doc/otl-e2e-2peEK9IF9n/",
+        ] {
+            assert!(front.names(spelling), "{spelling} was called a conflict");
+        }
+    }
+
+    #[test]
+    fn a_different_document_is_still_a_conflict() {
+        let front = FrontMatter {
+            id: Some("3b9070da-cb1a-4c8f-83ab-2c6bb168ea93".to_string()),
+            url_id: Some("2peEK9IF9n".to_string()),
+            revision: None,
+        };
+        for spelling in [
+            "other-doc",
+            // Ends in the same characters, but is not the slug of this
+            // document: the hyphen is what separates a slug from its id.
+            "X2peEK9IF9n",
+            // A prefix of the url id, not the url id.
+            "2peEK9IF",
+            "https://docs.example.com/doc/other-doc-abcdefghij",
+        ] {
+            assert!(!front.names(spelling), "{spelling} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_slug_still_matches_when_the_block_has_only_the_short_id() {
+        let front = FrontMatter {
+            id: None,
+            url_id: Some("2peEK9IF9n".to_string()),
+            revision: None,
+        };
+        assert!(front.names("otl-e2e-2peEK9IF9n"));
+        assert!(!front.names("otl-e2e-somethingelse"));
     }
 
     #[test]

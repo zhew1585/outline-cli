@@ -426,6 +426,7 @@ async fn an_exported_file_is_written_back_without_its_block_and_without_an_id() 
     // block must not reach the server as document text, and the block's
     // revision becomes the pin - a real JSON number, not "1".
     let server = MockServer::start().await;
+    mount_info(&server, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
         .and(body_json(json!({
@@ -457,19 +458,131 @@ async fn an_exported_file_is_written_back_without_its_block_and_without_an_id() 
     assert.success();
 }
 
+/// The same file with no `revision`, for tests about the id alone.
+fn exported_file_without_revision() -> String {
+    exported_file(1)
+        .lines()
+        .filter(|line| !line.starts_with("revision:"))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// `documents.info` answering with the document at `revision`.
+///
+/// `documents.update` is deliberately never mounted alongside this in the
+/// refusal tests: reaching it at all would mean a stale copy was sent.
+async fn mount_info(server: &MockServer, revision: u64) {
+    let mut document = document();
+    document["revision"] = json!(revision);
+    Mock::given(method("POST"))
+        .and(path("/api/documents.info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": document,
+            "status": 200,
+            "ok": true,
+        })))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_edited_since_the_export_is_refused_rather_than_overwritten() {
-    // The pin travels as `lastRevision`, so the server is the one that
-    // refuses - which is what makes it atomic rather than a read followed
-    // by a hopeful write.
+    // The regression this guards: a whole-body replace used to send
+    // `lastRevision` and trust the server to answer 409. A real Outline
+    // accepted `--if-revision 999` against a document at revision 17 and
+    // wrote anyway, silently losing the newer version - on the one path
+    // that overwrites the whole page. The check is local now, so the mock
+    // answers documents.info honestly and documents.update is unmounted:
+    // reaching it would fail the test.
     let server = MockServer::start().await;
+    mount_info(&server, 4).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("Notes.md");
+    std::fs::write(&file, exported_file(1)).unwrap();
+
+    let uri = server.uri();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "update", "--file"])
+            .arg(&file)
+            .write_stdin("")
+            .assert()
+    })
+    .await;
+    assert
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("revision 4"))
+        .stderr(predicate::str::contains("1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn if_revision_is_enforced_on_every_mode_that_does_not_read_the_body() {
+    // The three modes that send without reading: a replace, an append and
+    // a prepend. All three used to ignore --if-revision entirely.
+    for mode in [None, Some("append"), Some("prepend")] {
+        let server = MockServer::start().await;
+        mount_info(&server, 17).await;
+
+        let uri = server.uri();
+        let assert = blocking(move || {
+            let mut command = otl_at(&uri);
+            command.args(["docs", "update", "doc-new", "--if-revision", "999"]);
+            if let Some(mode) = mode {
+                command.args(["--mode", mode]);
+            }
+            command.write_stdin(NOTES).assert()
+        })
+        .await;
+        assert
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("revision 17"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn if_revision_is_enforced_for_a_metadata_only_write_too() {
+    // No body at all: --title still must not land on a document that has
+    // moved past the revision the caller asserted.
+    let server = MockServer::start().await;
+    mount_info(&server, 17).await;
+
+    let uri = server.uri();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args([
+                "docs",
+                "update",
+                "doc-new",
+                "--title",
+                "New",
+                "--if-revision",
+                "999",
+            ])
+            .write_stdin("")
+            .assert()
+    })
+    .await;
+    assert.failure().code(2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_matching_revision_still_writes_and_still_pins() {
+    // The other half: the check must not refuse a current copy, and the
+    // pin still travels for a server that does honour it.
+    let server = MockServer::start().await;
+    mount_info(&server, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
-        .and(body_partial_json(json!({ "lastRevision": 1 })))
-        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
-            "ok": false,
-            "error": "revision_conflict",
-            "message": "Document has been updated since the given revision",
+        .and(body_json(json!({
+            "id": "doc-new",
+            "text": NOTES,
+            "lastRevision": 1,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": document(), "status": 200, "ok": true,
         })))
         .mount(&server)
         .await;
@@ -487,10 +600,38 @@ async fn a_document_edited_since_the_export_is_refused_rather_than_overwritten()
             .assert()
     })
     .await;
-    assert
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("pinned to revision 1"));
+    assert.success();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_slug_form_of_an_id_is_not_a_contradiction() {
+    // `otl-e2e-2peEK9IF9n` is what a URL carries and what every other otl
+    // command takes; it was refused against a block naming the same
+    // document by UUID.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/documents.update"))
+        .and(body_partial_json(json!({ "id": "notes-xyz789" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": document(), "status": 200, "ok": true,
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("Notes.md");
+    std::fs::write(&file, exported_file_without_revision()).unwrap();
+
+    let uri = server.uri();
+    let assert = blocking(move || {
+        otl_at(&uri)
+            .args(["docs", "update", "notes-xyz789", "--file"])
+            .arg(&file)
+            .write_stdin("")
+            .assert()
+    })
+    .await;
+    assert.success();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -551,6 +692,7 @@ async fn an_id_that_contradicts_the_file_is_refused_before_any_request() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_short_id_from_a_url_is_not_a_contradiction() {
     let server = MockServer::start().await;
+    mount_info(&server, 1).await;
     Mock::given(method("POST"))
         .and(path("/api/documents.update"))
         .and(body_partial_json(json!({ "id": "xyz789" })))

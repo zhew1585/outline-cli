@@ -18,6 +18,11 @@
 //! somebody else's change. `--force` drops the block's revision for a
 //! caller who means to overwrite the newer version.
 //!
+//! That check costs one `documents.info` on the paths that do not already
+//! read the body, and it is not optional - a whole-body replace is the one
+//! write that overwrites the entire page, so it is the last place that may
+//! delegate the check to a server field an instance might not implement.
+//!
 //! All of this happens only when a block was actually present. A piped
 //! body, or a file without one, behaves exactly as it did before.
 //!
@@ -45,7 +50,7 @@ use crate::exit::CliError;
 use crate::render::OutputMode;
 use crate::session::Session;
 
-use super::anchor::{self, Plan};
+use super::anchor::{self, Pin, PinSource, Plan};
 use super::content::{self, Body};
 use super::detail;
 use super::frontmatter::FrontMatter;
@@ -124,9 +129,11 @@ Not overwriting someone else's edit:
   body you read earlier: without it, an edit computed from a stale copy can
   still apply cleanly on top of someone else's change.
 
-  Every path that reads the body also pins the write to the revision it
-  just read, so the window between this command's own read and its write is
-  closed with or without the flag.
+  Enforced by this CLI, on every mode, before anything is sent: a
+  mismatch exits 2 and no write happens. The revision is also sent as
+  lastRevision, which asks the server to reject a stale write on its side
+  too - but not every instance implements that field, so it is a second
+  line and never the only one.
 
 Writing back an exported file:
   A file from `otl docs export` opens with a YAML block naming the
@@ -136,9 +143,10 @@ Writing back an exported file:
 
   The block is stripped before sending, so it never becomes document text.
   Its `revision` becomes --if-revision unless you pass one, so a copy the
-  document has since moved past is refused rather than written; --force
-  drops it. An ID that disagrees with the block is a usage error, not a
-  silent choice between them.")]
+  document has since moved past is refused (exit 2) rather than written;
+  --force drops it. An ID that disagrees with the block is a usage error,
+  not a silent choice between them - the UUID, the short urlId and the
+  slug a URL carries all name the same document and none of them conflict.")]
 pub struct UpdateArgs {
     /// Document id (UUID or the short urlId from its URL). Optional when
     /// the body comes from a file carrying an `outline_id` block.
@@ -212,10 +220,10 @@ pub fn run(cmd: &UpdateArgs, mode: OutputMode, overrides: &Overrides) -> Result<
     let body = content::read(cmd.file.as_deref())?;
     let front = body.as_ref().and_then(|body| body.front.clone());
     let id = resolve_id(cmd.id.as_deref(), front.as_ref())?;
-    let if_revision = pinned_revision(cmd, front.as_ref());
+    let pin = pinned_revision(cmd, front.as_ref());
     validate(cmd, body.as_ref())?;
     let session = Session::open(overrides)?;
-    let plan = body_args(&session, cmd, &id, if_revision, body)?;
+    let plan = body_args(&session, cmd, &id, pin, body)?;
     let mut args = metadata_args(cmd, &id);
     args.extend(plan.args);
     if let Some(revision) = plan.pinned {
@@ -267,12 +275,20 @@ fn resolve_id(argument: Option<&str>, front: Option<&FrontMatter>) -> Result<Str
 /// have been sitting on disk for a week. `--force` drops the block's
 /// without touching the flag, so `--force --if-revision N` still means what
 /// it says.
-fn pinned_revision(cmd: &UpdateArgs, front: Option<&FrontMatter>) -> Option<u64> {
-    cmd.if_revision.or_else(|| {
-        front
-            .filter(|_| !cmd.force)
-            .and_then(|front| front.revision)
-    })
+fn pinned_revision(cmd: &UpdateArgs, front: Option<&FrontMatter>) -> Option<Pin> {
+    if let Some(revision) = cmd.if_revision {
+        return Some(Pin {
+            revision,
+            origin: PinSource::Flag,
+        });
+    }
+    front
+        .filter(|_| !cmd.force)
+        .and_then(|front| front.revision)
+        .map(|revision| Pin {
+            revision,
+            origin: PinSource::File,
+        })
 }
 
 /// Everything that can be refused before a request is sent.
@@ -382,40 +398,45 @@ fn body_args(
     session: &Session,
     cmd: &UpdateArgs,
     id: &str,
-    if_revision: Option<u64>,
+    pin: Option<Pin>,
     body: Option<Body>,
 ) -> Result<Plan, CliError> {
     if let Some(address) = &cmd.delete_section {
-        let (text, pinned) = anchor::current_body(session, id, if_revision)?;
+        let (text, pinned) = anchor::current_body(session, id, pin)?;
         return anchor::section_plan(&text, pinned, "--delete-section", address, None);
     }
     if let Some(address) = &cmd.section {
         // `validate` has already refused the bodyless case.
         let replacement = body.map(|body| body.text).unwrap_or_default();
-        let (text, pinned) = anchor::current_body(session, id, if_revision)?;
+        let (text, pinned) = anchor::current_body(session, id, pin)?;
         return anchor::section_plan(&text, pinned, "--section", address, Some(&replacement));
     }
     let Some(body) = body else {
+        anchor::require_revision(session, id, pin)?;
         return Ok(Plan {
             args: Vec::new(),
-            pinned: if_revision,
+            pinned: pin.map(|pin| pin.revision),
         });
     };
     if cmd.mode == Some(EditMode::Patch) {
         let target = cmd.find_text.clone().unwrap_or_default();
-        let (text, pinned) = anchor::current_body(session, id, if_revision)?;
+        let (text, pinned) = anchor::current_body(session, id, pin)?;
         anchor::verify(&text, &target)?;
         return Ok(anchor::patch_plan(body.text, target, pinned));
     }
-    // Replace, append and prepend have no anchor to verify, so they stay a
-    // single request and pin only what the caller asserted.
+    // Replace, append and prepend have no anchor to derive, so they read
+    // nothing unless a revision was asserted - and then they read only the
+    // revision, because `lastRevision` alone is not a check this CLI can
+    // rely on (see `anchor::require_revision`). A replace is the write with
+    // the most to lose, so it is the last one that may skip it.
+    anchor::require_revision(session, id, pin)?;
     let mut args = vec![("text".to_string(), body.text)];
     if let Some(mode) = cmd.mode {
         args.push(("editMode".to_string(), mode.api_value().to_string()));
     }
     Ok(Plan {
         args,
-        pinned: if_revision,
+        pinned: pin.map(|pin| pin.revision),
     })
 }
 
@@ -669,7 +690,13 @@ mod tests {
     #[test]
     fn the_files_revision_becomes_the_pin() {
         let front = front(Some("doc-1"), None, Some(15));
-        assert_eq!(pinned_revision(&cmd(None, false), Some(&front)), Some(15));
+        assert_eq!(
+            pinned_revision(&cmd(None, false), Some(&front)),
+            Some(Pin {
+                revision: 15,
+                origin: PinSource::File
+            })
+        );
     }
 
     #[test]
@@ -679,7 +706,13 @@ mod tests {
         let mut asserted = cmd(None, false);
         asserted.if_revision = Some(20);
         let front = front(Some("doc-1"), None, Some(15));
-        assert_eq!(pinned_revision(&asserted, Some(&front)), Some(20));
+        assert_eq!(
+            pinned_revision(&asserted, Some(&front)),
+            Some(Pin {
+                revision: 20,
+                origin: PinSource::Flag
+            })
+        );
     }
 
     #[test]
@@ -689,6 +722,12 @@ mod tests {
         forced.force = true;
         assert_eq!(pinned_revision(&forced, Some(&front)), None);
         forced.if_revision = Some(20);
-        assert_eq!(pinned_revision(&forced, Some(&front)), Some(20));
+        assert_eq!(
+            pinned_revision(&forced, Some(&front)),
+            Some(Pin {
+                revision: 20,
+                origin: PinSource::Flag
+            })
+        );
     }
 }
